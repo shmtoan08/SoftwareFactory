@@ -254,6 +254,28 @@ export interface VerifiedCodeImportRecord {
   created_at: string;
 }
 
+export type SnapshotRetentionClass = "EPHEMERAL_14D" | "MERGED_PERMANENT";
+
+export type VerificationOverallStatus =
+  | "PASSED"
+  | "FAILED_ACCEPTANCE"
+  | "TEST_TAMPERING_DETECTED"
+  | "TEST_TIMEOUT"
+  | "INFRA_ERROR";
+
+export type VerificationExecutionBackend =
+  | "docker"
+  | "linux-supervisor"
+  | "host-subprocess";
+
+export interface Tier3AssertionEvidence {
+  readonly filePath: string;
+  readonly skippedPatterns: readonly string[];
+  readonly assertionSnippets: readonly string[];
+  readonly trivialPatterns: readonly string[];
+  readonly hasRealAssertions: boolean;
+}
+
 export interface MergeCandidateRecord {
   merge_candidate_id: string;
   project_id: string;
@@ -264,6 +286,10 @@ export interface MergeCandidateRecord {
   merge_candidate_hash: string;
   verified_tree_hash: string;
   is_superseded: boolean;
+  snapshot_path?: string | null;
+  snapshot_sha256?: string | null;
+  snapshot_size_bytes?: number | null;
+  snapshot_retention_class?: SnapshotRetentionClass;
   created_at: string;
 }
 
@@ -276,6 +302,19 @@ export interface VerificationRunRecord {
   verified_tree_hash: string;
   verifier_image_digest: string;
   verdict: "PASS" | "FAIL";
+  overall_status?: VerificationOverallStatus;
+  tier1_trusted_acceptance_passed?: boolean | null;
+  tier2_protected_baseline_passed?: boolean | null;
+  tier2_baseline_tamper_detected?: boolean;
+  tampered_baseline_paths?: readonly string[];
+  tier3_agent_tests_passed?: boolean | null;
+  tier3_assertions?: readonly Tier3AssertionEvidence[];
+  infra_retry_count?: number;
+  execution_backend?: VerificationExecutionBackend;
+  hermetic_network_disabled?: boolean;
+  hardlink_cache_forbidden?: boolean;
+  is_docker_isolated?: boolean;
+  trusted_policy_sha256?: string | null;
   exit_code: number;
   duration_ms: number;
   report_sha256: string;

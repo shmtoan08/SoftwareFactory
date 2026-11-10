@@ -4,6 +4,7 @@ export interface TaskContractSpec {
   readonly allowed_files: readonly string[];
   readonly protected_paths?: readonly string[];
   readonly forbidden_paths?: readonly string[];
+  readonly trusted_policy_sha256?: string;
   readonly max_changed_files?: number;
   readonly max_deleted_lines?: number;
   readonly max_binary_bytes?: number;

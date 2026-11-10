@@ -5,16 +5,29 @@ import type {
   ReviewArtifactRecord,
   TaskLeaseRecord,
   TaskRecord,
+  TaskStatus,
   VerificationRunRecord,
   VerifiedCodeImportRecord,
 } from "@software-factory/shared-types";
-import type { GitTreeImportCandidateInput, TaskContractSpec } from "@software-factory/task-contract";
+import {
+  type GitTreeImportCandidateInput,
+  type TaskContractSpec,
+  inspectRealGitCommitForImport,
+} from "@software-factory/task-contract";
 import {
   type CasMergeResult,
   PostgresRlsError,
   type ProjectMemberRole,
   type SoftwareFactoryControlPlaneStore,
 } from "@software-factory/database";
+import {
+  type BuildMergeCandidateResult,
+  Docker3TierVerifier,
+  ImmutableSourceSnapshotStore,
+  type RetryableVerificationResult,
+  type TierCommandSpec,
+  buildRealGitMergeCandidate,
+} from "@software-factory/verifier";
 
 export interface CoreApiAuthContext {
   readonly projectId: string;
@@ -214,6 +227,7 @@ export class CoreApiTokenAuthenticator {
 export class CoreApiService {
   private readonly store: SoftwareFactoryControlPlaneStore;
   public readonly authenticator: CoreApiTokenAuthenticator;
+  public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
 
   constructor(
     store: SoftwareFactoryControlPlaneStore,
@@ -221,9 +235,11 @@ export class CoreApiService {
       authenticator?: CoreApiTokenAuthenticator;
       authSigningSecret?: string;
       clockFn?: () => Date;
+      snapshotStore?: ImmutableSourceSnapshotStore;
     }
   ) {
     this.store = store;
+    this.snapshotStore = options?.snapshotStore ?? null;
     this.authenticator =
       options?.authenticator ??
       new CoreApiTokenAuthenticator({
@@ -493,6 +509,377 @@ export class CoreApiService {
     );
   }
 
+  public async buildMergeCandidateFromGit(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      lease_id: string;
+      lease_epoch: number;
+      staging_ref: string;
+      agent_commit_hash: string;
+      repo_path: string;
+      git_dir?: string;
+      candidate_input?: GitTreeImportCandidateInput;
+      snapshot_store?: ImmutableSourceSnapshotStore;
+    }
+  ): Promise<
+    | {
+        readonly ok: true;
+        readonly verifiedImport: VerifiedCodeImportRecord;
+        readonly mergeCandidate: MergeCandidateRecord;
+        readonly candidateBuild: Extract<BuildMergeCandidateResult, { ok: true }>;
+      }
+    | {
+        readonly ok: false;
+        readonly reason: "MERGE_CONFLICT";
+        readonly verifiedImport: VerifiedCodeImportRecord;
+        readonly taskStatus: TaskStatus;
+        readonly conflictedFiles: readonly string[];
+        readonly conflictSummary: string;
+      }
+  > {
+    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
+
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => {
+        const task = this.store.getTaskById(input.task_id);
+        if (!task) {
+          throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project`);
+        }
+
+        const existingImports = this.store.getVerifiedImportsForTask(input.task_id);
+        let verifiedImport = existingImports.find(
+          (rec) =>
+            rec.lease_id === input.lease_id &&
+            rec.lease_epoch === input.lease_epoch &&
+            rec.agent_commit_hash === input.agent_commit_hash
+        );
+
+        if (!verifiedImport) {
+          const candidateInput =
+            input.candidate_input ??
+            inspectRealGitCommitForImport({
+              repoPath: input.repo_path,
+              gitDir: input.git_dir,
+              expectedBaseMainCommitHash: task.base_main_commit_hash,
+              agentCommitHash: input.agent_commit_hash,
+              contract: task.task_contract_json as unknown as TaskContractSpec,
+            });
+          verifiedImport = this.store.recordVerifiedCodeImport({
+            project_id: projectId,
+            task_id: input.task_id,
+            lease_id: input.lease_id,
+            lease_epoch: input.lease_epoch,
+            staging_ref: input.staging_ref,
+            candidate_input: candidateInput,
+          });
+        }
+
+        const buildResult = buildRealGitMergeCandidate({
+          repoPath: input.repo_path,
+          gitDir: input.git_dir,
+          taskId: input.task_id,
+          agentCommitHash: input.agent_commit_hash,
+          snapshotStore,
+          createdAt: new Date(this.store.clockTimestampIso()),
+        });
+
+        if (!buildResult.ok) {
+          const conflictRes = this.store.markMergeConflictReworkRequired({
+            project_id: projectId,
+            task_id: input.task_id,
+            import_id: verifiedImport.import_id,
+            agent_commit_hash: input.agent_commit_hash,
+            base_main_commit_hash: buildResult.baseMainCommitHash,
+            conflicted_files: buildResult.conflictedFiles,
+            conflict_summary: buildResult.conflictSummary,
+          });
+          return {
+            ok: false,
+            reason: "MERGE_CONFLICT",
+            verifiedImport,
+            taskStatus: conflictRes.task_status,
+            conflictedFiles: conflictRes.conflicted_files,
+            conflictSummary: buildResult.conflictSummary,
+          };
+        }
+
+        const mergeCandidate = this.store.createMergeCandidate({
+          project_id: projectId,
+          task_id: input.task_id,
+          import_id: verifiedImport.import_id,
+          base_main_commit_hash: buildResult.baseMainCommitHash,
+          merge_candidate_hash: buildResult.mergeCandidateHash,
+          verified_tree_hash: buildResult.verifiedTreeHash,
+          snapshot_path: buildResult.snapshotPath ?? null,
+          snapshot_sha256: buildResult.snapshotSha256 ?? null,
+          snapshot_size_bytes: buildResult.snapshotSizeBytes ?? null,
+          snapshot_retention_class: buildResult.snapshotRetentionClass ?? "EPHEMERAL_14D",
+        });
+
+        return {
+          ok: true,
+          verifiedImport,
+          mergeCandidate,
+          candidateBuild: buildResult,
+        };
+      }
+    );
+  }
+
+  public async verifyMergeCandidate(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      merge_candidate_id: string;
+      verifier: Docker3TierVerifier;
+      trusted_acceptance_dir: string;
+      expected_trusted_policy_sha256?: string;
+      repo_path?: string;
+      base_baseline_dir?: string;
+      deps_cache_dir?: string;
+      docker_image?: string;
+      execution_mode?: "auto" | "docker" | "sandbox" | "subprocess";
+      require_docker?: boolean;
+      network_disabled?: boolean;
+      step_timeout_ms?: number;
+      max_infra_retries?: number;
+      tier1_command: TierCommandSpec;
+      tier2_command?: TierCommandSpec;
+      tier3_command?: TierCommandSpec;
+      tier3_test_files?: readonly string[];
+      extra_env?: Readonly<Record<string, string>>;
+      infra_error_hook?: (attemptIndex: number) => boolean;
+    }
+  ): Promise<{
+    readonly finalRun: VerificationRunRecord;
+    readonly allRuns: readonly VerificationRunRecord[];
+    readonly retryResult: RetryableVerificationResult;
+    readonly taskStatus: TaskStatus;
+  }> {
+    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+
+    const { task, candidate } = await this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => {
+        const t = this.store.getTaskById(input.task_id);
+        const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
+        if (!t || !mc || mc.task_id !== t.task_id) {
+          throw new PostgresRlsError(
+            "23503",
+            `Task ${input.task_id} or MergeCandidate ${input.merge_candidate_id} not found`
+          );
+        }
+        if (!mc.snapshot_path || !mc.snapshot_sha256) {
+          throw new PostgresRlsError(
+            "23514",
+            `MergeCandidate ${mc.merge_candidate_id} is missing immutable snapshot_path/snapshot_sha256 required by M3 Verifier`
+          );
+        }
+        return { task: t, candidate: mc };
+      }
+    );
+
+    const recordedRuns: VerificationRunRecord[] = [];
+    const retryResult = await input.verifier.verifyCandidateWithRetries({
+      projectId,
+      taskId: task.task_id,
+      mergeCandidateId: candidate.merge_candidate_id,
+      mergeCandidateHash: candidate.merge_candidate_hash,
+      verifiedTreeHash: candidate.verified_tree_hash,
+      baseMainCommitHash: candidate.base_main_commit_hash,
+      taskContract: task.task_contract_json as unknown as TaskContractSpec,
+      snapshotPath: candidate.snapshot_path!,
+      snapshotSha256: candidate.snapshot_sha256!,
+      trustedAcceptanceDir: input.trusted_acceptance_dir,
+      expectedTrustedPolicySha256: input.expected_trusted_policy_sha256,
+      repoPath: input.repo_path,
+      baseBaselineDir: input.base_baseline_dir,
+      depsCacheDir: input.deps_cache_dir,
+      dockerImage: input.docker_image,
+      executionMode: input.execution_mode,
+      requireDocker: input.require_docker,
+      networkDisabled: input.network_disabled,
+      stepTimeoutMs: input.step_timeout_ms,
+      maxInfraRetries: input.max_infra_retries,
+      tier1Command: input.tier1_command,
+      tier2Command: input.tier2_command,
+      tier3Command: input.tier3_command,
+      tier3TestFiles: input.tier3_test_files,
+      extraEnv: input.extra_env,
+      infraErrorHook: input.infra_error_hook,
+      onAttemptRecorded: (attempt, isFinal) => {
+        const run = this.store.withRlsTransaction(
+          {
+            currentProjectId: projectId,
+            currentPrincipalId: verified.principalId,
+            currentRole: "core_api_service",
+          },
+          () =>
+            this.store.recordVerificationRun({
+              project_id: projectId,
+              task_id: candidate.task_id,
+              merge_candidate_id: candidate.merge_candidate_id,
+              merge_candidate_hash: candidate.merge_candidate_hash,
+              verified_tree_hash: candidate.verified_tree_hash,
+              verifier_image_digest: attempt.verifierImageDigest,
+              verdict: attempt.verdict,
+              overall_status: attempt.overallStatus,
+              tier1_trusted_acceptance_passed: attempt.tier1TrustedAcceptancePassed,
+              tier2_protected_baseline_passed: attempt.tier2ProtectedBaselinePassed,
+              tier2_baseline_tamper_detected: attempt.tier2BaselineTamperDetected,
+              tampered_baseline_paths: attempt.tamperedBaselinePaths,
+              tier3_agent_tests_passed: attempt.tier3AgentTestsPassed,
+              tier3_assertions: attempt.tier3Assertions,
+              infra_retry_count: attempt.attemptIndex,
+              execution_backend: attempt.executionBackend,
+              hermetic_network_disabled: attempt.hermeticNetworkDisabled,
+              hardlink_cache_forbidden: attempt.hardlinkCacheForbidden,
+              is_docker_isolated: attempt.isDockerIsolated,
+              trusted_policy_sha256: attempt.trustedPolicySha256,
+              keep_verifying_on_infra_retry:
+                attempt.overallStatus === "INFRA_ERROR" && !isFinal,
+              exit_code: attempt.exitCode,
+              duration_ms: attempt.durationMs,
+              report_sha256: attempt.reportSha256,
+            })
+        );
+        return Promise.resolve(run).then((persisted) => {
+          recordedRuns.push(persisted);
+        });
+      },
+    });
+
+    const finalRun = recordedRuns[recordedRuns.length - 1]!;
+    const updatedTask = await this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => this.store.getTaskById(task.task_id)
+    );
+
+    return {
+      finalRun,
+      allRuns: recordedRuns,
+      retryResult,
+      taskStatus: updatedTask!.status,
+    };
+  }
+
+  public async buildAndVerifyMergeCandidateFromGit(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      lease_id: string;
+      lease_epoch: number;
+      staging_ref: string;
+      agent_commit_hash: string;
+      repo_path: string;
+      git_dir?: string;
+      candidate_input?: GitTreeImportCandidateInput;
+      snapshot_store?: ImmutableSourceSnapshotStore;
+      verifier: Docker3TierVerifier;
+      trusted_acceptance_dir: string;
+      expected_trusted_policy_sha256?: string;
+      base_baseline_dir?: string;
+      deps_cache_dir?: string;
+      docker_image?: string;
+      execution_mode?: "auto" | "docker" | "sandbox" | "subprocess";
+      require_docker?: boolean;
+      network_disabled?: boolean;
+      step_timeout_ms?: number;
+      max_infra_retries?: number;
+      tier1_command: TierCommandSpec;
+      tier2_command?: TierCommandSpec;
+      tier3_command?: TierCommandSpec;
+      tier3_test_files?: readonly string[];
+      extra_env?: Readonly<Record<string, string>>;
+      infra_error_hook?: (attemptIndex: number) => boolean;
+    }
+  ): Promise<
+    | {
+        readonly ok: false;
+        readonly reason: "MERGE_CONFLICT";
+        readonly verifiedImport: VerifiedCodeImportRecord;
+        readonly taskStatus: TaskStatus;
+        readonly conflictedFiles: readonly string[];
+        readonly conflictSummary: string;
+      }
+    | {
+        readonly ok: true;
+        readonly verifiedImport: VerifiedCodeImportRecord;
+        readonly mergeCandidate: MergeCandidateRecord;
+        readonly finalRun: VerificationRunRecord;
+        readonly allRuns: readonly VerificationRunRecord[];
+        readonly retryResult: RetryableVerificationResult;
+        readonly taskStatus: TaskStatus;
+      }
+  > {
+    const built = await this.buildMergeCandidateFromGit(projectId, auth, {
+      task_id: input.task_id,
+      lease_id: input.lease_id,
+      lease_epoch: input.lease_epoch,
+      staging_ref: input.staging_ref,
+      agent_commit_hash: input.agent_commit_hash,
+      repo_path: input.repo_path,
+      git_dir: input.git_dir,
+      candidate_input: input.candidate_input,
+      snapshot_store: input.snapshot_store ?? input.verifier.snapshotStore,
+    });
+
+    if (!built.ok) {
+      return built;
+    }
+
+    const verifiedRes = await this.verifyMergeCandidate(projectId, auth, {
+      task_id: input.task_id,
+      merge_candidate_id: built.mergeCandidate.merge_candidate_id,
+      verifier: input.verifier,
+      trusted_acceptance_dir: input.trusted_acceptance_dir,
+      expected_trusted_policy_sha256: input.expected_trusted_policy_sha256,
+      repo_path: input.repo_path,
+      base_baseline_dir: input.base_baseline_dir,
+      deps_cache_dir: input.deps_cache_dir,
+      docker_image: input.docker_image,
+      execution_mode: input.execution_mode,
+      require_docker: input.require_docker,
+      network_disabled: input.network_disabled,
+      step_timeout_ms: input.step_timeout_ms,
+      max_infra_retries: input.max_infra_retries,
+      tier1_command: input.tier1_command,
+      tier2_command: input.tier2_command,
+      tier3_command: input.tier3_command,
+      tier3_test_files: input.tier3_test_files,
+      extra_env: input.extra_env,
+      infra_error_hook: input.infra_error_hook,
+    });
+
+    return {
+      ok: true,
+      verifiedImport: built.verifiedImport,
+      mergeCandidate: built.mergeCandidate,
+      finalRun: verifiedRes.finalRun,
+      allRuns: verifiedRes.allRuns,
+      retryResult: verifiedRes.retryResult,
+      taskStatus: verifiedRes.taskStatus,
+    };
+  }
+
   public async executeCasMerge(
     projectId: string,
     auth: CoreApiAuthContext,
@@ -500,20 +887,39 @@ export class CoreApiService {
       task_id: string;
       merge_candidate_id: string;
       approval_id: string;
+      snapshot_store?: ImmutableSourceSnapshotStore;
     }
   ): Promise<CasMergeResult> {
     const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const snapshotStore = input.snapshot_store ?? this.snapshotStore;
     return this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () =>
-        this.store.executeAtomicCasMergeOrReconcile({
+      async () => {
+        const res = await this.store.executeAtomicCasMergeOrReconcile({
           project_id: projectId,
-          ...input,
-        })
+          task_id: input.task_id,
+          merge_candidate_id: input.merge_candidate_id,
+          approval_id: input.approval_id,
+        });
+        if (snapshotStore) {
+          const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
+          if (mc?.snapshot_path) {
+            if (res.status === "MERGED_BY_CAS" || res.status === "RECONCILED_ALREADY_MERGED") {
+              snapshotStore.markMergedPermanent(mc.snapshot_path);
+            } else if (res.status === "CAS_CONFLICT_NEEDS_REBASE") {
+              snapshotStore.markInvalidatedOrSuperseded(
+                mc.snapshot_path,
+                new Date(this.store.clockTimestampIso())
+              );
+            }
+          }
+        }
+        return res;
+      }
     );
   }
 }

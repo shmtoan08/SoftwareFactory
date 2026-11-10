@@ -57,7 +57,11 @@ jobs:
           PGPASSWORD: factory_secret_password
         run: |
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0001_mvp_core_schema_and_rls.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
+
+      - name: Prepare Optional Docker Verifier Base Image
+        run: docker pull node:22-alpine || true
 
       - name: Execute Full Test Suite
         run: npm test

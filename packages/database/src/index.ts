@@ -8,9 +8,13 @@ import {
   type ProcessedWorkerEventRecord,
   type ReviewArtifactRecord,
   type ServerEventAckContract,
+  type SnapshotRetentionClass,
   type TaskLeaseRecord,
   type TaskRecord,
   type TaskStatus,
+  type Tier3AssertionEvidence,
+  type VerificationExecutionBackend,
+  type VerificationOverallStatus,
   type VerificationRunRecord,
   type VerifiedCodeImportRecord,
   type WorkerEventEnvelope,
@@ -1459,6 +1463,10 @@ export class SoftwareFactoryControlPlaneStore {
     base_main_commit_hash: string;
     merge_candidate_hash: string;
     verified_tree_hash: string;
+    snapshot_path?: string | null;
+    snapshot_sha256?: string | null;
+    snapshot_size_bytes?: number | null;
+    snapshot_retention_class?: SnapshotRetentionClass;
   }): MergeCandidateRecord {
     this.assertWritePermissionForProject(input.project_id);
     const task = this.tasks.get(input.task_id);
@@ -1475,6 +1483,27 @@ export class SoftwareFactoryControlPlaneStore {
       throw new PostgresRlsError(
         "23514",
         `Candidate verified_tree_hash ${input.verified_tree_hash} does not match import ${imp.verified_tree_hash}`
+      );
+    }
+
+    if (
+      input.snapshot_sha256 !== undefined &&
+      input.snapshot_sha256 !== null &&
+      !/^[0-9a-f]{64}$/.test(input.snapshot_sha256)
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `chk_mc_snapshot_sha256_hex: invalid snapshot SHA-256 ${input.snapshot_sha256}`
+      );
+    }
+    if (
+      input.snapshot_size_bytes !== undefined &&
+      input.snapshot_size_bytes !== null &&
+      input.snapshot_size_bytes < 0
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `chk_mc_snapshot_size_nonneg: snapshot_size_bytes must be >= 0`
       );
     }
 
@@ -1517,6 +1546,10 @@ export class SoftwareFactoryControlPlaneStore {
       merge_candidate_hash: input.merge_candidate_hash,
       verified_tree_hash: imp.verified_tree_hash,
       is_superseded: false,
+      snapshot_path: input.snapshot_path ?? null,
+      snapshot_sha256: input.snapshot_sha256 ?? null,
+      snapshot_size_bytes: input.snapshot_size_bytes ?? null,
+      snapshot_retention_class: input.snapshot_retention_class ?? "EPHEMERAL_14D",
       created_at: nowIso,
     };
     this.mergeCandidates.set(candidate.merge_candidate_id, candidate);
@@ -1536,6 +1569,53 @@ export class SoftwareFactoryControlPlaneStore {
     task.updated_at = nowIso;
 
     return { ...candidate };
+  }
+
+  /**
+   * Records a Merge Conflict while integrating `C_agent` onto `B_base` (`MVP-SPEC-04` §1.1 step 2).
+   * Does NOT create a `merge_candidates` row; immediately transitions Task to `ReworkRequired`
+   * (or `ManualIntervention` when `max_rework_cycles` is exhausted) with the conflicted file list.
+   */
+  public markMergeConflictReworkRequired(input: {
+    project_id: string;
+    task_id: string;
+    agent_commit_hash: string;
+    base_main_commit_hash: string;
+    conflicted_files: readonly string[];
+    import_id?: string;
+    conflict_summary?: string;
+  }): { readonly task_status: TaskStatus; readonly conflicted_files: readonly string[] } {
+    this.assertWritePermissionForProject(input.project_id);
+    const task = this.tasks.get(input.task_id);
+    if (!task || task.project_id !== input.project_id) {
+      throw new PostgresRlsError("23503", `Task ${input.task_id} not found for project`);
+    }
+
+    const nowIso = this.clockTimestampIso();
+    task.status =
+      task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+    task.updated_at = nowIso;
+
+    this.insertOutboxEventInternal(
+      input.project_id,
+      "task",
+      task.task_id,
+      "merge_candidate.conflict",
+      {
+        task_id: task.task_id,
+        import_id: input.import_id ?? null,
+        agent_commit_hash: input.agent_commit_hash,
+        base_main_commit_hash: input.base_main_commit_hash,
+        conflicted_files: [...input.conflicted_files],
+        conflict_summary: input.conflict_summary ?? null,
+        resulting_task_status: task.status,
+      }
+    );
+
+    return {
+      task_status: task.status,
+      conflicted_files: [...input.conflicted_files],
+    };
   }
 
   private invalidateArtifactsAndApprovalsForCandidate(
@@ -1564,6 +1644,20 @@ export class SoftwareFactoryControlPlaneStore {
     verified_tree_hash: string;
     verifier_image_digest: string;
     verdict: "PASS" | "FAIL";
+    overall_status?: VerificationOverallStatus;
+    tier1_trusted_acceptance_passed?: boolean | null;
+    tier2_protected_baseline_passed?: boolean | null;
+    tier2_baseline_tamper_detected?: boolean;
+    tampered_baseline_paths?: readonly string[];
+    tier3_agent_tests_passed?: boolean | null;
+    tier3_assertions?: readonly Tier3AssertionEvidence[];
+    infra_retry_count?: number;
+    execution_backend?: VerificationExecutionBackend;
+    hermetic_network_disabled?: boolean;
+    hardlink_cache_forbidden?: boolean;
+    is_docker_isolated?: boolean;
+    trusted_policy_sha256?: string | null;
+    keep_verifying_on_infra_retry?: boolean;
     exit_code: number;
     duration_ms: number;
     report_sha256: string;
@@ -1586,6 +1680,43 @@ export class SoftwareFactoryControlPlaneStore {
       );
     }
 
+    const overallStatus: VerificationOverallStatus =
+      input.overall_status ?? (input.verdict === "PASS" ? "PASSED" : "FAILED_ACCEPTANCE");
+    const tamperDetected = input.tier2_baseline_tamper_detected ?? false;
+    const infraRetryCount = input.infra_retry_count ?? 0;
+
+    if (!Number.isInteger(infraRetryCount) || infraRetryCount < 0) {
+      throw new PostgresRlsError("23514", "chk_vr_infra_retry_nonneg: infra_retry_count must be >= 0");
+    }
+
+    if (
+      input.trusted_policy_sha256 !== undefined &&
+      input.trusted_policy_sha256 !== null &&
+      !/^[0-9a-f]{64}$/.test(input.trusted_policy_sha256)
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `chk_vr_trusted_policy_sha256_hex: invalid trusted_policy_sha256 ${input.trusted_policy_sha256}`
+      );
+    }
+
+    if (
+      input.verdict === "PASS" &&
+      (overallStatus !== "PASSED" ||
+        tamperDetected ||
+        input.tier1_trusted_acceptance_passed === false ||
+        input.tier2_protected_baseline_passed === false)
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `chk_vr_pass_consistency: cannot record PASS verdict with overall_status=${overallStatus}, tamperDetected=${String(
+          tamperDetected
+        )}, tier1=${String(input.tier1_trusted_acceptance_passed)}, tier2=${String(
+          input.tier2_protected_baseline_passed
+        )}`
+      );
+    }
+
     const nowIso = this.clockTimestampIso();
     const record: VerificationRunRecord = {
       verification_run_id: randomUUID(),
@@ -1596,19 +1727,60 @@ export class SoftwareFactoryControlPlaneStore {
       verified_tree_hash: input.verified_tree_hash,
       verifier_image_digest: input.verifier_image_digest,
       verdict: input.verdict,
+      overall_status: overallStatus,
+      tier1_trusted_acceptance_passed:
+        input.tier1_trusted_acceptance_passed ?? (input.verdict === "PASS" ? true : null),
+      tier2_protected_baseline_passed:
+        input.tier2_protected_baseline_passed ?? (input.verdict === "PASS" ? true : null),
+      tier2_baseline_tamper_detected: tamperDetected,
+      tampered_baseline_paths: [...(input.tampered_baseline_paths ?? [])],
+      tier3_agent_tests_passed:
+        input.tier3_agent_tests_passed ?? (input.verdict === "PASS" ? true : null),
+      tier3_assertions: structuredClone(input.tier3_assertions ?? []),
+      infra_retry_count: infraRetryCount,
+      execution_backend: input.execution_backend ?? "docker",
+      hermetic_network_disabled: input.hermetic_network_disabled ?? true,
+      hardlink_cache_forbidden: input.hardlink_cache_forbidden ?? true,
+      is_docker_isolated: input.is_docker_isolated ?? false,
+      trusted_policy_sha256: input.trusted_policy_sha256 ?? null,
       exit_code: input.exit_code,
       duration_ms: input.duration_ms,
       report_sha256: input.report_sha256,
       created_at: nowIso,
     };
     this.verificationRuns.set(record.verification_run_id, record);
-    task.status =
-      input.verdict === "PASS"
-        ? "UnderIndependentReview"
-        : task.rework_count < task.max_rework_cycles
-        ? "ReworkRequired"
-        : "ManualIntervention";
+
+    if (input.verdict === "PASS") {
+      task.status = "UnderIndependentReview";
+    } else if (overallStatus === "INFRA_ERROR") {
+      // INFRA_ERROR NEVER consumes rework_count; either keeps VerifyingInDocker while retrying
+      // or escalates directly to ManualIntervention once retries are exhausted (MVP-SPEC-04 §2.3).
+      task.status = input.keep_verifying_on_infra_retry ? "VerifyingInDocker" : "ManualIntervention";
+    } else {
+      task.status =
+        task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+    }
     task.updated_at = nowIso;
+
+    this.insertOutboxEventInternal(
+      input.project_id,
+      "verification_run",
+      record.verification_run_id,
+      "verification.completed",
+      {
+        task_id: task.task_id,
+        merge_candidate_id: mc.merge_candidate_id,
+        merge_candidate_hash: mc.merge_candidate_hash,
+        verdict: record.verdict,
+        overall_status: record.overall_status,
+        tier2_baseline_tamper_detected: record.tier2_baseline_tamper_detected,
+        infra_retry_count: record.infra_retry_count,
+        execution_backend: record.execution_backend,
+        is_docker_isolated: record.is_docker_isolated,
+        resulting_task_status: task.status,
+      }
+    );
+
     return { ...record };
   }
 
@@ -1988,6 +2160,7 @@ export class SoftwareFactoryControlPlaneStore {
           approval.status = "CONSUMED";
           approval.consumed_at = nowIso;
         }
+        mc.snapshot_retention_class = "MERGED_PERMANENT";
         task.status = "MergedAndCompleted";
         task.merged_commit_hash = mc.merge_candidate_hash;
         task.merged_at = nowIso;
@@ -2060,6 +2233,7 @@ export class SoftwareFactoryControlPlaneStore {
       project.main_ref_commit_hash = mc.merge_candidate_hash;
       project.updated_at = nowIso;
 
+      mc.snapshot_retention_class = "MERGED_PERMANENT";
       approval.status = "CONSUMED";
       approval.consumed_at = nowIso;
       task.status = "MergedAndCompleted";
@@ -2087,6 +2261,32 @@ export class SoftwareFactoryControlPlaneStore {
         main_ref_commit_hash: mc.merge_candidate_hash,
       };
     });
+  }
+
+  public getMergeCandidateById(mergeCandidateId: string): MergeCandidateRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    const mc = this.mergeCandidates.get(mergeCandidateId);
+    if (!mc || mc.project_id !== currentProjectId) {
+      return null;
+    }
+    return { ...mc };
+  }
+
+  public listVerificationRunsForTask(taskId: string): VerificationRunRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: VerificationRunRecord[] = [];
+    for (const vr of this.verificationRuns.values()) {
+      if (vr.project_id === currentProjectId && vr.task_id === taskId) {
+        list.push({ ...vr });
+      }
+    }
+    return list;
   }
 
   public getApprovalById(approvalId: string): ApprovalDecisionRecord | null {

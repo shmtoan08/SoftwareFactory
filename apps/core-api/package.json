@@ -9,6 +9,7 @@
   "dependencies": {
     "@software-factory/shared-types": "1.5.0",
     "@software-factory/task-contract": "1.5.0",
-    "@software-factory/database": "1.5.0"
+    "@software-factory/database": "1.5.0",
+    "@software-factory/verifier": "1.5.0"
   }
 }

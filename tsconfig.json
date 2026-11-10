@@ -13,6 +13,7 @@
       "@software-factory/adapter-sdk": ["packages/adapter-sdk/src/index.ts"],
       "@software-factory/database": ["packages/database/src/index.ts"],
       "@software-factory/wna": ["packages/wna/src/index.ts"],
+      "@software-factory/verifier": ["packages/verifier/src/index.ts"],
       "@software-factory/core-api": ["apps/core-api/src/index.ts"],
       "@software-factory/agent-gateway": ["apps/agent-gateway/src/index.ts"],
       "@software-factory/web": ["apps/web/src/index.ts"]
