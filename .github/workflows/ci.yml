@@ -331,9 +331,9 @@ jobs:
                 verification_run_id, review_artifact_id, approval_request_id, approver_principal_id,
                 decision, status, approved_at, expires_at
               ) VALUES (
-                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a,
-                repeat('3', 40), repeat('1', 40), repeat('4', 40), repeat('5', 40),
-                v_vr_a, v_ra_a, v_ar_a2, 'alice-approver',
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a2,
+                repeat('3', 40), repeat('6', 40), repeat('8', 40), repeat('7', 40),
+                v_vr_a2, v_ra_a2, v_ar_a, 'alice-approver',
                 'APPROVED', 'ACTIVE', clock_timestamp(), clock_timestamp() + interval '1 hour'
               );
             EXCEPTION WHEN foreign_key_violation THEN v_caught := true;
