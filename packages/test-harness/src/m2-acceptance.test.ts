@@ -4,8 +4,11 @@ import { execFileSync, spawn } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readlinkSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -41,6 +44,10 @@ import {
 import {
   LinuxCgroupV2SandboxBackend,
   SimulatedCgroupV2SandboxBackend,
+  deriveTaskRunnerUid,
+  probeLinuxCgroupV2Support,
+  probeLinuxNamespaceSupport,
+  probeLinuxSubreaperSupport,
 } from "../../wna/src/index.ts";
 import {
   AgentGatewayHttpServer,
@@ -193,12 +200,20 @@ describe("Milestone M2 Gate — Worker Plane, Sandbox, Controlled Git Push Impor
 
     const meta = sandboxBackend.getSandboxSecurityMetadata(taskAId, epoch);
     assert.ok(meta);
-    assert.equal(meta.supervisorUser, "sf-wna");
-    assert.equal(meta.subreaperEnabled, true);
-    assert.equal(meta.sandboxUser, "sf-task-runner");
-    assert.deepEqual(meta.namespaces, ["mount", "pid", "ipc", "uts"]);
+    assert.equal(meta.isSimulated, true);
+    assert.equal(meta.backendMode, "simulated-cgroup-v2");
+    assert.equal(meta.supervisorUser, "simulated");
+    assert.equal(meta.subreaperEnabled, false);
+    assert.equal(meta.uidDropped, false);
+    assert.equal(meta.sandboxUser, "simulated");
+    assert.equal(meta.sandboxUid, deriveTaskRunnerUid(taskAId));
+    assert.equal(meta.sandboxGid, deriveTaskRunnerUid(taskAId));
+    assert.equal(meta.noNewPrivsEnabled, false);
+    assert.equal(meta.capabilitiesDropped, false);
+    assert.deepEqual(meta.namespaces, []);
+    assert.deepEqual(meta.maskedPathsApplied, []);
 
-    // 1. Sandbox process can access its own worktree and /tmp
+    // 1. Sandbox path policy helper allows own worktree and /tmp
     assert.deepEqual(
       sandboxBackend.assertSandboxPathAccess(taskAId, epoch, `${taskAWorktree}/src/index.ts`),
       { allowed: true }
@@ -208,13 +223,13 @@ describe("Milestone M2 Gate — Worker Plane, Sandbox, Controlled Git Push Impor
       { allowed: true }
     );
 
-    // 2. Sandbox process is strictly blocked from reading /etc/sf-wna (WNA credentials)
+    // 2. Sandbox path policy helper blocks reading /etc/sf-wna (WNA credentials)
     assert.throws(
       () => sandboxBackend.assertSandboxPathAccess(taskAId, epoch, "/etc/sf-wna/worker_credential.key"),
       /EACCES: Mount namespace isolation denied access to WNA credential path/
     );
 
-    // 3. Sandbox process is strictly blocked from reading another task's worktree
+    // 3. Sandbox path policy helper blocks reading another task's worktree
     assert.throws(
       () => sandboxBackend.assertSandboxPathAccess(taskAId, epoch, `${taskBWorktree}/src/secret.ts`),
       /EACCES: Mount namespace isolation denied cross-worktree or host path access/
@@ -227,11 +242,12 @@ describe("Milestone M2 Gate — Worker Plane, Sandbox, Controlled Git Push Impor
     assert.equal(cleanup.backendMode, "simulated-cgroup-v2");
     assert.equal(cleanup.isSimulated, true);
     assert.equal(cleanup.realKernelOperationsExecuted, false);
-    assert.equal(cleanup.freezeApplied, true);
-    assert.equal(cleanup.cgroupKillWritten, true);
+    assert.equal(cleanup.realProcessGroupKilled, false);
+    assert.equal(cleanup.freezeApplied, false);
+    assert.equal(cleanup.cgroupKillWritten, false);
     assert.equal(cleanup.populatedZeroVerified, true);
     assert.equal(cleanup.remainingProcsCount, 0);
-    assert.equal(cleanup.cgroupDirRemoved, true);
+    assert.equal(cleanup.cgroupDirRemoved, false);
     assert.deepEqual(cleanup.subreaperWaitpidReapedPids, [61099]);
     assert.deepEqual(cleanup.killedPids, [61001, 61002, 61099]);
   });
@@ -1454,7 +1470,7 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
     const worktreePath = "/var/lib/software-factory/worktrees/real-proc/epoch-1";
 
     try {
-      // 1. Spawn a real detached Node child process and kill it via OS process group SIGKILL
+      // 1. Spawn a real detached Node child process and kill it via OS cleanup
       const spawned = backend.spawnRealProcessInSandbox({
         taskId,
         leaseEpoch: 1,
@@ -1466,6 +1482,15 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
       });
       assert.equal(spawned.executionMode, "real-process");
       assert.ok(spawned.pid > 0);
+      assert.equal(spawned.securityMetadata.isSimulated, false);
+      assert.equal(spawned.securityMetadata.workerPid, spawned.pid);
+      if (process.platform === "linux") {
+        assert.equal(spawned.securityMetadata.subreaperEnabled, true);
+        assert.equal(spawned.securityMetadata.noNewPrivsEnabled, true);
+      } else {
+        assert.equal(spawned.securityMetadata.subreaperEnabled, false);
+        assert.deepEqual(spawned.securityMetadata.namespaces, []);
+      }
 
       // Verify traversal bypass is rejected fail-closed (FIX-15)
       assert.throws(
@@ -1492,8 +1517,15 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
       assert.equal(evidence.isSimulated, true);
       assert.equal(evidence.realProcessGroupKilled, true);
       assert.equal(evidence.realKernelOperationsExecuted, false);
+      assert.equal(evidence.freezeApplied, false);
+      assert.equal(evidence.cgroupKillWritten, false);
+      assert.equal(evidence.cgroupDirRemoved, false);
       assert.equal(evidence.remainingProcsCount, 0);
-      assert.deepEqual(evidence.killedPids, [spawned.pid]);
+      assert.ok(
+        evidence.killedPids.includes(spawned.pid),
+        `Expected killedPids (${JSON.stringify(evidence.killedPids)}) to include ${spawned.pid}`
+      );
+      assert.throws(() => process.kill(spawned.pid, 0));
 
       // 2. Requiring real Linux cgroups v2 when cgroupfs is unavailable fails closed
       assert.throws(
@@ -2259,4 +2291,370 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
     );
     assert.equal(updated?.status, "Ready");
   });
+
+  it("(r) Real Linux PR_SET_CHILD_SUBREAPER Double-Fork Detached Orphan Reaping & Fail-Closed Guard (FIX-05)", async () => {
+    const isOsPidAlive = (pid: number): boolean => {
+      if (process.platform === "linux") {
+        try {
+          const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+          const rparen = stat.lastIndexOf(")");
+          const state = rparen !== -1 ? stat[rparen + 2] : undefined;
+          if (state === "Z" || state === "X") {
+            return false;
+          }
+        } catch {
+          return false;
+        }
+      }
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const readLinuxPpid = (pid: number): number | null => {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const rparen = stat.lastIndexOf(")");
+        if (rparen === -1) {
+          return null;
+        }
+        const fields = stat.slice(rparen + 2).trim().split(/\s+/);
+        const ppid = Number(fields[1]);
+        return Number.isInteger(ppid) ? ppid : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const subreaperProbe = probeLinuxSubreaperSupport();
+    const backend = new LinuxCgroupV2SandboxBackend({
+      cgroupRoot: "/nonexistent/sf-cgroup-v2-root",
+    });
+    const taskId = "99000000-0000-4000-8000-000000000010";
+
+    if (process.platform !== "linux") {
+      assert.equal(subreaperProbe.supported, false);
+      assert.throws(
+        () =>
+          backend.spawnRealProcessInSandbox({
+            taskId,
+            leaseEpoch: 1,
+            command: process.execPath,
+            args: ["-e", "process.exit(0)"],
+            sanitizedEnv: {},
+            cwd: process.cwd(),
+            requireSubreaper: true,
+          }),
+        /ERR_LINUX_SUBREAPER_UNAVAILABLE/
+      );
+      return;
+    }
+
+    assert.equal(subreaperProbe.supported, true, subreaperProbe.reason);
+    const tempDir = mkdtempSync(join(tmpdir(), "sf-m2-subreaper-"));
+    try {
+      const innerScript = [
+        'const { spawn } = require("node:child_process");',
+        'const { renameSync, writeFileSync } = require("node:fs");',
+        'const orphan = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+        "orphan.unref();",
+        'const tmp = process.argv[1] + ".tmp";',
+        'writeFileSync(tmp, String(orphan.pid), "utf8");',
+        "renameSync(tmp, process.argv[1]);",
+        "process.exit(0);",
+      ].join("\n");
+      const outerScript = [
+        'const { spawn } = require("node:child_process");',
+        "const [pidFile, inner] = process.argv.slice(1);",
+        'const intermediate = spawn(process.execPath, ["-e", inner, pidFile], { stdio: "ignore" });',
+        'intermediate.on("exit", () => process.exit(0));',
+      ].join("\n");
+
+      const runDoubleForkScenario = async (
+        targetBackend: LinuxCgroupV2SandboxBackend,
+        leaseEpoch: number,
+        requireKernelCgroup: boolean
+      ) => {
+        const orphanPidFile = join(tempDir, `orphan-epoch-${leaseEpoch}.pid`);
+        const spawned = targetBackend.spawnRealProcessInSandbox({
+          taskId,
+          leaseEpoch,
+          command: process.execPath,
+          args: ["-e", outerScript, orphanPidFile, innerScript],
+          sanitizedEnv: {},
+          cwd: tempDir,
+          worktreePath: tempDir,
+          isolateNamespaces: false,
+          requireSubreaper: true,
+          requireKernelCgroup,
+        });
+
+        try {
+          assert.equal(spawned.securityMetadata.subreaperEnabled, true);
+          assert.ok(spawned.supervisorPid && spawned.supervisorPid > 0);
+
+          let orphanPid = 0;
+          const deadline = Date.now() + 5000;
+          while (Date.now() < deadline) {
+            if (existsSync(orphanPidFile) && !isOsPidAlive(spawned.pid)) {
+              const parsed = Number(readFileSync(orphanPidFile, "utf8").trim());
+              if (
+                Number.isInteger(parsed) &&
+                parsed > 0 &&
+                readLinuxPpid(parsed) === spawned.supervisorPid
+              ) {
+                orphanPid = parsed;
+                break;
+              }
+            }
+            await new Promise((r) => setTimeout(r, 20));
+          }
+
+          assert.ok(orphanPid > 0, "Expected detached double-fork orphan PID reparented to supervisor");
+          assert.notEqual(orphanPid, spawned.pid);
+          assert.equal(isOsPidAlive(orphanPid), true, "Orphan must remain alive after parent exit");
+          assert.equal(readLinuxPpid(orphanPid), spawned.supervisorPid);
+
+          const evidence = await targetBackend.killAndVerifyClean(taskId, leaseEpoch);
+          assert.equal(
+            isOsPidAlive(orphanPid),
+            false,
+            `Double-fork orphan PID ${orphanPid} must be terminated at OS level`
+          );
+          assert.equal(evidence.remainingProcsCount, 0);
+          assert.equal(evidence.realProcessGroupKilled, true);
+          assert.ok(evidence.killedPids.includes(spawned.pid));
+          assert.ok(evidence.killedPids.includes(orphanPid));
+          assert.ok(
+            evidence.subreaperWaitpidReapedPids.includes(orphanPid),
+            `Expected waitpid reaped PIDs (${JSON.stringify(evidence.subreaperWaitpidReapedPids)}) to include orphan ${orphanPid}`
+          );
+          return evidence;
+        } finally {
+          await targetBackend.killAndVerifyClean(taskId, leaseEpoch).catch(() => {});
+        }
+      };
+
+      const ev1 = await runDoubleForkScenario(backend, 1, false);
+      assert.equal(ev1.backendMode, "simulated-cgroup-v2");
+      assert.equal(ev1.isSimulated, true);
+      assert.equal(ev1.freezeApplied, false);
+      assert.equal(ev1.cgroupKillWritten, false);
+      assert.equal(ev1.cgroupDirRemoved, false);
+
+      const cgroupProbe = probeLinuxCgroupV2Support();
+      if (cgroupProbe.supported) {
+        const cgroupBackend = new LinuxCgroupV2SandboxBackend({
+          cgroupRoot: cgroupProbe.cgroupRoot,
+        });
+        const ev2 = await runDoubleForkScenario(cgroupBackend, 2, true);
+        assert.equal(ev2.backendMode, "linux-cgroup-v2");
+        assert.equal(ev2.isSimulated, false);
+        assert.equal(ev2.realKernelOperationsExecuted, true);
+        assert.equal(ev2.freezeApplied, true);
+        assert.equal(ev2.cgroupKillWritten, true);
+        assert.equal(ev2.populatedZeroVerified, true);
+        assert.equal(ev2.cgroupDirRemoved, true);
+      }
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("(s) Real Linux Namespaces (mount/pid/ipc/uts), OS-Level Secret Masking & Honest Fallback (FIX-05)", async () => {
+    const nsProbe = probeLinuxNamespaceSupport({ testMaskMount: true });
+    const cgroupProbe = probeLinuxCgroupV2Support();
+    const backend = new LinuxCgroupV2SandboxBackend({
+      cgroupRoot: cgroupProbe.supported ? cgroupProbe.cgroupRoot : "/nonexistent/sf-cgroup-v2-root",
+    });
+    const taskId = "99000000-0000-4000-8000-000000000011";
+
+    const tempDir = mkdtempSync(join(tmpdir(), "sf-m2-ns-"));
+    const worktreeDir = join(tempDir, "worktree");
+    const secretDir = join(tempDir, "forbidden-sf-wna");
+    const secretFile = join(tempDir, "forbidden-token.key");
+    const allowedFile = join(worktreeDir, "allowed.txt");
+    const reportFile = join(worktreeDir, "sandbox-report.json");
+
+    try {
+      mkdirSync(worktreeDir, { recursive: true });
+      mkdirSync(secretDir, { recursive: true });
+      if (typeof process.getuid === "function" && process.getuid() === 0) {
+        chmodSync(tempDir, 0o755);
+        chmodSync(worktreeDir, 0o777);
+      }
+      writeFileSync(join(secretDir, "worker.key"), "HOST_WNA_TOP_SECRET_CREDENTIAL", "utf8");
+      writeFileSync(secretFile, "HOST_WNA_TOP_SECRET_CREDENTIAL", "utf8");
+      writeFileSync(allowedFile, "WORKTREE_ALLOWED_DATA", "utf8");
+
+      if (!nsProbe.supported) {
+        assert.throws(
+          () =>
+            backend.spawnRealProcessInSandbox({
+              taskId,
+              leaseEpoch: 1,
+              command: process.execPath,
+              args: ["-e", "process.exit(0)"],
+              sanitizedEnv: {},
+              cwd: worktreeDir,
+              worktreePath: worktreeDir,
+              requireNamespaceIsolation: true,
+              maskedPaths: [secretDir, secretFile],
+            }),
+          /ERR_LINUX_NAMESPACE_UNAVAILABLE/
+        );
+
+        if (process.platform === "linux") {
+          const fallbackSpawned = backend.spawnRealProcessInSandbox({
+            taskId,
+            leaseEpoch: 2,
+            command: process.execPath,
+            args: ["-e", "setInterval(() => {}, 1000)"],
+            sanitizedEnv: {},
+            cwd: worktreeDir,
+            worktreePath: worktreeDir,
+            requireSubreaper: true,
+          });
+          assert.equal(fallbackSpawned.securityMetadata.subreaperEnabled, true);
+          assert.deepEqual(fallbackSpawned.securityMetadata.namespaces, []);
+          assert.deepEqual(fallbackSpawned.securityMetadata.maskedPathsApplied, []);
+          await backend.killAndVerifyClean(taskId, 2);
+        }
+        return;
+      }
+
+      const nsScript = [
+        'const { spawn } = require("node:child_process");',
+        'const { readdirSync, readFileSync, readlinkSync, renameSync, writeFileSync } = require("node:fs");',
+        'const path = require("node:path");',
+        "const [secretDir, secretFile, allowedFile, reportFile] = process.argv.slice(1);",
+        "let secretDirReadDenied = false;",
+        'let secretDirErrorCode = "";',
+        "try {",
+        '  readFileSync(path.join(secretDir, "worker.key"), "utf8");',
+        "} catch (err) {",
+        "  secretDirReadDenied = true;",
+        '  secretDirErrorCode = String((err && err.code) || err);',
+        "}",
+        "let readdirDenied = false;",
+        "let readdirEntryCount = -1;",
+        "try {",
+        "  readdirEntryCount = readdirSync(secretDir).length;",
+        "} catch {",
+        "  readdirDenied = true;",
+        "}",
+        "let secretFileDenied = false;",
+        "let secretFileLeaked = false;",
+        "try {",
+        '  const data = readFileSync(secretFile, "utf8");',
+        '  secretFileLeaked = data.includes("HOST_WNA_TOP_SECRET_CREDENTIAL");',
+        "} catch {",
+        "  secretFileDenied = true;",
+        "}",
+        'const allowedWorktreeContent = readFileSync(allowedFile, "utf8");',
+        'const orphan = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });',
+        "orphan.unref();",
+        "const payload = JSON.stringify({",
+        "  pidInsideSandbox: process.pid,",
+        "  secretDirReadDenied,",
+        "  secretDirErrorCode,",
+        "  readdirDenied,",
+        "  readdirEntryCount,",
+        "  secretFileDenied,",
+        "  secretFileLeaked,",
+        "  allowedWorktreeContent,",
+        '  mntNs: readlinkSync("/proc/self/ns/mnt"),',
+        '  pidNs: readlinkSync("/proc/self/ns/pid"),',
+        '  ipcNs: readlinkSync("/proc/self/ns/ipc"),',
+        '  utsNs: readlinkSync("/proc/self/ns/uts"),',
+        "});",
+        'writeFileSync(reportFile + ".tmp", payload, "utf8");',
+        'renameSync(reportFile + ".tmp", reportFile);',
+        "setInterval(() => {}, 1000);",
+      ].join("\n");
+
+      const spawned = backend.spawnRealProcessInSandbox({
+        taskId,
+        leaseEpoch: 1,
+        command: process.execPath,
+        args: ["-e", nsScript, secretDir, secretFile, allowedFile, reportFile],
+        sanitizedEnv: {},
+        cwd: worktreeDir,
+        worktreePath: worktreeDir,
+        requireNamespaceIsolation: true,
+        requireSubreaper: true,
+        requireKernelCgroup: cgroupProbe.supported,
+        maskedPaths: [secretDir, secretFile],
+      });
+
+      const meta = backend.getSandboxSecurityMetadata(taskId, 1);
+      assert.ok(meta);
+      assert.equal(meta.isSimulated, false);
+      assert.equal(meta.subreaperEnabled, true);
+      assert.equal(meta.noNewPrivsEnabled, true);
+      assert.equal(meta.capabilitiesDropped, true);
+      for (const expectedNs of ["mount", "pid", "ipc", "uts"] as const) {
+        assert.ok(meta.namespaces.includes(expectedNs));
+      }
+      assert.ok(meta.maskedPathsApplied.includes(secretDir));
+      assert.ok(meta.maskedPathsApplied.includes(secretFile));
+
+      const deadline = Date.now() + 5000;
+      while (!existsSync(reportFile) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(existsSync(reportFile), true, "Expected sandbox OS report file");
+
+      const report = JSON.parse(readFileSync(reportFile, "utf8")) as {
+        pidInsideSandbox: number;
+        secretDirReadDenied: boolean;
+        secretDirErrorCode: string;
+        readdirDenied: boolean;
+        readdirEntryCount: number;
+        secretFileDenied: boolean;
+        secretFileLeaked: boolean;
+        allowedWorktreeContent: string;
+        mntNs: string;
+        pidNs: string;
+        ipcNs: string;
+        utsNs: string;
+      };
+
+      assert.equal(report.secretDirReadDenied, true, `Got code ${report.secretDirErrorCode}`);
+      assert.ok(report.readdirDenied || report.readdirEntryCount === 0);
+      assert.equal(report.secretFileLeaked, false);
+      assert.ok(report.secretFileDenied || report.secretFileLeaked === false);
+      assert.equal(report.allowedWorktreeContent, "WORKTREE_ALLOWED_DATA");
+      assert.equal(report.pidInsideSandbox, 2);
+      assert.notEqual(report.mntNs, readlinkSync("/proc/self/ns/mnt"));
+      assert.notEqual(report.pidNs, readlinkSync("/proc/self/ns/pid"));
+      assert.notEqual(report.ipcNs, readlinkSync("/proc/self/ns/ipc"));
+      assert.notEqual(report.utsNs, readlinkSync("/proc/self/ns/uts"));
+
+      // Host filesystem outside private mount namespace remains unaffected
+      assert.equal(readFileSync(join(secretDir, "worker.key"), "utf8"), "HOST_WNA_TOP_SECRET_CREDENTIAL");
+      assert.equal(readFileSync(secretFile, "utf8"), "HOST_WNA_TOP_SECRET_CREDENTIAL");
+
+      const evidence = await backend.killAndVerifyClean(taskId, 1);
+      assert.equal(evidence.remainingProcsCount, 0);
+      assert.throws(() => process.kill(spawned.pid, 0));
+      if (cgroupProbe.supported) {
+        assert.equal(evidence.backendMode, "linux-cgroup-v2");
+        assert.equal(evidence.isSimulated, false);
+        assert.equal(evidence.realKernelOperationsExecuted, true);
+        assert.equal(evidence.freezeApplied, true);
+        assert.equal(evidence.cgroupKillWritten, true);
+        assert.equal(evidence.populatedZeroVerified, true);
+        assert.equal(evidence.cgroupDirRemoved, true);
+      }
+    } finally {
+      await backend.killAndVerifyClean(taskId, 1).catch(() => {});
+      await backend.killAndVerifyClean(taskId, 2).catch(() => {});
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
+
