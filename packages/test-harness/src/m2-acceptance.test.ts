@@ -1513,8 +1513,11 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
       );
 
       const evidence = await backend.killAndVerifyClean(taskId, 1);
-      assert.equal(evidence.backendMode, "simulated-cgroup-v2");
-      assert.equal(evidence.isSimulated, true);
+      assert.equal(
+        evidence.backendMode,
+        process.platform === "linux" ? "linux-supervisor" : "real-process"
+      );
+      assert.equal(evidence.isSimulated, false);
       assert.equal(evidence.realProcessGroupKilled, true);
       assert.equal(evidence.realKernelOperationsExecuted, false);
       assert.equal(evidence.freezeApplied, false);
@@ -2439,8 +2442,10 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
       };
 
       const ev1 = await runDoubleForkScenario(backend, 1, false);
-      assert.equal(ev1.backendMode, "simulated-cgroup-v2");
-      assert.equal(ev1.isSimulated, true);
+      assert.equal(ev1.backendMode, "linux-supervisor");
+      assert.equal(ev1.isSimulated, false);
+      assert.equal(ev1.realKernelOperationsExecuted, false);
+      assert.equal(ev1.realProcessGroupKilled, true);
       assert.equal(ev1.freezeApplied, false);
       assert.equal(ev1.cgroupKillWritten, false);
       assert.equal(ev1.cgroupDirRemoved, false);
@@ -2489,6 +2494,7 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
       writeFileSync(join(secretDir, "worker.key"), "HOST_WNA_TOP_SECRET_CREDENTIAL", "utf8");
       writeFileSync(secretFile, "HOST_WNA_TOP_SECRET_CREDENTIAL", "utf8");
       writeFileSync(allowedFile, "WORKTREE_ALLOWED_DATA", "utf8");
+      chmodSync(allowedFile, 0o644);
 
       if (!nsProbe.supported) {
         assert.throws(

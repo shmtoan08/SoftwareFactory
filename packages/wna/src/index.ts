@@ -64,7 +64,11 @@ export interface SandboxSecurityMetadata {
 export interface SandboxCleanupEvidence {
   readonly taskId: string;
   readonly leaseEpoch: number;
-  readonly backendMode: "linux-cgroup-v2" | "simulated-cgroup-v2";
+  readonly backendMode:
+    | "linux-cgroup-v2"
+    | "linux-supervisor"
+    | "real-process"
+    | "simulated-cgroup-v2";
   readonly isSimulated: boolean;
   readonly realKernelOperationsExecuted: boolean;
   readonly realProcessGroupKilled: boolean;
@@ -1046,8 +1050,9 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
    *   subreaper supervisor to drain/waitpid all descendants, polls `cgroup.events`, and calls `rmdir(cgroup)`.
    * - For `real-process`: on Linux signals the `PR_SET_CHILD_SUBREAPER` supervisor (`SIGTERM`) which
    *   kills `-workerPid` AND every adopted double-fork orphan descendant and calls `waitpid(-1)`; on
-   *   non-Linux sends `SIGKILL` to `-pid`. Always reports `isSimulated: true`, `freezeApplied: false`,
-   *   `cgroupKillWritten: false`, `cgroupDirRemoved: false` because kernel cgroupfs was not exercised.
+   *   non-Linux sends `SIGKILL` to `-pid`. Reports `backendMode: "linux-supervisor"` (or `"real-process"`),
+   *   `isSimulated: false`, `realProcessGroupKilled: true`, while reporting `realKernelOperationsExecuted: false`,
+   *   `freezeApplied: false`, `cgroupKillWritten: false`, `cgroupDirRemoved: false` because kernel cgroupfs was not exercised.
    * - For `simulated`: clears tracked state and explicitly reports `isSimulated: true`,
    *   `realKernelOperationsExecuted: false`, `freezeApplied: false`, `cgroupKillWritten: false`,
    *   `cgroupDirRemoved: false`.
@@ -1232,11 +1237,12 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       this.securityMetadata.delete(k);
       this.sandboxExecutionMode.delete(k);
 
+      const hasLinuxSupervisor = managed.some((proc) => proc.supervisorPid !== undefined);
       const evidence: SandboxCleanupEvidence = {
         taskId,
         leaseEpoch,
-        backendMode: "simulated-cgroup-v2",
-        isSimulated: true,
+        backendMode: hasLinuxSupervisor ? "linux-supervisor" : "real-process",
+        isSimulated: false,
         realKernelOperationsExecuted: false,
         realProcessGroupKilled: true,
         cgroupPath,
