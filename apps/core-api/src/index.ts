@@ -1634,7 +1634,8 @@ export class CoreApiService {
         );
 
         const nowMs = new Date(this.store.clockTimestampIso()).getTime();
-        const expiresAtMs = activeApprovalRequest
+        const isPendingRequest = activeApprovalRequest?.status === "PENDING";
+        const expiresAtMs = isPendingRequest
           ? Date.parse(activeApprovalRequest.expires_at)
           : null;
         const remainingTtlMs = expiresAtMs !== null ? expiresAtMs - nowMs : null;

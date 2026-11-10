@@ -182,7 +182,112 @@ const FORBIDDEN_CONTEXT_KEYS = new Set<string>([
   "lease_push_token",
 ]);
 
-function assertNoForbiddenContextKeys(value: unknown, path = "$", seen = new Set<unknown>()): void {
+const FORBIDDEN_CONTEXT_CANONICAL_KEYS = new Set<string>(
+  Array.from(FORBIDDEN_CONTEXT_KEYS, (k) => k.replace(/[-_\s]/g, "").toLowerCase())
+);
+
+const FORBIDDEN_STRING_RULES: ReadonlyArray<{
+  readonly label: string;
+  readonly regex: RegExp;
+}> = [
+  {
+    label: "inline forbidden context assignment",
+    regex:
+      /(?:developer_?scratchpad|scratchpad|chain_?of_?thought|reasoning_?trace|developer_?messages|conversation_?history|chat_?history|developer_?prompts|worker_?git_?push_?token|lease_?push_?token|git_?push_?token|developer_?credential)\s*[:=]/i,
+  },
+  {
+    label: "chain-of-thought markup tag",
+    regex: /<\/?(?:thinking|scratchpad|chain_of_thought|antml:thinking|reasoning_trace)\b[^>]*>/i,
+  },
+  {
+    label: "HTTP Authorization Bearer header",
+    regex: /\bAuthorization\s*:\s*Bearer\s+\S+/i,
+  },
+  {
+    label: "Bearer credential token",
+    regex: /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}/,
+  },
+  {
+    label: "lease push token literal",
+    regex: /\blease[-_]?token[-_:][A-Za-z0-9._-]{3,}/i,
+  },
+  {
+    label: "secret environment credential assignment",
+    regex:
+      /\b(?:ANTHROPIC_API_KEY|OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|PGPASSWORD|SF_GIT_PUSH_TOKEN|SF_WNA_PUSH_TOKEN)\s*[:=]\s*\S+/i,
+  },
+  {
+    label: "provider API secret token",
+    regex: new RegExp("\\bsk-" + "(?:ant|live|proj|svcacct)-[A-Za-z0-9_-]{12,}\\b"),
+  },
+  {
+    label: "VCS personal access token",
+    regex: new RegExp("\\bgh" + "[pousr]_[A-Za-z0-9_]{20,}\\b"),
+  },
+  {
+    label: "AWS access key",
+    regex: new RegExp("\\b(?:AK" + "IA|AS" + "IA)[0-9A-Z]{16}\\b"),
+  },
+  {
+    label: "database connection string with embedded credentials",
+    regex: new RegExp("postgres" + "(?:ql)?://[^:\\s/]+:[^@\\s/]+@[^\\s/]+", "i"),
+  },
+  {
+    label: "private key header block",
+    regex: new RegExp("-----BEGIN\\s+(?:[A-Z0-9]+\\s+)?PRIVATE" + "\\s+KEY-----"),
+  },
+];
+
+function isForbiddenContextKey(key: string): boolean {
+  const lowered = key.toLowerCase();
+  if (FORBIDDEN_CONTEXT_KEYS.has(lowered)) {
+    return true;
+  }
+  const canonical = lowered.replace(/[-_\s]/g, "");
+  return FORBIDDEN_CONTEXT_CANONICAL_KEYS.has(canonical);
+}
+
+function assertStringHasNoForbiddenContext(
+  raw: string,
+  path: string,
+  seen: Set<unknown>
+): void {
+  for (const rule of FORBIDDEN_STRING_RULES) {
+    if (rule.regex.test(raw)) {
+      throw new ReviewerContextLeakError(
+        `ERR_REVIEWER_CONTEXT_LEAK: Forbidden ${rule.label} detected in string at ${path}`
+      );
+    }
+  }
+
+  const trimmed = raw.trim();
+  if (
+    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+    (trimmed.startsWith("[") && trimmed.endsWith("]"))
+  ) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (parsed !== null && typeof parsed === "object") {
+        assertNoForbiddenContextKeys(parsed, `${path}(json)`, seen);
+      }
+    } catch (err: unknown) {
+      if (err instanceof ReviewerContextLeakError) {
+        throw err;
+      }
+      // ignore non-JSON prose starting/ending with braces
+    }
+  }
+}
+
+function assertNoForbiddenContextKeys(
+  value: unknown,
+  path = "$",
+  seen = new Set<unknown>()
+): void {
+  if (typeof value === "string") {
+    assertStringHasNoForbiddenContext(value, path, seen);
+    return;
+  }
   if (value === null || typeof value !== "object") {
     return;
   }
@@ -198,12 +303,36 @@ function assertNoForbiddenContextKeys(value: unknown, path = "$", seen = new Set
     return;
   }
 
+  if (value instanceof Set) {
+    let idx = 0;
+    for (const item of value) {
+      assertNoForbiddenContextKeys(item, `${path}[set:${idx}]`, seen);
+      idx += 1;
+    }
+    return;
+  }
+
+  if (value instanceof Map) {
+    for (const [k, v] of value.entries()) {
+      const keyStr = String(k);
+      if (isForbiddenContextKey(keyStr)) {
+        throw new ReviewerContextLeakError(
+          `ERR_REVIEWER_CONTEXT_LEAK: Forbidden developer context field '${keyStr}' detected at ${path}`
+        );
+      }
+      assertNoForbiddenContextKeys(v, `${path}.${keyStr}`, seen);
+    }
+    return;
+  }
+
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    const normalized = key.toLowerCase();
-    if (FORBIDDEN_CONTEXT_KEYS.has(normalized)) {
+    if (isForbiddenContextKey(key)) {
       throw new ReviewerContextLeakError(
         `ERR_REVIEWER_CONTEXT_LEAK: Forbidden developer context field '${key}' detected at ${path}`
       );
+    }
+    if (key === "snapshotStore" || key === "sandboxBackend" || typeof nested === "function") {
+      continue;
     }
     assertNoForbiddenContextKeys(nested, `${path}.${key}`, seen);
   }
@@ -406,6 +535,9 @@ function isLiteralOrConstantExpr(expr: ts.Expression): boolean {
   if (ts.isParenthesizedExpression(expr)) {
     return isLiteralOrConstantExpr(expr.expression);
   }
+  if (ts.isTypeOfExpression(expr)) {
+    return isLiteralOrConstantExpr(expr.expression);
+  }
   if (ts.isArrayLiteralExpression(expr)) {
     return expr.elements.every((el) => !ts.isSpreadElement(el) && isLiteralOrConstantExpr(el));
   }
@@ -591,13 +723,8 @@ export function analyzeTier3AgentTests(options: {
           getCalleeText(node.expression.expression.expression, sf) === "expect"
         ) {
           const actualArg = node.expression.expression.arguments[0];
-          const matcherName = node.expression.name.text;
           const expectedArg = node.arguments[0];
 
-          const isExpectTypeof =
-            actualArg !== undefined &&
-            ts.isTypeOfExpression(actualArg) &&
-            (matcherName === "toBe" || matcherName === "toEqual");
           const isLiteralPair =
             actualArg !== undefined &&
             isLiteralOrConstantExpr(actualArg) &&
@@ -607,7 +734,7 @@ export function analyzeTier3AgentTests(options: {
             expectedArg !== undefined &&
             actualArg.getText(sf) === expectedArg.getText(sf);
 
-          if (isExpectTypeof || isLiteralPair || isSelfComparison) {
+          if (isLiteralPair || isSelfComparison) {
             findings.push({
               code: "TRIVIAL_OR_TAUTOLOGICAL_ASSERTION",
               severity: "CRITICAL",
@@ -876,9 +1003,13 @@ export class IndependentReviewerService {
         requireReadOnlyMode: true,
       });
 
-      // Lock extracted workspace strictly read-only (0o444 files / 0o555 dirs)
+      // Lock extracted workspace & parent container strictly read-only (0o444 files / 0o555 dirs)
+      // while keeping sandboxRoot traversable (0o555) for dropped unprivileged Linux UIDs.
       setDirectoryTreeReadOnly(extractedSnapshotDir);
-      readOnlyEnforced = verifyExtractedTreeIsReadOnly(extractedSnapshotDir);
+      chmodSync(sandboxRoot, 0o555);
+      const treeBitsReadOnly =
+        verifyExtractedTreeIsReadOnly(extractedSnapshotDir) &&
+        (lstatSync(sandboxRoot).mode & 0o222) === 0;
 
       // 3. Build sanitized env -i environment with zero Git push / developer credentials
       const cleanEnv = sanitizeVerifierEnv(process.env, {
@@ -900,14 +1031,19 @@ export class IndependentReviewerService {
         "  }",
         "}",
         "const probeFlag = process.argv[1] === '1';",
-        "if (probeFlag && typeof process.getuid === 'function' && process.getuid() !== 0) {",
+        "if (probeFlag) {",
         "  let blocked = false;",
+        "  const probePath = path.join(process.cwd(), '__sf_ro_violation_probe');",
         "  try {",
-        "    fs.writeFileSync(path.join(process.cwd(), '__sf_ro_violation_probe'), 'tamper');",
+        "    fs.writeFileSync(probePath, 'tamper');",
         "  } catch (err) {",
         "    if (err && (err.code === 'EACCES' || err.code === 'EPERM' || err.code === 'EROFS')) {",
         "      blocked = true;",
         "    }",
+        "  } finally {",
+        "    try {",
+        "      if (fs.existsSync(probePath)) fs.unlinkSync(probePath);",
+        "    } catch {}",
         "  }",
         "  if (!blocked) process.exit(13);",
         "}",
@@ -928,8 +1064,9 @@ export class IndependentReviewerService {
         cwd: extractedSnapshotDir,
         worktreePath: extractedSnapshotDir,
         maskedPaths: request.repoPath ? [request.repoPath] : [],
-        isolateNamespaces: false,
-        dropPrivileges: false,
+        readOnlyPaths: [extractedSnapshotDir],
+        isolateNamespaces: true,
+        requireNamespaceIsolation: false,
       });
 
       sandboxPid = spawned.pid;
@@ -944,14 +1081,26 @@ export class IndependentReviewerService {
       );
       sandboxBackendMode = sandboxCleanupEvidence.backendMode;
 
+      const sandboxUid = sandboxSecurityMetadata.sandboxUid;
+      const kernelRoMountApplied = Boolean(
+        sandboxSecurityMetadata.readOnlyMountsApplied?.includes(extractedSnapshotDir)
+      );
+      const effectiveWriteIsolation = sandboxUid !== 0 || kernelRoMountApplied;
+      readOnlyEnforced =
+        treeBitsReadOnly && exitRes.code === 0 && effectiveWriteIsolation;
+
       const findings: ReviewFinding[] = [];
       if (exitRes.code !== 0 || !readOnlyEnforced) {
         findings.push({
           code: "READONLY_SANDBOX_VIOLATION",
           severity: "CRITICAL",
-          detail: `Reviewer read-only sandbox exited with code=${String(
+          detail: `Reviewer read-only sandbox failed verification (exitCode=${String(
             exitRes.code
-          )}, readOnlyEnforced=${String(readOnlyEnforced)} (${exitRes.stderrTail ?? ""})`,
+          )}, treeBitsReadOnly=${String(treeBitsReadOnly)}, sandboxUid=${String(
+            sandboxUid
+          )}, kernelRoMountApplied=${String(kernelRoMountApplied)}, stderr=${
+            exitRes.stderrTail ?? ""
+          })`,
         });
         readOnlyEnforced = false;
       }

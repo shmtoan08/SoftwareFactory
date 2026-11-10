@@ -2103,7 +2103,7 @@ export class SoftwareFactoryControlPlaneStore {
         'new row for relation "review_artifacts" violates NOT NULL / non-empty constraint on developer_session_id and reviewer_session_id'
       );
     }
-    if (devSession === revSession) {
+    if (devSession.toLowerCase() === revSession.toLowerCase()) {
       throw new PostgresRlsError(
         "23514",
         `new row violates check constraint "chk_independent_reviewer_session": developer session (${devSession}) must be distinct from reviewer session`
@@ -2116,7 +2116,7 @@ export class SoftwareFactoryControlPlaneStore {
     const devCred = hasDevCred ? input.developer_credential_id!.trim() : null;
     const revCred = hasRevCred ? input.reviewer_credential_id!.trim() : null;
     if (hasDevCred || hasRevCred) {
-      if (!devCred || !revCred || devCred === revCred) {
+      if (!devCred || !revCred || devCred.toLowerCase() === revCred.toLowerCase()) {
         throw new PostgresRlsError(
           "23514",
           `new row violates check constraint "chk_ra_independent_credential": developer credential (${String(
@@ -2201,7 +2201,7 @@ export class SoftwareFactoryControlPlaneStore {
         rs.verification_run_id !== input.verification_run_id ||
         rs.role !== "ROLE_REVIEWER_READONLY" ||
         rs.reviewer_principal_id.toLowerCase() !== revPrincipal.toLowerCase() ||
-        (revCred !== null && rs.reviewer_credential_id !== revCred) ||
+        (revCred !== null && rs.reviewer_credential_id.toLowerCase() !== revCred.toLowerCase()) ||
         (revProfile !== null && rs.reviewer_agent_profile_id.toLowerCase() !== revProfile.toLowerCase())
       ) {
         throw new PostgresRlsError(
@@ -2299,6 +2299,9 @@ export class SoftwareFactoryControlPlaneStore {
         ar.merge_candidate_id === input.merge_candidate_id &&
         ar.review_artifact_id === input.review_artifact_id
       ) {
+        if (ar.status === "PENDING") {
+          return ar;
+        }
         matched = ar;
       }
     }
@@ -2410,10 +2413,22 @@ export class SoftwareFactoryControlPlaneStore {
       review_artifact_id: ra.review_artifact_id,
     });
 
-    if (input.approval_request_id && (!approvalRequest || approvalRequest.project_id !== input.project_id)) {
+    if (
+      input.approval_request_id &&
+      (!approvalRequest ||
+        approvalRequest.project_id !== input.project_id ||
+        approvalRequest.task_id !== input.task_id ||
+        approvalRequest.merge_candidate_id !== mc.merge_candidate_id ||
+        approvalRequest.review_artifact_id !== ra.review_artifact_id ||
+        approvalRequest.verification_run_id !== vr.verification_run_id ||
+        approvalRequest.agent_commit_hash !== mc.agent_commit_hash ||
+        approvalRequest.base_main_commit_hash !== mc.base_main_commit_hash ||
+        approvalRequest.merge_candidate_hash !== mc.merge_candidate_hash ||
+        approvalRequest.verified_tree_hash !== mc.verified_tree_hash)
+    ) {
       throw new PostgresRlsError(
         "23503",
-        `ApprovalRequest ${input.approval_request_id} does not belong to candidate ${mc.merge_candidate_id}`
+        `ApprovalRequest ${input.approval_request_id} violates composite binding to candidate ${mc.merge_candidate_id} / review ${ra.review_artifact_id}`
       );
     }
 
@@ -2451,28 +2466,31 @@ export class SoftwareFactoryControlPlaneStore {
         );
       }
 
-      // Check ApprovalRequest TTL & PENDING state against clock_timestamp() (MVP-SPEC-04 §4)
-      if (approvalRequest) {
-        if (
-          approvalRequest.status !== "PENDING" ||
-          new Date(approvalRequest.expires_at).getTime() <= nowDate.getTime()
-        ) {
+      // Check ApprovalRequest presence, PENDING state, and TTL against clock_timestamp() (MVP-SPEC-04 §4)
+      if (
+        !approvalRequest ||
+        approvalRequest.status !== "PENDING" ||
+        new Date(approvalRequest.expires_at).getTime() <= nowDate.getTime()
+      ) {
+        if (approvalRequest) {
           approvalRequest.status = "INVALIDATED_EXPIRED";
           approvalRequest.updated_at = nowIso;
-          mc.is_superseded = true;
-          this.invalidateArtifactsAndApprovalsForCandidate(
-            mc.merge_candidate_id,
-            "APPROVAL_REQUEST_TTL_EXPIRED",
-            "INVALIDATED_STALE_CANDIDATE"
-          );
-          task.status = "BuildingMergeCandidate";
-          task.active_merge_candidate_id = null;
-          task.updated_at = nowIso;
-          throw new ApprovalExpiredOrStaleError(
-            `ERR_APPROVAL_EXPIRED_OR_STALE: ApprovalRequest ${approvalRequest.approval_request_id} expired at ${approvalRequest.expires_at}`,
-            "INVALIDATED_EXPIRED"
-          );
         }
+        mc.is_superseded = true;
+        this.invalidateArtifactsAndApprovalsForCandidate(
+          mc.merge_candidate_id,
+          approvalRequest ? "APPROVAL_REQUEST_TTL_EXPIRED" : "APPROVAL_REQUEST_MISSING",
+          "INVALIDATED_STALE_CANDIDATE"
+        );
+        task.status = "BuildingMergeCandidate";
+        task.active_merge_candidate_id = null;
+        task.updated_at = nowIso;
+        throw new ApprovalExpiredOrStaleError(
+          approvalRequest
+            ? `ERR_APPROVAL_EXPIRED_OR_STALE: ApprovalRequest ${approvalRequest.approval_request_id} expired or not PENDING (status=${approvalRequest.status}, expires_at=${approvalRequest.expires_at})`
+            : `ERR_APPROVAL_EXPIRED_OR_STALE: No PENDING ApprovalRequest exists for candidate ${mc.merge_candidate_id} and review ${ra.review_artifact_id}`,
+          "INVALIDATED_EXPIRED"
+        );
       }
     }
 
@@ -2557,6 +2575,10 @@ export class SoftwareFactoryControlPlaneStore {
     refs?.delete(refName);
   }
 
+  public deleteApprovalRequestForTest(approvalRequestId: string): boolean {
+    return this.approvalRequests.delete(approvalRequestId);
+  }
+
   private getOrCreateMergeOperation(input: {
     project_id: string;
     task_id: string;
@@ -2567,7 +2589,7 @@ export class SoftwareFactoryControlPlaneStore {
     verified_tree_hash: string;
     nowIso: string;
   }): { record: MergeOperationRecord; isRetryOfExisting: boolean } {
-    const key = `merge:${input.project_id}:${input.task_id}:${input.merge_candidate_hash}`;
+    const key = `merge:${input.project_id}:${input.task_id}:${input.merge_candidate_hash}:${input.approval_id}`;
     for (const existing of this.mergeOperations.values()) {
       if (existing.project_id === input.project_id && existing.merge_idempotency_key === key) {
         return { record: existing, isRetryOfExisting: true };
@@ -2597,8 +2619,8 @@ export class SoftwareFactoryControlPlaneStore {
   /**
    * 6-Step Post-Merge Reconciler & Idempotent Atomic CAS Merge (MVP-SPEC-04 Section 5.1 & Section 5.2)
    * Handles:
-   * - `merge_operations` idempotency tracking (`merge:<project_id>:<task_id>:<merge_candidate_hash>`)
-   * - Already `MergedAndCompleted` strict idempotent return (no extra outbox events or Git commits)
+   * - `merge_operations` idempotency tracking (`merge:<project_id>:<task_id>:<merge_candidate_hash>:<approval_id>`)
+   * - Already `MergedAndCompleted` strict idempotent return (no extra outbox events, Git commits, or retry_count increments)
    * - Crash after `git update-ref` succeeded (`currentMainSha === merge_candidate_hash`) -> reconciles DB to `MergedAndCompleted` with `reconciled_after_lost_response = true`
    * - Approval TTL expiry (`expires_at <= clock_timestamp()`) -> marks approval `EXPIRED` and transitions task to `AwaitingHumanApproval` (and updates `ApprovalRequest` appropriately)
    * - True CAS conflict (`currentMainSha !== base_main_commit_hash`) -> marks `merge_operations` `CAS_CONFLICT_ABORTED`, supersedes candidate, marks review/approval `INVALIDATED_STALE_BASE`, updates `base_main_commit_hash`, and transitions task to `BuildingMergeCandidate`
@@ -2661,6 +2683,43 @@ export class SoftwareFactoryControlPlaneStore {
         );
       }
 
+      // Step 1: If DB already recorded MergedAndCompleted, return strictly idempotently
+      // without creating duplicate merge_operations or inflating retry_count.
+      if (task.status === "MergedAndCompleted" && task.merged_commit_hash) {
+        let existingOp: MergeOperationRecord | undefined;
+        for (const op of this.mergeOperations.values()) {
+          if (
+            op.project_id === input.project_id &&
+            op.task_id === input.task_id &&
+            op.approval_id === approval.approval_id
+          ) {
+            existingOp = op;
+            break;
+          }
+          if (
+            !existingOp &&
+            op.project_id === input.project_id &&
+            op.task_id === input.task_id &&
+            op.merge_candidate_id === mc.merge_candidate_id &&
+            op.status === "MERGED"
+          ) {
+            existingOp = op;
+          }
+        }
+        if (existingOp && existingOp.status !== "MERGED") {
+          existingOp.status = "MERGED";
+          existingOp.completed_at = existingOp.completed_at ?? nowIso;
+        }
+        return {
+          status: "RECONCILED_ALREADY_MERGED",
+          task_status: "MergedAndCompleted",
+          merged_commit_hash: task.merged_commit_hash,
+          main_ref_commit_hash: currentMainSha,
+          merge_op_id: existingOp?.merge_op_id ?? randomUUID(),
+          reconciled_after_lost_response: existingOp?.reconciled_after_lost_response ?? false,
+        };
+      }
+
       const { record: mergeOp, isRetryOfExisting } = this.getOrCreateMergeOperation({
         project_id: input.project_id,
         task_id: input.task_id,
@@ -2671,24 +2730,8 @@ export class SoftwareFactoryControlPlaneStore {
         verified_tree_hash: mc.verified_tree_hash,
         nowIso,
       });
-      if (isRetryOfExisting) {
+      if (isRetryOfExisting && mergeOp.status === "IN_PROGRESS") {
         mergeOp.retry_count += 1;
-      }
-
-      // Step 1: If DB already recorded MergedAndCompleted, return strictly idempotently
-      if (task.status === "MergedAndCompleted" && task.merged_commit_hash) {
-        if (mergeOp.status !== "MERGED") {
-          mergeOp.status = "MERGED";
-          mergeOp.completed_at = mergeOp.completed_at ?? nowIso;
-        }
-        return {
-          status: "RECONCILED_ALREADY_MERGED",
-          task_status: "MergedAndCompleted",
-          merged_commit_hash: task.merged_commit_hash,
-          main_ref_commit_hash: currentMainSha,
-          merge_op_id: mergeOp.merge_op_id,
-          reconciled_after_lost_response: mergeOp.reconciled_after_lost_response,
-        };
       }
 
       const linkedApprovalRequest = approval.approval_request_id
@@ -2754,6 +2797,7 @@ export class SoftwareFactoryControlPlaneStore {
           approval.status = "EXPIRED";
           approval.invalidated_reason = "APPROVAL_TTL_EXPIRED";
         }
+        mergeOp.last_error = "APPROVAL_TTL_EXPIRED";
         if (linkedApprovalRequest) {
           const reqExpired =
             new Date(linkedApprovalRequest.expires_at).getTime() <= nowDate.getTime();

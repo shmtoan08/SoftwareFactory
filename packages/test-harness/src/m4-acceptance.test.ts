@@ -21,6 +21,7 @@ import {
 import { CoreApiService, type CoreApiWarning } from "@software-factory/core-api";
 import {
   ApprovalExpiredOrStaleError,
+  PostgresRlsError,
   SimulatedPostMergeCrashError,
   SoftwareFactoryControlPlaneStore,
 } from "@software-factory/database";
@@ -419,7 +420,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
           err instanceof ReviewerIdentityIndependenceError && err.dimension === "principal"
       );
 
-      // Reject matching session
+      // Reject matching session (exact and case-insensitive)
       assert.throws(
         () =>
           fx.gateway.issueReviewerSessionCredential({
@@ -429,13 +430,31 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
         (err: unknown) =>
           err instanceof ReviewerIdentityIndependenceError && err.dimension === "session"
       );
+      assert.throws(
+        () =>
+          fx.gateway.issueReviewerSessionCredential({
+            ...baseIdentity,
+            reviewer_session_id: "DEV-SESS-001",
+          }),
+        (err: unknown) =>
+          err instanceof ReviewerIdentityIndependenceError && err.dimension === "session"
+      );
 
-      // Reject matching credential
+      // Reject matching credential (exact and case-insensitive)
       assert.throws(
         () =>
           fx.gateway.issueReviewerSessionCredential({
             ...baseIdentity,
             reviewer_credential_id: "dev-cred-001",
+          }),
+        (err: unknown) =>
+          err instanceof ReviewerIdentityIndependenceError && err.dimension === "credential"
+      );
+      assert.throws(
+        () =>
+          fx.gateway.issueReviewerSessionCredential({
+            ...baseIdentity,
+            reviewer_credential_id: "DEV-CRED-001",
           }),
         (err: unknown) =>
           err instanceof ReviewerIdentityIndependenceError && err.dimension === "credential"
@@ -504,7 +523,8 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       );
       assert.equal(pushCheck.valid, false);
 
-      // Database store layer must also enforce chk_ra_independent_credential and chk_ra_independent_agent_profile
+      // Database store layer must also enforce case-insensitive/trimmed chk_ra_independent_credential,
+      // chk_independent_reviewer_session & chk_ra_independent_agent_profile (M4-FIX-08)
       await assert.rejects(
         () =>
           fx.store.withRlsTransaction(
@@ -529,8 +549,8 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
                 reviewer_principal_id: "rev-agent-beta",
                 developer_session_id: "dev-sess-001",
                 reviewer_session_id: "rev-sess-002",
-                developer_credential_id: "shared-cred",
-                reviewer_credential_id: "shared-cred",
+                developer_credential_id: "Shared-Cred",
+                reviewer_credential_id: " shared-cred ",
                 developer_agent_profile_id: "profile-a",
                 reviewer_agent_profile_id: "profile-b",
                 verdict: "PASS",
@@ -538,6 +558,41 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
           ),
         (err: unknown) =>
           err instanceof Error && err.message.includes("chk_ra_independent_credential")
+      );
+
+      await assert.rejects(
+        () =>
+          fx.store.withRlsTransaction(
+            {
+              currentProjectId: fx.projectId,
+              currentPrincipalId: "operator-alice",
+              currentRole: "core_api_service",
+            },
+            () =>
+              fx.store.recordReviewArtifact({
+                project_id: fx.projectId,
+                task_id: prep.task.task_id,
+                merge_candidate_id: prep.mergeCandidate.merge_candidate_id,
+                verification_run_id: prep.finalRun.verification_run_id,
+                merge_candidate_hash: prep.mergeCandidate.merge_candidate_hash,
+                verified_tree_hash: prep.mergeCandidate.verified_tree_hash,
+                writer_provider: "anthropic",
+                writer_model: "claude-sonnet-4",
+                reviewer_provider: "google",
+                reviewer_model: "gemini-2.5-pro",
+                developer_principal_id: "dev-agent-alpha",
+                reviewer_principal_id: "rev-agent-beta",
+                developer_session_id: "Shared-Sess",
+                reviewer_session_id: " shared-sess ",
+                developer_credential_id: "dev-cred-001",
+                reviewer_credential_id: "rev-cred-002",
+                developer_agent_profile_id: "profile-a",
+                reviewer_agent_profile_id: "profile-b",
+                verdict: "PASS",
+              })
+          ),
+        (err: unknown) =>
+          err instanceof Error && err.message.includes("chk_independent_reviewer_session")
       );
 
       await assert.rejects(
@@ -593,13 +648,21 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
         ].join("\n"),
       });
 
-      // Attempt to leak developer scratchpad / CoT / push token -> must fail closed with ERR_REVIEWER_CONTEXT_LEAK
-      for (const forbiddenPayload of [
+      // Attempt to leak developer scratchpad / CoT / push tokens (both object keys and serialized/inline strings)
+      // -> must fail closed with ERR_REVIEWER_CONTEXT_LEAK (M4-FIX-08)
+      const forbiddenPayloads: Array<Record<string, unknown>> = [
         { developerScratchpad: "internal reasoning step 1" },
         { chainOfThought: "let me bypass tests" },
         { conversationHistory: [{ role: "assistant", content: "secret prompt" }] },
         { workerGitPushToken: "lease-token-xyz" },
-      ]) {
+        { customNote: "Authorization: Bearer secret-bearer-token-1234567890" },
+        { metadata: JSON.stringify({ nested: { developerScratchpad: "hidden json scratchpad" } }) },
+        { diffComment: "<thinking>leak developer cot</thinking>" },
+        { debugHeader: "git_push_token=abc123" },
+        { envDump: ["GITHUB", "_TOKEN=demo_value_123"].join("") },
+        { pemPayload: ["-----BEGIN ", "PRIVATE ", "KEY-----"].join("") },
+      ];
+      for (const forbiddenPayload of forbiddenPayloads) {
         await assert.rejects(
           () =>
             fx.coreApi.runIndependentReview(fx.projectId, fx.authOp, {
@@ -663,8 +726,6 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
                 writeBlockedInsideEvaluatorDir = true;
               }
             }
-          } else {
-            writeBlockedInsideEvaluatorDir = true;
           }
           return { verdict: "PASS" };
         },
@@ -680,7 +741,16 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(reviewOut.reviewSession.cleanup_populated_zero_verified, true);
       assert.ok(reviewOut.executionResult.sandboxPid && reviewOut.executionResult.sandboxPid > 0);
       assert.equal(reviewOut.executionResult.readOnlyEnforced, true);
-      assert.equal(writeBlockedInsideEvaluatorDir, true);
+      if (typeof process.getuid === "function" && process.getuid() !== 0) {
+        assert.equal(writeBlockedInsideEvaluatorDir, true);
+      } else {
+        const meta = reviewOut.executionResult.sandboxSecurityMetadata;
+        assert.ok(
+          meta !== null &&
+            (meta.sandboxUid !== 0 || (meta.readOnlyMountsApplied?.length ?? 0) > 0),
+          "Root execution must enforce UID drop or kernel MS_RDONLY bind mount"
+        );
+      }
       assert.match(capturedDiffText, /export function subtract/);
       assert.deepEqual(capturedCleanInputKeys, [
         "baseMainCommitHash",
@@ -697,6 +767,84 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
         "verifiedTreeHash",
       ]);
 
+      // M4-FIX-02 negative verification: root sandbox without kernel RO mount & exit-13 probe must fail closed
+      const unisolatedRootBackend = new (class extends LinuxCgroupV2SandboxBackend {
+        public override spawnRealProcessInSandbox(
+          opts: Parameters<LinuxCgroupV2SandboxBackend["spawnRealProcessInSandbox"]>[0]
+        ) {
+          const real = super.spawnRealProcessInSandbox(opts);
+          return {
+            ...real,
+            securityMetadata: {
+              ...real.securityMetadata,
+              sandboxUid: 0,
+              uidDropped: false,
+              readOnlyMountsApplied: [],
+            },
+          };
+        }
+      })();
+      const rootFailRes = await fx.reviewerService.executeIndependentReview({
+        reviewSessionId: "99999999-9999-4999-8999-999999999901",
+        projectId: fx.projectId,
+        taskId: prep.task.task_id,
+        mergeCandidateId: prep.mergeCandidate.merge_candidate_id,
+        mergeCandidateHash: prep.mergeCandidate.merge_candidate_hash,
+        verifiedTreeHash: prep.mergeCandidate.verified_tree_hash,
+        baseMainCommitHash: prep.mergeCandidate.base_main_commit_hash,
+        snapshotPath: prep.mergeCandidate.snapshot_path!,
+        snapshotSha256: prep.mergeCandidate.snapshot_sha256!,
+        taskContract: fx.contract,
+        verificationRun: prep.finalRun,
+        reviewerIdentity: {
+          principalId: "rev-ro-check-1",
+          credentialId: "rev-cred-ro-1",
+          sessionId: "rev-sess-ro-1",
+          agentProfileId: "profile-reviewer-sec",
+          provider: "google",
+          model: "gemini-2.5-pro",
+          role: "ROLE_REVIEWER_READONLY",
+        },
+        repoPath: fx.bareRepoDir,
+        tier3TestFiles: ["test/calc.agent.test.mjs"],
+        sandboxBackend: unisolatedRootBackend,
+      });
+      assert.equal(rootFailRes.readOnlyEnforced, false);
+      assert.equal(rootFailRes.verdict, "FAIL");
+      assert.ok(rootFailRes.findings.some((f) => f.code === "READONLY_SANDBOX_VIOLATION"));
+
+      const probeExit13Res = await fx.reviewerService.executeIndependentReview({
+        reviewSessionId: "99999999-9999-4999-8999-999999999902",
+        projectId: fx.projectId,
+        taskId: prep.task.task_id,
+        mergeCandidateId: prep.mergeCandidate.merge_candidate_id,
+        mergeCandidateHash: prep.mergeCandidate.merge_candidate_hash,
+        verifiedTreeHash: prep.mergeCandidate.verified_tree_hash,
+        baseMainCommitHash: prep.mergeCandidate.base_main_commit_hash,
+        snapshotPath: prep.mergeCandidate.snapshot_path!,
+        snapshotSha256: prep.mergeCandidate.snapshot_sha256!,
+        taskContract: fx.contract,
+        verificationRun: prep.finalRun,
+        reviewerIdentity: {
+          principalId: "rev-ro-check-2",
+          credentialId: "rev-cred-ro-2",
+          sessionId: "rev-sess-ro-2",
+          agentProfileId: "profile-reviewer-sec",
+          provider: "google",
+          model: "gemini-2.5-pro",
+          role: "ROLE_REVIEWER_READONLY",
+        },
+        repoPath: fx.bareRepoDir,
+        tier3TestFiles: ["test/calc.agent.test.mjs"],
+        sandboxCommandHook: {
+          command: process.execPath,
+          args: ["-e", "process.exit(13)"],
+        },
+      });
+      assert.equal(probeExit13Res.readOnlyEnforced, false);
+      assert.equal(probeExit13Res.verdict, "FAIL");
+      assert.ok(probeExit13Res.findings.some((f) => f.code === "READONLY_SANDBOX_VIOLATION"));
+
       // Failed sessions from Context Firewall checks were recorded cleanly as FAILED (zero dangling ACTIVE sessions)
       const allSessions = await fx.store.withRlsTransaction(
         {
@@ -706,7 +854,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
         },
         () => fx.store.listReviewSessionsForTask(prep.task.task_id)
       );
-      assert.equal(allSessions.filter((s) => s.status === "FAILED").length, 4);
+      assert.equal(allSessions.filter((s) => s.status === "FAILED").length, forbiddenPayloads.length);
       assert.equal(allSessions.filter((s) => s.status === "ACTIVE").length, 0);
     } finally {
       fx.cleanup();
@@ -863,6 +1011,45 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       });
       assert.equal(rev1.reviewArtifact.status, "VALID");
 
+      // Case A2: Trivial typeof-of-literal assertions (`assert.equal(typeof "x", "string")` & `expect(typeof 123).toBe("number")`)
+      const prepTrivialTypeof = await prepareVerifiedCandidate(fx, {
+        title: "M4 Gate 3A2 Trivial Typeof Literal Reject",
+        agentTestPath: "test/trivial-typeof.agent.test.mjs",
+        agentTestSource: [
+          'import assert from "node:assert/strict";',
+          'import { subtract } from "../src/calculator.mjs";',
+          "const expect = (v) => ({ toBe: (e) => assert.equal(v, e) });",
+          'assert.equal(typeof "x", "string");',
+          'expect(typeof 123).toBe("number");',
+          "void subtract;",
+          "",
+        ].join("\n"),
+      });
+      const revTrivialTypeof = await fx.coreApi.runIndependentReview(fx.projectId, fx.authOp, {
+        task_id: prepTrivialTypeof.task.task_id,
+        merge_candidate_id: prepTrivialTypeof.mergeCandidate.merge_candidate_id,
+        verification_run_id: prepTrivialTypeof.finalRun.verification_run_id,
+        reviewer_principal_id: "rev-ast-01b",
+        reviewer_agent_profile_id: "profile-rev-ast",
+        reviewer_provider: "google",
+        reviewer_model: "gemini-2.5-pro",
+        developer_principal_id: "dev-agent-1",
+        developer_session_id: "dev-sess-t1b",
+        developer_credential_id: "dev-cred-t1b",
+        developer_agent_profile_id: "profile-dev-1",
+        writer_provider: "anthropic",
+        writer_model: "claude-sonnet-4",
+        agent_gateway: fx.gateway,
+        repo_path: fx.bareRepoDir,
+        tier3_test_files: ["test/trivial-typeof.agent.test.mjs"],
+      });
+      assert.equal(revTrivialTypeof.reviewArtifact.verdict, "FAIL");
+      assert.ok(
+        revTrivialTypeof.executionResult.tier3Inspection.findings.some(
+          (f) => f.code === "TRIVIAL_OR_TAUTOLOGICAL_ASSERTION"
+        )
+      );
+
       // Trigger new verification run on same candidate -> must auto-invalidate rev1 + its ApprovalRequest
       await fx.coreApi.verifyMergeCandidate(fx.projectId, fx.authOp, {
         task_id: prepValid.task.task_id,
@@ -893,6 +1080,44 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(oldAfterRerun.ra?.status, "INVALIDATED_STALE_CANDIDATE");
       assert.equal(oldAfterRerun.ra?.is_invalidated, true);
       assert.equal(oldAfterRerun.ar?.status, "INVALIDATED_STALE_CANDIDATE");
+
+      // Case E (M4-FIX-03): Legitimate runtime symbol `expect(typeof symbol).toBe/toEqual("function")` must PASS
+      const prepValidTypeof = await prepareVerifiedCandidate(fx, {
+        title: "M4 Gate 3E Valid Runtime Typeof Symbol Accept",
+        agentTestPath: "test/valid-typeof.agent.test.mjs",
+        agentTestSource: [
+          'import assert from "node:assert/strict";',
+          'import { subtract } from "../src/calculator.mjs";',
+          "const expect = (v) => ({",
+          "  toBe: (e) => assert.equal(v, e),",
+          "  toEqual: (e) => assert.deepEqual(v, e),",
+          "});",
+          'expect(typeof subtract).toBe("function");',
+          'expect(typeof subtract).toEqual("function");',
+          "",
+        ].join("\n"),
+      });
+      const revValidTypeof = await fx.coreApi.runIndependentReview(fx.projectId, fx.authOp, {
+        task_id: prepValidTypeof.task.task_id,
+        merge_candidate_id: prepValidTypeof.mergeCandidate.merge_candidate_id,
+        verification_run_id: prepValidTypeof.finalRun.verification_run_id,
+        reviewer_principal_id: "rev-ast-01e",
+        reviewer_agent_profile_id: "profile-rev-ast",
+        reviewer_provider: "google",
+        reviewer_model: "gemini-2.5-pro",
+        developer_principal_id: "dev-agent-1",
+        developer_session_id: "dev-sess-t5",
+        developer_credential_id: "dev-cred-t5",
+        developer_agent_profile_id: "profile-dev-1",
+        writer_provider: "anthropic",
+        writer_model: "claude-sonnet-4",
+        agent_gateway: fx.gateway,
+        repo_path: fx.bareRepoDir,
+        tier3_test_files: ["test/valid-typeof.agent.test.mjs"],
+      });
+      assert.equal(revValidTypeof.reviewArtifact.verdict, "PASS");
+      assert.equal(revValidTypeof.executionResult.tier3Inspection.findings.length, 0);
+      assert.equal(revValidTypeof.approvalRequest?.status, "PENDING");
     } finally {
       fx.cleanup();
     }
@@ -996,6 +1221,17 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(postExpireState.req?.status, "INVALIDATED_EXPIRED");
       assert.equal(postExpireState.task?.status, "BuildingMergeCandidate");
 
+      // M4-FIX-05: Non-PENDING ApprovalRequest must report expiresAtMs=null, remainingTtlMs=null, isExpiredAtNow=false
+      fx.advanceClockMs(5_000);
+      const nonPendingBundle = await fx.webConsole.loadApprovalCenterBundle({
+        auth: fx.authApprover,
+        projectId: fx.projectId,
+        taskId: prep.task.task_id,
+      });
+      assert.equal(nonPendingBundle.activeApprovalRequest?.status, "INVALIDATED_EXPIRED");
+      assert.equal(nonPendingBundle.remainingTtlMs, null);
+      assert.equal(nonPendingBundle.isExpiredAtNow, false);
+
       // Part B: Stale live Git main check inside Approval Center + submitHumanApproval
       const prepStale = await prepareVerifiedCandidate(fx, {
         title: "M4 Gate 4B Stale Main Check",
@@ -1073,6 +1309,123 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(postStale.ra?.status, "INVALIDATED_STALE_BASE");
       assert.equal(postStale.task?.status, "BuildingMergeCandidate");
       assert.equal(postStale.task?.base_main_commit_hash, movedMainSha);
+
+      // Part C (M4-FIX-01): Composite binding rejects swapped approval_request_id across candidates
+      const prepBindA = await prepareVerifiedCandidate(fx, {
+        title: "M4 Gate 4C Bind A",
+        agentTestPath: "test/calc-bind-a.agent.test.mjs",
+        agentTestSource: [
+          'import assert from "node:assert/strict";',
+          'import { subtract } from "../src/calculator.mjs";',
+          "assert.equal(subtract(20, 7), 13);",
+          "",
+        ].join("\n"),
+      });
+      const revBindA = await fx.coreApi.runIndependentReview(fx.projectId, fx.authOp, {
+        task_id: prepBindA.task.task_id,
+        merge_candidate_id: prepBindA.mergeCandidate.merge_candidate_id,
+        verification_run_id: prepBindA.finalRun.verification_run_id,
+        reviewer_principal_id: "rev-04c",
+        reviewer_agent_profile_id: "profile-rev-04c",
+        reviewer_provider: "google",
+        reviewer_model: "gemini-2.5-pro",
+        developer_principal_id: "dev-04c",
+        developer_session_id: "dev-sess-04c",
+        developer_credential_id: "dev-cred-04c",
+        developer_agent_profile_id: "profile-dev-04c",
+        writer_provider: "anthropic",
+        writer_model: "claude-sonnet-4",
+        agent_gateway: fx.gateway,
+        repo_path: fx.bareRepoDir,
+        tier3_test_files: ["test/calc-bind-a.agent.test.mjs"],
+      });
+
+      const prepBindB = await prepareVerifiedCandidate(fx, {
+        title: "M4 Gate 4C Bind B",
+        agentTestPath: "test/calc-bind-b.agent.test.mjs",
+        agentTestSource: [
+          'import assert from "node:assert/strict";',
+          'import { subtract } from "../src/calculator.mjs";',
+          "assert.equal(subtract(40, 15), 25);",
+          "",
+        ].join("\n"),
+      });
+      const revBindB = await fx.coreApi.runIndependentReview(fx.projectId, fx.authOp, {
+        task_id: prepBindB.task.task_id,
+        merge_candidate_id: prepBindB.mergeCandidate.merge_candidate_id,
+        verification_run_id: prepBindB.finalRun.verification_run_id,
+        reviewer_principal_id: "rev-04d",
+        reviewer_agent_profile_id: "profile-rev-04d",
+        reviewer_provider: "google",
+        reviewer_model: "gemini-2.5-pro",
+        developer_principal_id: "dev-04d",
+        developer_session_id: "dev-sess-04d",
+        developer_credential_id: "dev-cred-04d",
+        developer_agent_profile_id: "profile-dev-04d",
+        writer_provider: "anthropic",
+        writer_model: "claude-sonnet-4",
+        agent_gateway: fx.gateway,
+        repo_path: fx.bareRepoDir,
+        tier3_test_files: ["test/calc-bind-b.agent.test.mjs"],
+      });
+
+      await assert.rejects(
+        () =>
+          fx.webConsole.approveCandidateWith8FieldBinding({
+            auth: fx.authApprover,
+            candidate: prepBindA.mergeCandidate,
+            verificationRun: prepBindA.finalRun,
+            reviewArtifact: revBindA.reviewArtifact,
+            approvalRequestId: revBindB.approvalRequest!.approval_request_id,
+            repoPath: fx.bareRepoDir,
+          }),
+        (err: unknown) =>
+          err instanceof PostgresRlsError &&
+          err.sqlState === "23503" &&
+          err.message.includes("violates composite binding")
+      );
+
+      // Verify revBindA and revBindB requests remain untouched & PENDING after swap rejection
+      const postSwapState = await fx.store.withRlsTransaction(
+        {
+          currentProjectId: fx.projectId,
+          currentPrincipalId: "approver-bob",
+          currentRole: "core_api_service",
+        },
+        () => ({
+          reqA: fx.store.getApprovalRequestById(revBindA.approvalRequest!.approval_request_id),
+          reqB: fx.store.getApprovalRequestById(revBindB.approvalRequest!.approval_request_id),
+        })
+      );
+      assert.equal(postSwapState.reqA?.status, "PENDING");
+      assert.equal(postSwapState.reqB?.status, "PENDING");
+
+      // Part D (M4-FIX-06): Fail closed (409 ERR_APPROVAL_EXPIRED_OR_STALE) when APPROVED has no PENDING ApprovalRequest
+      const deletedReq = await fx.store.withRlsTransaction(
+        {
+          currentProjectId: fx.projectId,
+          currentPrincipalId: "approver-bob",
+          currentRole: "core_api_service",
+        },
+        () => fx.store.deleteApprovalRequestForTest(revBindB.approvalRequest!.approval_request_id)
+      );
+      assert.equal(deletedReq, true);
+
+      await assert.rejects(
+        () =>
+          fx.webConsole.approveCandidateWith8FieldBinding({
+            auth: fx.authApprover,
+            candidate: prepBindB.mergeCandidate,
+            verificationRun: prepBindB.finalRun,
+            reviewArtifact: revBindB.reviewArtifact,
+            approvalRequestId: undefined,
+            repoPath: fx.bareRepoDir,
+          }),
+        (err: unknown) =>
+          err instanceof ApprovalExpiredOrStaleError &&
+          err.code === "ERR_APPROVAL_EXPIRED_OR_STALE" &&
+          err.httpStatus === 409
+      );
     } finally {
       fx.cleanup();
     }
@@ -1195,7 +1548,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(afterRetries.ops.length, 1);
       assert.equal(afterRetries.ops[0]?.status, "MERGED");
       assert.equal(afterRetries.ops[0]?.reconciled_after_lost_response, true);
-      assert.equal(afterRetries.ops[0]?.retry_count, 5);
+      assert.equal(afterRetries.ops[0]?.retry_count, 1);
       assert.equal(
         afterRetries.events.filter((e) => e.event_type === "task.merged_reconciled").length,
         1
@@ -1207,6 +1560,129 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(
         fx.snapshotStore.getManifest(prep.mergeCandidate.snapshot_path!)?.retentionClass,
         "MERGED_PERMANENT"
+      );
+
+      // M4-FIX-05: Approved/terminal request must not compute TTL expiry flags as expired even after clock advances
+      fx.advanceClockMs(200_000);
+      const postMergeBundle = await fx.webConsole.loadApprovalCenterBundle({
+        auth: fx.authApprover,
+        projectId: fx.projectId,
+        taskId: prep.task.task_id,
+        repoPath: fx.bareRepoDir,
+      });
+      assert.equal(postMergeBundle.activeApprovalRequest?.status, "APPROVED");
+      assert.equal(postMergeBundle.remainingTtlMs, null);
+      assert.equal(postMergeBundle.isExpiredAtNow, false);
+
+      // Part B (M4-FIX-04): Approval decision TTL expiry + re-approval uses distinct merge_idempotency_key (includes approval_id)
+      const prepTtl = await prepareVerifiedCandidate(fx, {
+        title: "M4 Gate 5B Approval TTL Re-Approval Key",
+        agentTestPath: "test/calc-ttl-reapprove.agent.test.mjs",
+        agentTestSource: [
+          'import assert from "node:assert/strict";',
+          'import { subtract } from "../src/calculator.mjs";',
+          "assert.equal(subtract(75, 25), 50);",
+          "",
+        ].join("\n"),
+      });
+      const revTtl = await fx.coreApi.runIndependentReview(fx.projectId, fx.authOp, {
+        task_id: prepTtl.task.task_id,
+        merge_candidate_id: prepTtl.mergeCandidate.merge_candidate_id,
+        verification_run_id: prepTtl.finalRun.verification_run_id,
+        reviewer_principal_id: "rev-ttl-reapprove",
+        reviewer_agent_profile_id: "profile-rev-ttl",
+        reviewer_provider: "google",
+        reviewer_model: "gemini-2.5-pro",
+        developer_principal_id: "dev-ttl-reapprove",
+        developer_session_id: "dev-sess-ttl-reapprove",
+        developer_credential_id: "dev-cred-ttl-reapprove",
+        developer_agent_profile_id: "profile-dev-ttl",
+        writer_provider: "anthropic",
+        writer_model: "claude-sonnet-4",
+        agent_gateway: fx.gateway,
+        repo_path: fx.bareRepoDir,
+        tier3_test_files: ["test/calc-ttl-reapprove.agent.test.mjs"],
+      });
+
+      const approval1 = await fx.webConsole.approveCandidateWith8FieldBinding({
+        auth: fx.authApprover,
+        candidate: prepTtl.mergeCandidate,
+        verificationRun: prepTtl.finalRun,
+        reviewArtifact: revTtl.reviewArtifact,
+        approvalRequestId: revTtl.approvalRequest!.approval_request_id,
+        ttlMs: 30_000,
+        repoPath: fx.bareRepoDir,
+      });
+
+      // Let approval1 (30s) expire while ApprovalRequest (120s) stays within window
+      fx.advanceClockMs(40_000);
+      const expiredCasRes = await fx.coreApi.executeCasMerge(fx.projectId, fx.authOp, {
+        task_id: prepTtl.task.task_id,
+        merge_candidate_id: prepTtl.mergeCandidate.merge_candidate_id,
+        approval_id: approval1.approval_id,
+        require_real_git: true,
+      });
+      assert.equal(expiredCasRes.status, "APPROVAL_EXPIRED");
+      assert.equal(expiredCasRes.task_status, "AwaitingHumanApproval");
+      assert.equal(expiredCasRes.invalidated_approval_id, approval1.approval_id);
+
+      const midTtlState = await fx.store.withRlsTransaction(
+        {
+          currentProjectId: fx.projectId,
+          currentPrincipalId: "operator-alice",
+          currentRole: "core_api_service",
+        },
+        () => ({
+          req: fx.store.getApprovalRequestById(revTtl.approvalRequest!.approval_request_id),
+          ops: fx.store.listMergeOperationsForTask(prepTtl.task.task_id),
+        })
+      );
+      assert.equal(midTtlState.req?.status, "PENDING");
+      assert.equal(midTtlState.ops.length, 1);
+      assert.equal(midTtlState.ops[0]?.last_error, "APPROVAL_TTL_EXPIRED");
+      assert.equal(
+        midTtlState.ops[0]?.merge_idempotency_key,
+        `merge:${fx.projectId}:${prepTtl.task.task_id}:${prepTtl.mergeCandidate.merge_candidate_hash}:${approval1.approval_id}`
+      );
+
+      // Re-approve same candidate with fresh decision approval2 and complete CAS merge cleanly
+      const approval2 = await fx.webConsole.approveCandidateWith8FieldBinding({
+        auth: fx.authApprover,
+        candidate: prepTtl.mergeCandidate,
+        verificationRun: prepTtl.finalRun,
+        reviewArtifact: revTtl.reviewArtifact,
+        approvalRequestId: revTtl.approvalRequest!.approval_request_id,
+        ttlMs: 120_000,
+        repoPath: fx.bareRepoDir,
+      });
+      const reapprovedCasRes = await fx.coreApi.executeCasMerge(fx.projectId, fx.authOp, {
+        task_id: prepTtl.task.task_id,
+        merge_candidate_id: prepTtl.mergeCandidate.merge_candidate_id,
+        approval_id: approval2.approval_id,
+        require_real_git: true,
+      });
+      assert.equal(reapprovedCasRes.status, "MERGED_BY_CAS");
+      assert.equal(reapprovedCasRes.task_status, "MergedAndCompleted");
+
+      const postTtlState = await fx.store.withRlsTransaction(
+        {
+          currentProjectId: fx.projectId,
+          currentPrincipalId: "operator-alice",
+          currentRole: "core_api_service",
+        },
+        () => fx.store.listMergeOperationsForTask(prepTtl.task.task_id)
+      );
+      assert.equal(postTtlState.length, 2);
+      assert.equal(postTtlState[0]?.approval_id, approval1.approval_id);
+      assert.equal(postTtlState[1]?.approval_id, approval2.approval_id);
+      assert.equal(postTtlState[1]?.status, "MERGED");
+      assert.equal(
+        postTtlState[1]?.merge_idempotency_key,
+        `merge:${fx.projectId}:${prepTtl.task.task_id}:${prepTtl.mergeCandidate.merge_candidate_hash}:${approval2.approval_id}`
+      );
+      assert.notEqual(
+        postTtlState[0]?.merge_idempotency_key,
+        postTtlState[1]?.merge_idempotency_key
       );
     } finally {
       fx.cleanup();

@@ -373,7 +373,7 @@ export class AgentGatewayService implements AgentGatewayTransportClient {
 
     const devSession = input.developer_session_id.trim();
     const revSession = input.reviewer_session_id?.trim() || `rev-sess-${randomUUID()}`;
-    if (!devSession || devSession === revSession) {
+    if (!devSession || devSession.toLowerCase() === revSession.toLowerCase()) {
       throw new ReviewerIdentityIndependenceError(
         "session",
         `Reviewer session '${revSession}' must be non-empty and distinct from developer session '${devSession}'`
@@ -382,7 +382,7 @@ export class AgentGatewayService implements AgentGatewayTransportClient {
 
     const devCred = input.developer_credential_id.trim();
     const revCred = input.reviewer_credential_id?.trim() || `rev-cred-${randomUUID()}`;
-    if (!devCred || devCred === revCred) {
+    if (!devCred || devCred.toLowerCase() === revCred.toLowerCase()) {
       throw new ReviewerIdentityIndependenceError(
         "credential",
         `Reviewer credential '${revCred}' must be non-empty and distinct from developer credential '${devCred}'`

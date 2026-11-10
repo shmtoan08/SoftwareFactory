@@ -236,7 +236,7 @@ CREATE TABLE IF NOT EXISTS review_artifacts (
   CONSTRAINT chk_independent_reviewer_session CHECK (
     NULLIF(btrim(developer_session_id), '') IS NOT NULL
     AND NULLIF(btrim(reviewer_session_id), '') IS NOT NULL
-    AND btrim(developer_session_id) IS DISTINCT FROM btrim(reviewer_session_id)
+    AND lower(btrim(developer_session_id)) IS DISTINCT FROM lower(btrim(reviewer_session_id))
   ),
   CONSTRAINT fk_ra_verification FOREIGN KEY (
     verification_run_id, project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash

@@ -17,6 +17,7 @@
 #include <sys/mount.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -385,6 +386,47 @@ static int apply_mount_mask(const char *masked_path) {
   return 1;
 }
 
+static int apply_readonly_bind_mount(const char *target_path) {
+  struct stat st;
+  if (stat(target_path, &st) != 0) {
+    return -1;
+  }
+  if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+    return -1;
+  }
+  unsigned long preserve_flags = 0;
+  struct statvfs vfs;
+  if (statvfs(target_path, &vfs) == 0) {
+#ifdef ST_NOSUID
+    if (vfs.f_flag & ST_NOSUID) preserve_flags |= MS_NOSUID;
+#endif
+#ifdef ST_NODEV
+    if (vfs.f_flag & ST_NODEV) preserve_flags |= MS_NODEV;
+#endif
+#ifdef ST_NOEXEC
+    if (vfs.f_flag & ST_NOEXEC) preserve_flags |= MS_NOEXEC;
+#endif
+#ifdef ST_NOATIME
+    if (vfs.f_flag & ST_NOATIME) preserve_flags |= MS_NOATIME;
+#endif
+#ifdef ST_NODIRATIME
+    if (vfs.f_flag & ST_NODIRATIME) preserve_flags |= MS_NODIRATIME;
+#endif
+#ifdef ST_RELATIME
+    if (vfs.f_flag & ST_RELATIME) preserve_flags |= MS_RELATIME;
+#endif
+  }
+  if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+    if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_REC | preserve_flags, NULL) != 0) {
+      int saved = errno;
+      umount2(target_path, MNT_DETACH);
+      errno = saved;
+      return -1;
+    }
+  }
+  return 0;
+}
+
 typedef struct {
   const char *cgroup_path;
   bool require_cgroup;
@@ -403,6 +445,8 @@ typedef struct {
   size_t arg_count;
   const char **masked_paths;
   size_t mask_count;
+  const char **ro_paths;
+  size_t ro_path_count;
 } SupervisorConfig;
 
 static int parse_nul_config(const char *buf, size_t len, SupervisorConfig *cfg) {
@@ -415,6 +459,7 @@ static int parse_nul_config(const char *buf, size_t len, SupervisorConfig *cfg) 
   size_t pos = 0;
   size_t args_cap = 0;
   size_t masks_cap = 0;
+  size_t ro_cap = 0;
   while (pos < len) {
     const char *key = buf + pos;
     size_t klen = strnlen(key, len - pos);
@@ -473,6 +518,17 @@ static int parse_nul_config(const char *buf, size_t len, SupervisorConfig *cfg) 
         cfg->masked_paths = next;
       }
       cfg->masked_paths[cfg->mask_count++] = val;
+    } else if (strcmp(key, "ro_path") == 0) {
+      if (cfg->ro_path_count == ro_cap) {
+        ro_cap = ro_cap ? ro_cap * 2 : 8;
+        const char **next =
+            (const char **)realloc((void *)cfg->ro_paths, ro_cap * sizeof(char *));
+        if (!next) {
+          return -1;
+        }
+        cfg->ro_paths = next;
+      }
+      cfg->ro_paths[cfg->ro_path_count++] = val;
     }
   }
   if (!cfg->cwd || !cfg->ready_file || !cfg->reap_file || !cfg->cmd) {
@@ -796,6 +852,7 @@ int main(int argc, char **argv) {
       write_ready_failure(cfg.ready_file, "ERR_LINUX_SUBREAPER_UNAVAILABLE", strerror(errno));
       free((void *)cfg.args);
       free((void *)cfg.masked_paths);
+      free((void *)cfg.ro_paths);
       free(cfg_raw);
       close(sig_pipe[0]);
       close(sig_pipe[1]);
@@ -809,6 +866,7 @@ int main(int argc, char **argv) {
     write_ready_failure(cfg.ready_file, "ERR_SANDBOX_SPAWN_FAILED", strerror(errno));
     free((void *)cfg.args);
     free((void *)cfg.masked_paths);
+    free((void *)cfg.ro_paths);
     free(cfg_raw);
     close(sig_pipe[0]);
     close(sig_pipe[1]);
@@ -824,6 +882,7 @@ int main(int argc, char **argv) {
     close(meta_pipe[1]);
     free((void *)cfg.args);
     free((void *)cfg.masked_paths);
+    free((void *)cfg.ro_paths);
     free(cfg_raw);
     close(sig_pipe[0]);
     close(sig_pipe[1]);
@@ -862,6 +921,11 @@ int main(int argc, char **argv) {
     size_t applied_mask_cnt = 0;
     if (cfg.mask_count > 0) {
       applied_masks = (const char **)calloc(cfg.mask_count, sizeof(char *));
+    }
+    const char **applied_ro_mounts = NULL;
+    size_t applied_ro_cnt = 0;
+    if (cfg.ro_path_count > 0) {
+      applied_ro_mounts = (const char **)calloc(cfg.ro_path_count, sizeof(char *));
     }
 
     bool host_is_root = (geteuid() == 0);
@@ -921,6 +985,19 @@ int main(int argc, char **argv) {
             char msg[1024];
             snprintf(msg, sizeof(msg), "Failed to mask %.500s: %.200s", cfg.masked_paths[i],
                      strerror(errno));
+            send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", msg);
+            close(meta_pipe[1]);
+            _exit(1);
+          }
+        }
+        for (size_t i = 0; i < cfg.ro_path_count; i++) {
+          int rrc = apply_readonly_bind_mount(cfg.ro_paths[i]);
+          if (rrc == 0 && applied_ro_mounts) {
+            applied_ro_mounts[applied_ro_cnt++] = cfg.ro_paths[i];
+          } else if (rrc < 0 && cfg.require_ns) {
+            char msg[1024];
+            snprintf(msg, sizeof(msg), "Failed to mount read-only %.500s: %.200s",
+                     cfg.ro_paths[i], strerror(errno));
             send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", msg);
             close(meta_pipe[1]);
             _exit(1);
@@ -1022,7 +1099,7 @@ int main(int argc, char **argv) {
     gid_t effective_gid = user_ns_used ? host_gid : getegid();
 
     /* Emit partial telemetry suffix; supervisor parent prepends real host workerPid/supervisorPid */
-    size_t jcap = 8192 + cfg.mask_count * 1024;
+    size_t jcap = 8192 + (cfg.mask_count + cfg.ro_path_count) * 1024;
     char *jbuf = (char *)malloc(jcap);
     if (!jbuf) {
       send_pipe_error(meta_pipe[1], "ERR_SANDBOX_SPAWN_FAILED", "oom");
@@ -1053,6 +1130,13 @@ int main(int argc, char **argv) {
         }
         json_write_escaped(jf, applied_masks[i]);
       }
+      fputs("],\"readOnlyMountsApplied\":[", jf);
+      for (size_t i = 0; i < applied_ro_cnt; i++) {
+        if (i > 0) {
+          fputc(',', jf);
+        }
+        json_write_escaped(jf, applied_ro_mounts[i]);
+      }
       fputs("]}\n", jf);
       long pos = ftell(jf);
       fclose(jf);
@@ -1062,6 +1146,8 @@ int main(int argc, char **argv) {
       }
     }
     free(jbuf);
+    free((void *)applied_masks);
+    free((void *)applied_ro_mounts);
 
     char **exec_argv = (char **)calloc(cfg.arg_count + 2, sizeof(char *));
     if (!exec_argv) {
@@ -1106,6 +1192,7 @@ int main(int argc, char **argv) {
       write_ready_failure(cfg.ready_file, "ERR_LINUX_CGROUP_V2_UNAVAILABLE", err_msg);
       free((void *)cfg.args);
       free((void *)cfg.masked_paths);
+      free((void *)cfg.ro_paths);
       free(cfg_raw);
       close(sig_pipe[0]);
       close(sig_pipe[1]);
@@ -1189,6 +1276,7 @@ int main(int argc, char **argv) {
     free(mbuf);
     free((void *)cfg.args);
     free((void *)cfg.masked_paths);
+    free((void *)cfg.ro_paths);
     free(cfg_raw);
     close(sig_pipe[0]);
     close(sig_pipe[1]);
@@ -1324,6 +1412,7 @@ int main(int argc, char **argv) {
 
   free((void *)cfg.args);
   free((void *)cfg.masked_paths);
+  free((void *)cfg.ro_paths);
   free(cfg_raw);
   close(sig_pipe[0]);
   close(sig_pipe[1]);

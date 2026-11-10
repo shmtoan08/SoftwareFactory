@@ -54,6 +54,7 @@ export interface SandboxSecurityMetadata {
   readonly capabilitiesDropped: boolean;
   readonly namespaces: readonly LinuxNamespaceKind[];
   readonly maskedPathsApplied: readonly string[];
+  readonly readOnlyMountsApplied?: readonly string[];
   readonly mountedWorktreePath: string;
   readonly ephemeralGitPushRef: string;
 }
@@ -124,6 +125,7 @@ interface SupervisorReadyPayload {
   readonly capabilitiesDropped?: boolean;
   readonly namespaces?: readonly LinuxNamespaceKind[];
   readonly maskedPathsApplied?: readonly string[];
+  readonly readOnlyMountsApplied?: readonly string[];
 }
 
 interface SupervisorReapPayload {
@@ -542,6 +544,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       capabilitiesDropped: false,
       namespaces: [],
       maskedPathsApplied: [],
+      readOnlyMountsApplied: [],
       mountedWorktreePath,
       ephemeralGitPushRef: `refs/heads/sf/staging/${taskId}/${leaseEpoch}`,
     };
@@ -602,6 +605,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     requireNamespaceIsolation?: boolean;
     isolateNamespaces?: boolean;
     maskedPaths?: readonly string[];
+    readOnlyPaths?: readonly string[];
     dropPrivileges?: boolean;
   }): RealProcessSpawnResult {
     const k = this.key(input.taskId, input.leaseEpoch);
@@ -723,6 +727,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         capabilitiesDropped: false,
         namespaces: [],
         maskedPathsApplied: [],
+        readOnlyMountsApplied: [],
         mountedWorktreePath,
         ephemeralGitPushRef: `refs/heads/sf/staging/${input.taskId}/${input.leaseEpoch}`,
       };
@@ -775,6 +780,9 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       }
       for (const mp of allMaskedPaths) {
         configPairs.push(["mask", mp]);
+      }
+      for (const rp of input.readOnlyPaths ?? []) {
+        configPairs.push(["ro_path", rp]);
       }
       writeFileSync(configPath, buildNulConfigBuffer(configPairs));
 
@@ -919,6 +927,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         capabilitiesDropped: Boolean(ready.capabilitiesDropped),
         namespaces: ready.namespaces ?? [],
         maskedPathsApplied: ready.maskedPathsApplied ?? [],
+        readOnlyMountsApplied: ready.readOnlyMountsApplied ?? [],
         mountedWorktreePath,
         ephemeralGitPushRef: `refs/heads/sf/staging/${input.taskId}/${input.leaseEpoch}`,
       };

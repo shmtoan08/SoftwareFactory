@@ -63,9 +63,144 @@ jobs:
           psql -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
           DECLARE
+            v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
+            v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
+            v_task_a UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_task_b UUID := 'b4444444-4444-4444-4444-444444444444';
+            v_lease_a UUID := 'c3333333-3333-3333-3333-333333333333';
+            v_lease_b UUID := 'c4444444-4444-4444-4444-444444444444';
+            v_imp_a UUID := 'd3333333-3333-3333-3333-333333333333';
+            v_imp_b UUID := 'd4444444-4444-4444-4444-444444444444';
+            v_cand_a UUID := 'e3333333-3333-3333-3333-333333333333';
+            v_cand_a2 UUID := 'e3333333-3333-3333-3333-333333333334';
+            v_cand_b UUID := 'e4444444-4444-4444-4444-444444444444';
+            v_vr_a UUID := 'f3333333-3333-3333-3333-333333333333';
+            v_vr_a2 UUID := 'f3333333-3333-3333-3333-333333333334';
+            v_vr_b UUID := 'f4444444-4444-4444-4444-444444444444';
+            v_rs_a UUID := '13333333-3333-3333-3333-333333333333';
+            v_rs_a2 UUID := '13333333-3333-3333-3333-333333333334';
+            v_rs_b UUID := '14444444-4444-4444-4444-444444444444';
+            v_ra_a UUID := '23333333-3333-3333-3333-333333333333';
+            v_ra_a2 UUID := '23333333-3333-3333-3333-333333333334';
+            v_ra_b UUID := '24444444-4444-4444-4444-444444444444';
+            v_ar_a UUID := '53333333-3333-3333-3333-333333333333';
+            v_ar_a2 UUID := '53333333-3333-3333-3333-333333333334';
+            v_ar_b UUID := '54444444-4444-4444-4444-444444444444';
+            v_ad_a UUID := '63333333-3333-3333-3333-333333333333';
+            v_ad_b UUID := '64444444-4444-4444-4444-444444444444';
+            v_mo_a UUID := '73333333-3333-3333-3333-333333333333';
+            v_mo_b UUID := '74444444-4444-4444-4444-444444444444';
             v_caught BOOLEAN := false;
           BEGIN
+            -- Pre-clean any stale fixtures in FK-safe dependency order
+            DELETE FROM merge_operations WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM approval_decisions WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM approval_requests WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM review_artifacts WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM review_sessions WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM verification_runs WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM merge_candidates WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM verified_code_imports WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM processed_worker_events WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM task_leases WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM tasks WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM outbox_events WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM audit_logs WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM project_memberships WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM projects WHERE project_id IN (v_proj_a, v_proj_b);
+
+            -- Seed valid multi-tenant fixtures for Project A and Project B
+            INSERT INTO projects (project_id, slug, name, repo_bare_path, default_branch, approval_ttl_seconds)
+            VALUES
+              (v_proj_a, 'm4-ci-proj-a', 'M4 CI Project A', '/var/git/m4-a.git', 'main', 3600),
+              (v_proj_b, 'm4-ci-proj-b', 'M4 CI Project B', '/var/git/m4-b.git', 'main', 3600);
+
+            INSERT INTO tasks (task_id, project_id, title, task_contract_json, status, base_main_commit_hash, current_attempt_no)
+            VALUES
+              (v_task_a, v_proj_a, 'M4 Task A', '{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('1', 40), 1),
+              (v_task_b, v_proj_b, 'M4 Task B', '{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('2', 40), 1);
+
+            INSERT INTO task_leases (
+              lease_id, project_id, task_id, attempt_no, lease_epoch, worker_id,
+              status, task_execution_idempotency_key, last_processed_seq,
+              heartbeat_interval_ms, lease_ttl_ms, expires_at
+            ) VALUES
+              (v_lease_a, v_proj_a, v_task_a, 1, 1, 'worker-a', 'COMPLETED', repeat('a', 64), 1, 10000, 35000, clock_timestamp() + interval '1 hour'),
+              (v_lease_b, v_proj_b, v_task_b, 1, 1, 'worker-b', 'COMPLETED', repeat('b', 64), 1, 10000, 35000, clock_timestamp() + interval '1 hour');
+
+            INSERT INTO verified_code_imports (
+              import_id, project_id, task_id, lease_id, lease_epoch,
+              agent_commit_hash, verified_tree_hash, staging_ref, changed_files_count, deleted_lines_count
+            ) VALUES
+              (v_imp_a, v_proj_a, v_task_a, v_lease_a, 1, repeat('3', 40), repeat('4', 40), 'refs/factory/Verify/' || v_task_a || '/1', 1, 0),
+              (v_imp_b, v_proj_b, v_task_b, v_lease_b, 1, repeat('d', 40), repeat('e', 40), 'refs/factory/Verify/' || v_task_b || '/1', 1, 0);
+
+            INSERT INTO merge_candidates (
+              merge_candidate_id, project_id, task_id, import_id,
+              agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash
+            ) VALUES
+              (v_cand_a,  v_proj_a, v_task_a, v_imp_a, repeat('3', 40), repeat('1', 40), repeat('5', 40), repeat('4', 40)),
+              (v_cand_a2, v_proj_a, v_task_a, v_imp_a, repeat('3', 40), repeat('6', 40), repeat('7', 40), repeat('8', 40)),
+              (v_cand_b,  v_proj_b, v_task_b, v_imp_b, repeat('d', 40), repeat('2', 40), repeat('f', 40), repeat('e', 40));
+
+            INSERT INTO verification_runs (
+              verification_run_id, project_id, task_id, merge_candidate_id,
+              merge_candidate_hash, verified_tree_hash, verifier_image_digest,
+              verdict, overall_status, tier1_trusted_acceptance_passed,
+              tier2_protected_baseline_passed, tier3_agent_tests_passed,
+              exit_code, duration_ms, report_sha256
+            ) VALUES
+              (v_vr_a,  v_proj_a, v_task_a, v_cand_a,  repeat('5', 40), repeat('4', 40), 'sha256:test', 'PASS', 'PASSED', true, true, true, 0, 10, repeat('a', 64)),
+              (v_vr_a2, v_proj_a, v_task_a, v_cand_a2, repeat('7', 40), repeat('8', 40), 'sha256:test', 'PASS', 'PASSED', true, true, true, 0, 10, repeat('b', 64)),
+              (v_vr_b,  v_proj_b, v_task_b, v_cand_b,  repeat('f', 40), repeat('e', 40), 'sha256:test', 'PASS', 'PASSED', true, true, true, 0, 10, repeat('c', 64));
+
+            INSERT INTO review_sessions (
+              review_session_id, project_id, task_id, merge_candidate_id, verification_run_id,
+              reviewer_principal_id, reviewer_credential_id, reviewer_agent_profile_id,
+              reviewer_provider, reviewer_model, role, sandbox_backend_mode, status
+            ) VALUES
+              (v_rs_a,  v_proj_a, v_task_a, v_cand_a,  v_vr_a,  'rev-a1', 'rev-cred-a1', 'prof-rev-a', 'google', 'gemini-2.5-pro', 'ROLE_REVIEWER_READONLY', 'linux-supervisor', 'COMPLETED'),
+              (v_rs_a2, v_proj_a, v_task_a, v_cand_a2, v_vr_a2, 'rev-a2', 'rev-cred-a2', 'prof-rev-a', 'google', 'gemini-2.5-pro', 'ROLE_REVIEWER_READONLY', 'linux-supervisor', 'COMPLETED'),
+              (v_rs_b,  v_proj_b, v_task_b, v_cand_b,  v_vr_b,  'rev-b1', 'rev-cred-b1', 'prof-rev-b', 'google', 'gemini-2.5-pro', 'ROLE_REVIEWER_READONLY', 'linux-supervisor', 'COMPLETED');
+
+            INSERT INTO review_artifacts (
+              review_artifact_id, project_id, task_id, merge_candidate_id, verification_run_id,
+              merge_candidate_hash, verified_tree_hash, writer_provider, writer_model,
+              reviewer_provider, reviewer_model, developer_principal_id, reviewer_principal_id,
+              developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
+              developer_agent_profile_id, reviewer_agent_profile_id, review_session_id, verdict, status
+            ) VALUES
+              (v_ra_a,  v_proj_a, v_task_a, v_cand_a,  v_vr_a,  repeat('5', 40), repeat('4', 40), 'anthropic', 'claude-sonnet-4', 'google', 'gemini-2.5-pro', 'dev-a', 'rev-a1', 'dev-sess-a1', 'rev-sess-a1', 'dev-cred-a1', 'rev-cred-a1', 'prof-dev-a', 'prof-rev-a', v_rs_a,  'PASS', 'VALID'),
+              (v_ra_a2, v_proj_a, v_task_a, v_cand_a2, v_vr_a2, repeat('7', 40), repeat('8', 40), 'anthropic', 'claude-sonnet-4', 'google', 'gemini-2.5-pro', 'dev-a', 'rev-a2', 'dev-sess-a2', 'rev-sess-a2', 'dev-cred-a2', 'rev-cred-a2', 'prof-dev-a', 'prof-rev-a', v_rs_a2, 'PASS', 'VALID'),
+              (v_ra_b,  v_proj_b, v_task_b, v_cand_b,  v_vr_b,  repeat('f', 40), repeat('e', 40), 'anthropic', 'claude-sonnet-4', 'google', 'gemini-2.5-pro', 'dev-b', 'rev-b1', 'dev-sess-b1', 'rev-sess-b1', 'dev-cred-b1', 'rev-cred-b1', 'prof-dev-b', 'prof-rev-b', v_rs_b,  'PASS', 'VALID');
+
+            INSERT INTO approval_requests (
+              approval_request_id, project_id, task_id, merge_candidate_id,
+              agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash,
+              verification_run_id, review_artifact_id, status, expires_at, created_at
+            ) VALUES
+              (v_ar_a,  v_proj_a, v_task_a, v_cand_a,  repeat('3', 40), repeat('1', 40), repeat('5', 40), repeat('4', 40), v_vr_a,  v_ra_a,  'APPROVED', clock_timestamp() + interval '1 hour', clock_timestamp()),
+              (v_ar_a2, v_proj_a, v_task_a, v_cand_a2, repeat('3', 40), repeat('6', 40), repeat('7', 40), repeat('8', 40), v_vr_a2, v_ra_a2, 'PENDING',  clock_timestamp() + interval '1 hour', clock_timestamp()),
+              (v_ar_b,  v_proj_b, v_task_b, v_cand_b,  repeat('d', 40), repeat('2', 40), repeat('f', 40), repeat('e', 40), v_vr_b,  v_ra_b,  'APPROVED', clock_timestamp() + interval '1 hour', clock_timestamp());
+
+            INSERT INTO approval_decisions (
+              approval_id, project_id, task_id, merge_candidate_id,
+              agent_commit_hash, base_main_commit_hash, verified_tree_hash, merge_candidate_hash,
+              verification_run_id, review_artifact_id, approval_request_id, approver_principal_id,
+              decision, status, approved_at, expires_at
+            ) VALUES
+              (v_ad_a, v_proj_a, v_task_a, v_cand_a, repeat('3', 40), repeat('1', 40), repeat('4', 40), repeat('5', 40), v_vr_a, v_ra_a, v_ar_a, 'alice-approver', 'APPROVED', 'ACTIVE', clock_timestamp(), clock_timestamp() + interval '1 hour'),
+              (v_ad_b, v_proj_b, v_task_b, v_cand_b, repeat('d', 40), repeat('2', 40), repeat('e', 40), repeat('f', 40), v_vr_b, v_ra_b, v_ar_b, 'bob-approver',   'APPROVED', 'ACTIVE', clock_timestamp(), clock_timestamp() + interval '1 hour');
+
+            INSERT INTO merge_operations (
+              merge_op_id, project_id, task_id, merge_candidate_id, approval_id,
+              merge_idempotency_key, base_main_commit_hash, merge_candidate_hash, verified_tree_hash, status
+            ) VALUES
+              (v_mo_a, v_proj_a, v_task_a, v_cand_a, v_ad_a, 'merge:' || v_proj_a || ':' || v_task_a || ':' || repeat('5', 40) || ':' || v_ad_a, repeat('1', 40), repeat('5', 40), repeat('4', 40), 'IN_PROGRESS'),
+              (v_mo_b, v_proj_b, v_task_b, v_cand_b, v_ad_b, 'merge:' || v_proj_b || ':' || v_task_b || ':' || repeat('f', 40) || ':' || v_ad_b, repeat('2', 40), repeat('f', 40), repeat('e', 40), 'IN_PROGRESS');
+
             -- M3 check: PASS verdict requires tier3_agent_tests_passed = TRUE
+            v_caught := false;
             BEGIN
               INSERT INTO verification_runs (
                 verification_run_id, project_id, task_id, merge_candidate_id,
@@ -74,7 +209,7 @@ jobs:
                 tier2_protected_baseline_passed, tier3_agent_tests_passed,
                 exit_code, duration_ms, report_sha256
               ) VALUES (
-                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a,
                 repeat('5', 40), repeat('4', 40), 'sha256:test',
                 'PASS', 'PASSED', true, true, false, 0, 10, repeat('a', 64)
               );
@@ -84,7 +219,7 @@ jobs:
               RAISE EXCEPTION 'chk_vr_pass_consistency failed to reject PASS with tier3_agent_tests_passed=FALSE';
             END IF;
 
-            -- M4 check 1: chk_ra_independent_credential
+            -- M4 check 1 (M4-FIX-08): chk_ra_independent_credential (case-insensitive + trimmed)
             v_caught := false;
             BEGIN
               INSERT INTO review_artifacts (
@@ -94,16 +229,38 @@ jobs:
                 developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
                 developer_agent_profile_id, reviewer_agent_profile_id, verdict
               ) VALUES (
-                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a, v_vr_a,
                 repeat('5', 40), repeat('4', 40), 'anthropic', 'claude-sonnet-4',
                 'google', 'gemini-2.5-pro', 'dev-1', 'rev-1',
-                'dev-sess-1', 'rev-sess-1', 'shared-cred', ' shared-cred ',
+                'dev-sess-1', 'rev-sess-1', 'Shared-Cred', ' shared-cred ',
                 'prof-dev', 'prof-rev', 'PASS'
               );
             EXCEPTION WHEN check_violation THEN v_caught := true;
             END;
             IF NOT v_caught THEN
               RAISE EXCEPTION 'chk_ra_independent_credential failed';
+            END IF;
+
+            -- M4 check 1b (M4-FIX-08): chk_independent_reviewer_session (case-insensitive + trimmed)
+            v_caught := false;
+            BEGIN
+              INSERT INTO review_artifacts (
+                review_artifact_id, project_id, task_id, merge_candidate_id, verification_run_id,
+                merge_candidate_hash, verified_tree_hash, writer_provider, writer_model,
+                reviewer_provider, reviewer_model, developer_principal_id, reviewer_principal_id,
+                developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
+                developer_agent_profile_id, reviewer_agent_profile_id, verdict
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a, v_vr_a,
+                repeat('5', 40), repeat('4', 40), 'anthropic', 'claude-sonnet-4',
+                'google', 'gemini-2.5-pro', 'dev-1', 'rev-1',
+                'Shared-Sess', ' shared-sess ', 'dev-cred-1', 'rev-cred-1',
+                'prof-dev', 'prof-rev', 'PASS'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'chk_independent_reviewer_session failed case-insensitive check';
             END IF;
 
             -- M4 check 2: chk_ra_independent_agent_profile (case-insensitive)
@@ -116,7 +273,7 @@ jobs:
                 developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
                 developer_agent_profile_id, reviewer_agent_profile_id, verdict
               ) VALUES (
-                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a, v_vr_a,
                 repeat('5', 40), repeat('4', 40), 'anthropic', 'claude-sonnet-4',
                 'google', 'gemini-2.5-pro', 'dev-1', 'rev-1',
                 'dev-sess-1', 'rev-sess-1', 'dev-cred-1', 'rev-cred-1',
@@ -136,7 +293,7 @@ jobs:
                 reviewer_principal_id, reviewer_credential_id, reviewer_agent_profile_id,
                 reviewer_provider, reviewer_model, role, sandbox_backend_mode, status
               ) VALUES (
-                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a, v_vr_a,
                 'rev-1', 'rev-cred-1', 'prof-rev', 'google', 'gemini-2.5-pro',
                 'ROLE_DEVELOPER_WRITE', 'linux-supervisor', 'ACTIVE'
               );
@@ -154,9 +311,9 @@ jobs:
                 agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash,
                 verification_run_id, review_artifact_id, status, expires_at, created_at
               ) VALUES (
-                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
-                repeat('1', 40), repeat('2', 40), repeat('3', 40), repeat('4', 40),
-                gen_random_uuid(), gen_random_uuid(), 'PENDING',
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a,
+                repeat('3', 40), repeat('1', 40), repeat('5', 40), repeat('4', 40),
+                v_vr_a, v_ra_a, 'PENDING',
                 TIMESTAMPTZ '2026-11-10T10:00:00Z', TIMESTAMPTZ '2026-11-10T10:00:00Z'
               );
             EXCEPTION WHEN check_violation THEN v_caught := true;
@@ -165,29 +322,141 @@ jobs:
               RAISE EXCEPTION 'chk_ar_ttl_window failed';
             END IF;
 
+            -- M4 check 5 (M4-FIX-01): composite FK fk_ad_approval_request rejects swapped approval_request_id across candidates
+            v_caught := false;
+            BEGIN
+              INSERT INTO approval_decisions (
+                approval_id, project_id, task_id, merge_candidate_id,
+                agent_commit_hash, base_main_commit_hash, verified_tree_hash, merge_candidate_hash,
+                verification_run_id, review_artifact_id, approval_request_id, approver_principal_id,
+                decision, status, approved_at, expires_at
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_task_a, v_cand_a,
+                repeat('3', 40), repeat('1', 40), repeat('4', 40), repeat('5', 40),
+                v_vr_a, v_ra_a, v_ar_a2, 'alice-approver',
+                'APPROVED', 'ACTIVE', clock_timestamp(), clock_timestamp() + interval '1 hour'
+              );
+            EXCEPTION WHEN foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'fk_ad_approval_request failed to reject mismatched approval_request_id';
+            END IF;
+
             IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'uq_one_pending_approval_request_per_candidate') THEN
               RAISE EXCEPTION 'Missing partial unique index uq_one_pending_approval_request_per_candidate';
             END IF;
             IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_mo_idempotency') THEN
               RAISE EXCEPTION 'Missing unique constraint uq_mo_idempotency';
             END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_ar_composite_binding') THEN
+              RAISE EXCEPTION 'Missing unique constraint uq_ar_composite_binding';
+            END IF;
           END
           $$;
 
+          -- M4-FIX-07: Seeded Multi-Tenant RLS, Column GRANT & DISCARD ALL Probes under app_runtime
           BEGIN;
           SET LOCAL ROLE app_runtime;
           DO $$
           DECLARE
+            v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
+            v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
+            v_task_b UUID := 'b4444444-4444-4444-4444-444444444444';
+            v_cand_b UUID := 'e4444444-4444-4444-4444-444444444444';
+            v_vr_b   UUID := 'f4444444-4444-4444-4444-444444444444';
+            v_ra_a   UUID := '23333333-3333-3333-3333-333333333333';
+            v_ra_b   UUID := '24444444-4444-4444-4444-444444444444';
+            v_ad_b   UUID := '64444444-4444-4444-4444-444444444444';
             v_cnt INTEGER;
             v_caught BOOLEAN;
             tbl TEXT;
           BEGIN
+            -- 1. Default deny when app.current_project_id is unset (despite seeded rows)
             SELECT count(*) INTO v_cnt FROM review_sessions;
-            IF v_cnt <> 0 THEN RAISE EXCEPTION 'review_sessions RLS default deny failed'; END IF;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'review_sessions RLS default deny failed (saw %)', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM approval_requests;
-            IF v_cnt <> 0 THEN RAISE EXCEPTION 'approval_requests RLS default deny failed'; END IF;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'approval_requests RLS default deny failed (saw %)', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM merge_operations;
-            IF v_cnt <> 0 THEN RAISE EXCEPTION 'merge_operations RLS default deny failed'; END IF;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'merge_operations RLS default deny failed (saw %)', v_cnt; END IF;
+
+            -- 2. Scoped to Project A as core_api_service
+            PERFORM set_config('app.current_project_id', v_proj_a::text, true);
+            PERFORM set_config('app.current_principal_id', 'alice-operator', true);
+            PERFORM set_config('app.current_role', 'core_api_service', true);
+
+            SELECT count(*) INTO v_cnt FROM review_sessions;
+            IF v_cnt <> 2 THEN RAISE EXCEPTION 'review_sessions tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM review_sessions WHERE project_id = v_proj_b;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'review_sessions leaked Project B rows to Project A'; END IF;
+
+            SELECT count(*) INTO v_cnt FROM approval_requests;
+            IF v_cnt <> 2 THEN RAISE EXCEPTION 'approval_requests tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM approval_requests WHERE project_id = v_proj_b;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'approval_requests leaked Project B rows to Project A'; END IF;
+
+            SELECT count(*) INTO v_cnt FROM merge_operations;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'merge_operations tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM merge_operations WHERE project_id = v_proj_b;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'merge_operations leaked Project B rows to Project A'; END IF;
+
+            -- 3. Cross-tenant INSERT blocked (42501 insufficient_privilege)
+            v_caught := false;
+            BEGIN
+              INSERT INTO review_sessions (
+                review_session_id, project_id, task_id, merge_candidate_id, verification_run_id,
+                reviewer_principal_id, reviewer_credential_id, reviewer_agent_profile_id,
+                reviewer_provider, reviewer_model, role, sandbox_backend_mode, status
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_task_b, v_cand_b, v_vr_b,
+                'intruder', 'intr-cred', 'intr-prof', 'google', 'gemini-2.5-pro',
+                'ROLE_REVIEWER_READONLY', 'linux-supervisor', 'ACTIVE'
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into review_sessions was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO approval_requests (
+                approval_request_id, project_id, task_id, merge_candidate_id,
+                agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash,
+                verification_run_id, review_artifact_id, status, expires_at, created_at
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_task_b, v_cand_b,
+                repeat('d', 40), repeat('2', 40), repeat('f', 40), repeat('e', 40),
+                v_vr_b, v_ra_b, 'PENDING', clock_timestamp() + interval '1 hour', clock_timestamp()
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into approval_requests was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO merge_operations (
+                merge_op_id, project_id, task_id, merge_candidate_id, approval_id,
+                merge_idempotency_key, base_main_commit_hash, merge_candidate_hash, verified_tree_hash, status
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_task_b, v_cand_b, v_ad_b,
+                'cross-tenant-key', repeat('2', 40), repeat('f', 40), repeat('e', 40), 'IN_PROGRESS'
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into merge_operations was not blocked'; END IF;
+
+            -- 4. Cross-tenant UPDATE affects 0 rows
+            UPDATE review_sessions SET status = 'REVOKED' WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified review_sessions rows: %', v_cnt; END IF;
+
+            UPDATE approval_requests SET status = 'REJECTED' WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified approval_requests rows: %', v_cnt; END IF;
+
+            UPDATE merge_operations SET status = 'MERGED' WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified merge_operations rows: %', v_cnt; END IF;
+
+            -- 5. DELETE denied on M4 tables for app_runtime
             FOREACH tbl IN ARRAY ARRAY['review_sessions', 'approval_requests', 'merge_operations']
             LOOP
               v_caught := false;
@@ -199,9 +468,78 @@ jobs:
                 RAISE EXCEPTION 'DELETE privilege unexpectedly allowed for app_runtime on %', tbl;
               END IF;
             END LOOP;
+
+            -- 6. Column-level UPDATE GRANT enforcement on review_artifacts
+            v_caught := false;
+            BEGIN
+              UPDATE review_artifacts SET verdict = 'FAIL' WHERE review_artifact_id = v_ra_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Non-whitelisted UPDATE on review_artifacts.verdict was unexpectedly allowed for app_runtime';
+            END IF;
+
+            UPDATE review_artifacts
+              SET status = 'INVALIDATED_STALE_BASE', is_invalidated = TRUE, invalidated_reason = 'ci_rls_probe'
+              WHERE review_artifact_id = v_ra_a;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 1 THEN
+              RAISE EXCEPTION 'Whitelisted status invalidation UPDATE failed on Project A review_artifact (updated %)', v_cnt;
+            END IF;
+
+            UPDATE review_artifacts
+              SET status = 'INVALIDATED_STALE_BASE', is_invalidated = TRUE
+              WHERE review_artifact_id = v_ra_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN
+              RAISE EXCEPTION 'Cross-tenant UPDATE unexpectedly modified Project B review_artifact (%)', v_cnt;
+            END IF;
           END
           $$;
           COMMIT;
+
+          DISCARD ALL;
+
+          BEGIN;
+          SET LOCAL ROLE app_runtime;
+          DO $$
+          DECLARE
+            v_cnt INTEGER;
+          BEGIN
+            SELECT count(*) INTO v_cnt FROM review_sessions;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked review_sessions rows: %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM approval_requests;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked approval_requests rows: %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM merge_operations;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked merge_operations rows: %', v_cnt; END IF;
+          END
+          $$;
+          COMMIT;
+
+          -- Cleanup M4 CI fixtures cleanly as owner
+          DO $$
+          DECLARE
+            v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
+            v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
+          BEGIN
+            DELETE FROM merge_operations WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM approval_decisions WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM approval_requests WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM review_artifacts WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM review_sessions WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM verification_runs WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM merge_candidates WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM verified_code_imports WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM processed_worker_events WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM task_leases WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM tasks WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM outbox_events WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM audit_logs WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM project_memberships WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM projects WHERE project_id IN (v_proj_a, v_proj_b);
+            RAISE NOTICE 'M4 Seeded Multi-Tenant RLS, Column-GRANT & Composite FK Matrix PASSED.';
+          END
+          $$;
           SQL
 
       - name: Prepare Optional Docker Verifier Base Image
