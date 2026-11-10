@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Software Factory v1.5 — Fail-Closed Git Pre-Receive Hook Gatekeeper
+# Spec Reference: MVP-SPEC-03 Section 5.1
+# Enforces 2000ms hard timeout and restricts Worker pushes exclusively to
+# refs/heads/sf/staging/<task_id>/<lease_epoch> with an ACTIVE lease.
+# =============================================================================
+set -euo pipefail
+
+GATEWAY_PRE_RECEIVE_URL="${SF_GATEWAY_PRE_RECEIVE_URL:-http://127.0.0.1:4100/internal/v1/git/pre-receive-verify}"
+LEASE_TOKEN="${SF_GIT_LEASE_TOKEN:-}"
+
+if [[ -z "${LEASE_TOKEN}" ]]; then
+  echo "ERROR [SF-PRE-RECEIVE]: Missing SF_GIT_LEASE_TOKEN. Failing closed." >&2
+  exit 1
+fi
+
+while read -r old_sha new_sha ref_name; do
+  # Never allow direct push to refs/heads/main from Worker transport
+  if [[ ! "${ref_name}" =~ ^refs/heads/sf/staging/[0-9a-fA-F-]+/[0-9]+$ ]]; then
+    echo "ERROR [SF-PRE-RECEIVE]: Push to '${ref_name}' is forbidden. Only refs/heads/sf/staging/<task_id>/<lease_epoch> is allowed." >&2
+    exit 1
+  fi
+
+  # Query Agent Gateway with strict 2000ms timeout (Fail-Closed on timeout or non-200)
+  http_code=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+    --max-time 2 \
+    -X POST "${GATEWAY_PRE_RECEIVE_URL}" \
+    -H "Authorization: Bearer ${LEASE_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{\"old_sha\":\"${old_sha}\",\"new_sha\":\"${new_sha}\",\"ref_name\":\"${ref_name}\"}" || echo "000")
+
+  if [[ "${http_code}" != "200" ]]; then
+    echo "ERROR [SF-PRE-RECEIVE]: Lease authorization failed or timed out (HTTP ${http_code}) for '${ref_name}'. Failing closed." >&2
+    exit 1
+  fi
+done
+
+exit 0

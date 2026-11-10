@@ -1,0 +1,12 @@
+{
+  "name": "@software-factory/task-contract",
+  "version": "1.5.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@software-factory/shared-types": "1.5.0"
+  }
+}

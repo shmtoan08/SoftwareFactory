@@ -1,0 +1,19 @@
+{
+  "name": "@software-factory/monorepo",
+  "version": "1.5.0",
+  "private": true,
+  "description": "Software Factory v1.5 — Control Plane, Agent Gateway, Managed Linux Worker, and Verification/Merge Pipeline",
+  "type": "module",
+  "engineStrict": true,
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --test packages/test-harness/src/m1-acceptance.test.ts",
+    "test:all": "node --test packages/*/src/*.test.ts packages/test-harness/src/*.test.ts"
+  }
+}
