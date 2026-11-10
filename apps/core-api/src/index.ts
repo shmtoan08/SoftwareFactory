@@ -1,9 +1,13 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { existsSync } from "node:fs";
 import type {
   ApprovalDecisionRecord,
+  ApprovalRequestRecord,
   MergeCandidateRecord,
+  MergeOperationRecord,
   ReviewArtifactRecord,
+  ReviewSessionRecord,
   TaskLeaseRecord,
   TaskRecord,
   TaskStatus,
@@ -30,6 +34,73 @@ import {
   type TierCommandSpec,
   buildRealGitMergeCandidate,
 } from "@software-factory/verifier";
+import {
+  type IndependentReviewEvaluator,
+  type IndependentReviewExecutionResult,
+  IndependentReviewerService,
+} from "@software-factory/reviewer";
+import type {
+  AgentGatewayService,
+  IssuedReviewerSessionCredential,
+} from "@software-factory/agent-gateway";
+import type { LinuxCgroupV2SandboxBackend } from "@software-factory/wna";
+
+export interface CoreApiWarning {
+  readonly code: string;
+  readonly message: string;
+  readonly taskId?: string;
+  readonly mergeCandidateId?: string;
+  readonly error?: string;
+  readonly occurredAt: string;
+}
+
+export interface ApprovalCenterBundle {
+  readonly project: {
+    readonly project_id: string;
+    readonly slug: string;
+    readonly approval_ttl_seconds: number;
+    readonly main_ref_commit_hash: string;
+  };
+  readonly task: TaskRecord;
+  readonly activeCandidate: MergeCandidateRecord | null;
+  readonly latestVerificationRun: VerificationRunRecord | null;
+  readonly latestReviewSession: ReviewSessionRecord | null;
+  readonly latestReviewArtifact: ReviewArtifactRecord | null;
+  readonly activeApprovalRequest: ApprovalRequestRecord | null;
+  readonly approvalDecisions: readonly ApprovalDecisionRecord[];
+  readonly mergeOperations: readonly MergeOperationRecord[];
+  readonly liveMainCommitHash: string | null;
+  readonly staleBaseDetected: boolean;
+  readonly isExpiredAtNow: boolean;
+  readonly remainingTtlMs: number | null;
+  readonly diffSummary: {
+    readonly changedFiles: readonly string[];
+    readonly diffText: string;
+  };
+  readonly eightFieldLockPayload: {
+    readonly project_id: string;
+    readonly task_id: string;
+    readonly merge_candidate_id: string;
+    readonly approval_request_id: string | null;
+    readonly agent_commit_hash: string;
+    readonly base_main_commit_hash: string;
+    readonly verified_tree_hash: string;
+    readonly merge_candidate_hash: string;
+    readonly verification_run_id: string;
+    readonly review_artifact_id: string;
+  } | null;
+  readonly candidateLineage: {
+    readonly mainHeadCommitHash: string | null;
+    readonly verifiedImport: VerifiedCodeImportRecord | null;
+    readonly mergeCandidate: MergeCandidateRecord | null;
+    readonly verificationRun: VerificationRunRecord | null;
+    readonly reviewSession: ReviewSessionRecord | null;
+    readonly reviewArtifact: ReviewArtifactRecord | null;
+    readonly approvalRequest: ApprovalRequestRecord | null;
+    readonly approvalDecisions: readonly ApprovalDecisionRecord[];
+    readonly mergeOperations: readonly MergeOperationRecord[];
+  };
+}
 
 export interface CoreApiAuthContext {
   readonly projectId: string;
@@ -230,6 +301,8 @@ export class CoreApiService {
   private readonly store: SoftwareFactoryControlPlaneStore;
   public readonly authenticator: CoreApiTokenAuthenticator;
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
+  public readonly warnings: CoreApiWarning[] = [];
+  private readonly onWarning?: (warning: CoreApiWarning) => void;
 
   constructor(
     store: SoftwareFactoryControlPlaneStore,
@@ -238,16 +311,77 @@ export class CoreApiService {
       authSigningSecret?: string;
       clockFn?: () => Date;
       snapshotStore?: ImmutableSourceSnapshotStore;
+      onWarning?: (warning: CoreApiWarning) => void;
     }
   ) {
     this.store = store;
     this.snapshotStore = options?.snapshotStore ?? null;
+    this.onWarning = options?.onWarning;
     this.authenticator =
       options?.authenticator ??
       new CoreApiTokenAuthenticator({
         signingSecret: options?.authSigningSecret,
         clockFn: options?.clockFn ?? (() => new Date(this.store.clockTimestampIso())),
       });
+  }
+
+  private emitWarning(warning: CoreApiWarning): void {
+    this.warnings.push(warning);
+    this.onWarning?.(warning);
+  }
+
+  private isRealGitRepoOnDisk(repoPath: string | null | undefined, gitDir?: string): boolean {
+    if (!repoPath || !existsSync(repoPath)) {
+      return false;
+    }
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(gitDir ? { GIT_DIR: gitDir } : {}),
+    };
+    const check = spawnSync("git", ["rev-parse", "--git-dir"], {
+      cwd: repoPath,
+      env,
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    return check.status === 0;
+  }
+
+  private createRealGitCasBridge(repoPath: string, gitDir?: string): {
+    readonly getCurrentMainHead: () => string;
+    readonly atomicCompareAndSwapMainRef: (
+      expectedOldSha: string,
+      newCandidateSha: string
+    ) => boolean;
+  } {
+    const gitEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(gitDir ? { GIT_DIR: gitDir } : {}),
+    };
+    return {
+      getCurrentMainHead: () =>
+        execFileSync("git", ["rev-parse", "--verify", "refs/heads/main^{commit}"], {
+          cwd: repoPath,
+          env: gitEnv,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 10_000,
+        }).trim(),
+      atomicCompareAndSwapMainRef: (expectedOldSha: string, newCandidateSha: string) => {
+        const res = spawnSync(
+          "git",
+          ["update-ref", "refs/heads/main", newCandidateSha, expectedOldSha],
+          {
+            cwd: repoPath,
+            env: gitEnv,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 10_000,
+          }
+        );
+        return res.status === 0;
+      },
+    };
   }
 
   public issueAuthContext(input: {
@@ -484,6 +618,7 @@ export class CoreApiService {
     input: {
       task_id: string;
       merge_candidate_id: string;
+      approval_request_id?: string;
       agent_commit_hash: string;
       base_main_commit_hash: string;
       verified_tree_hash: string;
@@ -493,6 +628,9 @@ export class CoreApiService {
       decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
       feedback?: string;
       ttl_ms?: number;
+      repo_path?: string;
+      git_dir?: string;
+      current_main_commit_hash?: string;
     }
   ): Promise<ApprovalDecisionRecord> {
     const verified = this.authorize(auth, projectId, APPROVAL_ROLES);
@@ -502,12 +640,31 @@ export class CoreApiService {
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () =>
-        this.store.submitHumanApproval({
+      () => {
+        const project = this.store.getProjectById(projectId);
+        const repoPath = input.repo_path ?? project?.repo_bare_path;
+        let liveMainSha = input.current_main_commit_hash;
+        if (!liveMainSha && this.isRealGitRepoOnDisk(repoPath, input.git_dir)) {
+          liveMainSha = this.createRealGitCasBridge(repoPath!, input.git_dir).getCurrentMainHead();
+        }
+        return this.store.submitHumanApproval({
           project_id: projectId,
           approver_principal_id: verified.principalId,
-          ...input,
-        })
+          task_id: input.task_id,
+          merge_candidate_id: input.merge_candidate_id,
+          approval_request_id: input.approval_request_id,
+          agent_commit_hash: input.agent_commit_hash,
+          base_main_commit_hash: input.base_main_commit_hash,
+          verified_tree_hash: input.verified_tree_hash,
+          merge_candidate_hash: input.merge_candidate_hash,
+          verification_run_id: input.verification_run_id,
+          review_artifact_id: input.review_artifact_id,
+          decision: input.decision,
+          feedback: input.feedback,
+          ttl_ms: input.ttl_ms,
+          current_main_commit_hash: liveMainSha,
+        });
+      }
     );
   }
 
@@ -742,13 +899,14 @@ export class CoreApiService {
   }> {
     const verified = this.authorize(auth, projectId, MUTATION_ROLES);
 
-    const { task, candidate } = await this.store.withRlsTransaction(
+    const { task, candidate, resolvedRepoPath } = await this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
       () => {
+        const project = this.store.getProjectById(projectId);
         const t = this.store.getTaskById(input.task_id);
         const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
         if (!t || !mc || mc.task_id !== t.task_id) {
@@ -763,7 +921,12 @@ export class CoreApiService {
             `MergeCandidate ${mc.merge_candidate_id} is missing immutable snapshot_path/snapshot_sha256 required by M3 Verifier`
           );
         }
-        return { task: t, candidate: mc };
+        const resolvedRepoPath =
+          input.repo_path ??
+          (project && this.isRealGitRepoOnDisk(project.repo_bare_path, undefined)
+            ? project.repo_bare_path
+            : undefined);
+        return { task: t, candidate: mc, resolvedRepoPath };
       }
     );
 
@@ -780,7 +943,7 @@ export class CoreApiService {
       snapshotSha256: candidate.snapshot_sha256!,
       trustedAcceptanceDir: input.trusted_acceptance_dir,
       expectedTrustedPolicySha256: input.expected_trusted_policy_sha256,
-      repoPath: input.repo_path,
+      repoPath: resolvedRepoPath,
       baseBaselineDir: input.base_baseline_dir,
       depsCacheDir: input.deps_cache_dir,
       dockerImage: input.docker_image,
@@ -955,6 +1118,632 @@ export class CoreApiService {
     };
   }
 
+  public async runIndependentReview(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      merge_candidate_id: string;
+      verification_run_id: string;
+      reviewer_principal_id: string;
+      reviewer_session_id?: string;
+      reviewer_credential_id?: string;
+      reviewer_agent_profile_id: string;
+      reviewer_provider: string;
+      reviewer_model: string;
+      developer_principal_id: string;
+      developer_session_id: string;
+      developer_credential_id: string;
+      developer_agent_profile_id: string;
+      writer_provider: string;
+      writer_model: string;
+      requested_role?: string;
+      agent_gateway: AgentGatewayService;
+      reviewer_service?: IndependentReviewerService;
+      snapshot_store?: ImmutableSourceSnapshotStore;
+      sandbox_backend?: LinuxCgroupV2SandboxBackend;
+      repo_path?: string;
+      git_dir?: string;
+      tier3_test_files?: readonly string[];
+      evaluator?: IndependentReviewEvaluator;
+      probe_read_only_enforcement?: boolean;
+      approval_request_ttl_ms?: number;
+      extra_forbidden_context?: Readonly<Record<string, unknown>>;
+    }
+  ): Promise<{
+    readonly reviewSession: ReviewSessionRecord;
+    readonly reviewArtifact: ReviewArtifactRecord;
+    readonly approvalRequest: ApprovalRequestRecord | null;
+    readonly executionResult: IndependentReviewExecutionResult;
+    readonly taskStatus: TaskStatus;
+    readonly issuedCredential: IssuedReviewerSessionCredential;
+  }> {
+    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+
+    const { task, candidate, verificationRun, project } = await this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => {
+        const p = this.store.getProjectById(projectId);
+        const t = this.store.getTaskById(input.task_id);
+        const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
+        const vr = this.store
+          .listVerificationRunsForTask(input.task_id)
+          .find((r) => r.verification_run_id === input.verification_run_id);
+        if (!p || !t || !mc || !vr || mc.task_id !== t.task_id || vr.merge_candidate_id !== mc.merge_candidate_id) {
+          throw new PostgresRlsError(
+            "23503",
+            `Task ${input.task_id}, candidate ${input.merge_candidate_id}, or verification run ${input.verification_run_id} not found`
+          );
+        }
+        if (!mc.snapshot_path || !mc.snapshot_sha256) {
+          throw new PostgresRlsError(
+            "23514",
+            `MergeCandidate ${mc.merge_candidate_id} is missing snapshot_path/snapshot_sha256 required for 3D Independent Review`
+          );
+        }
+        return { project: p, task: t, candidate: mc, verificationRun: vr };
+      }
+    );
+
+    const issuedCredential = input.agent_gateway.issueReviewerSessionCredential({
+      task_id: task.task_id,
+      merge_candidate_id: candidate.merge_candidate_id,
+      verification_run_id: verificationRun.verification_run_id,
+      requested_role: input.requested_role,
+      developer_principal_id: input.developer_principal_id,
+      reviewer_principal_id: input.reviewer_principal_id,
+      developer_session_id: input.developer_session_id,
+      reviewer_session_id: input.reviewer_session_id,
+      developer_credential_id: input.developer_credential_id,
+      reviewer_credential_id: input.reviewer_credential_id,
+      developer_agent_profile_id: input.developer_agent_profile_id,
+      reviewer_agent_profile_id: input.reviewer_agent_profile_id,
+      writer_provider: input.writer_provider,
+      writer_model: input.writer_model,
+      reviewer_provider: input.reviewer_provider,
+      reviewer_model: input.reviewer_model,
+    });
+
+    const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
+    const reviewerService =
+      input.reviewer_service ??
+      new IndependentReviewerService({
+        snapshotStore,
+        sandboxBackend: input.sandbox_backend,
+      });
+
+    const reviewSessionId = issuedCredential.claims.reviewerSessionId;
+    const startedSession = await this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () =>
+        this.store.recordReviewSession({
+          review_session_id: reviewSessionId,
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: candidate.merge_candidate_id,
+          verification_run_id: verificationRun.verification_run_id,
+          reviewer_principal_id: issuedCredential.claims.reviewerPrincipalId,
+          reviewer_credential_id: issuedCredential.claims.reviewerCredentialId,
+          reviewer_agent_profile_id: issuedCredential.claims.reviewerAgentProfileId,
+          reviewer_provider: issuedCredential.claims.reviewerProvider,
+          reviewer_model: issuedCredential.claims.reviewerModel,
+          role: "ROLE_REVIEWER_READONLY",
+          sandbox_backend_mode: process.platform === "linux" ? "linux-supervisor" : "real-process",
+          status: "ACTIVE",
+        })
+    );
+
+    const effectiveRepoPath = input.repo_path ?? (this.isRealGitRepoOnDisk(project.repo_bare_path, input.git_dir) ? project.repo_bare_path : undefined);
+    let executionResult: IndependentReviewExecutionResult;
+    try {
+      executionResult = await reviewerService.executeIndependentReview({
+        reviewSessionId: startedSession.review_session_id,
+        projectId,
+        taskId: task.task_id,
+        mergeCandidateId: candidate.merge_candidate_id,
+        mergeCandidateHash: candidate.merge_candidate_hash,
+        verifiedTreeHash: candidate.verified_tree_hash,
+        baseMainCommitHash: candidate.base_main_commit_hash,
+        snapshotPath: candidate.snapshot_path!,
+        snapshotSha256: candidate.snapshot_sha256!,
+        taskContract: task.task_contract_json as unknown as TaskContractSpec,
+        verificationRun,
+        reviewerIdentity: {
+          principalId: issuedCredential.claims.reviewerPrincipalId,
+          credentialId: issuedCredential.claims.reviewerCredentialId,
+          sessionId: issuedCredential.claims.reviewerSessionId,
+          agentProfileId: issuedCredential.claims.reviewerAgentProfileId,
+          provider: issuedCredential.claims.reviewerProvider,
+          model: issuedCredential.claims.reviewerModel,
+          role: issuedCredential.claims.role,
+        },
+        repoPath: effectiveRepoPath,
+        gitDir: input.git_dir,
+        tier3TestFiles: input.tier3_test_files,
+        snapshotStore,
+        sandboxBackend: input.sandbox_backend,
+        evaluator: input.evaluator,
+        probeReadOnlyEnforcement: input.probe_read_only_enforcement,
+        ...(input.extra_forbidden_context ?? {}),
+      });
+    } catch (err) {
+      await this.store.withRlsTransaction(
+        {
+          currentProjectId: projectId,
+          currentPrincipalId: verified.principalId,
+          currentRole: "core_api_service",
+        },
+        () =>
+          this.store.completeReviewSession({
+            project_id: projectId,
+            review_session_id: startedSession.review_session_id,
+            status: "FAILED",
+            cleanup_populated_zero_verified: true,
+          })
+      );
+      throw err;
+    }
+
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => {
+        const completedSession = this.store.completeReviewSession({
+          project_id: projectId,
+          review_session_id: startedSession.review_session_id,
+          status: "COMPLETED",
+          cleanup_populated_zero_verified:
+            executionResult.sandboxCleanupEvidence?.populatedZeroVerified ?? true,
+          sandbox_backend_mode: executionResult.sandboxBackendMode,
+          sandbox_pid: executionResult.sandboxPid,
+          sandbox_cgroup_path: executionResult.sandboxCgroupPath,
+        });
+
+        const reviewArtifact = this.store.recordReviewArtifact({
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: candidate.merge_candidate_id,
+          verification_run_id: verificationRun.verification_run_id,
+          merge_candidate_hash: candidate.merge_candidate_hash,
+          verified_tree_hash: candidate.verified_tree_hash,
+          writer_provider: input.writer_provider,
+          writer_model: input.writer_model,
+          reviewer_provider: issuedCredential.claims.reviewerProvider,
+          reviewer_model: issuedCredential.claims.reviewerModel,
+          developer_principal_id: input.developer_principal_id,
+          reviewer_principal_id: issuedCredential.claims.reviewerPrincipalId,
+          developer_session_id: input.developer_session_id,
+          reviewer_session_id: issuedCredential.claims.reviewerSessionId,
+          developer_credential_id: input.developer_credential_id,
+          reviewer_credential_id: issuedCredential.claims.reviewerCredentialId,
+          developer_agent_profile_id: input.developer_agent_profile_id,
+          reviewer_agent_profile_id: issuedCredential.claims.reviewerAgentProfileId,
+          review_session_id: completedSession.review_session_id,
+          summary_markdown: executionResult.summaryMarkdown,
+          report_sha256: executionResult.reportSha256,
+          approval_request_ttl_ms: input.approval_request_ttl_ms,
+          verdict: executionResult.verdict,
+          findings_json: executionResult.findings as unknown as ReadonlyArray<Record<string, unknown>>,
+        });
+
+        const approvalRequest =
+          executionResult.verdict === "PASS"
+            ? this.store.getLatestApprovalRequestForCandidate(candidate.merge_candidate_id)
+            : null;
+        const updatedTask = this.store.getTaskById(task.task_id);
+
+        return {
+          reviewSession: completedSession,
+          reviewArtifact,
+          approvalRequest,
+          executionResult,
+          taskStatus: updatedTask!.status,
+          issuedCredential,
+        };
+      }
+    );
+  }
+
+  public async rebuildMergeCandidateAfterCasConflict(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      repo_path?: string;
+      git_dir?: string;
+      import_id?: string;
+      snapshot_store?: ImmutableSourceSnapshotStore;
+    }
+  ): Promise<
+    | {
+        readonly ok: true;
+        readonly verifiedImport: VerifiedCodeImportRecord;
+        readonly mergeCandidate: MergeCandidateRecord;
+        readonly candidateBuild: Extract<BuildMergeCandidateResult, { ok: true }>;
+      }
+    | {
+        readonly ok: false;
+        readonly reason: "MERGE_CONFLICT";
+        readonly verifiedImport: VerifiedCodeImportRecord;
+        readonly taskStatus: TaskStatus;
+        readonly conflictedFiles: readonly string[];
+        readonly conflictSummary: string;
+      }
+  > {
+    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
+
+    const { task, verifiedImport, repoPath, clockIso } = await this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => {
+        const p = this.store.getProjectById(projectId);
+        const t = this.store.getTaskById(input.task_id);
+        if (!p || !t) {
+          throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project`);
+        }
+        if (t.status !== "BuildingMergeCandidate") {
+          throw new PostgresRlsError(
+            "23514",
+            `rebuildMergeCandidateAfterCasConflict requires task status BuildingMergeCandidate, got ${t.status}`
+          );
+        }
+        const imports = this.store.getVerifiedImportsForTask(t.task_id);
+        const imp = input.import_id
+          ? imports.find((rec) => rec.import_id === input.import_id)
+          : imports[imports.length - 1];
+        if (!imp) {
+          throw new PostgresRlsError(
+            "23503",
+            `No VerifiedCodeImport found for task ${t.task_id} to rebuild merge candidate`
+          );
+        }
+        const resolvedRepo = input.repo_path ?? p.repo_bare_path;
+        if (!this.isRealGitRepoOnDisk(resolvedRepo, input.git_dir)) {
+          throw new Error(
+            `ERR_REAL_GIT_REPO_REQUIRED: cannot rebuild real merge candidate without valid Git repository at '${resolvedRepo}'`
+          );
+        }
+        return {
+          task: t,
+          verifiedImport: imp,
+          repoPath: resolvedRepo,
+          clockIso: this.store.clockTimestampIso(),
+        };
+      }
+    );
+
+    const gitEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(input.git_dir ? { GIT_DIR: input.git_dir } : {}),
+    };
+    const candidateRef = `refs/factory/candidates/${task.task_id}`;
+    let previousCandidateRefSha: string | null = null;
+    try {
+      previousCandidateRefSha =
+        execFileSync("git", ["rev-parse", "--verify", "--quiet", candidateRef], {
+          cwd: repoPath,
+          env: gitEnv,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 10_000,
+        }).trim() || null;
+    } catch {
+      previousCandidateRefSha = null;
+    }
+
+    const buildResult = buildRealGitMergeCandidate({
+      repoPath,
+      gitDir: input.git_dir,
+      taskId: task.task_id,
+      agentCommitHash: verifiedImport.agent_commit_hash,
+      candidateRef,
+      snapshotStore,
+      createdAt: new Date(clockIso),
+    });
+
+    if (!buildResult.ok) {
+      return this.store.withRlsTransaction(
+        {
+          currentProjectId: projectId,
+          currentPrincipalId: verified.principalId,
+          currentRole: "core_api_service",
+        },
+        () => {
+          const conflictRes = this.store.markMergeConflictReworkRequired({
+            project_id: projectId,
+            task_id: task.task_id,
+            import_id: verifiedImport.import_id,
+            agent_commit_hash: verifiedImport.agent_commit_hash,
+            base_main_commit_hash: buildResult.baseMainCommitHash,
+            conflicted_files: buildResult.conflictedFiles,
+            conflict_summary: buildResult.conflictSummary,
+          });
+          return {
+            ok: false as const,
+            reason: "MERGE_CONFLICT" as const,
+            verifiedImport,
+            taskStatus: conflictRes.task_status,
+            conflictedFiles: conflictRes.conflicted_files,
+            conflictSummary: buildResult.conflictSummary,
+          };
+        }
+      );
+    }
+
+    try {
+      const mergeCandidate = await this.store.withRlsTransaction(
+        {
+          currentProjectId: projectId,
+          currentPrincipalId: verified.principalId,
+          currentRole: "core_api_service",
+        },
+        () =>
+          this.store.createMergeCandidate({
+            project_id: projectId,
+            task_id: task.task_id,
+            import_id: verifiedImport.import_id,
+            base_main_commit_hash: buildResult.baseMainCommitHash,
+            merge_candidate_hash: buildResult.mergeCandidateHash,
+            verified_tree_hash: buildResult.verifiedTreeHash,
+            allow_rebased_tree_hash: true,
+            snapshot_path: buildResult.snapshotPath ?? null,
+            snapshot_sha256: buildResult.snapshotSha256 ?? null,
+            snapshot_size_bytes: buildResult.snapshotSizeBytes ?? null,
+            snapshot_retention_class: buildResult.snapshotRetentionClass ?? "EPHEMERAL_14D",
+          })
+      );
+
+      return {
+        ok: true,
+        verifiedImport,
+        mergeCandidate,
+        candidateBuild: buildResult,
+      };
+    } catch (err) {
+      try {
+        if (previousCandidateRefSha) {
+          execFileSync("git", ["update-ref", buildResult.candidateRef, previousCandidateRefSha], {
+            cwd: repoPath,
+            env: gitEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 10_000,
+          });
+        } else {
+          execFileSync("git", ["update-ref", "-d", buildResult.candidateRef], {
+            cwd: repoPath,
+            env: gitEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 10_000,
+          });
+        }
+      } catch {
+        // best-effort Git ref compensation
+      }
+      if (snapshotStore && buildResult.snapshotCreated && buildResult.snapshotPath) {
+        try {
+          snapshotStore.deleteSnapshot(buildResult.snapshotPath);
+        } catch {
+          // best-effort snapshot cleanup
+        }
+      }
+      throw err;
+    }
+  }
+
+  public async getApprovalCenterBundle(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      repo_path?: string;
+      git_dir?: string;
+    }
+  ): Promise<ApprovalCenterBundle> {
+    const verified = this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => {
+        const project = this.store.getProjectById(projectId);
+        const task = this.store.getTaskById(input.task_id);
+        if (!project || !task) {
+          throw new PostgresRlsError("23503", `Project ${projectId} or task ${input.task_id} not found`);
+        }
+
+        const candidates = this.store.listMergeCandidatesForTask(task.task_id);
+        const activeCandidate =
+          (task.active_merge_candidate_id
+            ? candidates.find((c) => c.merge_candidate_id === task.active_merge_candidate_id)
+            : undefined) ??
+          candidates.find((c) => !c.is_superseded) ??
+          (candidates.length > 0 ? candidates[candidates.length - 1]! : null);
+
+        const runs = this.store.listVerificationRunsForTask(task.task_id);
+        const latestVerificationRun =
+          (activeCandidate
+            ? runs
+                .filter((r) => r.merge_candidate_id === activeCandidate.merge_candidate_id)
+                .slice(-1)[0]
+            : undefined) ??
+          (runs.length > 0 ? runs[runs.length - 1]! : null);
+
+        const sessions = this.store.listReviewSessionsForTask(task.task_id);
+        const latestReviewSession =
+          (activeCandidate
+            ? sessions
+                .filter((s) => s.merge_candidate_id === activeCandidate.merge_candidate_id)
+                .slice(-1)[0]
+            : undefined) ??
+          (sessions.length > 0 ? sessions[sessions.length - 1]! : null);
+
+        const artifacts = this.store.listReviewArtifactsForTask(task.task_id);
+        const latestReviewArtifact =
+          (activeCandidate
+            ? artifacts
+                .filter((a) => a.merge_candidate_id === activeCandidate.merge_candidate_id)
+                .slice(-1)[0]
+            : undefined) ??
+          (artifacts.length > 0 ? artifacts[artifacts.length - 1]! : null);
+
+        const requests = this.store.listApprovalRequestsForTask(task.task_id);
+        const activeApprovalRequest =
+          (activeCandidate
+            ? requests
+                .filter((r) => r.merge_candidate_id === activeCandidate.merge_candidate_id)
+                .slice(-1)[0]
+            : undefined) ??
+          (requests.length > 0 ? requests[requests.length - 1]! : null);
+
+        const approvalDecisions = this.store.listApprovalDecisionsForTask(task.task_id);
+        const mergeOperations = this.store.listMergeOperationsForTask(task.task_id);
+        const imports = this.store.getVerifiedImportsForTask(task.task_id);
+        const verifiedImport =
+          (activeCandidate
+            ? imports.find((i) => i.import_id === activeCandidate.import_id)
+            : undefined) ??
+          (imports.length > 0 ? imports[imports.length - 1]! : null);
+
+        const effectiveRepo = input.repo_path ?? project.repo_bare_path;
+        const hasRealRepo = this.isRealGitRepoOnDisk(effectiveRepo, input.git_dir);
+        const liveMainCommitHash = hasRealRepo
+          ? this.createRealGitCasBridge(effectiveRepo, input.git_dir).getCurrentMainHead()
+          : this.store.getMainRefCommitHash();
+
+        const staleBaseDetected = Boolean(
+          activeCandidate &&
+            liveMainCommitHash &&
+            activeCandidate.base_main_commit_hash !== liveMainCommitHash
+        );
+
+        const nowMs = new Date(this.store.clockTimestampIso()).getTime();
+        const expiresAtMs = activeApprovalRequest
+          ? Date.parse(activeApprovalRequest.expires_at)
+          : null;
+        const remainingTtlMs = expiresAtMs !== null ? expiresAtMs - nowMs : null;
+        const isExpiredAtNow = remainingTtlMs !== null ? remainingTtlMs <= 0 : false;
+
+        let changedFiles: string[] = [];
+        let diffText = "";
+        if (hasRealRepo && activeCandidate) {
+          const gitEnv: NodeJS.ProcessEnv = {
+            ...process.env,
+            ...(input.git_dir ? { GIT_DIR: input.git_dir } : {}),
+          };
+          try {
+            changedFiles = execFileSync(
+              "git",
+              [
+                "diff",
+                "--name-only",
+                activeCandidate.base_main_commit_hash,
+                activeCandidate.merge_candidate_hash,
+              ],
+              {
+                cwd: effectiveRepo,
+                env: gitEnv,
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: 10_000,
+              }
+            )
+              .split("\n")
+              .map((s) => s.trim())
+              .filter(Boolean);
+            diffText = execFileSync(
+              "git",
+              [
+                "diff",
+                "--unified=3",
+                activeCandidate.base_main_commit_hash,
+                activeCandidate.merge_candidate_hash,
+              ],
+              {
+                cwd: effectiveRepo,
+                env: gitEnv,
+                encoding: "utf8",
+                stdio: ["ignore", "pipe", "pipe"],
+                timeout: 10_000,
+              }
+            );
+          } catch {
+            diffText = `(diff unavailable for ${activeCandidate.base_main_commit_hash}..${activeCandidate.merge_candidate_hash})`;
+          }
+        }
+
+        const eightFieldLockPayload =
+          activeCandidate && latestVerificationRun && latestReviewArtifact
+            ? {
+                project_id: projectId,
+                task_id: task.task_id,
+                merge_candidate_id: activeCandidate.merge_candidate_id,
+                approval_request_id: activeApprovalRequest?.approval_request_id ?? null,
+                agent_commit_hash: activeCandidate.agent_commit_hash,
+                base_main_commit_hash: activeCandidate.base_main_commit_hash,
+                verified_tree_hash: activeCandidate.verified_tree_hash,
+                merge_candidate_hash: activeCandidate.merge_candidate_hash,
+                verification_run_id: latestVerificationRun.verification_run_id,
+                review_artifact_id: latestReviewArtifact.review_artifact_id,
+              }
+            : null;
+
+        return {
+          project: {
+            project_id: project.project_id,
+            slug: project.slug,
+            approval_ttl_seconds: project.approval_ttl_seconds,
+            main_ref_commit_hash: project.main_ref_commit_hash,
+          },
+          task,
+          activeCandidate,
+          latestVerificationRun,
+          latestReviewSession,
+          latestReviewArtifact,
+          activeApprovalRequest,
+          approvalDecisions,
+          mergeOperations,
+          liveMainCommitHash,
+          staleBaseDetected,
+          isExpiredAtNow,
+          remainingTtlMs,
+          diffSummary: {
+            changedFiles,
+            diffText,
+          },
+          eightFieldLockPayload,
+          candidateLineage: {
+            mainHeadCommitHash: liveMainCommitHash,
+            verifiedImport,
+            mergeCandidate: activeCandidate,
+            verificationRun: latestVerificationRun,
+            reviewSession: latestReviewSession,
+            reviewArtifact: latestReviewArtifact,
+            approvalRequest: activeApprovalRequest,
+            approvalDecisions,
+            mergeOperations,
+          },
+        };
+      }
+    );
+  }
+
   public async executeCasMerge(
     projectId: string,
     auth: CoreApiAuthContext,
@@ -962,6 +1751,10 @@ export class CoreApiService {
       task_id: string;
       merge_candidate_id: string;
       approval_id: string;
+      repo_path?: string;
+      git_dir?: string;
+      require_real_git?: boolean;
+      simulateCrashAfterGitUpdateRef?: boolean;
       snapshot_store?: ImmutableSourceSnapshotStore;
     }
   ): Promise<CasMergeResult> {
@@ -974,11 +1767,27 @@ export class CoreApiService {
         currentRole: "core_api_service",
       },
       async () => {
+        const project = this.store.getProjectById(projectId);
+        const resolvedRepoPath = input.repo_path ?? project?.repo_bare_path;
+        const hasRealGitRepo = this.isRealGitRepoOnDisk(resolvedRepoPath, input.git_dir);
+        if (input.require_real_git && !hasRealGitRepo) {
+          throw new Error(
+            `ERR_REAL_GIT_REPO_REQUIRED: executeCasMerge requires valid Git repository at '${String(
+              resolvedRepoPath
+            )}'`
+          );
+        }
+        const gitBridge = hasRealGitRepo
+          ? this.createRealGitCasBridge(resolvedRepoPath!, input.git_dir)
+          : undefined;
+
         const casRes = await this.store.executeAtomicCasMergeOrReconcile({
           project_id: projectId,
           task_id: input.task_id,
           merge_candidate_id: input.merge_candidate_id,
           approval_id: input.approval_id,
+          gitBridge,
+          simulateCrashAfterGitUpdateRef: input.simulateCrashAfterGitUpdateRef,
         });
         const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
         return {
@@ -1000,7 +1809,15 @@ export class CoreApiService {
         if (
           !(err instanceof SnapshotIntegrityError && err.code === "ERR_SNAPSHOT_NOT_FOUND")
         ) {
-          // CAS merge is already durably committed in DB/Git; do not throw back and appear failed on local manifest I/O drift.
+          // CAS merge is already durably committed in DB/Git; record structured warning without rolling back merge.
+          this.emitWarning({
+            code: "WARN_SNAPSHOT_PROMOTION_FAILED",
+            message: `Snapshot retention update failed after CAS merge for candidate ${input.merge_candidate_id}`,
+            taskId: input.task_id,
+            mergeCandidateId: input.merge_candidate_id,
+            error: err instanceof Error ? err.message : String(err),
+            occurredAt: clockIso,
+          });
         }
       }
     }

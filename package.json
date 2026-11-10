@@ -15,10 +15,11 @@
   "scripts": {
     "lint": "node scripts/ci/lint.mjs",
     "scan:secrets": "node scripts/ci/secret-scan.mjs",
-    "test": "node --test packages/test-harness/src/m1-acceptance.test.ts packages/test-harness/src/m2-acceptance.test.ts packages/test-harness/src/m3-acceptance.test.ts",
+    "test": "node --test packages/test-harness/src/m1-acceptance.test.ts packages/test-harness/src/m2-acceptance.test.ts packages/test-harness/src/m3-acceptance.test.ts packages/test-harness/src/m4-acceptance.test.ts",
     "test:m1": "node --test packages/test-harness/src/m1-acceptance.test.ts",
     "test:m2": "node --test packages/test-harness/src/m2-acceptance.test.ts",
     "test:m3": "node --test packages/test-harness/src/m3-acceptance.test.ts",
+    "test:m4": "node --test packages/test-harness/src/m4-acceptance.test.ts",
     "test:all": "node --test packages/*/src/*.test.ts packages/test-harness/src/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

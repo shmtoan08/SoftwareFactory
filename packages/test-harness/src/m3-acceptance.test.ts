@@ -1682,6 +1682,7 @@ describe("Milestone M3 Acceptance Gate Suite (Candidate Builder + 3-Tier Trusted
       // Minor #5: buildMergeCandidateFromGit rolls back candidate ref + snapshot when createMergeCandidate fails
       const latestMainSha = fx.gitAt(fx.bareRepoDir, ["rev-parse", "refs/heads/main"]);
       fx.store.forceSetMainRefCommitHashForTest(fx.projectId, latestMainSha);
+      fx.gitAt(fx.agentWorkDir, ["fetch", "origin", "main"]);
       fx.gitAt(fx.agentWorkDir, ["reset", "--hard", latestMainSha]);
       writeFileSync(join(fx.agentWorkDir, "src", "minor5.mjs"), "export const m5 = 1;\n", "utf8");
       fx.gitAt(fx.agentWorkDir, ["add", "src/minor5.mjs"]);

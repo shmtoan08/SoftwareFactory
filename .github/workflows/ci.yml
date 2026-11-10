@@ -58,8 +58,151 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0001_mvp_core_schema_and_rls.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
-          psql -v ON_ERROR_STOP=1 -c "DO \$\$ DECLARE v_caught boolean := false; BEGIN BEGIN INSERT INTO verification_runs (verification_run_id, project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash, verifier_image_digest, verdict, overall_status, tier1_trusted_acceptance_passed, tier2_protected_baseline_passed, tier3_agent_tests_passed, exit_code, duration_ms, report_sha256) VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), '5555555555555555555555555555555555555555', '4444444444444444444444444444444444444444', 'sha256:test', 'PASS', 'PASSED', true, true, false, 0, 10, repeat('a', 64)); EXCEPTION WHEN check_violation THEN v_caught := true; END; IF NOT v_caught THEN RAISE EXCEPTION 'chk_vr_pass_consistency failed to reject PASS with tier3_agent_tests_passed=FALSE'; END IF; END \$\$;"
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            v_caught BOOLEAN := false;
+          BEGIN
+            -- M3 check: PASS verdict requires tier3_agent_tests_passed = TRUE
+            BEGIN
+              INSERT INTO verification_runs (
+                verification_run_id, project_id, task_id, merge_candidate_id,
+                merge_candidate_hash, verified_tree_hash, verifier_image_digest,
+                verdict, overall_status, tier1_trusted_acceptance_passed,
+                tier2_protected_baseline_passed, tier3_agent_tests_passed,
+                exit_code, duration_ms, report_sha256
+              ) VALUES (
+                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                repeat('5', 40), repeat('4', 40), 'sha256:test',
+                'PASS', 'PASSED', true, true, false, 0, 10, repeat('a', 64)
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'chk_vr_pass_consistency failed to reject PASS with tier3_agent_tests_passed=FALSE';
+            END IF;
+
+            -- M4 check 1: chk_ra_independent_credential
+            v_caught := false;
+            BEGIN
+              INSERT INTO review_artifacts (
+                review_artifact_id, project_id, task_id, merge_candidate_id, verification_run_id,
+                merge_candidate_hash, verified_tree_hash, writer_provider, writer_model,
+                reviewer_provider, reviewer_model, developer_principal_id, reviewer_principal_id,
+                developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
+                developer_agent_profile_id, reviewer_agent_profile_id, verdict
+              ) VALUES (
+                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                repeat('5', 40), repeat('4', 40), 'anthropic', 'claude-sonnet-4',
+                'google', 'gemini-2.5-pro', 'dev-1', 'rev-1',
+                'dev-sess-1', 'rev-sess-1', 'shared-cred', ' shared-cred ',
+                'prof-dev', 'prof-rev', 'PASS'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'chk_ra_independent_credential failed';
+            END IF;
+
+            -- M4 check 2: chk_ra_independent_agent_profile (case-insensitive)
+            v_caught := false;
+            BEGIN
+              INSERT INTO review_artifacts (
+                review_artifact_id, project_id, task_id, merge_candidate_id, verification_run_id,
+                merge_candidate_hash, verified_tree_hash, writer_provider, writer_model,
+                reviewer_provider, reviewer_model, developer_principal_id, reviewer_principal_id,
+                developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
+                developer_agent_profile_id, reviewer_agent_profile_id, verdict
+              ) VALUES (
+                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                repeat('5', 40), repeat('4', 40), 'anthropic', 'claude-sonnet-4',
+                'google', 'gemini-2.5-pro', 'dev-1', 'rev-1',
+                'dev-sess-1', 'rev-sess-1', 'dev-cred-1', 'rev-cred-1',
+                'Prof-Shared', 'prof-shared', 'PASS'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'chk_ra_independent_agent_profile failed';
+            END IF;
+
+            -- M4 check 3: review_sessions role strictly ROLE_REVIEWER_READONLY
+            v_caught := false;
+            BEGIN
+              INSERT INTO review_sessions (
+                review_session_id, project_id, task_id, merge_candidate_id, verification_run_id,
+                reviewer_principal_id, reviewer_credential_id, reviewer_agent_profile_id,
+                reviewer_provider, reviewer_model, role, sandbox_backend_mode, status
+              ) VALUES (
+                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                'rev-1', 'rev-cred-1', 'prof-rev', 'google', 'gemini-2.5-pro',
+                'ROLE_DEVELOPER_WRITE', 'linux-supervisor', 'ACTIVE'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'review_sessions role CHECK failed';
+            END IF;
+
+            -- M4 check 4: chk_ar_ttl_window
+            v_caught := false;
+            BEGIN
+              INSERT INTO approval_requests (
+                approval_request_id, project_id, task_id, merge_candidate_id,
+                agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash,
+                verification_run_id, review_artifact_id, status, expires_at, created_at
+              ) VALUES (
+                gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+                repeat('1', 40), repeat('2', 40), repeat('3', 40), repeat('4', 40),
+                gen_random_uuid(), gen_random_uuid(), 'PENDING',
+                TIMESTAMPTZ '2026-11-10T10:00:00Z', TIMESTAMPTZ '2026-11-10T10:00:00Z'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'chk_ar_ttl_window failed';
+            END IF;
+
+            IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'uq_one_pending_approval_request_per_candidate') THEN
+              RAISE EXCEPTION 'Missing partial unique index uq_one_pending_approval_request_per_candidate';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_mo_idempotency') THEN
+              RAISE EXCEPTION 'Missing unique constraint uq_mo_idempotency';
+            END IF;
+          END
+          $$;
+
+          BEGIN;
+          SET LOCAL ROLE app_runtime;
+          DO $$
+          DECLARE
+            v_cnt INTEGER;
+            v_caught BOOLEAN;
+            tbl TEXT;
+          BEGIN
+            SELECT count(*) INTO v_cnt FROM review_sessions;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'review_sessions RLS default deny failed'; END IF;
+            SELECT count(*) INTO v_cnt FROM approval_requests;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'approval_requests RLS default deny failed'; END IF;
+            SELECT count(*) INTO v_cnt FROM merge_operations;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'merge_operations RLS default deny failed'; END IF;
+            FOREACH tbl IN ARRAY ARRAY['review_sessions', 'approval_requests', 'merge_operations']
+            LOOP
+              v_caught := false;
+              BEGIN
+                EXECUTE format('DELETE FROM %I', tbl);
+              EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+              END;
+              IF NOT v_caught THEN
+                RAISE EXCEPTION 'DELETE privilege unexpectedly allowed for app_runtime on %', tbl;
+              END IF;
+            END LOOP;
+          END
+          $$;
+          COMMIT;
+          SQL
 
       - name: Prepare Optional Docker Verifier Base Image
         run: docker pull node:22-alpine || true

@@ -68,6 +68,7 @@ export interface SnapshotGcResult {
   readonly deletedPaths: readonly string[];
   readonly retainedPermanentPaths: readonly string[];
   readonly retainedActivePaths: readonly string[];
+  readonly corruptManifestPaths: readonly string[];
 }
 
 export class SnapshotIntegrityError extends Error {
@@ -417,6 +418,7 @@ export class ImmutableSourceSnapshotStore {
     const deletedPaths: string[] = [];
     const retainedPermanentPaths: string[] = [];
     const retainedActivePaths: string[] = [];
+    const corruptManifestPaths: string[] = [];
     const nowMs = now.getTime();
 
     const subEntries = readdirSync(this.storageDir, { withFileTypes: true });
@@ -444,11 +446,12 @@ export class ImmutableSourceSnapshotStore {
             parsed === null ||
             typeof (parsed as { snapshotPath?: unknown }).snapshotPath !== "string"
           ) {
+            corruptManifestPaths.push(metaPath);
             continue;
           }
           manifest = parsed as SnapshotManifest;
         } catch {
-          // Skip corrupted .meta.json so GC can continue cleaning valid snapshots
+          corruptManifestPaths.push(metaPath);
           continue;
         }
         if (manifest.retentionClass === "MERGED_PERMANENT") {
@@ -457,6 +460,7 @@ export class ImmutableSourceSnapshotStore {
         }
         const expMs = manifest.expiresAt ? Date.parse(manifest.expiresAt) : Number.POSITIVE_INFINITY;
         if (Number.isNaN(expMs)) {
+          corruptManifestPaths.push(metaPath);
           continue;
         }
         if (expMs <= nowMs) {
@@ -483,6 +487,7 @@ export class ImmutableSourceSnapshotStore {
       deletedPaths,
       retainedPermanentPaths,
       retainedActivePaths,
+      corruptManifestPaths,
     };
   }
 }

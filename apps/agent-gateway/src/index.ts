@@ -1,4 +1,4 @@
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type {
   LeaseSyncStatusResponse,
@@ -20,6 +20,42 @@ export interface LeasePushTokenClaims {
   readonly leaseEpoch: number;
   readonly workerId: string;
   readonly exp: number;
+}
+
+export interface ReviewerSessionTokenClaims {
+  readonly role: "ROLE_REVIEWER_READONLY";
+  readonly gitWriteAccess: false;
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly mergeCandidateId: string;
+  readonly verificationRunId: string;
+  readonly reviewerPrincipalId: string;
+  readonly reviewerCredentialId: string;
+  readonly reviewerSessionId: string;
+  readonly reviewerAgentProfileId: string;
+  readonly reviewerProvider: string;
+  readonly reviewerModel: string;
+  readonly exp: number;
+}
+
+export interface IssuedReviewerSessionCredential {
+  readonly token: string;
+  readonly claims: ReviewerSessionTokenClaims;
+}
+
+export class ReviewerIdentityIndependenceError extends Error {
+  public readonly code = "ERR_REVIEWER_IDENTITY_INDEPENDENCE";
+  public readonly sqlState = "23514";
+  public readonly dimension: "principal" | "session" | "credential" | "agent_profile" | "model" | "role";
+
+  constructor(
+    dimension: "principal" | "session" | "credential" | "agent_profile" | "model" | "role",
+    message: string
+  ) {
+    super(message);
+    this.name = "ReviewerIdentityIndependenceError";
+    this.dimension = dimension;
+  }
 }
 
 const STAGING_REF_PATTERN =
@@ -135,23 +171,260 @@ export class EphemeralGitPushTokenService {
 }
 
 /**
- * AgentGatewayService (MVP-SPEC-01 Section 3.1 & MVP-SPEC-03 Section 1-2 & Section 5)
- * Mediates all Worker (WNA) traffic using scoped `gateway_service` RLS transactions.
- * Workers never receive direct PostgreSQL credentials.
+ * Ephemeral Read-Only Credential Issuer for 3D Independent Reviewers (`MVP-SPEC-04` §3.1).
+ * Always mints short-lived `ROLE_REVIEWER_READONLY` credentials with `gitWriteAccess: false`.
+ */
+export class EphemeralReviewerCredentialService {
+  private readonly signingSecret: string;
+  private readonly clockFn: () => Date;
+
+  constructor(options?: { signingSecret?: string; clockFn?: () => Date }) {
+    if (options?.signingSecret !== undefined) {
+      if (options.signingSecret.trim().length === 0) {
+        throw new Error("EphemeralReviewerCredentialService signingSecret must not be empty");
+      }
+      this.signingSecret = options.signingSecret;
+    } else {
+      this.signingSecret = randomBytes(32).toString("hex");
+    }
+    this.clockFn = options?.clockFn ?? (() => new Date());
+  }
+
+  public issueReviewerSessionToken(input: {
+    projectId: string;
+    taskId: string;
+    mergeCandidateId: string;
+    verificationRunId: string;
+    reviewerPrincipalId: string;
+    reviewerCredentialId?: string;
+    reviewerSessionId?: string;
+    reviewerAgentProfileId: string;
+    reviewerProvider: string;
+    reviewerModel: string;
+    ttlMs?: number;
+  }): IssuedReviewerSessionCredential {
+    const ttlMs = input.ttlMs ?? 300_000;
+    if (ttlMs <= 0) {
+      throw new Error("Reviewer credential ttlMs must be positive");
+    }
+    const reviewerSessionId = input.reviewerSessionId?.trim() || `rev-sess-${randomUUID()}`;
+    const reviewerCredentialId = input.reviewerCredentialId?.trim() || `rev-cred-${randomUUID()}`;
+
+    const claims: ReviewerSessionTokenClaims = {
+      role: "ROLE_REVIEWER_READONLY",
+      gitWriteAccess: false,
+      projectId: input.projectId,
+      taskId: input.taskId,
+      mergeCandidateId: input.mergeCandidateId,
+      verificationRunId: input.verificationRunId,
+      reviewerPrincipalId: input.reviewerPrincipalId.trim(),
+      reviewerCredentialId,
+      reviewerSessionId,
+      reviewerAgentProfileId: input.reviewerAgentProfileId.trim(),
+      reviewerProvider: input.reviewerProvider.trim(),
+      reviewerModel: input.reviewerModel.trim(),
+      exp: this.clockFn().getTime() + ttlMs,
+    };
+
+    const payloadB64 = Buffer.from(JSON.stringify(claims), "utf8").toString("base64url");
+    const sigB64 = createHmac("sha256", this.signingSecret)
+      .update(payloadB64, "utf8")
+      .digest("base64url");
+
+    return {
+      token: `${payloadB64}.${sigB64}`,
+      claims,
+    };
+  }
+
+  public verifyReviewerSessionToken(
+    token: string,
+    expectedProjectId?: string
+  ):
+    | { readonly valid: true; readonly claims: ReviewerSessionTokenClaims }
+    | { readonly valid: false; readonly reason: string } {
+    if (!token || typeof token !== "string") {
+      return { valid: false, reason: "Missing reviewer session credential" };
+    }
+    const parts = token.split(".");
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      return { valid: false, reason: "Malformed reviewer session credential" };
+    }
+    const [payloadB64, sigB64] = parts;
+    const expectedSigB64 = createHmac("sha256", this.signingSecret)
+      .update(payloadB64, "utf8")
+      .digest("base64url");
+
+    const actualBuf = Buffer.from(sigB64, "utf8");
+    const expectedBuf = Buffer.from(expectedSigB64, "utf8");
+    if (actualBuf.length !== expectedBuf.length || !timingSafeEqual(actualBuf, expectedBuf)) {
+      return { valid: false, reason: "Invalid reviewer credential signature" };
+    }
+
+    let claims: ReviewerSessionTokenClaims;
+    try {
+      claims = JSON.parse(
+        Buffer.from(payloadB64, "base64url").toString("utf8")
+      ) as ReviewerSessionTokenClaims;
+    } catch {
+      return { valid: false, reason: "Corrupted reviewer credential payload" };
+    }
+
+    if (claims.role !== "ROLE_REVIEWER_READONLY" || claims.gitWriteAccess !== false) {
+      return {
+        valid: false,
+        reason: "Reviewer credential rejected: must be ROLE_REVIEWER_READONLY with gitWriteAccess=false",
+      };
+    }
+    if (expectedProjectId && claims.projectId !== expectedProjectId) {
+      return {
+        valid: false,
+        reason: `Reviewer credential project ${claims.projectId} does not match ${expectedProjectId}`,
+      };
+    }
+    if (claims.exp <= this.clockFn().getTime()) {
+      return { valid: false, reason: "Reviewer session credential has expired" };
+    }
+    return { valid: true, claims };
+  }
+
+  public authorizeReviewerGitOperation(
+    token: string,
+    operation: "read" | "push" | "update-ref",
+    expectedProjectId?: string
+  ): { readonly allowed: boolean; readonly error_code?: string; readonly reason?: string } {
+    const verification = this.verifyReviewerSessionToken(token, expectedProjectId);
+    if (!verification.valid) {
+      return {
+        allowed: false,
+        error_code: "ERR_REVIEWER_INVALID_CREDENTIAL",
+        reason: verification.reason,
+      };
+    }
+    if (operation !== "read") {
+      return {
+        allowed: false,
+        error_code: "ERR_REVIEWER_READONLY_GIT_WRITE_FORBIDDEN",
+        reason: `ROLE_REVIEWER_READONLY is strictly prohibited from executing Git write operation '${operation}'`,
+      };
+    }
+    return { allowed: true };
+  }
+}
+
+/**
+ * AgentGatewayService (MVP-SPEC-01 Section 3.1, MVP-SPEC-03 Section 1-2 & 5, MVP-SPEC-04 Section 3.1)
+ * Mediates all Worker (WNA) traffic using scoped `gateway_service` RLS transactions and issues
+ * strictly isolated `ROLE_REVIEWER_READONLY` credentials for Independent Reviewers.
  */
 export class AgentGatewayService implements AgentGatewayTransportClient {
   private readonly store: SoftwareFactoryControlPlaneStore;
   private readonly projectId: string;
   private readonly workerPrincipalId: string;
+  public readonly reviewerCredentialService: EphemeralReviewerCredentialService;
 
   constructor(options: {
     store: SoftwareFactoryControlPlaneStore;
     projectId: string;
     workerPrincipalId?: string;
+    reviewerCredentialService?: EphemeralReviewerCredentialService;
   }) {
     this.store = options.store;
     this.projectId = options.projectId;
     this.workerPrincipalId = options.workerPrincipalId ?? "wna-worker-node-01";
+    this.reviewerCredentialService =
+      options.reviewerCredentialService ?? new EphemeralReviewerCredentialService();
+  }
+
+  public issueReviewerSessionCredential(input: {
+    task_id: string;
+    merge_candidate_id: string;
+    verification_run_id: string;
+    requested_role?: string;
+    developer_principal_id: string;
+    reviewer_principal_id: string;
+    developer_session_id: string;
+    reviewer_session_id?: string;
+    developer_credential_id: string;
+    reviewer_credential_id?: string;
+    developer_agent_profile_id: string;
+    reviewer_agent_profile_id: string;
+    writer_provider: string;
+    writer_model: string;
+    reviewer_provider: string;
+    reviewer_model: string;
+    ttl_ms?: number;
+  }): IssuedReviewerSessionCredential {
+    if (input.requested_role && input.requested_role !== "ROLE_REVIEWER_READONLY") {
+      throw new ReviewerIdentityIndependenceError(
+        "role",
+        `Reviewer must be issued strictly as ROLE_REVIEWER_READONLY, got ${input.requested_role}`
+      );
+    }
+
+    const devPrincipal = input.developer_principal_id.trim();
+    const revPrincipal = input.reviewer_principal_id.trim();
+    if (!devPrincipal || !revPrincipal || devPrincipal.toLowerCase() === revPrincipal.toLowerCase()) {
+      throw new ReviewerIdentityIndependenceError(
+        "principal",
+        `Reviewer principal '${revPrincipal}' must be non-empty and distinct from developer principal '${devPrincipal}'`
+      );
+    }
+
+    const devSession = input.developer_session_id.trim();
+    const revSession = input.reviewer_session_id?.trim() || `rev-sess-${randomUUID()}`;
+    if (!devSession || devSession === revSession) {
+      throw new ReviewerIdentityIndependenceError(
+        "session",
+        `Reviewer session '${revSession}' must be non-empty and distinct from developer session '${devSession}'`
+      );
+    }
+
+    const devCred = input.developer_credential_id.trim();
+    const revCred = input.reviewer_credential_id?.trim() || `rev-cred-${randomUUID()}`;
+    if (!devCred || devCred === revCred) {
+      throw new ReviewerIdentityIndependenceError(
+        "credential",
+        `Reviewer credential '${revCred}' must be non-empty and distinct from developer credential '${devCred}'`
+      );
+    }
+
+    const devProfile = input.developer_agent_profile_id.trim();
+    const revProfile = input.reviewer_agent_profile_id.trim();
+    if (!devProfile || !revProfile || devProfile.toLowerCase() === revProfile.toLowerCase()) {
+      throw new ReviewerIdentityIndependenceError(
+        "agent_profile",
+        `Reviewer agent_profile '${revProfile}' must be non-empty and distinct from developer profile '${devProfile}'`
+      );
+    }
+
+    if (
+      !input.writer_provider.trim() ||
+      !input.writer_model.trim() ||
+      !input.reviewer_provider.trim() ||
+      !input.reviewer_model.trim() ||
+      (input.writer_provider.trim().toLowerCase() === input.reviewer_provider.trim().toLowerCase() &&
+        input.writer_model.trim().toLowerCase() === input.reviewer_model.trim().toLowerCase())
+    ) {
+      throw new ReviewerIdentityIndependenceError(
+        "model",
+        `Reviewer model (${input.reviewer_provider}/${input.reviewer_model}) must be distinct from writer model (${input.writer_provider}/${input.writer_model})`
+      );
+    }
+
+    return this.reviewerCredentialService.issueReviewerSessionToken({
+      projectId: this.projectId,
+      taskId: input.task_id,
+      mergeCandidateId: input.merge_candidate_id,
+      verificationRunId: input.verification_run_id,
+      reviewerPrincipalId: revPrincipal,
+      reviewerCredentialId: revCred,
+      reviewerSessionId: revSession,
+      reviewerAgentProfileId: revProfile,
+      reviewerProvider: input.reviewer_provider,
+      reviewerModel: input.reviewer_model,
+      ttlMs: input.ttl_ms,
+    });
   }
 
   public async submitEvent(

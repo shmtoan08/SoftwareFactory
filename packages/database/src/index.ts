@@ -2,11 +2,16 @@ import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type ApprovalDecisionRecord,
+  type ApprovalRequestRecord,
   type LeaseSyncStatusResponse,
   type MergeCandidateRecord,
+  type MergeOperationRecord,
   type OutboxEventRecord,
   type ProcessedWorkerEventRecord,
   type ReviewArtifactRecord,
+  type ReviewArtifactStatus,
+  type ReviewSessionRecord,
+  type ReviewSessionStatus,
   type ServerEventAckContract,
   type SnapshotRetentionClass,
   type TaskLeaseRecord,
@@ -65,6 +70,30 @@ export class PostgresRlsError extends Error {
   }
 }
 
+export class ApprovalExpiredOrStaleError extends Error {
+  public readonly code = "ERR_APPROVAL_EXPIRED_OR_STALE" as const;
+  public readonly httpStatus = 409 as const;
+  public readonly sqlState = "23514" as const;
+  public readonly approvalRequestStatus?: string;
+
+  constructor(message: string, approvalRequestStatus?: string) {
+    super(message);
+    this.name = "ApprovalExpiredOrStaleError";
+    this.approvalRequestStatus = approvalRequestStatus;
+  }
+}
+
+export class SimulatedPostMergeCrashError extends Error {
+  public readonly code = "ERR_SIMULATED_POST_MERGE_CRASH" as const;
+  public readonly mergeOpId?: string;
+
+  constructor(message: string, mergeOpId?: string) {
+    super(message);
+    this.name = "SimulatedPostMergeCrashError";
+    this.mergeOpId = mergeOpId;
+  }
+}
+
 export interface ProjectRecord {
   project_id: string;
   slug: string;
@@ -87,13 +116,15 @@ export interface CasMergeResult {
   readonly merged_commit_hash: string | null;
   readonly main_ref_commit_hash: string;
   readonly invalidated_approval_id?: string;
+  readonly merge_op_id?: string;
+  readonly reconciled_after_lost_response?: boolean;
 }
 
 /**
  * SoftwareFactoryControlPlaneStore implements the PostgreSQL 4-Tier RLS Engine,
  * Canonical Lock Ordering (`task_leases` -> `tasks`), `clock_timestamp()` evaluation,
- * Lease/Event Coordinator, 3D Independent Reviewer Guard, 8-Field Approval Binding,
- * and Atomic CAS Merge + Post-Merge Reconciler (MVP-SPEC-02, MVP-SPEC-03, MVP-SPEC-04).
+ * Lease/Event Coordinator, 3D Independent Reviewer Guard, 8-Field Approval Binding & TTL,
+ * and Idempotent Atomic CAS Merge + Post-Merge Reconciler (MVP-SPEC-02, MVP-SPEC-03, MVP-SPEC-04).
  */
 export class SoftwareFactoryControlPlaneStore {
   private clockFn: () => Date;
@@ -118,8 +149,11 @@ export class SoftwareFactoryControlPlaneStore {
   private verifiedCodeImports: Map<string, VerifiedCodeImportRecord> = new Map();
   private mergeCandidates: Map<string, MergeCandidateRecord> = new Map();
   private verificationRuns: Map<string, VerificationRunRecord> = new Map();
+  private reviewSessions: Map<string, ReviewSessionRecord> = new Map();
   private reviewArtifacts: Map<string, ReviewArtifactRecord> = new Map();
+  private approvalRequests: Map<string, ApprovalRequestRecord> = new Map();
   private approvalDecisions: Map<string, ApprovalDecisionRecord> = new Map();
+  private mergeOperations: Map<string, MergeOperationRecord> = new Map();
   private outboxEvents: Map<string, OutboxEventRecord> = new Map();
 
   // Simulated bare Git repository state per project: ref -> commit_hash, and commit_hash -> metadata
@@ -1463,6 +1497,7 @@ export class SoftwareFactoryControlPlaneStore {
     base_main_commit_hash: string;
     merge_candidate_hash: string;
     verified_tree_hash: string;
+    allow_rebased_tree_hash?: boolean;
     snapshot_path?: string | null;
     snapshot_sha256?: string | null;
     snapshot_size_bytes?: number | null;
@@ -1479,7 +1514,14 @@ export class SoftwareFactoryControlPlaneStore {
       throw new PostgresRlsError("23503", "Import does not belong to the specified task");
     }
 
-    if (input.verified_tree_hash !== imp.verified_tree_hash) {
+    if (!/^[0-9a-f]{40,64}$/i.test(input.verified_tree_hash)) {
+      throw new PostgresRlsError(
+        "23514",
+        `Invalid verified_tree_hash ${input.verified_tree_hash}`
+      );
+    }
+
+    if (!input.allow_rebased_tree_hash && input.verified_tree_hash !== imp.verified_tree_hash) {
       throw new PostgresRlsError(
         "23514",
         `Candidate verified_tree_hash ${input.verified_tree_hash} does not match import ${imp.verified_tree_hash}`
@@ -1531,8 +1573,23 @@ export class SoftwareFactoryControlPlaneStore {
         oldMc.is_superseded = true;
         this.invalidateArtifactsAndApprovalsForCandidate(
           oldMc.merge_candidate_id,
-          "SUPERSEDED_BY_NEW_MERGE_CANDIDATE"
+          "SUPERSEDED_BY_NEW_MERGE_CANDIDATE",
+          "INVALIDATED_STALE_CANDIDATE"
         );
+      }
+    }
+
+    // Also auto-invalidate any remaining VALID review artifacts on this task whose hash != new candidate hash
+    for (const ra of this.reviewArtifacts.values()) {
+      if (
+        ra.project_id === input.project_id &&
+        ra.task_id === input.task_id &&
+        ra.merge_candidate_hash !== input.merge_candidate_hash &&
+        (ra.status ?? "VALID") === "VALID"
+      ) {
+        ra.status = "INVALIDATED_STALE_CANDIDATE";
+        ra.is_invalidated = true;
+        ra.invalidated_reason = ra.invalidated_reason ?? "SUPERSEDED_BY_NEW_MERGE_CANDIDATE";
       }
     }
 
@@ -1544,7 +1601,7 @@ export class SoftwareFactoryControlPlaneStore {
       agent_commit_hash: imp.agent_commit_hash,
       base_main_commit_hash: input.base_main_commit_hash,
       merge_candidate_hash: input.merge_candidate_hash,
-      verified_tree_hash: imp.verified_tree_hash,
+      verified_tree_hash: input.verified_tree_hash,
       is_superseded: false,
       snapshot_path: input.snapshot_path ?? null,
       snapshot_sha256: input.snapshot_sha256 ?? null,
@@ -1594,6 +1651,7 @@ export class SoftwareFactoryControlPlaneStore {
     const nowIso = this.clockTimestampIso();
     task.status =
       task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+    this.closeActiveLeasesForTask(task, "COMPLETED");
     task.updated_at = nowIso;
 
     this.insertOutboxEventInternal(
@@ -1618,14 +1676,47 @@ export class SoftwareFactoryControlPlaneStore {
     };
   }
 
+  private closeActiveLeasesForTask(
+    task: TaskRecord,
+    targetStatus: "COMPLETED" | "REVOKED",
+    reason?: string
+  ): void {
+    const nowIso = this.clockTimestampIso();
+    for (const lease of this.taskLeases.values()) {
+      if (lease.task_id === task.task_id && lease.status === "ACTIVE") {
+        lease.status = targetStatus;
+        if (targetStatus === "COMPLETED") {
+          lease.completed_at = lease.completed_at ?? nowIso;
+        } else {
+          lease.revoked_at = lease.revoked_at ?? nowIso;
+          lease.revoke_reason = lease.revoke_reason ?? reason ?? "TASK_SUPERSEDED";
+        }
+      }
+    }
+    task.active_lease_id = null;
+  }
+
   private invalidateArtifactsAndApprovalsForCandidate(
     mergeCandidateId: string,
-    reason: string
+    reason: string,
+    artifactStatus: ReviewArtifactStatus = "INVALIDATED_STALE_CANDIDATE"
   ): void {
+    const nowIso = this.clockTimestampIso();
     for (const ra of this.reviewArtifacts.values()) {
-      if (ra.merge_candidate_id === mergeCandidateId && !ra.is_invalidated) {
+      if (ra.merge_candidate_id === mergeCandidateId && (!ra.is_invalidated || (ra.status ?? "VALID") === "VALID")) {
         ra.is_invalidated = true;
         ra.invalidated_reason = reason;
+        ra.status = artifactStatus;
+      }
+    }
+    const targetRequestStatus =
+      artifactStatus === "INVALIDATED_STALE_BASE"
+        ? "INVALIDATED_STALE_BASE"
+        : "INVALIDATED_STALE_CANDIDATE";
+    for (const ar of this.approvalRequests.values()) {
+      if (ar.merge_candidate_id === mergeCandidateId && ar.status === "PENDING") {
+        ar.status = targetRequestStatus;
+        ar.updated_at = nowIso;
       }
     }
     for (const ad of this.approvalDecisions.values()) {
@@ -1718,6 +1809,13 @@ export class SoftwareFactoryControlPlaneStore {
       );
     }
 
+    // Re-running Verifier automatically invalidates any previous reviews/approvals tied to an older run (MVP-SPEC-04 §3.1)
+    this.invalidateArtifactsAndApprovalsForCandidate(
+      mc.merge_candidate_id,
+      "VERIFICATION_RUN_RERUN",
+      "INVALIDATED_STALE_CANDIDATE"
+    );
+
     const nowIso = this.clockTimestampIso();
     const record: VerificationRunRecord = {
       verification_run_id: randomUUID(),
@@ -1769,9 +1867,13 @@ export class SoftwareFactoryControlPlaneStore {
       // INFRA_ERROR NEVER consumes rework_count; either keeps VerifyingInDocker while retrying
       // or escalates directly to ManualIntervention once retries are exhausted (MVP-SPEC-04 §2.3).
       task.status = input.keep_verifying_on_infra_retry ? "VerifyingInDocker" : "ManualIntervention";
+      if (task.status === "ManualIntervention") {
+        this.closeActiveLeasesForTask(task, "COMPLETED");
+      }
     } else {
       task.status =
         task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+      this.closeActiveLeasesForTask(task, "COMPLETED");
     }
     task.updated_at = nowIso;
 
@@ -1798,11 +1900,128 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   /**
+   * Records an ephemeral read-only Independent Reviewer Sandbox session (`review_sessions`).
+   */
+  public recordReviewSession(input: {
+    review_session_id?: string;
+    project_id: string;
+    task_id: string;
+    merge_candidate_id: string;
+    verification_run_id: string;
+    reviewer_principal_id: string;
+    reviewer_credential_id: string;
+    reviewer_agent_profile_id: string;
+    reviewer_provider: string;
+    reviewer_model: string;
+    role: "ROLE_REVIEWER_READONLY";
+    sandbox_backend_mode: string;
+    sandbox_pid?: number | null;
+    sandbox_cgroup_path?: string | null;
+    cleanup_populated_zero_verified?: boolean;
+    status?: ReviewSessionStatus;
+    started_at?: string;
+    completed_at?: string | null;
+  }): ReviewSessionRecord {
+    this.assertWritePermissionForProject(input.project_id);
+    if (input.role !== "ROLE_REVIEWER_READONLY") {
+      throw new PostgresRlsError(
+        "23514",
+        `review_sessions role must be ROLE_REVIEWER_READONLY, got ${String(input.role)}`
+      );
+    }
+    if (
+      !input.reviewer_principal_id.trim() ||
+      !input.reviewer_credential_id.trim() ||
+      !input.reviewer_agent_profile_id.trim() ||
+      !input.reviewer_provider.trim() ||
+      !input.reviewer_model.trim()
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "review_sessions requires non-empty principal, credential, agent_profile, provider, and model"
+      );
+    }
+    const task = this.tasks.get(input.task_id);
+    const mc = this.mergeCandidates.get(input.merge_candidate_id);
+    const vr = this.verificationRuns.get(input.verification_run_id);
+    if (
+      !task ||
+      !mc ||
+      !vr ||
+      task.project_id !== input.project_id ||
+      mc.project_id !== input.project_id ||
+      vr.project_id !== input.project_id ||
+      mc.task_id !== input.task_id ||
+      vr.merge_candidate_id !== input.merge_candidate_id
+    ) {
+      throw new PostgresRlsError(
+        "23503",
+        "ReviewSession references non-existent or cross-tenant task, candidate, or verification run"
+      );
+    }
+
+    const nowIso = this.clockTimestampIso();
+    const record: ReviewSessionRecord = {
+      review_session_id: input.review_session_id ?? randomUUID(),
+      project_id: input.project_id,
+      task_id: input.task_id,
+      merge_candidate_id: input.merge_candidate_id,
+      verification_run_id: input.verification_run_id,
+      reviewer_principal_id: input.reviewer_principal_id.trim(),
+      reviewer_credential_id: input.reviewer_credential_id.trim(),
+      reviewer_agent_profile_id: input.reviewer_agent_profile_id.trim(),
+      reviewer_provider: input.reviewer_provider.trim(),
+      reviewer_model: input.reviewer_model.trim(),
+      role: input.role,
+      sandbox_backend_mode: input.sandbox_backend_mode,
+      sandbox_pid: input.sandbox_pid ?? null,
+      sandbox_cgroup_path: input.sandbox_cgroup_path ?? null,
+      cleanup_populated_zero_verified: input.cleanup_populated_zero_verified ?? false,
+      status: input.status ?? "ACTIVE",
+      started_at: input.started_at ?? nowIso,
+      completed_at: input.completed_at ?? null,
+    };
+    this.reviewSessions.set(record.review_session_id, record);
+    return { ...record };
+  }
+
+  public completeReviewSession(input: {
+    project_id: string;
+    review_session_id: string;
+    status: "COMPLETED" | "FAILED" | "REVOKED";
+    cleanup_populated_zero_verified: boolean;
+    sandbox_backend_mode?: string;
+    sandbox_pid?: number | null;
+    sandbox_cgroup_path?: string | null;
+  }): ReviewSessionRecord {
+    this.assertWritePermissionForProject(input.project_id);
+    const session = this.reviewSessions.get(input.review_session_id);
+    if (!session || session.project_id !== input.project_id) {
+      throw new PostgresRlsError("23503", `ReviewSession ${input.review_session_id} not found`);
+    }
+    session.status = input.status;
+    session.cleanup_populated_zero_verified = input.cleanup_populated_zero_verified;
+    if (input.sandbox_backend_mode !== undefined) {
+      session.sandbox_backend_mode = input.sandbox_backend_mode;
+    }
+    if (input.sandbox_pid !== undefined) {
+      session.sandbox_pid = input.sandbox_pid;
+    }
+    if (input.sandbox_cgroup_path !== undefined) {
+      session.sandbox_cgroup_path = input.sandbox_cgroup_path;
+    }
+    session.completed_at = this.clockTimestampIso();
+    return { ...session };
+  }
+
+  /**
    * 3D Independent Reviewer Artifact Recording (MVP-SPEC-04 Section 3.1)
    * Enforces:
    * 1. Model independence: `(writer_provider, writer_model) IS DISTINCT FROM (reviewer_provider, reviewer_model)`
    * 2. Principal independence: non-empty distinct `developer_principal_id` & `reviewer_principal_id`
    * 3. Session independence: non-empty distinct `developer_session_id` & `reviewer_session_id` (FIX-03)
+   * 4. Credential & Agent Profile independence when provided (`chk_ra_independent_credential` / `chk_ra_independent_agent_profile`)
+   * 5. Auto-creates TTL-bound `ApprovalRequest` (`PENDING`) when `verdict === "PASS"`.
    */
   public recordReviewArtifact(input: {
     project_id: string;
@@ -1819,10 +2038,23 @@ export class SoftwareFactoryControlPlaneStore {
     reviewer_principal_id: string;
     developer_session_id: string;
     reviewer_session_id: string;
+    developer_credential_id?: string | null;
+    reviewer_credential_id?: string | null;
+    developer_agent_profile_id?: string | null;
+    reviewer_agent_profile_id?: string | null;
+    review_session_id?: string | null;
+    summary_markdown?: string | null;
+    report_sha256?: string | null;
+    approval_request_ttl_ms?: number;
     verdict: "PASS" | "FAIL";
     findings_json?: ReadonlyArray<Record<string, unknown>>;
   }): ReviewArtifactRecord {
     this.assertWritePermissionForProject(input.project_id);
+
+    const project = this.projects.get(input.project_id);
+    if (!project) {
+      throw new PostgresRlsError("23503", `Project ${input.project_id} not found`);
+    }
 
     // Dimension 1: Model Identity Independence Check
     if (
@@ -1878,6 +2110,51 @@ export class SoftwareFactoryControlPlaneStore {
       );
     }
 
+    // Dimension 4: Credential Independence Check (`chk_ra_independent_credential`)
+    const hasDevCred = input.developer_credential_id !== undefined && input.developer_credential_id !== null;
+    const hasRevCred = input.reviewer_credential_id !== undefined && input.reviewer_credential_id !== null;
+    const devCred = hasDevCred ? input.developer_credential_id!.trim() : null;
+    const revCred = hasRevCred ? input.reviewer_credential_id!.trim() : null;
+    if (hasDevCred || hasRevCred) {
+      if (!devCred || !revCred || devCred === revCred) {
+        throw new PostgresRlsError(
+          "23514",
+          `new row violates check constraint "chk_ra_independent_credential": developer credential (${String(
+            devCred
+          )}) must be non-empty and distinct from reviewer credential (${String(revCred)})`
+        );
+      }
+    }
+
+    // Dimension 5: Agent Profile Independence Check (`chk_ra_independent_agent_profile`)
+    const hasDevProf =
+      input.developer_agent_profile_id !== undefined && input.developer_agent_profile_id !== null;
+    const hasRevProf =
+      input.reviewer_agent_profile_id !== undefined && input.reviewer_agent_profile_id !== null;
+    const devProfile = hasDevProf ? input.developer_agent_profile_id!.trim() : null;
+    const revProfile = hasRevProf ? input.reviewer_agent_profile_id!.trim() : null;
+    if (hasDevProf || hasRevProf) {
+      if (!devProfile || !revProfile || devProfile.toLowerCase() === revProfile.toLowerCase()) {
+        throw new PostgresRlsError(
+          "23514",
+          `new row violates check constraint "chk_ra_independent_agent_profile": developer profile (${String(
+            devProfile
+          )}) must be non-empty and distinct from reviewer profile (${String(revProfile)})`
+        );
+      }
+    }
+
+    if (
+      input.report_sha256 !== undefined &&
+      input.report_sha256 !== null &&
+      !/^[0-9a-f]{64}$/.test(input.report_sha256)
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `chk_ra_report_sha256_hex: invalid report SHA-256 ${input.report_sha256}`
+      );
+    }
+
     const vr = this.verificationRuns.get(input.verification_run_id);
     const mc = this.mergeCandidates.get(input.merge_candidate_id);
     const task = this.tasks.get(input.task_id);
@@ -1899,7 +2176,43 @@ export class SoftwareFactoryControlPlaneStore {
       );
     }
 
-    const nowIso = this.clockTimestampIso();
+    // Bind strictly to the latest VerificationRun for this candidate
+    let latestVr: VerificationRunRecord | undefined;
+    for (const candidateVr of this.verificationRuns.values()) {
+      if (candidateVr.project_id === input.project_id && candidateVr.merge_candidate_id === mc.merge_candidate_id) {
+        latestVr = candidateVr;
+      }
+    }
+    if (latestVr && latestVr.verification_run_id !== vr.verification_run_id) {
+      throw new PostgresRlsError(
+        "23503",
+        `VerificationRun ${vr.verification_run_id} was superseded by newer run ${latestVr.verification_run_id}`
+      );
+    }
+
+    // Validate ReviewSession FK binding if supplied
+    if (input.review_session_id) {
+      const rs = this.reviewSessions.get(input.review_session_id);
+      if (
+        !rs ||
+        rs.project_id !== input.project_id ||
+        rs.task_id !== input.task_id ||
+        rs.merge_candidate_id !== input.merge_candidate_id ||
+        rs.verification_run_id !== input.verification_run_id ||
+        rs.role !== "ROLE_REVIEWER_READONLY" ||
+        rs.reviewer_principal_id.toLowerCase() !== revPrincipal.toLowerCase() ||
+        (revCred !== null && rs.reviewer_credential_id !== revCred) ||
+        (revProfile !== null && rs.reviewer_agent_profile_id.toLowerCase() !== revProfile.toLowerCase())
+      ) {
+        throw new PostgresRlsError(
+          "23503",
+          `ReviewArtifact review_session_id ${input.review_session_id} binding mismatch`
+        );
+      }
+    }
+
+    const nowDate = this.clockFn();
+    const nowIso = nowDate.toISOString();
     const record: ReviewArtifactRecord = {
       review_artifact_id: randomUUID(),
       project_id: input.project_id,
@@ -1916,32 +2229,93 @@ export class SoftwareFactoryControlPlaneStore {
       reviewer_principal_id: revPrincipal,
       developer_session_id: devSession,
       reviewer_session_id: revSession,
+      developer_credential_id: devCred,
+      reviewer_credential_id: revCred,
+      developer_agent_profile_id: devProfile,
+      reviewer_agent_profile_id: revProfile,
+      review_session_id: input.review_session_id ?? null,
       verdict: input.verdict,
+      status: "VALID",
       is_invalidated: false,
       invalidated_reason: null,
+      summary_markdown: input.summary_markdown ?? null,
+      report_sha256: input.report_sha256 ?? null,
       findings_json: input.findings_json ?? [],
       created_at: nowIso,
     };
     this.reviewArtifacts.set(record.review_artifact_id, record);
-    task.status =
-      input.verdict === "PASS"
-        ? "AwaitingHumanApproval"
-        : task.rework_count < task.max_rework_cycles
-        ? "ReworkRequired"
-        : "ManualIntervention";
+
+    if (input.verdict === "PASS") {
+      task.status = "AwaitingHumanApproval";
+
+      // Supersede any stale PENDING ApprovalRequest for this candidate and create a fresh PENDING request
+      for (const oldAr of this.approvalRequests.values()) {
+        if (oldAr.merge_candidate_id === mc.merge_candidate_id && oldAr.status === "PENDING") {
+          oldAr.status = "INVALIDATED_STALE_CANDIDATE";
+          oldAr.updated_at = nowIso;
+        }
+      }
+      const reqTtlMs = input.approval_request_ttl_ms ?? project.approval_ttl_seconds * 1000;
+      if (reqTtlMs <= 0) {
+        throw new PostgresRlsError("23514", "chk_ar_ttl_window: expires_at must be > created_at");
+      }
+      const approvalRequest: ApprovalRequestRecord = {
+        approval_request_id: randomUUID(),
+        project_id: input.project_id,
+        task_id: input.task_id,
+        merge_candidate_id: mc.merge_candidate_id,
+        agent_commit_hash: mc.agent_commit_hash,
+        base_main_commit_hash: mc.base_main_commit_hash,
+        merge_candidate_hash: mc.merge_candidate_hash,
+        verified_tree_hash: mc.verified_tree_hash,
+        verification_run_id: vr.verification_run_id,
+        review_artifact_id: record.review_artifact_id,
+        status: "PENDING",
+        expires_at: new Date(nowDate.getTime() + reqTtlMs).toISOString(),
+        created_at: nowIso,
+        updated_at: nowIso,
+      };
+      this.approvalRequests.set(approvalRequest.approval_request_id, approvalRequest);
+    } else {
+      task.status =
+        task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+      this.closeActiveLeasesForTask(task, "COMPLETED");
+    }
     task.updated_at = nowIso;
     return { ...record };
+  }
+
+  private findApprovalRequestForApproval(input: {
+    approval_request_id?: string;
+    merge_candidate_id: string;
+    review_artifact_id: string;
+  }): ApprovalRequestRecord | undefined {
+    if (input.approval_request_id) {
+      return this.approvalRequests.get(input.approval_request_id);
+    }
+    let matched: ApprovalRequestRecord | undefined;
+    for (const ar of this.approvalRequests.values()) {
+      if (
+        ar.merge_candidate_id === input.merge_candidate_id &&
+        ar.review_artifact_id === input.review_artifact_id
+      ) {
+        matched = ar;
+      }
+    }
+    return matched;
   }
 
   /**
    * 8-Field Cryptographically Bound Human Approval (MVP-SPEC-02 Section 2 & MVP-SPEC-04 Section 4)
    * Enforces fail-closed RBAC membership (`PROJECT_APPROVER` | `ORG_ADMIN`), RLS-T8 8-field FK binding,
-   * `REQUEST_CHANGES` rework transitions, and project-configured `approval_ttl_seconds` TTL window.
+   * `ApprovalRequest` TTL enforcement (`expires_at > clock_timestamp()`, throwing `409 ERR_APPROVAL_EXPIRED_OR_STALE`),
+   * live `refs/heads/main` stale-base detection, `REQUEST_CHANGES` rework transitions, and project-configured TTL.
    */
   public submitHumanApproval(input: {
     project_id: string;
     task_id: string;
     merge_candidate_id: string;
+    approval_request_id?: string;
     agent_commit_hash: string;
     base_main_commit_hash: string;
     verified_tree_hash: string;
@@ -1952,6 +2326,7 @@ export class SoftwareFactoryControlPlaneStore {
     decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
     feedback?: string;
     ttl_ms?: number;
+    current_main_commit_hash?: string;
   }): ApprovalDecisionRecord {
     this.assertWritePermissionForProject(input.project_id);
 
@@ -2017,6 +2392,7 @@ export class SoftwareFactoryControlPlaneStore {
       ra.merge_candidate_hash !== input.merge_candidate_hash ||
       ra.verified_tree_hash !== input.verified_tree_hash ||
       ra.is_invalidated ||
+      (ra.status ?? "VALID") !== "VALID" ||
       ra.verdict !== "PASS" ||
       vr.verdict !== "PASS"
     ) {
@@ -2028,6 +2404,78 @@ export class SoftwareFactoryControlPlaneStore {
 
     const nowDate = this.clockFn();
     const nowIso = nowDate.toISOString();
+    const approvalRequest = this.findApprovalRequestForApproval({
+      approval_request_id: input.approval_request_id,
+      merge_candidate_id: mc.merge_candidate_id,
+      review_artifact_id: ra.review_artifact_id,
+    });
+
+    if (input.approval_request_id && (!approvalRequest || approvalRequest.project_id !== input.project_id)) {
+      throw new PostgresRlsError(
+        "23503",
+        `ApprovalRequest ${input.approval_request_id} does not belong to candidate ${mc.merge_candidate_id}`
+      );
+    }
+
+    if (input.decision === "APPROVED") {
+      // Check live refs/heads/main against candidate.base_main_commit_hash before granting approval (MVP-SPEC-04 §4)
+      const refs = this.gitRefsByProject.get(input.project_id);
+      const liveMainSha = input.current_main_commit_hash ?? refs?.get("refs/heads/main");
+      if (!liveMainSha || liveMainSha !== mc.base_main_commit_hash) {
+        if (liveMainSha && refs) {
+          refs.set("refs/heads/main", liveMainSha);
+          project.main_ref_commit_hash = liveMainSha;
+          project.updated_at = nowIso;
+        }
+        mc.is_superseded = true;
+        this.invalidateArtifactsAndApprovalsForCandidate(
+          mc.merge_candidate_id,
+          `APPROVAL_REJECTED_STALE_BASE_${mc.base_main_commit_hash}_VS_${String(liveMainSha)}`,
+          "INVALIDATED_STALE_BASE"
+        );
+        if (approvalRequest) {
+          approvalRequest.status = "INVALIDATED_STALE_BASE";
+          approvalRequest.updated_at = nowIso;
+        }
+        task.status = "BuildingMergeCandidate";
+        if (liveMainSha) {
+          task.base_main_commit_hash = liveMainSha;
+        }
+        task.active_merge_candidate_id = null;
+        task.updated_at = nowIso;
+        throw new ApprovalExpiredOrStaleError(
+          `ERR_APPROVAL_EXPIRED_OR_STALE: candidate base_main_commit_hash ${mc.base_main_commit_hash} is stale against live main ${String(
+            liveMainSha
+          )}`,
+          "INVALIDATED_STALE_BASE"
+        );
+      }
+
+      // Check ApprovalRequest TTL & PENDING state against clock_timestamp() (MVP-SPEC-04 §4)
+      if (approvalRequest) {
+        if (
+          approvalRequest.status !== "PENDING" ||
+          new Date(approvalRequest.expires_at).getTime() <= nowDate.getTime()
+        ) {
+          approvalRequest.status = "INVALIDATED_EXPIRED";
+          approvalRequest.updated_at = nowIso;
+          mc.is_superseded = true;
+          this.invalidateArtifactsAndApprovalsForCandidate(
+            mc.merge_candidate_id,
+            "APPROVAL_REQUEST_TTL_EXPIRED",
+            "INVALIDATED_STALE_CANDIDATE"
+          );
+          task.status = "BuildingMergeCandidate";
+          task.active_merge_candidate_id = null;
+          task.updated_at = nowIso;
+          throw new ApprovalExpiredOrStaleError(
+            `ERR_APPROVAL_EXPIRED_OR_STALE: ApprovalRequest ${approvalRequest.approval_request_id} expired at ${approvalRequest.expires_at}`,
+            "INVALIDATED_EXPIRED"
+          );
+        }
+      }
+    }
+
     const ttlMs = input.ttl_ms ?? project.approval_ttl_seconds * 1000;
     if (ttlMs <= 0) {
       throw new PostgresRlsError("23514", "chk_approval_ttl_window: expires_at must be > approved_at");
@@ -2038,6 +2486,7 @@ export class SoftwareFactoryControlPlaneStore {
       project_id: input.project_id,
       task_id: input.task_id,
       merge_candidate_id: input.merge_candidate_id,
+      approval_request_id: approvalRequest?.approval_request_id ?? null,
       agent_commit_hash: input.agent_commit_hash,
       base_main_commit_hash: input.base_main_commit_hash,
       verified_tree_hash: input.verified_tree_hash,
@@ -2053,14 +2502,21 @@ export class SoftwareFactoryControlPlaneStore {
       consumed_at: input.decision === "APPROVED" ? null : nowIso,
     };
 
+    if (approvalRequest) {
+      approvalRequest.status = input.decision === "APPROVED" ? "APPROVED" : "REJECTED";
+      approvalRequest.updated_at = nowIso;
+    }
+
     this.approvalDecisions.set(record.approval_id, record);
     if (input.decision === "APPROVED") {
       task.status = "AtomicCasMerge";
     } else if (input.decision === "REQUEST_CHANGES") {
       task.status =
         task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+      this.closeActiveLeasesForTask(task, "COMPLETED");
     } else {
       task.status = "ManualIntervention";
+      this.closeActiveLeasesForTask(task, "COMPLETED");
     }
     task.updated_at = nowIso;
 
@@ -2072,6 +2528,7 @@ export class SoftwareFactoryControlPlaneStore {
       {
         task_id: task.task_id,
         merge_candidate_id: mc.merge_candidate_id,
+        approval_request_id: approvalRequest?.approval_request_id ?? null,
         decision: input.decision,
         approver_principal_id: input.approver_principal_id,
         resulting_task_status: task.status,
@@ -2100,20 +2557,66 @@ export class SoftwareFactoryControlPlaneStore {
     refs?.delete(refName);
   }
 
+  private getOrCreateMergeOperation(input: {
+    project_id: string;
+    task_id: string;
+    merge_candidate_id: string;
+    approval_id: string;
+    base_main_commit_hash: string;
+    merge_candidate_hash: string;
+    verified_tree_hash: string;
+    nowIso: string;
+  }): { record: MergeOperationRecord; isRetryOfExisting: boolean } {
+    const key = `merge:${input.project_id}:${input.task_id}:${input.merge_candidate_hash}`;
+    for (const existing of this.mergeOperations.values()) {
+      if (existing.project_id === input.project_id && existing.merge_idempotency_key === key) {
+        return { record: existing, isRetryOfExisting: true };
+      }
+    }
+    const record: MergeOperationRecord = {
+      merge_op_id: randomUUID(),
+      project_id: input.project_id,
+      task_id: input.task_id,
+      merge_candidate_id: input.merge_candidate_id,
+      approval_id: input.approval_id,
+      merge_idempotency_key: key,
+      base_main_commit_hash: input.base_main_commit_hash,
+      merge_candidate_hash: input.merge_candidate_hash,
+      verified_tree_hash: input.verified_tree_hash,
+      status: "IN_PROGRESS",
+      reconciled_after_lost_response: false,
+      retry_count: 0,
+      last_error: null,
+      created_at: input.nowIso,
+      completed_at: null,
+    };
+    this.mergeOperations.set(record.merge_op_id, record);
+    return { record, isRetryOfExisting: false };
+  }
+
   /**
-   * 6-Step Post-Merge Reconciler & Atomic CAS Merge (MVP-SPEC-04 Section 5.1 & Section 5.2)
+   * 6-Step Post-Merge Reconciler & Idempotent Atomic CAS Merge (MVP-SPEC-04 Section 5.1 & Section 5.2)
    * Handles:
-   * - Already `MergedAndCompleted` idempotent return
-   * - Crash after `git update-ref` succeeded (`currentMainSha === merge_candidate_hash`) -> reconciles DB to `MergedAndCompleted`
-   * - Approval TTL expiry (`expires_at <= clock_timestamp()`) -> marks approval `EXPIRED` and transitions task to `AwaitingHumanApproval`
-   * - CAS conflict (`currentMainSha !== base_main_commit_hash`) -> marks candidate superseded, invalidates review & approval, updates `base_main_commit_hash`, and transitions task to `BuildingMergeCandidate`
-   * - Clean CAS (`currentMainSha === base_main_commit_hash`) -> atomically updates `refs/heads/main` to `merge_candidate_hash`, marks approval `CONSUMED`, and transitions task to `MergedAndCompleted`.
+   * - `merge_operations` idempotency tracking (`merge:<project_id>:<task_id>:<merge_candidate_hash>`)
+   * - Already `MergedAndCompleted` strict idempotent return (no extra outbox events or Git commits)
+   * - Crash after `git update-ref` succeeded (`currentMainSha === merge_candidate_hash`) -> reconciles DB to `MergedAndCompleted` with `reconciled_after_lost_response = true`
+   * - Approval TTL expiry (`expires_at <= clock_timestamp()`) -> marks approval `EXPIRED` and transitions task to `AwaitingHumanApproval` (and updates `ApprovalRequest` appropriately)
+   * - True CAS conflict (`currentMainSha !== base_main_commit_hash`) -> marks `merge_operations` `CAS_CONFLICT_ABORTED`, supersedes candidate, marks review/approval `INVALIDATED_STALE_BASE`, updates `base_main_commit_hash`, and transitions task to `BuildingMergeCandidate`
+   * - Clean CAS (`currentMainSha === base_main_commit_hash`) -> atomically updates `refs/heads/main` to `merge_candidate_hash`, marks approval `CONSUMED` & `merge_operations` `MERGED`, and transitions task to `MergedAndCompleted`.
    */
   public async executeAtomicCasMergeOrReconcile(input: {
     project_id: string;
     task_id: string;
     merge_candidate_id: string;
     approval_id: string;
+    gitBridge?: {
+      readonly getCurrentMainHead: () => string;
+      readonly atomicCompareAndSwapMainRef: (
+        expectedOldSha: string,
+        newCandidateSha: string
+      ) => boolean;
+    };
+    simulateCrashAfterGitUpdateRef?: boolean;
   }): Promise<CasMergeResult> {
     this.assertWritePermissionForProject(input.project_id);
 
@@ -2148,7 +2651,9 @@ export class SoftwareFactoryControlPlaneStore {
         );
       }
 
-      const currentMainSha = refs.get("refs/heads/main");
+      const currentMainSha = input.gitBridge
+        ? input.gitBridge.getCurrentMainHead()
+        : refs.get("refs/heads/main");
       if (!currentMainSha) {
         throw new PostgresRlsError(
           "23503",
@@ -2156,15 +2661,39 @@ export class SoftwareFactoryControlPlaneStore {
         );
       }
 
-      // Step 1: If DB already recorded MergedAndCompleted, return idempotently
+      const { record: mergeOp, isRetryOfExisting } = this.getOrCreateMergeOperation({
+        project_id: input.project_id,
+        task_id: input.task_id,
+        merge_candidate_id: mc.merge_candidate_id,
+        approval_id: approval.approval_id,
+        base_main_commit_hash: mc.base_main_commit_hash,
+        merge_candidate_hash: mc.merge_candidate_hash,
+        verified_tree_hash: mc.verified_tree_hash,
+        nowIso,
+      });
+      if (isRetryOfExisting) {
+        mergeOp.retry_count += 1;
+      }
+
+      // Step 1: If DB already recorded MergedAndCompleted, return strictly idempotently
       if (task.status === "MergedAndCompleted" && task.merged_commit_hash) {
+        if (mergeOp.status !== "MERGED") {
+          mergeOp.status = "MERGED";
+          mergeOp.completed_at = mergeOp.completed_at ?? nowIso;
+        }
         return {
           status: "RECONCILED_ALREADY_MERGED",
           task_status: "MergedAndCompleted",
           merged_commit_hash: task.merged_commit_hash,
           main_ref_commit_hash: currentMainSha,
+          merge_op_id: mergeOp.merge_op_id,
+          reconciled_after_lost_response: mergeOp.reconciled_after_lost_response,
         };
       }
+
+      const linkedApprovalRequest = approval.approval_request_id
+        ? this.approvalRequests.get(approval.approval_request_id)
+        : undefined;
 
       // Step 2: Check if Git `refs/heads/main` ALREADY contains `merge_candidate_hash`
       // (Recovering from crash after Git CAS succeeded but before DB commit completed!)
@@ -2173,10 +2702,24 @@ export class SoftwareFactoryControlPlaneStore {
           approval.status = "CONSUMED";
           approval.consumed_at = nowIso;
         }
+        if (linkedApprovalRequest && linkedApprovalRequest.status !== "APPROVED") {
+          linkedApprovalRequest.status = "APPROVED";
+          linkedApprovalRequest.updated_at = nowIso;
+        }
+        refs.set("refs/heads/main", mc.merge_candidate_hash);
+        project.main_ref_commit_hash = mc.merge_candidate_hash;
+        project.updated_at = nowIso;
+
         mc.snapshot_retention_class = "MERGED_PERMANENT";
+        mergeOp.status = "MERGED";
+        mergeOp.reconciled_after_lost_response = true;
+        mergeOp.last_error = null;
+        mergeOp.completed_at = nowIso;
+
         task.status = "MergedAndCompleted";
         task.merged_commit_hash = mc.merge_candidate_hash;
         task.merged_at = nowIso;
+        this.closeActiveLeasesForTask(task, "COMPLETED");
         task.updated_at = nowIso;
 
         this.insertOutboxEventInternal(
@@ -2188,6 +2731,7 @@ export class SoftwareFactoryControlPlaneStore {
             task_id: task.task_id,
             merge_candidate_id: mc.merge_candidate_id,
             merged_commit_hash: mc.merge_candidate_hash,
+            merge_op_id: mergeOp.merge_op_id,
           }
         );
 
@@ -2196,6 +2740,8 @@ export class SoftwareFactoryControlPlaneStore {
           task_status: "MergedAndCompleted",
           merged_commit_hash: mc.merge_candidate_hash,
           main_ref_commit_hash: currentMainSha,
+          merge_op_id: mergeOp.merge_op_id,
+          reconciled_after_lost_response: true,
         };
       }
 
@@ -2208,6 +2754,12 @@ export class SoftwareFactoryControlPlaneStore {
           approval.status = "EXPIRED";
           approval.invalidated_reason = "APPROVAL_TTL_EXPIRED";
         }
+        if (linkedApprovalRequest) {
+          const reqExpired =
+            new Date(linkedApprovalRequest.expires_at).getTime() <= nowDate.getTime();
+          linkedApprovalRequest.status = reqExpired ? "INVALIDATED_EXPIRED" : "PENDING";
+          linkedApprovalRequest.updated_at = nowIso;
+        }
         task.status = "AwaitingHumanApproval";
         task.updated_at = nowIso;
 
@@ -2217,31 +2769,131 @@ export class SoftwareFactoryControlPlaneStore {
           merged_commit_hash: null,
           main_ref_commit_hash: currentMainSha,
           invalidated_approval_id: approval.approval_id,
+          merge_op_id: mergeOp.merge_op_id,
         };
       }
 
-      // Step 4: Check if `refs/heads/main` moved away from `base_main_commit_hash` (CAS Conflict)
-      if (currentMainSha !== mc.base_main_commit_hash) {
+      const abortForTrueCasConflict = (observedMainSha: string): CasMergeResult => {
+        refs.set("refs/heads/main", observedMainSha);
+        project.main_ref_commit_hash = observedMainSha;
+        project.updated_at = nowIso;
+
+        mergeOp.status = "CAS_CONFLICT_ABORTED";
+        mergeOp.last_error = `CAS_MAIN_MOVED_FROM_${mc.base_main_commit_hash}_TO_${observedMainSha}`;
+        mergeOp.completed_at = nowIso;
+
         mc.is_superseded = true;
         this.invalidateArtifactsAndApprovalsForCandidate(
           mc.merge_candidate_id,
-          `CAS_MAIN_MOVED_FROM_${mc.base_main_commit_hash}_TO_${currentMainSha}`
+          mergeOp.last_error,
+          "INVALIDATED_STALE_BASE"
         );
+        if (linkedApprovalRequest) {
+          linkedApprovalRequest.status = "INVALIDATED_STALE_BASE";
+          linkedApprovalRequest.updated_at = nowIso;
+        }
         task.status = "BuildingMergeCandidate";
-        task.base_main_commit_hash = currentMainSha;
+        task.base_main_commit_hash = observedMainSha;
         task.active_merge_candidate_id = null;
         task.updated_at = nowIso;
+
+        this.insertOutboxEventInternal(
+          input.project_id,
+          "merge_operation",
+          mergeOp.merge_op_id,
+          "merge.cas_conflict_detected",
+          {
+            task_id: task.task_id,
+            merge_candidate_id: mc.merge_candidate_id,
+            stale_base_main_commit_hash: mc.base_main_commit_hash,
+            observed_main_commit_hash: observedMainSha,
+          }
+        );
 
         return {
           status: "CAS_CONFLICT_NEEDS_REBASE",
           task_status: "BuildingMergeCandidate",
           merged_commit_hash: null,
-          main_ref_commit_hash: currentMainSha,
+          main_ref_commit_hash: observedMainSha,
           invalidated_approval_id: approval.approval_id,
+          merge_op_id: mergeOp.merge_op_id,
         };
+      };
+
+      // Step 4: Check if `refs/heads/main` moved away from `base_main_commit_hash` (True CAS Conflict)
+      if (currentMainSha !== mc.base_main_commit_hash) {
+        return abortForTrueCasConflict(currentMainSha);
       }
 
-      // Step 5 & 6: Execute Atomic Git CAS (`git update-ref refs/heads/main <merge_candidate_hash> <base_main_commit_hash>`)
+      // Step 5: Execute Atomic Git CAS (`git update-ref refs/heads/main <merge_candidate_hash> <base_main_commit_hash>`)
+      if (input.gitBridge) {
+        const casOk = input.gitBridge.atomicCompareAndSwapMainRef(
+          mc.base_main_commit_hash,
+          mc.merge_candidate_hash
+        );
+        if (!casOk) {
+          const racedMainSha = input.gitBridge.getCurrentMainHead();
+          if (racedMainSha === mc.merge_candidate_hash) {
+            // Concurrent process already landed the exact same candidate commit -> reconcile
+            approval.status = "CONSUMED";
+            approval.consumed_at = nowIso;
+            if (linkedApprovalRequest) {
+              linkedApprovalRequest.status = "APPROVED";
+              linkedApprovalRequest.updated_at = nowIso;
+            }
+            refs.set("refs/heads/main", mc.merge_candidate_hash);
+            project.main_ref_commit_hash = mc.merge_candidate_hash;
+            project.updated_at = nowIso;
+            mc.snapshot_retention_class = "MERGED_PERMANENT";
+            mergeOp.status = "MERGED";
+            mergeOp.reconciled_after_lost_response = true;
+            mergeOp.completed_at = nowIso;
+            task.status = "MergedAndCompleted";
+            task.merged_commit_hash = mc.merge_candidate_hash;
+            task.merged_at = nowIso;
+            this.closeActiveLeasesForTask(task, "COMPLETED");
+            task.updated_at = nowIso;
+            this.insertOutboxEventInternal(
+              input.project_id,
+              "task",
+              task.task_id,
+              "task.merged_reconciled",
+              {
+                task_id: task.task_id,
+                merge_candidate_id: mc.merge_candidate_id,
+                merged_commit_hash: mc.merge_candidate_hash,
+                merge_op_id: mergeOp.merge_op_id,
+              }
+            );
+            return {
+              status: "RECONCILED_ALREADY_MERGED",
+              task_status: "MergedAndCompleted",
+              merged_commit_hash: mc.merge_candidate_hash,
+              main_ref_commit_hash: racedMainSha,
+              merge_op_id: mergeOp.merge_op_id,
+              reconciled_after_lost_response: true,
+            };
+          }
+          return abortForTrueCasConflict(racedMainSha);
+        }
+      }
+
+      // Fault-injection point: simulates lost response / DB crash AFTER Git `update-ref` already moved `refs/heads/main`!
+      // Git `refs/heads/main` holds <mc.merge_candidate_hash>; DB keeps merge_operations='IN_PROGRESS' & task='AtomicCasMerge'.
+      if (input.simulateCrashAfterGitUpdateRef) {
+        if (!input.gitBridge) {
+          refs.set("refs/heads/main", mc.merge_candidate_hash);
+          project.main_ref_commit_hash = mc.merge_candidate_hash;
+          project.updated_at = nowIso;
+        }
+        mergeOp.last_error = "ERR_SIMULATED_POST_MERGE_CRASH";
+        throw new SimulatedPostMergeCrashError(
+          `Simulated crash right after git update-ref moved refs/heads/main to ${mc.merge_candidate_hash}`,
+          mergeOp.merge_op_id
+        );
+      }
+
+      // Step 6: Commit DB state synchronously with merged Git main head
       refs.set("refs/heads/main", mc.merge_candidate_hash);
       project.main_ref_commit_hash = mc.merge_candidate_hash;
       project.updated_at = nowIso;
@@ -2249,9 +2901,17 @@ export class SoftwareFactoryControlPlaneStore {
       mc.snapshot_retention_class = "MERGED_PERMANENT";
       approval.status = "CONSUMED";
       approval.consumed_at = nowIso;
+      if (linkedApprovalRequest) {
+        linkedApprovalRequest.status = "APPROVED";
+        linkedApprovalRequest.updated_at = nowIso;
+      }
+      mergeOp.status = "MERGED";
+      mergeOp.last_error = null;
+      mergeOp.completed_at = nowIso;
       task.status = "MergedAndCompleted";
       task.merged_commit_hash = mc.merge_candidate_hash;
       task.merged_at = nowIso;
+      this.closeActiveLeasesForTask(task, "COMPLETED");
       task.updated_at = nowIso;
 
       this.insertOutboxEventInternal(
@@ -2264,6 +2924,7 @@ export class SoftwareFactoryControlPlaneStore {
           merge_candidate_id: mc.merge_candidate_id,
           merged_commit_hash: mc.merge_candidate_hash,
           approval_id: approval.approval_id,
+          merge_op_id: mergeOp.merge_op_id,
         }
       );
 
@@ -2272,8 +2933,18 @@ export class SoftwareFactoryControlPlaneStore {
         task_status: "MergedAndCompleted",
         merged_commit_hash: mc.merge_candidate_hash,
         main_ref_commit_hash: mc.merge_candidate_hash,
+        merge_op_id: mergeOp.merge_op_id,
+        reconciled_after_lost_response: false,
       };
     });
+  }
+
+  public getMainRefCommitHash(): string | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    return this.gitRefsByProject.get(currentProjectId)?.get("refs/heads/main") ?? null;
   }
 
   public getMergeCandidateById(mergeCandidateId: string): MergeCandidateRecord | null {
@@ -2288,6 +2959,20 @@ export class SoftwareFactoryControlPlaneStore {
     return { ...mc };
   }
 
+  public listMergeCandidatesForTask(taskId: string): MergeCandidateRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: MergeCandidateRecord[] = [];
+    for (const mc of this.mergeCandidates.values()) {
+      if (mc.project_id === currentProjectId && mc.task_id === taskId) {
+        list.push({ ...mc });
+      }
+    }
+    return list;
+  }
+
   public listVerificationRunsForTask(taskId: string): VerificationRunRecord[] {
     const currentProjectId = this.requireCurrentProjectId();
     if (!currentProjectId) {
@@ -2297,6 +2982,32 @@ export class SoftwareFactoryControlPlaneStore {
     for (const vr of this.verificationRuns.values()) {
       if (vr.project_id === currentProjectId && vr.task_id === taskId) {
         list.push({ ...vr });
+      }
+    }
+    return list;
+  }
+
+  public getReviewSessionById(reviewSessionId: string): ReviewSessionRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    const rs = this.reviewSessions.get(reviewSessionId);
+    if (!rs || rs.project_id !== currentProjectId) {
+      return null;
+    }
+    return { ...rs };
+  }
+
+  public listReviewSessionsForTask(taskId: string): ReviewSessionRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ReviewSessionRecord[] = [];
+    for (const rs of this.reviewSessions.values()) {
+      if (rs.project_id === currentProjectId && rs.task_id === taskId) {
+        list.push({ ...rs });
       }
     }
     return list;
@@ -2314,6 +3025,62 @@ export class SoftwareFactoryControlPlaneStore {
     return { ...ad };
   }
 
+  public listApprovalDecisionsForTask(taskId: string): ApprovalDecisionRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ApprovalDecisionRecord[] = [];
+    for (const ad of this.approvalDecisions.values()) {
+      if (ad.project_id === currentProjectId && ad.task_id === taskId) {
+        list.push({ ...ad });
+      }
+    }
+    return list;
+  }
+
+  public getApprovalRequestById(approvalRequestId: string): ApprovalRequestRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    const ar = this.approvalRequests.get(approvalRequestId);
+    if (!ar || ar.project_id !== currentProjectId) {
+      return null;
+    }
+    return { ...ar };
+  }
+
+  public getLatestApprovalRequestForCandidate(
+    mergeCandidateId: string
+  ): ApprovalRequestRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    let latest: ApprovalRequestRecord | null = null;
+    for (const ar of this.approvalRequests.values()) {
+      if (ar.project_id === currentProjectId && ar.merge_candidate_id === mergeCandidateId) {
+        latest = { ...ar };
+      }
+    }
+    return latest;
+  }
+
+  public listApprovalRequestsForTask(taskId: string): ApprovalRequestRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ApprovalRequestRecord[] = [];
+    for (const ar of this.approvalRequests.values()) {
+      if (ar.project_id === currentProjectId && ar.task_id === taskId) {
+        list.push({ ...ar });
+      }
+    }
+    return list;
+  }
+
   public getReviewArtifactById(reviewArtifactId: string): ReviewArtifactRecord | null {
     const currentProjectId = this.requireCurrentProjectId();
     if (!currentProjectId) {
@@ -2324,6 +3091,46 @@ export class SoftwareFactoryControlPlaneStore {
       return null;
     }
     return { ...ra };
+  }
+
+  public listReviewArtifactsForTask(taskId: string): ReviewArtifactRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ReviewArtifactRecord[] = [];
+    for (const ra of this.reviewArtifacts.values()) {
+      if (ra.project_id === currentProjectId && ra.task_id === taskId) {
+        list.push({ ...ra });
+      }
+    }
+    return list;
+  }
+
+  public getMergeOperationById(mergeOpId: string): MergeOperationRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    const mo = this.mergeOperations.get(mergeOpId);
+    if (!mo || mo.project_id !== currentProjectId) {
+      return null;
+    }
+    return { ...mo };
+  }
+
+  public listMergeOperationsForTask(taskId: string): MergeOperationRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: MergeOperationRecord[] = [];
+    for (const mo of this.mergeOperations.values()) {
+      if (mo.project_id === currentProjectId && mo.task_id === taskId) {
+        list.push({ ...mo });
+      }
+    }
+    return list;
   }
 
   public listOutboxEventsForProject(): OutboxEventRecord[] {

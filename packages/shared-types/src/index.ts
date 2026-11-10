@@ -321,6 +321,34 @@ export interface VerificationRunRecord {
   created_at: string;
 }
 
+export type ReviewArtifactStatus =
+  | "VALID"
+  | "INVALIDATED_STALE_CANDIDATE"
+  | "INVALIDATED_STALE_BASE";
+
+export type ReviewSessionStatus = "ACTIVE" | "COMPLETED" | "FAILED" | "REVOKED";
+
+export interface ReviewSessionRecord {
+  review_session_id: string;
+  project_id: string;
+  task_id: string;
+  merge_candidate_id: string;
+  verification_run_id: string;
+  reviewer_principal_id: string;
+  reviewer_credential_id: string;
+  reviewer_agent_profile_id: string;
+  reviewer_provider: string;
+  reviewer_model: string;
+  role: "ROLE_REVIEWER_READONLY";
+  sandbox_backend_mode: string;
+  sandbox_pid: number | null;
+  sandbox_cgroup_path: string | null;
+  cleanup_populated_zero_verified: boolean;
+  status: ReviewSessionStatus;
+  started_at: string;
+  completed_at: string | null;
+}
+
 export interface ReviewArtifactRecord {
   review_artifact_id: string;
   project_id: string;
@@ -333,15 +361,48 @@ export interface ReviewArtifactRecord {
   reviewer_principal_id: string;
   developer_session_id: string;
   reviewer_session_id: string;
+  developer_credential_id?: string | null;
+  reviewer_credential_id?: string | null;
+  developer_agent_profile_id?: string | null;
+  reviewer_agent_profile_id?: string | null;
+  review_session_id?: string | null;
   writer_provider: string;
   writer_model: string;
   reviewer_provider: string;
   reviewer_model: string;
   verdict: "PASS" | "FAIL";
+  status?: ReviewArtifactStatus;
   is_invalidated: boolean;
   invalidated_reason: string | null;
+  summary_markdown?: string | null;
+  report_sha256?: string | null;
   findings_json: ReadonlyArray<Record<string, unknown>>;
   created_at: string;
+}
+
+export type ApprovalRequestStatus =
+  | "PENDING"
+  | "APPROVED"
+  | "REJECTED"
+  | "INVALIDATED_EXPIRED"
+  | "INVALIDATED_STALE_BASE"
+  | "INVALIDATED_STALE_CANDIDATE";
+
+export interface ApprovalRequestRecord {
+  approval_request_id: string;
+  project_id: string;
+  task_id: string;
+  merge_candidate_id: string;
+  agent_commit_hash: string;
+  base_main_commit_hash: string;
+  merge_candidate_hash: string;
+  verified_tree_hash: string;
+  verification_run_id: string;
+  review_artifact_id: string;
+  status: ApprovalRequestStatus;
+  expires_at: string;
+  created_at: string;
+  updated_at: string;
 }
 
 /**
@@ -352,6 +413,7 @@ export interface ApprovalDecisionRecord {
   project_id: string;
   task_id: string;
   merge_candidate_id: string;
+  approval_request_id?: string | null;
   agent_commit_hash: string;
   base_main_commit_hash: string;
   verified_tree_hash: string;
@@ -365,6 +427,26 @@ export interface ApprovalDecisionRecord {
   approved_at: string;
   expires_at: string;
   consumed_at: string | null;
+}
+
+export type MergeOperationStatus = "IN_PROGRESS" | "MERGED" | "CAS_CONFLICT_ABORTED";
+
+export interface MergeOperationRecord {
+  merge_op_id: string;
+  project_id: string;
+  task_id: string;
+  merge_candidate_id: string;
+  approval_id: string;
+  merge_idempotency_key: string;
+  base_main_commit_hash: string;
+  merge_candidate_hash: string;
+  verified_tree_hash: string;
+  status: MergeOperationStatus;
+  reconciled_after_lost_response: boolean;
+  retry_count: number;
+  last_error: string | null;
+  created_at: string;
+  completed_at: string | null;
 }
 
 export interface OutboxEventRecord {
