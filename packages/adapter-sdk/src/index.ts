@@ -31,12 +31,13 @@ export interface AgentInvocationPlan {
 
 export interface AgentExecutionResult {
   readonly exitCode: number;
-  readonly agentCommitHash: string;
-  readonly verifiedTreeHash: string;
+  readonly agentCommitHash: string | null;
+  readonly verifiedTreeHash: string | null;
   readonly writerProvider: string;
   readonly writerModel: string;
   readonly stdoutTail: string;
   readonly stderrTail: string;
+  readonly error?: string;
 }
 
 export interface AgentRuntimeAdapter {
@@ -77,9 +78,11 @@ export interface AssembledTaskExecutionContext {
 }
 
 /**
- * TaskContextAssembler (Roadmap M2 Section 1)
+ * TaskContextAssembler (Roadmap M2 Section 1 & FIX-26)
  * Builds a clean `env -i` environment whitelist (stripping all WNA / DB / Cloud credentials)
  * and constructs deterministic task instructions bound to the TaskContract.
+ * If `ctx.hostEnvironmentToSanitize` is provided for inspection/testing, its non-whitelisted keys
+ * are inspected and confirmed discarded; forbidden keys are strictly prevented from entering `sanitizedEnv`.
  */
 export class TaskContextAssembler {
   public static assemble(ctx: AgentTaskContext): AssembledTaskExecutionContext {
@@ -106,7 +109,7 @@ export class TaskContextAssembler {
     ].join("\n");
 
     // Strictly build from an empty environment (`env -i` semantics):
-    // Never copy host/WNA secretseven if `hostEnvironmentToSanitize` contains them.
+    // Never copy host/WNA secrets even if `hostEnvironmentToSanitize` contains them.
     const sanitizedEnv: Record<string, string> = {
       PATH: "/usr/local/bin:/usr/bin:/bin",
       HOME: `/tmp/sf-task-runner-${ctx.taskId}-${ctx.leaseEpoch}`,
@@ -148,7 +151,7 @@ export class TaskContextAssembler {
 
 /**
  * First Production Coding Agent Runtime Adapter: ClaudeCodeCliAdapter (`P-010`)
- * (MVP-SPEC-03 Section 4.4 & Roadmap M2 Section 1)
+ * (MVP-SPEC-03 Section 4.4, Roadmap M2 Section 1, FIX-06)
  */
 export class ClaudeCodeCliAdapter implements AgentRuntimeAdapter {
   public readonly runtimeId = "claude-code-cli" as const;
@@ -186,13 +189,14 @@ export class ClaudeCodeCliAdapter implements AgentRuntimeAdapter {
   }
 
   public async parseExecutionResult(
-    ctx: AgentTaskContext,
+    _ctx: AgentTaskContext,
     rawExitCode: number,
     stdout: string,
     stderr: string
   ): Promise<AgentExecutionResult> {
-    let parsedCommit: string | undefined;
-    let parsedTree: string | undefined;
+    let parsedCommit: string | null = null;
+    let parsedTree: string | null = null;
+    let parseError: string | undefined;
 
     const trimmed = stdout.trim();
     if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
@@ -204,25 +208,29 @@ export class ClaudeCodeCliAdapter implements AgentRuntimeAdapter {
         if (typeof json.verified_tree_hash === "string" && /^[0-9a-f]{40}$/i.test(json.verified_tree_hash)) {
           parsedTree = json.verified_tree_hash.toLowerCase();
         }
-      } catch {
-        // Fallback to deterministic hash extraction below
+      } catch (err: unknown) {
+        parseError = `Failed to parse JSON output: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
 
-    const agentCommitHash =
-      parsedCommit ??
-      sha256Hex(`claude-p010:commit:${ctx.projectId}:${ctx.taskId}:${ctx.leaseId}:${ctx.leaseEpoch}`).slice(
-        0,
-        40
-      );
-    const verifiedTreeHash =
-      parsedTree ??
-      sha256Hex(`claude-p010:tree:${ctx.projectId}:${ctx.taskId}:${ctx.leaseEpoch}`).slice(0, 40);
+    // FIX-06: NEVER fabricate a fake commit hash with sha256Hex when output lacks a valid commit!
+    if (!parsedCommit || !parsedTree) {
+      return {
+        exitCode: rawExitCode !== 0 ? rawExitCode : 1,
+        agentCommitHash: null,
+        verifiedTreeHash: null,
+        writerProvider: this.writerProvider,
+        writerModel: this.writerModel,
+        stdoutTail: stdout.slice(-2048),
+        stderrTail: stderr.slice(-2048),
+        error: parseError ?? "Failed to parse valid 40-char commit hash and tree hash in CLI output",
+      };
+    }
 
     return {
       exitCode: rawExitCode,
-      agentCommitHash,
-      verifiedTreeHash,
+      agentCommitHash: parsedCommit,
+      verifiedTreeHash: parsedTree,
       writerProvider: this.writerProvider,
       writerModel: this.writerModel,
       stdoutTail: stdout.slice(-2048),

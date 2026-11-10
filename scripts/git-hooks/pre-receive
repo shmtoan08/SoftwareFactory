@@ -16,6 +16,12 @@ if [[ -z "${LEASE_TOKEN}" ]]; then
 fi
 
 while read -r old_sha new_sha ref_name; do
+  # Never allow ref deletion
+  if [[ "${new_sha}" =~ ^0+$ ]]; then
+    echo "ERROR [SF-PRE-RECEIVE]: Ref deletion of '${ref_name}' is forbidden." >&2
+    exit 1
+  fi
+
   # Never allow direct push to refs/heads/main from Worker transport
   if [[ ! "${ref_name}" =~ ^(refs/heads/sf/staging|refs/factory/Verify)/[0-9a-fA-F-]+/[0-9]+$ ]]; then
     echo "ERROR [SF-PRE-RECEIVE]: Push to '${ref_name}' is forbidden. Only refs/heads/sf/staging/<task_id>/<lease_epoch> or refs/factory/Verify/<task_id>/<lease_epoch> is allowed." >&2

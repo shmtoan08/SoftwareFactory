@@ -25,11 +25,12 @@ export interface SandboxSecurityMetadata {
 }
 
 /**
- * SandboxBackend Interface & Cleanup Evidence (MVP-SPEC-03 Section 4.2 & 4.3, Roadmap M2)
+ * SandboxBackend Interface & Cleanup Evidence (MVP-SPEC-03 Section 4.2 & 4.3, Roadmap M2, FIX-05, FIX-15)
  */
 export interface SandboxCleanupEvidence {
   readonly taskId: string;
   readonly leaseEpoch: number;
+  readonly backendMode: "linux-cgroup-v2" | "simulated-cgroup-v2";
   readonly cgroupPath: string;
   readonly freezeApplied: boolean;
   readonly cgroupKillWritten: boolean;
@@ -55,6 +56,18 @@ export interface SandboxBackend {
 }
 
 /**
+ * Derives a deterministic UID/GID in the user namespace (10000..29999) based on the task_id
+ * to ensure two different tasks never share the same sandbox UID (FIX-15).
+ */
+export function deriveTaskRunnerUid(taskId: string): number {
+  let hash = 0;
+  for (let i = 0; i < taskId.length; i++) {
+    hash = (hash * 31 + taskId.charCodeAt(i)) >>> 0;
+  }
+  return 10000 + (hash % 20000);
+}
+
+/**
  * Linux Cgroups v2 + Subreaper Sandbox Backend (MVP-SPEC-03 Section 4.2 & Roadmap M2)
  * Implements:
  * - WNA Supervisor running as `sf-wna` with `prctl(PR_SET_CHILD_SUBREAPER, 1)`
@@ -67,6 +80,11 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
   private reparentedOrphans: Map<string, Set<number>> = new Map();
   private securityMetadata: Map<string, SandboxSecurityMetadata> = new Map();
   private cleanupHistory: Map<string, SandboxCleanupEvidence> = new Map();
+  private readonly isRealLinux: boolean;
+
+  constructor() {
+    this.isRealLinux = process.platform === "linux" && existsSync("/sys/fs/cgroup");
+  }
 
   private key(taskId: string, leaseEpoch: number): string {
     return `${taskId}:${leaseEpoch}`;
@@ -99,12 +117,13 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
 
     const mountedWorktreePath =
       input.worktreePath ?? `/var/lib/software-factory/worktrees/${input.taskId}/epoch-${input.leaseEpoch}`;
+    const taskUid = deriveTaskRunnerUid(input.taskId);
     this.securityMetadata.set(k, {
       supervisorUser: "sf-wna",
       subreaperEnabled: true,
       sandboxUser: "sf-task-runner",
-      sandboxUid: 10000 + input.leaseEpoch,
-      sandboxGid: 10000 + input.leaseEpoch,
+      sandboxUid: taskUid,
+      sandboxGid: taskUid,
       namespaces: ["mount", "pid", "ipc", "uts"],
       mountedWorktreePath,
       ephemeralGitPushRef: `refs/heads/sf/staging/${input.taskId}/${input.leaseEpoch}`,
@@ -215,6 +234,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     const evidence: SandboxCleanupEvidence = {
       taskId,
       leaseEpoch,
+      backendMode: this.isRealLinux ? "linux-cgroup-v2" : "simulated-cgroup-v2",
       cgroupPath,
       freezeApplied: true,
       cgroupKillWritten: true,

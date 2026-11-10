@@ -464,6 +464,17 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
         agent_commit_hash: execResult.agentCommitHash,
         verified_tree_hash: execResult.verifiedTreeHash,
         parent_commit_hashes: [INITIAL_MAIN_SHA],
+        changes: [
+          {
+            path: "src/calculator.ts",
+            mode: "100644",
+            size_bytes: 120,
+            added_lines: 10,
+            deleted_lines: 0,
+            is_binary: false,
+            blob_sha: INITIAL_MAIN_SHA,
+          },
+        ],
       });
       assert.equal(pushRes.allowed, true);
 
@@ -866,6 +877,17 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       agent_commit_hash: orphanCommit,
       verified_tree_hash: orphanTree,
       parent_commit_hashes: [INITIAL_MAIN_SHA],
+      changes: [
+        {
+          path: "src/calculator.ts",
+          mode: "100644",
+          size_bytes: 120,
+          added_lines: 10,
+          deleted_lines: 0,
+          is_binary: false,
+          blob_sha: INITIAL_MAIN_SHA,
+        },
+      ],
     });
     assert.equal(pushRes.allowed, true);
 

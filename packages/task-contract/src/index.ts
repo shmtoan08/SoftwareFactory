@@ -12,13 +12,22 @@ export interface TaskContractSpec {
 
 export const DEFAULT_SYSTEM_FORBIDDEN_PATHS: readonly string[] = [
   ".git/**",
+  "**/.git/**",
   ".gitmodules",
+  "**/.gitmodules",
   ".gitattributes",
+  "**/.gitattributes",
   ".githooks/**",
+  "**/.githooks/**",
   ".github/workflows/**",
+  "**/.github/workflows/**",
   ".env*",
+  "**/.env*",
+  "**/.env.*",
   "**/*.pem",
   "**/*.key",
+  "**/id_rsa*",
+  "**/*id_rsa*",
 ];
 
 export const DEFAULT_MAX_CHANGED_FILES = 25;
@@ -40,7 +49,7 @@ export type PathPolicyVerdict =
 /**
  * Converts a POSIX glob pattern (supporting `**`, `*`, `?`) to a strict RegExp.
  */
-export function globToRegExp(globPattern: string): RegExp {
+export function globToRegExp(globPattern: string, caseInsensitive = false): RegExp {
   const normalized = globPattern.replace(/\\/g, "/").replace(/^\/+/, "");
   let regexStr = "^";
   let i = 0;
@@ -74,15 +83,16 @@ export function globToRegExp(globPattern: string): RegExp {
     i += 1;
   }
   regexStr += "$";
-  return new RegExp(regexStr);
+  return new RegExp(regexStr, caseInsensitive ? "i" : undefined);
 }
 
 export function matchesAnyGlob(
   relativePath: string,
-  patterns: readonly string[]
+  patterns: readonly string[],
+  caseInsensitive = false
 ): string | null {
   for (const pattern of patterns) {
-    if (globToRegExp(pattern).test(relativePath)) {
+    if (globToRegExp(pattern, caseInsensitive).test(relativePath)) {
       return pattern;
     }
   }
@@ -132,7 +142,8 @@ export function evaluatePathPolicyPrecedence(
     ...DEFAULT_SYSTEM_FORBIDDEN_PATHS,
     ...(contract.forbidden_paths ?? []),
   ];
-  const matchedForbidden = matchesAnyGlob(relativePath, forbiddenList);
+  // Match forbidden paths case-insensitively to prevent extension/case evasion (e.g. .PEM, .KEY, .Env)
+  const matchedForbidden = matchesAnyGlob(relativePath, forbiddenList, true);
   if (matchedForbidden !== null) {
     return {
       allowed: false,
@@ -353,6 +364,30 @@ export function validateGitTreeImport(
   };
 }
 
+function parseNumstatPath(rawPath: string): { oldPath?: string; newPath: string } {
+  // Case 1: prefix{old => new}suffix or {old => new}
+  const braceMatch = rawPath.match(/^(.*?)\{(.*?)\s*=>\s*(.*?)\}(.*)$/);
+  if (braceMatch) {
+    const prefix = braceMatch[1]!;
+    const oldPart = braceMatch[2]!;
+    const newPart = braceMatch[3]!;
+    const suffix = braceMatch[4]!;
+    return {
+      oldPath: `${prefix}${oldPart}${suffix}`.replace(/\/+/g, "/").replace(/^\/+/, ""),
+      newPath: `${prefix}${newPart}${suffix}`.replace(/\/+/g, "/").replace(/^\/+/, ""),
+    };
+  }
+  // Case 2: old => new
+  const arrowMatch = rawPath.match(/^(.*?)\s*=>\s*(.*?)$/);
+  if (arrowMatch) {
+    return {
+      oldPath: arrowMatch[1]!.trim().replace(/^\/+/, ""),
+      newPath: arrowMatch[2]!.trim().replace(/^\/+/, ""),
+    };
+  }
+  return { newPath: rawPath.trim().replace(/^\/+/, "") };
+}
+
 /**
  * Inspects a real Git repository on disk (`git rev-list`, `git rev-parse`, `git diff-tree`)
  * and constructs a `GitTreeImportCandidateInput` for `validateGitTreeImport` (Milestone M2).
@@ -363,11 +398,13 @@ export function inspectRealGitCommitForImport(options: {
   agentCommitHash: string;
   contract: TaskContractSpec;
 }): GitTreeImportCandidateInput {
-  const git = (args: string[]): string =>
+  const git = (args: string[], inputStdin?: string): string =>
     execFileSync("git", args, {
       cwd: options.repoPath,
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: inputStdin !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+      input: inputStdin,
+      timeout: 10_000,
     }).trim();
 
   // 1. Extract commit + parents (`<commit> <parent1> ...`)
@@ -404,18 +441,55 @@ export function inspectRealGitCommitForImport(options: {
     if (cols.length >= 3) {
       const addedRaw = cols[0]!;
       const deletedRaw = cols[1]!;
-      const targetPath = cols[cols.length - 1]!;
+      const rawPath = cols[cols.length - 1]!;
       const isBinary = addedRaw === "-" || deletedRaw === "-";
-      numstatByPath.set(targetPath, {
+      const statObj = {
         added: isBinary ? 0 : Number.parseInt(addedRaw, 10) || 0,
         deleted: isBinary ? 0 : Number.parseInt(deletedRaw, 10) || 0,
         isBinary,
-      });
+      };
+      numstatByPath.set(rawPath, statObj);
+      const parsed = parseNumstatPath(rawPath);
+      numstatByPath.set(parsed.newPath, statObj);
+      if (parsed.oldPath) {
+        numstatByPath.set(parsed.oldPath, statObj);
+      }
+    }
+  }
+
+  // Pre-fetch all blob sizes in one batch with `git cat-file --batch-check`
+  const rawLines = rawOutput.split("\n").filter(Boolean);
+  const blobShasToQuery: string[] = [];
+  for (const line of rawLines) {
+    const [metaPart] = line.split("\t");
+    if (!metaPart) continue;
+    const metaTokens = metaPart.replace(/^:/, "").split(/\s+/);
+    const newMode = metaTokens[1] ?? "100644";
+    const newBlobSha = metaTokens[3] ?? "0000000000000000000000000000000000000000";
+    if (newMode !== "000000" && newMode !== "160000" && !/^0+$/.test(newBlobSha)) {
+      blobShasToQuery.push(newBlobSha);
+    }
+  }
+
+  const blobSizeBySha = new Map<string, number>();
+  if (blobShasToQuery.length > 0) {
+    try {
+      const batchCheckOut = git(["cat-file", "--batch-check"], blobShasToQuery.join("\n") + "\n");
+      for (const line of batchCheckOut.split("\n").filter(Boolean)) {
+        const tokens = line.split(" ");
+        if (tokens.length >= 3) {
+          const sha = tokens[0]!;
+          const size = Number.parseInt(tokens[2]!, 10) || 0;
+          blobSizeBySha.set(sha, size);
+        }
+      }
+    } catch {
+      // Fallback on single cat-file if batch-check fails
     }
   }
 
   const changes: GitTreeChangeEntry[] = [];
-  for (const line of rawOutput.split("\n").filter(Boolean)) {
+  for (const line of rawLines) {
     const [metaPart, ...pathParts] = line.split("\t");
     if (!metaPart || pathParts.length === 0) {
       continue;
@@ -433,11 +507,16 @@ export function inspectRealGitCommitForImport(options: {
     const effectiveMode = newMode === "000000" ? oldMode : newMode;
     let sizeBytes = 0;
     if (newMode !== "000000" && newMode !== "160000" && !/^0+$/.test(newBlobSha)) {
-      const sizeStr = git(["cat-file", "-s", newBlobSha]);
-      sizeBytes = Number.parseInt(sizeStr, 10) || 0;
+      sizeBytes =
+        blobSizeBySha.get(newBlobSha) ??
+        (Number.parseInt(git(["cat-file", "-s", newBlobSha]), 10) || 0);
     }
 
-    const stat = numstatByPath.get(targetPath) ?? { added: 0, deleted: 0, isBinary: false };
+    const stat =
+      numstatByPath.get(targetPath) ??
+      (oldPath ? numstatByPath.get(oldPath) : undefined) ??
+      { added: 0, deleted: 0, isBinary: false };
+
     changes.push({
       path: targetPath,
       ...(oldPath !== undefined ? { old_path: oldPath } : {}),

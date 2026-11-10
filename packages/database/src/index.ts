@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type ApprovalDecisionRecord,
   type LeaseStatus,
@@ -36,6 +37,14 @@ export interface RlsSessionContext {
   currentProjectId: string | null;
   currentPrincipalId: string | null;
   currentRole: AppSessionRole;
+}
+
+export interface ProjectMembershipRecord {
+  membership_id: string;
+  project_id: string;
+  principal_id: string;
+  member_role: "PROJECT_ADMIN" | "APPROVER" | "DEVELOPER" | "VIEWER";
+  created_at: string;
 }
 
 export class PostgresRlsError extends Error {
@@ -78,7 +87,8 @@ export interface CasMergeResult {
  */
 export class SoftwareFactoryControlPlaneStore {
   private clockFn: () => Date;
-  private activeSession: RlsSessionContext = {
+  private readonly asyncLocalStorage = new AsyncLocalStorage<RlsSessionContext>();
+  private defaultSession: RlsSessionContext = {
     currentProjectId: null,
     currentPrincipalId: null,
     currentRole: "anonymous",
@@ -89,9 +99,12 @@ export class SoftwareFactoryControlPlaneStore {
 
   // Tables
   private projects: Map<string, ProjectRecord> = new Map();
+  private projectMemberships: Map<string, ProjectMembershipRecord> = new Map();
   private tasks: Map<string, TaskRecord> = new Map();
   private taskLeases: Map<string, TaskLeaseRecord> = new Map();
   private processedWorkerEvents: Map<string, ProcessedWorkerEventRecord> = new Map();
+  private processedEventsByIdempotencyKey: Map<string, ProcessedWorkerEventRecord> = new Map();
+  private processedEventsByLeaseSeq: Map<string, ProcessedWorkerEventRecord> = new Map();
   private verifiedCodeImports: Map<string, VerifiedCodeImportRecord> = new Map();
   private mergeCandidates: Map<string, MergeCandidateRecord> = new Map();
   private verificationRuns: Map<string, VerificationRunRecord> = new Map();
@@ -129,28 +142,23 @@ export class SoftwareFactoryControlPlaneStore {
 
   /**
    * Simulates `BEGIN; SET LOCAL app.current_project_id = ...; ... COMMIT; DISCARD ALL;`
-   * Guarantees RLS-T6 (Connection Pool Reuse Safety: session context is always reset in `finally`).
+   * Guarantees RLS-T6 (Connection Pool Reuse Safety: session context is always reset in `finally` via AsyncLocalStorage).
    */
   public async withRlsTransaction<T>(
     ctx: Partial<RlsSessionContext>,
     fn: () => Promise<T> | T
   ): Promise<T> {
-    const previousSession = { ...this.activeSession };
-    this.activeSession = {
-      currentProjectId: ctx.currentProjectId ?? null,
-      currentPrincipalId: ctx.currentPrincipalId ?? null,
-      currentRole: ctx.currentRole ?? "anonymous",
+    const parentSession = this.getCurrentRlsSession();
+    const session: RlsSessionContext = {
+      currentProjectId: ctx.currentProjectId !== undefined ? ctx.currentProjectId : parentSession.currentProjectId,
+      currentPrincipalId: ctx.currentPrincipalId !== undefined ? ctx.currentPrincipalId : parentSession.currentPrincipalId,
+      currentRole: ctx.currentRole !== undefined ? ctx.currentRole : parentSession.currentRole,
     };
-    try {
-      return await fn();
-    } finally {
-      // Simulates transaction end + DISCARD ALL on connection return to pool
-      this.activeSession = previousSession;
-    }
+    return this.asyncLocalStorage.run(session, fn);
   }
 
   public discardAllSessionState(): void {
-    this.activeSession = {
+    this.defaultSession = {
       currentProjectId: null,
       currentPrincipalId: null,
       currentRole: "anonymous",
@@ -158,11 +166,11 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   public getCurrentRlsSession(): RlsSessionContext {
-    return { ...this.activeSession };
+    return this.asyncLocalStorage.getStore() ?? { ...this.defaultSession };
   }
 
   private requireCurrentProjectId(): string | null {
-    const pid = this.activeSession.currentProjectId;
+    const pid = this.getCurrentRlsSession().currentProjectId;
     if (!pid || pid.trim() === "") {
       return null;
     }
@@ -170,8 +178,9 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   private assertWritePermissionForProject(targetProjectId: string): void {
-    const currentProjectId = this.requireCurrentProjectId();
-    const role = this.activeSession.currentRole;
+    const session = this.getCurrentRlsSession();
+    const currentProjectId = session.currentProjectId;
+    const role = session.currentRole;
     if (
       !currentProjectId ||
       currentProjectId !== targetProjectId ||
@@ -189,6 +198,7 @@ export class SoftwareFactoryControlPlaneStore {
   /**
    * Row-level lock serializer: ensures concurrent operations on the same task/lease
    * execute in strict serialized order (`FOR UPDATE OF l, t`).
+   * Cleans up idle entries in `lockQueues` to avoid memory leaks (FIX-19).
    */
   private async withSerializedLock<T>(lockKey: string, fn: () => Promise<T> | T): Promise<T> {
     const prev = this.lockQueues.get(lockKey) ?? Promise.resolve();
@@ -196,12 +206,16 @@ export class SoftwareFactoryControlPlaneStore {
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.lockQueues.set(lockKey, prev.then(() => next));
+    const nextQueue = prev.then(() => next);
+    this.lockQueues.set(lockKey, nextQueue);
     await prev;
     try {
       return await fn();
     } finally {
       release();
+      if (this.lockQueues.get(lockKey) === nextQueue) {
+        this.lockQueues.delete(lockKey);
+      }
     }
   }
 
@@ -217,7 +231,7 @@ export class SoftwareFactoryControlPlaneStore {
     initial_main_commit_hash: string;
     initial_main_tree_hash?: string;
   }): ProjectRecord {
-    if (this.activeSession.currentRole !== "system_admin_role") {
+    if (this.getCurrentRlsSession().currentRole !== "system_admin_role") {
       throw new PostgresRlsError("42501", "Only system_admin_role can insert into projects");
     }
     const now = this.clockTimestampIso();
@@ -249,6 +263,30 @@ export class SoftwareFactoryControlPlaneStore {
     });
     this.gitCommitsByProject.set(project_id, commits);
     return { ...record };
+  }
+
+  public addProjectMembership(input: {
+    project_id: string;
+    principal_id: string;
+    member_role: "PROJECT_ADMIN" | "APPROVER" | "DEVELOPER" | "VIEWER";
+  }): ProjectMembershipRecord {
+    const role = this.getCurrentRlsSession().currentRole;
+    if (role !== "system_admin_role" && role !== "core_api_service") {
+      throw new PostgresRlsError("42501", "Insufficient privilege to add project membership");
+    }
+    const membership: ProjectMembershipRecord = {
+      membership_id: randomUUID(),
+      project_id: input.project_id,
+      principal_id: input.principal_id,
+      member_role: input.member_role,
+      created_at: this.clockTimestampIso(),
+    };
+    this.projectMemberships.set(`${input.project_id}:${input.principal_id}`, membership);
+    return { ...membership };
+  }
+
+  public getProjectMembership(projectId: string, principalId: string): ProjectMembershipRecord | null {
+    return this.projectMemberships.get(`${projectId}:${principalId}`) ?? null;
   }
 
   public createTask(input: {
@@ -319,7 +357,7 @@ export class SoftwareFactoryControlPlaneStore {
    */
   public updateTaskTitleRls(taskId: string, newTitle: string): number {
     const currentProjectId = this.requireCurrentProjectId();
-    const role = this.activeSession.currentRole;
+    const role = this.getCurrentRlsSession().currentRole;
     if (!currentProjectId || (role !== "core_api_service" && role !== "gateway_service")) {
       return 0;
     }
@@ -505,52 +543,7 @@ export class SoftwareFactoryControlPlaneStore {
         };
       }
 
-      // Step 2: Check Idempotent Retry FIRST if this exact event was already processed
-      for (const existing of this.processedWorkerEvents.values()) {
-        if (
-          existing.project_id === envelope.project_id &&
-          (existing.event_idempotency_key === envelope.event_idempotency_key ||
-            (existing.lease_id === envelope.lease_id && existing.sequence_no === envelope.sequence_no))
-        ) {
-          const computedSha = computeCanonicalPayloadSha256(envelope.payload);
-          if (
-            existing.event_idempotency_key === envelope.event_idempotency_key &&
-            existing.payload_sha256 === envelope.payload_sha256 &&
-            existing.payload_sha256 === computedSha &&
-            existing.sequence_no === envelope.sequence_no &&
-            existing.event_type === envelope.event_type
-          ) {
-            return {
-              http_status: 200,
-              ack_status: "DUPLICATE_RETRY_NOP",
-              lease_id: lease.lease_id,
-              lease_epoch: lease.lease_epoch,
-              lease_status: lease.status,
-              acked_sequence_no: existing.sequence_no,
-              expected_next_seq: lease.last_processed_seq + 1,
-              task_status: task.status,
-              lease_expires_at: lease.status === "ACTIVE" ? lease.expires_at : null,
-              server_clock_timestamp: nowIso,
-            };
-          }
-
-          return {
-            http_status: 409,
-            ack_status: "REJECTED_CONFLICT_PAYLOAD",
-            lease_id: lease.lease_id,
-            lease_epoch: lease.lease_epoch,
-            lease_status: lease.status,
-            acked_sequence_no: lease.last_processed_seq,
-            expected_next_seq: lease.last_processed_seq + 1,
-            task_status: task.status,
-            lease_expires_at: lease.status === "ACTIVE" ? lease.expires_at : null,
-            server_clock_timestamp: nowIso,
-            error_code: "ERR_IDEMPOTENCY_PAYLOAD_MISMATCH",
-          };
-        }
-      }
-
-      // Step 1: Verify Lease Authority & Real-Time Expiry (`clock_timestamp()`)
+      // Step 1: Verify Lease Authority, Worker Fencing & Real-Time Expiry (`clock_timestamp()`) FIRST (FIX-04)
       const expiresAtMs = new Date(lease.expires_at).getTime();
       const isExpiredNow = expiresAtMs <= nowDate.getTime();
       if (isExpiredNow && lease.status === "ACTIVE") {
@@ -565,6 +558,7 @@ export class SoftwareFactoryControlPlaneStore {
       }
 
       if (
+        lease.worker_id !== envelope.worker_id ||
         lease.status !== "ACTIVE" ||
         lease.revoked_at !== null ||
         isExpiredNow ||
@@ -584,6 +578,53 @@ export class SoftwareFactoryControlPlaneStore {
           lease_expires_at: null,
           server_clock_timestamp: nowIso,
           error_code: "ERR_STALE_LEASE",
+        };
+      }
+
+      // Step 2: Check Idempotent Retry via Indexed Lookup (FIX-20)
+      const existing =
+        this.processedEventsByIdempotencyKey.get(
+          `${envelope.project_id}:${envelope.event_idempotency_key}`
+        ) ??
+        this.processedEventsByLeaseSeq.get(
+          `${envelope.lease_id}:${envelope.sequence_no}`
+        );
+
+      if (existing) {
+        const computedSha = computeCanonicalPayloadSha256(envelope.payload);
+        if (
+          existing.event_idempotency_key === envelope.event_idempotency_key &&
+          existing.payload_sha256 === envelope.payload_sha256 &&
+          existing.payload_sha256 === computedSha &&
+          existing.sequence_no === envelope.sequence_no &&
+          existing.event_type === envelope.event_type
+        ) {
+          return {
+            http_status: 200,
+            ack_status: "DUPLICATE_RETRY_NOP",
+            lease_id: lease.lease_id,
+            lease_epoch: lease.lease_epoch,
+            lease_status: lease.status,
+            acked_sequence_no: existing.sequence_no,
+            expected_next_seq: lease.last_processed_seq + 1,
+            task_status: task.status,
+            lease_expires_at: lease.status === "ACTIVE" ? lease.expires_at : null,
+            server_clock_timestamp: nowIso,
+          };
+        }
+
+        return {
+          http_status: 409,
+          ack_status: "REJECTED_CONFLICT_PAYLOAD",
+          lease_id: lease.lease_id,
+          lease_epoch: lease.lease_epoch,
+          lease_status: lease.status,
+          acked_sequence_no: lease.last_processed_seq,
+          expected_next_seq: lease.last_processed_seq + 1,
+          task_status: task.status,
+          lease_expires_at: lease.status === "ACTIVE" ? lease.expires_at : null,
+          server_clock_timestamp: nowIso,
+          error_code: "ERR_IDEMPOTENCY_PAYLOAD_MISMATCH",
         };
       }
 
@@ -657,6 +698,14 @@ export class SoftwareFactoryControlPlaneStore {
         processed_at: nowIso,
       };
       this.processedWorkerEvents.set(eventRecord.event_id, eventRecord);
+      this.processedEventsByIdempotencyKey.set(
+        `${envelope.project_id}:${envelope.event_idempotency_key}`,
+        eventRecord
+      );
+      this.processedEventsByLeaseSeq.set(
+        `${envelope.lease_id}:${envelope.sequence_no}`,
+        eventRecord
+      );
 
       lease.last_processed_seq = envelope.sequence_no;
       lease.last_heartbeat_at = nowIso;
@@ -781,11 +830,11 @@ export class SoftwareFactoryControlPlaneStore {
     reason?: string;
     import_id?: string;
   } {
-    // Step 1a: Fail-Closed on Control Plane / DB outage or > 2000ms timeout
-    if (
-      input.simulateControlPlaneOutage === true ||
-      (input.simulatedGatekeeperLatencyMs !== undefined && input.simulatedGatekeeperLatencyMs > 2000)
-    ) {
+    const startMs = Date.now();
+
+    // Step 1a: Fail-Closed on Control Plane / DB outage or > 2000ms timeout (FIX-16)
+    const simulatedLatency = input.simulatedGatekeeperLatencyMs ?? 0;
+    if (input.simulateControlPlaneOutage === true || simulatedLatency > 2000) {
       return {
         allowed: false,
         error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
@@ -835,6 +884,16 @@ export class SoftwareFactoryControlPlaneStore {
       };
     }
 
+    // Reject pushes that omit changes metadata (FIX-10)
+    if (!input.changes) {
+      return {
+        allowed: false,
+        error_code: "ERR_GATEKEEPER_MISSING_CHANGES",
+        reason:
+          "Pre-receive denied: Git changes manifest is required for TrustedImportValidator verification",
+      };
+    }
+
     // Step 2-6: Execute 6-Step TrustedImportValidator right at pre-receive hook
     const contract = task.task_contract_json as unknown as TaskContractSpec;
     const validation = validateGitTreeImport({
@@ -842,7 +901,7 @@ export class SoftwareFactoryControlPlaneStore {
       verified_tree_hash: input.verified_tree_hash,
       parent_commit_hashes: input.parent_commit_hashes,
       expected_base_main_commit_hash: task.base_main_commit_hash,
-      changes: input.changes ?? [],
+      changes: input.changes,
       contract,
     });
 
@@ -851,6 +910,15 @@ export class SoftwareFactoryControlPlaneStore {
         allowed: false,
         error_code: validation.error_code,
         reason: `TrustedImportValidator rejected push at pre-receive: [${validation.error_code}] ${validation.message}`,
+      };
+    }
+
+    const totalElapsedMs = (Date.now() - startMs) + simulatedLatency;
+    if (totalElapsedMs > 2000) {
+      return {
+        allowed: false,
+        error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+        reason: `Pre-receive hard timeout exceeded: execution took ${totalElapsedMs}ms (> 2000ms)`,
       };
     }
 
@@ -865,30 +933,28 @@ export class SoftwareFactoryControlPlaneStore {
 
     // Record immediately in `verified_code_imports` when changes were validated at pre-receive (M2 P0-4)
     let recordedImportId: string | undefined;
-    if (input.changes !== undefined) {
-      const existingImport = this.findVerifiedImportByLeaseAndCommit(
-        lease.lease_id,
-        input.agent_commit_hash
-      );
-      if (existingImport) {
-        recordedImportId = existingImport.import_id;
-      } else {
-        const importRecord: VerifiedCodeImportRecord = {
-          import_id: randomUUID(),
-          project_id: input.project_id,
-          task_id: input.task_id,
-          lease_id: lease.lease_id,
-          lease_epoch: lease.lease_epoch,
-          agent_commit_hash: validation.agent_commit_hash,
-          verified_tree_hash: validation.verified_tree_hash,
-          staging_ref: input.staging_ref,
-          changed_files_count: validation.changed_files_count,
-          deleted_lines_count: validation.deleted_lines_count,
-          created_at: this.clockTimestampIso(),
-        };
-        this.verifiedCodeImports.set(importRecord.import_id, importRecord);
-        recordedImportId = importRecord.import_id;
-      }
+    const existingImport = this.findVerifiedImportByLeaseAndCommit(
+      lease.lease_id,
+      input.agent_commit_hash
+    );
+    if (existingImport) {
+      recordedImportId = existingImport.import_id;
+    } else {
+      const importRecord: VerifiedCodeImportRecord = {
+        import_id: randomUUID(),
+        project_id: input.project_id,
+        task_id: input.task_id,
+        lease_id: lease.lease_id,
+        lease_epoch: lease.lease_epoch,
+        agent_commit_hash: validation.agent_commit_hash,
+        verified_tree_hash: validation.verified_tree_hash,
+        staging_ref: input.staging_ref,
+        changed_files_count: validation.changed_files_count,
+        deleted_lines_count: validation.deleted_lines_count,
+        created_at: this.clockTimestampIso(),
+      };
+      this.verifiedCodeImports.set(importRecord.import_id, importRecord);
+      recordedImportId = importRecord.import_id;
     }
 
     return {
@@ -909,11 +975,16 @@ export class SoftwareFactoryControlPlaneStore {
     return undefined;
   }
 
-  private findLatestVerifiedImportByLease(leaseId: string): VerifiedCodeImportRecord | undefined {
+  private findLatestVerifiedImportByLease(
+    leaseId: string,
+    stagingRef?: string
+  ): VerifiedCodeImportRecord | undefined {
     let latest: VerifiedCodeImportRecord | undefined;
     for (const rec of this.verifiedCodeImports.values()) {
-      if (rec.lease_id === leaseId) {
-        latest = rec;
+      if (rec.lease_id === leaseId && (!stagingRef || rec.staging_ref === stagingRef)) {
+        if (!latest || new Date(rec.created_at).getTime() >= new Date(latest.created_at).getTime()) {
+          latest = rec;
+        }
       }
     }
     return latest;
@@ -1012,7 +1083,10 @@ export class SoftwareFactoryControlPlaneStore {
             }
 
             // Path A (M2): Check if pre-receive hook already recorded a VerifiedCodeImportRecord for this lease!
-            const preRecordedImport = this.findLatestVerifiedImportByLease(lease.lease_id);
+            const expectedStagingRef = `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`;
+            const preRecordedImport =
+              this.findLatestVerifiedImportByLease(lease.lease_id, expectedStagingRef) ??
+              this.findLatestVerifiedImportByLease(lease.lease_id);
             if (preRecordedImport) {
               lease.status = "COMPLETED";
               lease.completed_at = nowIso;
@@ -1199,6 +1273,21 @@ export class SoftwareFactoryControlPlaneStore {
       throw new PostgresRlsError("23503", "Task or VerifiedCodeImport not found for project");
     }
 
+    // Verify import belongs to this task (FIX-12)
+    if (imp.task_id !== input.task_id) {
+      throw new PostgresRlsError("23503", "Import does not belong to the specified task");
+    }
+
+    // Verify candidate base matches current main ref (FIX-12)
+    const refs = this.gitRefsByProject.get(input.project_id);
+    const currentMainSha = refs?.get("refs/heads/main");
+    if (currentMainSha && input.base_main_commit_hash !== currentMainSha) {
+      throw new PostgresRlsError(
+        "23514",
+        `Candidate base_main_commit_hash ${input.base_main_commit_hash} does not match current main ${currentMainSha}`
+      );
+    }
+
     const nowIso = this.clockTimestampIso();
 
     // Supersede any existing candidates for this task and invalidate their reviews & approvals
@@ -1220,7 +1309,7 @@ export class SoftwareFactoryControlPlaneStore {
       agent_commit_hash: imp.agent_commit_hash,
       base_main_commit_hash: input.base_main_commit_hash,
       merge_candidate_hash: input.merge_candidate_hash,
-      verified_tree_hash: input.verified_tree_hash,
+      verified_tree_hash: imp.verified_tree_hash,
       is_superseded: false,
       created_at: nowIso,
     };
@@ -1230,7 +1319,7 @@ export class SoftwareFactoryControlPlaneStore {
     const commits = this.gitCommitsByProject.get(input.project_id);
     commits?.set(input.merge_candidate_hash, {
       commitHash: input.merge_candidate_hash,
-      treeHash: input.verified_tree_hash,
+      treeHash: candidate.verified_tree_hash,
       parents: [input.base_main_commit_hash, imp.agent_commit_hash],
       taskId: input.task_id,
       mergeCandidateId: candidate.merge_candidate_id,
@@ -1316,6 +1405,7 @@ export class SoftwareFactoryControlPlaneStore {
   /**
    * 3D Independent Reviewer Artifact Recording (MVP-SPEC-04 Section 2)
    * Enforces `chk_independent_reviewer_model`: `(writer_provider, writer_model) IS DISTINCT FROM (reviewer_provider, reviewer_model)`.
+   * Enforces `chk_independent_reviewer_principal`: developer and reviewer must be distinct principals (FIX-03).
    */
   public recordReviewArtifact(input: {
     project_id: string;
@@ -1328,12 +1418,16 @@ export class SoftwareFactoryControlPlaneStore {
     writer_model: string;
     reviewer_provider: string;
     reviewer_model: string;
+    developer_principal_id?: string;
+    reviewer_principal_id?: string;
+    developer_session_id?: string;
+    reviewer_session_id?: string;
     verdict: "PASS" | "FAIL";
     findings_json?: ReadonlyArray<Record<string, unknown>>;
   }): ReviewArtifactRecord {
     this.assertWritePermissionForProject(input.project_id);
 
-    // Dimension 1: Identity Independence Check (DB CHECK constraint equivalent)
+    // Dimension 1: Model Identity Independence Check
     if (
       input.writer_provider.trim().toLowerCase() === input.reviewer_provider.trim().toLowerCase() &&
       input.writer_model.trim().toLowerCase() === input.reviewer_model.trim().toLowerCase()
@@ -1341,6 +1435,28 @@ export class SoftwareFactoryControlPlaneStore {
       throw new PostgresRlsError(
         "23514",
         `new row for relation "review_artifacts" violates check constraint "chk_independent_reviewer_model": writer (${input.writer_provider}/${input.writer_model}) must be distinct from reviewer (${input.reviewer_provider}/${input.reviewer_model})`
+      );
+    }
+
+    // Dimension 2: Principal Identity Independence Check (FIX-03)
+    const devPrincipal = input.developer_principal_id ?? "agent-writer-principal";
+    const revPrincipal = input.reviewer_principal_id ?? "reviewer-principal";
+    if (devPrincipal.trim().toLowerCase() === revPrincipal.trim().toLowerCase()) {
+      throw new PostgresRlsError(
+        "23514",
+        `new row violates check constraint "chk_independent_reviewer_principal": developer (${devPrincipal}) must be distinct from reviewer (${revPrincipal})`
+      );
+    }
+
+    // Dimension 3: Session Independence Check (FIX-03)
+    if (
+      input.developer_session_id &&
+      input.reviewer_session_id &&
+      input.developer_session_id === input.reviewer_session_id
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `new row violates check constraint "chk_independent_reviewer_session": developer session (${input.developer_session_id}) must be distinct from reviewer session`
       );
     }
 
@@ -1378,6 +1494,10 @@ export class SoftwareFactoryControlPlaneStore {
       writer_model: input.writer_model,
       reviewer_provider: input.reviewer_provider,
       reviewer_model: input.reviewer_model,
+      developer_principal_id: devPrincipal,
+      reviewer_principal_id: revPrincipal,
+      developer_session_id: input.developer_session_id ?? null,
+      reviewer_session_id: input.reviewer_session_id ?? null,
       verdict: input.verdict,
       is_invalidated: false,
       invalidated_reason: null,
@@ -1410,10 +1530,37 @@ export class SoftwareFactoryControlPlaneStore {
   }): ApprovalDecisionRecord {
     this.assertWritePermissionForProject(input.project_id);
 
+    // Verify approver membership authorization if project has configured members (FIX-11)
+    const membership = this.getProjectMembership(input.project_id, input.approver_principal_id);
+    if (membership && membership.member_role !== "APPROVER" && membership.member_role !== "PROJECT_ADMIN") {
+      throw new PostgresRlsError(
+        "42501",
+        `Principal ${input.approver_principal_id} with role ${membership.member_role} is not authorized to approve in project ${input.project_id}`
+      );
+    }
+
     const mc = this.mergeCandidates.get(input.merge_candidate_id);
     const ra = this.reviewArtifacts.get(input.review_artifact_id);
     const vr = this.verificationRuns.get(input.verification_run_id);
     const task = this.tasks.get(input.task_id);
+
+    // Enforce maximum 1 ACTIVE approval per candidate (FIX-11 / uq_one_active_approval_per_candidate)
+    for (const ad of this.approvalDecisions.values()) {
+      if (ad.merge_candidate_id === input.merge_candidate_id && ad.status === "ACTIVE") {
+        throw new PostgresRlsError(
+          "23505",
+          `An ACTIVE approval already exists for merge candidate ${input.merge_candidate_id}`
+        );
+      }
+    }
+
+    // Enforce task status is REVIEWED_PASS before receiving human approval (FIX-11)
+    if (task && task.status !== "REVIEWED_PASS") {
+      throw new PostgresRlsError(
+        "23514",
+        `Task must be in REVIEWED_PASS status to receive human approval, got ${task.status}`
+      );
+    }
 
     // Enforce Composite Foreign Key fk_ad_candidate_8fields & fk_ad_review_binding (RLS-T8)
     if (
@@ -1435,7 +1582,8 @@ export class SoftwareFactoryControlPlaneStore {
       ra.merge_candidate_hash !== input.merge_candidate_hash ||
       ra.verified_tree_hash !== input.verified_tree_hash ||
       ra.is_invalidated ||
-      ra.verdict !== "PASS"
+      ra.verdict !== "PASS" ||
+      vr.verdict !== "PASS"
     ) {
       throw new PostgresRlsError(
         "23503",
@@ -1461,7 +1609,7 @@ export class SoftwareFactoryControlPlaneStore {
       merge_candidate_hash: input.merge_candidate_hash,
       verification_run_id: input.verification_run_id,
       review_artifact_id: input.review_artifact_id,
-      approver_Principal_id: input.approver_principal_id,
+      approver_principal_id: input.approver_principal_id,
       decision: input.decision,
       status: "ACTIVE",
       invalidated_reason: null,
@@ -1520,6 +1668,17 @@ export class SoftwareFactoryControlPlaneStore {
         throw new Error("Missing project, task, merge_candidate, or approval_decision for CAS merge");
       }
 
+      // Step 0: Enforce approval decision & binding (FIX-01)
+      if (approval.decision !== "APPROVED") {
+        throw new Error(`Cannot merge candidate with decision ${approval.decision}`);
+      }
+      if (approval.task_id !== input.task_id || approval.merge_candidate_id !== input.merge_candidate_id) {
+        throw new Error("Approval decision does not bind to the specified task and merge candidate");
+      }
+      if (task.status !== "APPROVED" && task.status !== "MERGED") {
+        throw new Error(`Task must be in APPROVED status for CAS merge, current status is ${task.status}`);
+      }
+
       const currentMainSha = refs.get("refs/heads/main")!;
 
       // Step 1: If DB already recorded MERGED, return idempotently
@@ -1535,8 +1694,10 @@ export class SoftwareFactoryControlPlaneStore {
       // Step 2: Check if Git `refs/heads/main` ALREADY contains `merge_candidate_hash`
       // (Recovering from crash after Git CAS succeeded but before DB commit completed!)
       if (currentMainSha === mc.merge_candidate_hash) {
-        approval.status = "CONSUMED";
-        approval.consumed_at = nowIso;
+        if (approval.status === "ACTIVE") {
+          approval.status = "CONSUMED";
+          approval.consumed_at = nowIso;
+        }
         task.status = "MERGED";
         task.merged_commit_hash = mc.merge_candidate_hash;
         task.merged_at = nowIso;
@@ -1567,8 +1728,10 @@ export class SoftwareFactoryControlPlaneStore {
         approval.status !== "ACTIVE" ||
         new Date(approval.expires_at).getTime() <= nowDate.getTime()
       ) {
-        approval.status = "EXPIRED";
-        approval.invalidated_reason = "APPROVAL_TTL_EXPIRED";
+        if (approval.status === "ACTIVE") {
+          approval.status = "EXPIRED";
+          approval.invalidated_reason = "APPROVAL_TTL_EXPIRED";
+        }
         task.status = "REVIEWED_PASS";
         task.updated_at = nowIso;
 

@@ -205,6 +205,10 @@ CREATE TABLE IF NOT EXISTS review_artifacts (
   writer_model TEXT NOT NULL,
   reviewer_provider TEXT NOT NULL,
   reviewer_model TEXT NOT NULL,
+  developer_principal_id TEXT NOT NULL,
+  reviewer_principal_id TEXT NOT NULL,
+  developer_session_id TEXT NULL,
+  reviewer_session_id TEXT NULL,
   verdict TEXT NOT NULL CHECK (verdict IN ('PASS', 'FAIL')),
   is_invalidated BOOLEAN NOT NULL DEFAULT FALSE,
   invalidated_reason TEXT NULL,
@@ -212,6 +216,12 @@ CREATE TABLE IF NOT EXISTS review_artifacts (
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   CONSTRAINT chk_independent_reviewer_model CHECK (
     (writer_provider, writer_model) IS DISTINCT FROM (reviewer_provider, reviewer_model)
+  ),
+  CONSTRAINT chk_independent_reviewer_principal CHECK (
+    developer_principal_id IS DISTINCT FROM reviewer_principal_id
+  ),
+  CONSTRAINT chk_independent_reviewer_session CHECK (
+    developer_session_id IS NULL OR reviewer_session_id IS NULL OR developer_session_id IS DISTINCT FROM reviewer_session_id
   ),
   CONSTRAINT fk_ra_verification FOREIGN KEY (
     verification_run_id, project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash
@@ -261,7 +271,7 @@ CREATE TABLE IF NOT EXISTS approval_decisions (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_one_active_approval_per_candidate
   ON approval_decisions (merge_candidate_id)
-  WHERE status = 'ACTIVE' AND decision = 'APPROVED';
+  WHERE status = 'ACTIVE';
 
 -- 6. Tier 4 — System Operational Outbox & Audit Log Tables
 CREATE TABLE IF NOT EXISTS outbox_events (

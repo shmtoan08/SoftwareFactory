@@ -10,6 +10,11 @@ import type {
 import type { GitTreeImportCandidateInput, TaskContractSpec } from "@software-factory/task-contract";
 import type { CasMergeResult, SoftwareFactoryControlPlaneStore } from "@software-factory/database";
 
+export interface CoreApiAuthContext {
+  projectId: string;
+  principalId: string;
+}
+
 /**
  * CoreApiService (MVP-SPEC-01, MVP-SPEC-02, MVP-SPEC-04)
  * Orchestrates Control Plane operations within scoped `core_api_service` RLS transactions:
@@ -158,6 +163,10 @@ export class CoreApiService {
       writer_model: string;
       reviewer_provider: string;
       reviewer_model: string;
+      developer_principal_id?: string;
+      reviewer_principal_id?: string;
+      developer_session_id?: string;
+      reviewer_session_id?: string;
       review_verdict: "PASS" | "FAIL";
       findings_json?: ReadonlyArray<Record<string, unknown>>;
     }
@@ -196,6 +205,10 @@ export class CoreApiService {
           writer_model: input.writer_model,
           reviewer_provider: input.reviewer_provider,
           reviewer_model: input.reviewer_model,
+          developer_principal_id: input.developer_principal_id,
+          reviewer_principal_id: input.reviewer_principal_id,
+          developer_session_id: input.developer_session_id,
+          reviewer_session_id: input.reviewer_session_id,
           verdict: input.review_verdict,
           findings_json: input.findings_json,
         });

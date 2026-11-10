@@ -9,6 +9,7 @@ import { sha256Hex } from "../../shared-types/src/index.ts";
 import {
   type TaskContractSpec,
   inspectRealGitCommitForImport,
+  validateGitTreeImport,
 } from "../../task-contract/src/index.ts";
 import {
   type AgentRuntimeAdapter,
@@ -603,3 +604,489 @@ describe("Milestone M2 Gate — Worker Plane, Linux Sandbox (Subreaper), Control
     }
   });
 });
+
+describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () => {
+  it("(a) Merge with REJECTED approval is strictly blocked (FIX-01)", async () => {
+    const { store, coreApi, projectId } = createM2Environment();
+    const task = await coreApi.createTask(projectId, "admin-1", {
+      title: "Test Reject CAS Merge",
+      task_contract: M2_CONTRACT,
+    });
+    const lease = await coreApi.dispatchTaskLease(projectId, "admin-1", {
+      task_id: task.task_id,
+      worker_id: "worker-1",
+    });
+
+    await store.withRlsTransaction(
+      { currentProjectId: projectId, currentRole: "core_api_service" },
+      async () => {
+        const imp = store.recordVerifiedCodeImport({
+          project_id: projectId,
+          task_id: task.task_id,
+          lease_id: lease.lease_id,
+          lease_epoch: lease.lease_epoch,
+          staging_ref: `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`,
+          candidate_input: {
+            agent_commit_hash: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+            verified_tree_hash: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+            parent_commit_hashes: [BASE_MAIN_SHA],
+            expected_base_main_commit_hash: BASE_MAIN_SHA,
+            contract: M2_CONTRACT,
+            changes: [
+              {
+                path: "src/feature.ts",
+                mode: "100644",
+                size_bytes: 100,
+                added_lines: 5,
+                deleted_lines: 0,
+                is_binary: false,
+                blob_sha: BASE_MAIN_SHA,
+              },
+            ],
+          },
+        });
+
+        const mc = store.createMergeCandidate({
+          project_id: projectId,
+          task_id: task.task_id,
+          import_id: imp.import_id,
+          base_main_commit_hash: BASE_MAIN_SHA,
+          merge_candidate_hash: "cccc3333cccc3333cccc3333cccc3333cccc3333",
+          verified_tree_hash: imp.verified_tree_hash,
+        });
+
+        const vr = store.recordVerificationRun({
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: mc.merge_candidate_id,
+          merge_candidate_hash: mc.merge_candidate_hash,
+          verified_tree_hash: mc.verified_tree_hash,
+          verifier_image_digest: "sha256:verifier",
+          verdict: "PASS",
+          exit_code: 0,
+          duration_ms: 100,
+          report_sha256: "sha256:report",
+        });
+
+        const ra = store.recordReviewArtifact({
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: mc.merge_candidate_id,
+          verification_run_id: vr.verification_run_id,
+          merge_candidate_hash: mc.merge_candidate_hash,
+          verified_tree_hash: mc.verified_tree_hash,
+          writer_provider: "anthropic",
+          writer_model: "claude-3-5-sonnet",
+          reviewer_provider: "google",
+          reviewer_model: "gemini-1-5-pro",
+          verdict: "PASS",
+        });
+
+        // Submit REJECTED decision
+        const rejectedApproval = store.submitHumanApproval({
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: mc.merge_candidate_id,
+          agent_commit_hash: mc.agent_commit_hash,
+          base_main_commit_hash: mc.base_main_commit_hash,
+          verified_tree_hash: mc.verified_tree_hash,
+          merge_candidate_hash: mc.merge_candidate_hash,
+          verification_run_id: vr.verification_run_id,
+          review_artifact_id: ra.review_artifact_id,
+          approver_principal_id: "approver-human-1",
+          decision: "REJECTED",
+        });
+        assert.equal(rejectedApproval.decision, "REJECTED");
+
+        // Attempting CAS merge with REJECTED approval must be blocked
+        await assert.rejects(
+          async () => {
+            await store.executeAtomicCasMergeOrReconcile({
+              project_id: projectId,
+              task_id: task.task_id,
+              merge_candidate_id: mc.merge_candidate_id,
+              approval_id: rejectedApproval.approval_id,
+            });
+          },
+          /Cannot merge candidate with decision REJECTED/
+        );
+      }
+    );
+  });
+
+  it("(b) Human approval by non-authorized project member is rejected (FIX-11)", async () => {
+    const { store, projectId } = createM2Environment();
+    // Add developer member (not approver)
+    await store.withRlsTransaction(
+      { currentRole: "system_admin_role" },
+      () => {
+        store.addProjectMembership({
+          project_id: projectId,
+          principal_id: "junior-dev-1",
+          member_role: "DEVELOPER",
+        });
+      }
+    );
+
+    await store.withRlsTransaction(
+      { currentProjectId: projectId, currentRole: "core_api_service" },
+      async () => {
+        await assert.rejects(
+          async () => {
+            store.submitHumanApproval({
+              project_id: projectId,
+              task_id: "non-existent",
+              merge_candidate_id: "mc-1",
+              agent_commit_hash: "a".repeat(40),
+              base_main_commit_hash: "b".repeat(40),
+              verified_tree_hash: "c".repeat(40),
+              merge_candidate_hash: "d".repeat(40),
+              verification_run_id: "vr-1",
+              review_artifact_id: "ra-1",
+              approver_principal_id: "junior-dev-1",
+              decision: "APPROVED",
+            });
+          },
+          (err: any) => err.sqlState === "42501" || err.message.includes("not authorized")
+        );
+      }
+    );
+  });
+
+  it("(c) Worker event fencing rejects worker_id mismatch with 409 ERR_STALE_LEASE (FIX-04)", async () => {
+    const { coreApi, gateway, projectId } = createM2Environment();
+    const task = await coreApi.createTask(projectId, "admin-1", {
+      title: "Worker fencing test",
+      task_contract: M2_CONTRACT,
+    });
+    const lease = await coreApi.dispatchTaskLease(projectId, "admin-1", {
+      task_id: task.task_id,
+      worker_id: "worker-legitimate",
+    });
+
+    // Impostor worker tries to submit event for this lease
+    const ack = await gateway.submitEvent({
+      envelope_version: "1.0",
+      project_id: projectId,
+      task_id: task.task_id,
+      lease_id: lease.lease_id,
+      lease_epoch: lease.lease_epoch,
+      worker_id: "worker-impostor",
+      sequence_no: 1,
+      event_type: "task.accepted",
+      event_idempotency_key: "idem-fencing-test",
+      payload_sha256: sha256Hex(JSON.stringify({ started: true })),
+      emitted_at: new Date().toISOString(),
+      payload: { started: true },
+    });
+
+    assert.equal(ack.http_status, 409);
+    assert.equal(ack.ack_status, "REJECTED_STALE_LEASE");
+    assert.equal(ack.error_code, "ERR_STALE_LEASE");
+  });
+
+  it("(d) Nested .env and uppercase forbidden extensions (.PEM, .KEY) are rejected (FIX-07)", async () => {
+    // 1. Nested .env
+    const resNestedEnv = validateGitTreeImport({
+      agent_commit_hash: "a".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      parent_commit_hashes: [BASE_MAIN_SHA],
+      expected_base_main_commit_hash: BASE_MAIN_SHA,
+      contract: M2_CONTRACT,
+      changes: [
+        {
+          path: "subfolder/config/.env.production",
+          mode: "100644",
+          size_bytes: 50,
+          added_lines: 2,
+          deleted_lines: 0,
+          is_binary: false,
+          blob_sha: BASE_MAIN_SHA,
+        },
+      ],
+    });
+    assert.equal(resNestedEnv.valid, false);
+    assert.equal(resNestedEnv.error_code, "ERR_IMPORT_PATH_POLICY_VIOLATION");
+
+    // 2. Uppercase .PEM extension
+    const resUpperPem = validateGitTreeImport({
+      agent_commit_hash: "a".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      parent_commit_hashes: [BASE_MAIN_SHA],
+      expected_base_main_commit_hash: BASE_MAIN_SHA,
+      contract: M2_CONTRACT,
+      changes: [
+        {
+          path: "certs/SERVER.PEM",
+          mode: "100644",
+          size_bytes: 120,
+          added_lines: 5,
+          deleted_lines: 0,
+          is_binary: false,
+          blob_sha: BASE_MAIN_SHA,
+        },
+      ],
+    });
+    assert.equal(resUpperPem.valid, false);
+    assert.equal(resUpperPem.error_code, "ERR_IMPORT_PATH_POLICY_VIOLATION");
+  });
+
+  it("(e) Multiple ACTIVE approvals for the same candidate are rejected with 23505 (FIX-11)", async () => {
+    const { store, coreApi, projectId } = createM2Environment();
+    const task = await coreApi.createTask(projectId, "admin-1", {
+      title: "Duplicate active approval check",
+      task_contract: M2_CONTRACT,
+    });
+    const lease = await coreApi.dispatchTaskLease(projectId, "admin-1", {
+      task_id: task.task_id,
+      worker_id: "worker-1",
+    });
+
+    await store.withRlsTransaction(
+      { currentProjectId: projectId, currentRole: "core_api_service" },
+      async () => {
+        const imp = store.recordVerifiedCodeImport({
+          project_id: projectId,
+          task_id: task.task_id,
+          lease_id: lease.lease_id,
+          lease_epoch: lease.lease_epoch,
+          staging_ref: `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`,
+          candidate_input: {
+            agent_commit_hash: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+            verified_tree_hash: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+            parent_commit_hashes: [BASE_MAIN_SHA],
+            expected_base_main_commit_hash: BASE_MAIN_SHA,
+            contract: M2_CONTRACT,
+            changes: [
+              {
+                path: "src/feature.ts",
+                mode: "100644",
+                size_bytes: 100,
+                added_lines: 5,
+                deleted_lines: 0,
+                is_binary: false,
+                blob_sha: BASE_MAIN_SHA,
+              },
+            ],
+          },
+        });
+
+        const mc = store.createMergeCandidate({
+          project_id: projectId,
+          task_id: task.task_id,
+          import_id: imp.import_id,
+          base_main_commit_hash: BASE_MAIN_SHA,
+          merge_candidate_hash: "cccc3333cccc3333cccc3333cccc3333cccc3333",
+          verified_tree_hash: imp.verified_tree_hash,
+        });
+
+        const vr = store.recordVerificationRun({
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: mc.merge_candidate_id,
+          merge_candidate_hash: mc.merge_candidate_hash,
+          verified_tree_hash: mc.verified_tree_hash,
+          verifier_image_digest: "sha256:verifier",
+          verdict: "PASS",
+          exit_code: 0,
+          duration_ms: 100,
+          report_sha256: "sha256:report",
+        });
+
+        const ra = store.recordReviewArtifact({
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: mc.merge_candidate_id,
+          verification_run_id: vr.verification_run_id,
+          merge_candidate_hash: mc.merge_candidate_hash,
+          verified_tree_hash: mc.verified_tree_hash,
+          writer_provider: "anthropic",
+          writer_model: "claude-3-5-sonnet",
+          reviewer_provider: "google",
+          reviewer_model: "gemini-1-5-pro",
+          verdict: "PASS",
+        });
+
+        // First ACTIVE approval
+        store.submitHumanApproval({
+          project_id: projectId,
+          task_id: task.task_id,
+          merge_candidate_id: mc.merge_candidate_id,
+          agent_commit_hash: mc.agent_commit_hash,
+          base_main_commit_hash: mc.base_main_commit_hash,
+          verified_tree_hash: mc.verified_tree_hash,
+          merge_candidate_hash: mc.merge_candidate_hash,
+          verification_run_id: vr.verification_run_id,
+          review_artifact_id: ra.review_artifact_id,
+          approver_principal_id: "approver-1",
+          decision: "APPROVED",
+        });
+
+        // Second ACTIVE approval on same candidate must throw 23505 unique violation
+        assert.throws(
+          () => {
+            store.submitHumanApproval({
+              project_id: projectId,
+              task_id: task.task_id,
+              merge_candidate_id: mc.merge_candidate_id,
+              agent_commit_hash: mc.agent_commit_hash,
+              base_main_commit_hash: mc.base_main_commit_hash,
+              verified_tree_hash: mc.verified_tree_hash,
+              merge_candidate_hash: mc.merge_candidate_hash,
+              verification_run_id: vr.verification_run_id,
+              review_artifact_id: ra.review_artifact_id,
+              approver_principal_id: "approver-2",
+              decision: "APPROVED",
+            });
+          },
+          (err: any) => err.sqlState === "23505"
+        );
+      }
+    );
+  });
+
+  it("(f) Merge candidate bound to import of another task is rejected with 23503 (FIX-12)", async () => {
+    const { store, coreApi, projectId } = createM2Environment();
+    const task1 = await coreApi.createTask(projectId, "admin-1", {
+      title: "Task 1",
+      task_contract: M2_CONTRACT,
+    });
+    const task2 = await coreApi.createTask(projectId, "admin-1", {
+      title: "Task 2",
+      task_contract: M2_CONTRACT,
+    });
+    const lease1 = await coreApi.dispatchTaskLease(projectId, "admin-1", {
+      task_id: task1.task_id,
+      worker_id: "worker-1",
+    });
+
+    await store.withRlsTransaction(
+      { currentProjectId: projectId, currentRole: "core_api_service" },
+      () => {
+        const imp1 = store.recordVerifiedCodeImport({
+          project_id: projectId,
+          task_id: task1.task_id,
+          lease_id: lease1.lease_id,
+          lease_epoch: lease1.lease_epoch,
+          staging_ref: `refs/heads/sf/staging/${task1.task_id}/${lease1.lease_epoch}`,
+          candidate_input: {
+            agent_commit_hash: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+            verified_tree_hash: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+            parent_commit_hashes: [BASE_MAIN_SHA],
+            expected_base_main_commit_hash: BASE_MAIN_SHA,
+            contract: M2_CONTRACT,
+            changes: [
+              {
+                path: "src/feature.ts",
+                mode: "100644",
+                size_bytes: 100,
+                added_lines: 5,
+                deleted_lines: 0,
+                is_binary: false,
+                blob_sha: BASE_MAIN_SHA,
+              },
+            ],
+          },
+        });
+
+        // Trying to create candidate for task2 with import of task1 -> must throw 23503
+        assert.throws(
+          () => {
+            store.createMergeCandidate({
+              project_id: projectId,
+              task_id: task2.task_id,
+              import_id: imp1.import_id,
+              base_main_commit_hash: BASE_MAIN_SHA,
+              merge_candidate_hash: "cccc3333cccc3333cccc3333cccc3333cccc3333",
+              verified_tree_hash: imp1.verified_tree_hash,
+            });
+          },
+          (err: any) => err.sqlState === "23503"
+        );
+      }
+    );
+  });
+
+  it("(g) Rename + delete exceeding wipeout threshold is blocked (FIX-09)", async () => {
+    const res = validateGitTreeImport({
+      agent_commit_hash: "a".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      parent_commit_hashes: [BASE_MAIN_SHA],
+      expected_base_main_commit_hash: BASE_MAIN_SHA,
+      contract: {
+        ...M2_CONTRACT,
+        max_deleted_lines: 50,
+      },
+      changes: [
+        {
+          path: "src/new-name.ts",
+          old_path: "src/old-name.ts",
+          mode: "100644",
+          size_bytes: 200,
+          added_lines: 10,
+          deleted_lines: 75, // Exceeds max_deleted_lines (50)
+          is_binary: false,
+          blob_sha: BASE_MAIN_SHA,
+        },
+      ],
+    });
+
+    assert.equal(res.valid, false);
+    assert.equal(res.error_code, "ERR_IMPORT_ABNORMAL_DIFF_THRESHOLD");
+  });
+
+  it("(h) Push without changes is rejected with ERR_GATEKEEPER_MISSING_CHANGES (FIX-10)", async () => {
+    const { coreApi, gateway, projectId } = createM2Environment();
+    const task = await coreApi.createTask(projectId, "admin-1", {
+      title: "Missing changes push test",
+      task_contract: M2_CONTRACT,
+    });
+    const lease = await coreApi.dispatchTaskLease(projectId, "admin-1", {
+      task_id: task.task_id,
+      worker_id: "worker-1",
+    });
+
+    const pushRes = await gateway.authorizeAndPushStagingRef({
+      task_id: task.task_id,
+      lease_id: lease.lease_id,
+      lease_epoch: lease.lease_epoch,
+      staging_ref: `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`,
+      agent_commit_hash: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+      verified_tree_hash: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+      parent_commit_hashes: [BASE_MAIN_SHA],
+      // changes is intentionally omitted!
+    });
+
+    assert.equal(pushRes.allowed, false);
+    assert.equal(pushRes.error_code, "ERR_GATEKEEPER_MISSING_CHANGES");
+  });
+
+  it("(i) Claude adapter with unparseable stdout returns null hashes without fabricating fake ones (FIX-06)", async () => {
+    const adapter = new ClaudeCodeCliAdapter();
+    const ctx: AgentTaskContext = {
+      projectId: "p-1",
+      taskId: "t-1",
+      leaseId: "l-1",
+      leaseEpoch: 1,
+      worktreePath: "/tmp/worktree",
+      baseMainCommitHash: BASE_MAIN_SHA,
+      taskTitle: "Fake stdout test",
+      taskContract: M2_CONTRACT,
+      ephemeralGitPushToken: "token-1",
+      hostEnvironmentToSanitize: {},
+    };
+
+    const res = await adapter.parseExecutionResult(
+      ctx,
+      0,
+      "I am an LLM output that failed to emit structured git commit hashes.",
+      ""
+    );
+
+    // Must never return 40-char fake hashes!
+    assert.equal(res.agentCommitHash, null);
+    assert.equal(res.verifiedTreeHash, null);
+    assert.ok(res.error && res.error.includes("Failed to parse valid 40-char commit hash"));
+  });
+});
+

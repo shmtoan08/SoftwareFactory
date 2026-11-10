@@ -16,6 +16,10 @@
     "test": "node --test packages/test-harness/src/m1-acceptance.test.ts packages/test-harness/src/m2-acceptance.test.ts",
     "test:m1": "node --test packages/test-harness/src/m1-acceptance.test.ts",
     "test:m2": "node --test packages/test-harness/src/m2-acceptance.test.ts",
-    "test:all": "node --test packages/*/src/*.test.ts packages/test-harness/src/*.test.ts"
+    "test:all": "node --test packages/*/src/*.test.ts packages/test-harness/src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
   }
 }

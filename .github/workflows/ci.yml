@@ -1,0 +1,57 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Build, Typecheck, RLS Verification & Test Suite
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: software_factory_test
+          POSTGRES_USER: factory_admin
+          POSTGRES_PASSWORD: factory_secret_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci || npm install --no-audit
+
+      - name: TypeScript Typecheck
+        run: npm run typecheck
+
+      - name: Verify PostgreSQL Migrations & RLS Matrix (RLS-T1..RLS-T8)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGDATABASE: software_factory_test
+          PGUSER: factory_admin
+          PGPASSWORD: factory_secret_password
+        run: |
+          psql -f packages/database/migrations/0001_mvp_core_schema_and_rls.sql
+          psql -f packages/database/migrations/0002_rls_verification_matrix.sql
+
+      - name: Execute Full Test Suite
+        run: npm test

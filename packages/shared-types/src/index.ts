@@ -280,6 +280,10 @@ export interface ReviewArtifactRecord {
   verification_run_id: string;
   merge_candidate_hash: string;
   verified_tree_hash: string;
+  developer_principal_id: string;
+  reviewer_principal_id: string;
+  developer_session_id?: string;
+  reviewer_session_id?: string;
   writer_provider: string;
   writer_model: string;
   reviewer_provider: string;
@@ -305,7 +309,7 @@ export interface ApprovalDecisionRecord {
   merge_candidate_hash: string;
   verification_run_id: string;
   review_artifact_id: string;
-  approver_Principal_id: string;
+  approver_principal_id: string;
   decision: "APPROVED" | "REJECTED";
   status: "ACTIVE" | "CONSUMED" | "INVALIDATED" | "EXPIRED";
   invalidated_reason: string | null;
@@ -329,11 +333,14 @@ export interface OutboxEventRecord {
  * Deterministic Canonical JSON serialization (sorts object keys recursively)
  */
 export function canonicalizeJson(value: unknown): string {
+  if (value === undefined) {
+    return "null";
+  }
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
-    return `[${value.map((item) => canonicalizeJson(item)).join(",")}]`;
+    return `[${value.map((item) => (item === undefined ? "null" : canonicalizeJson(item))).join(",")}]`;
   }
   const record = value as Record<string, unknown>;
   const sortedKeys = Object.keys(record).sort();
