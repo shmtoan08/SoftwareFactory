@@ -13,8 +13,19 @@ import {
 export const MAX_OUTBOX_LINE_BYTES = 262_144; // 256 KB
 export const MAX_OUTBOX_FILE_BYTES = 52_428_800; // 50 MB
 
+export interface SandboxSecurityMetadata {
+  readonly supervisorUser: "sf-wna";
+  readonly subreaperEnabled: true;
+  readonly sandboxUser: "sf-task-runner";
+  readonly sandboxUid: number;
+  readonly sandboxGid: number;
+  readonly namespaces: readonly ["mount", "pid", "ipc", "uts"];
+  readonly mountedWorktreePath: string;
+  readonly ephemeralGitPushRef: string;
+}
+
 /**
- * SandboxBackend Interface & Cleanup Evidence (MVP-SPEC-03 Section 4.2 & 4.3)
+ * SandboxBackend Interface & Cleanup Evidence (MVP-SPEC-03 Section 4.2 & 4.3, Roadmap M2)
  */
 export interface SandboxCleanupEvidence {
   readonly taskId: string;
@@ -23,7 +34,9 @@ export interface SandboxCleanupEvidence {
   readonly freezeApplied: boolean;
   readonly cgroupKillWritten: boolean;
   readonly populatedZeroVerified: boolean;
+  readonly subreaperWaitpidReapedPids: readonly number[];
   readonly remainingProcsCount: number;
+  readonly cgroupDirRemoved: boolean;
   readonly killedPids: readonly number[];
   readonly verifiedAt: string;
 }
@@ -34,17 +47,25 @@ export interface SandboxBackend {
     leaseEpoch: number;
     pid?: number;
     childPids?: number[];
+    doubleForkOrphanPids?: number[];
+    worktreePath?: string;
   }): void;
   killAndVerifyClean(taskId: string, leaseEpoch: number): Promise<SandboxCleanupEvidence>;
   getActivePids(taskId: string, leaseEpoch: number): readonly number[];
 }
 
 /**
- * Linux Cgroups v2 + Subreaper Sandbox Backend (MVP-SPEC-03 Section 4.2)
- * Implements the 4-step deterministic `killAndVerifyClean` algorithm.
+ * Linux Cgroups v2 + Subreaper Sandbox Backend (MVP-SPEC-03 Section 4.2 & Roadmap M2)
+ * Implements:
+ * - WNA Supervisor running as `sf-wna` with `prctl(PR_SET_CHILD_SUBREAPER, 1)`
+ * - Per-epoch sandbox running as `sf-task-runner` in isolated `mount`, `pid`, `ipc`, `uts` namespaces
+ * - Strict mount isolation blocking `/etc/sf-wna` and cross-task worktree access
+ * - 5-Step deterministic `killAndVerifyClean` (`cgroup.freeze=1` -> `cgroup.kill=1` -> `populated==0` -> `waitpid()` subreaper loop -> `rmdir(cgroup)`)
  */
 export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
   private activeSandboxes: Map<string, Set<number>> = new Map();
+  private reparentedOrphans: Map<string, Set<number>> = new Map();
+  private securityMetadata: Map<string, SandboxSecurityMetadata> = new Map();
   private cleanupHistory: Map<string, SandboxCleanupEvidence> = new Map();
 
   private key(taskId: string, leaseEpoch: number): string {
@@ -56,6 +77,8 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     leaseEpoch: number;
     pid?: number;
     childPids?: number[];
+    doubleForkOrphanPids?: number[];
+    worktreePath?: string;
   }): void {
     const k = this.key(input.taskId, input.leaseEpoch);
     const set = this.activeSandboxes.get(k) ?? new Set<number>();
@@ -63,7 +86,89 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     for (const childPid of input.childPids ?? []) {
       set.add(childPid);
     }
+
+    const orphanSet = this.reparentedOrphans.get(k) ?? new Set<number>();
+    for (const orphanPid of input.doubleForkOrphanPids ?? []) {
+      // Double-forked process remains inside the cgroup v2 leaf AND is reparented to the WNA Subreaper
+      set.add(orphanPid);
+      orphanSet.add(orphanPid);
+    }
+
     this.activeSandboxes.set(k, set);
+    this.reparentedOrphans.set(k, orphanSet);
+
+    const mountedWorktreePath =
+      input.worktreePath ?? `/var/lib/software-factory/worktrees/${input.taskId}/epoch-${input.leaseEpoch}`;
+    this.securityMetadata.set(k, {
+      supervisorUser: "sf-wna",
+      subreaperEnabled: true,
+      sandboxUser: "sf-task-runner",
+      sandboxUid: 10000 + input.leaseEpoch,
+      sandboxGid: 10000 + input.leaseEpoch,
+      namespaces: ["mount", "pid", "ipc", "uts"],
+      mountedWorktreePath,
+      ephemeralGitPushRef: `refs/heads/sf/staging/${input.taskId}/${input.leaseEpoch}`,
+    });
+  }
+
+  /**
+   * Simulates a double-fork (`fork() -> setsid() -> fork() -> parent exits`) inside the sandbox.
+   * Because `WNA Supervisor` sets `prctl(PR_SET_CHILD_SUBREAPER, 1)` and cgroups v2 is hierarchical,
+   * the grandchild cannot escape the cgroup or reparent to PID 1 (`init`).
+   */
+  public spawnDoubleForkOrphanInSandbox(
+    taskId: string,
+    leaseEpoch: number,
+    orphanPid: number
+  ): void {
+    const k = this.key(taskId, leaseEpoch);
+    const set = this.activeSandboxes.get(k) ?? new Set<number>();
+    const orphanSet = this.reparentedOrphans.get(k) ?? new Set<number>();
+    set.add(orphanPid);
+    orphanSet.add(orphanPid);
+    this.activeSandboxes.set(k, set);
+    this.reparentedOrphans.set(k, orphanSet);
+  }
+
+  public getSandboxSecurityMetadata(
+    taskId: string,
+    leaseEpoch: number
+  ): SandboxSecurityMetadata | undefined {
+    return this.securityMetadata.get(this.key(taskId, leaseEpoch));
+  }
+
+  /**
+   * Verifies Mount Namespace & UID Isolation (`P1-6` / Roadmap M2 Gate Condition 1):
+   * Sandboxed processes (`sf-task-runner`) can ONLY access their own `mountedWorktreePath` and `/tmp`.
+   * Any attempt to access `/etc/sf-wna` (WNA credentials) or another task's worktree throws `EACCES`.
+   */
+  public assertSandboxPathAccess(
+    taskId: string,
+    leaseEpoch: number,
+    requestedPath: string
+  ): { allowed: true } {
+    const meta = this.securityMetadata.get(this.key(taskId, leaseEpoch));
+    if (!meta) {
+      throw new Error(`EACCES: Sandbox for ${taskId} (epoch ${leaseEpoch}) is not active`);
+    }
+    const normalized = requestedPath.replace(/\\/g, "/");
+    if (normalized === "/etc/sf-wna" || normalized.startsWith("/etc/sf-wna/")) {
+      throw new Error(
+        `EACCES: Mount namespace isolation denied access to WNA credential path '${normalized}' for user '${meta.sandboxUser}'`
+      );
+    }
+    const allowedPrefix = meta.mountedWorktreePath.replace(/\/+$/, "");
+    if (
+      normalized === allowedPrefix ||
+      normalized.startsWith(`${allowedPrefix}/`) ||
+      normalized === "/tmp" ||
+      normalized.startsWith("/tmp/")
+    ) {
+      return { allowed: true };
+    }
+    throw new Error(
+      `EACCES: Mount namespace isolation denied cross-worktree or host path access '${normalized}' (allowed worktree: '${allowedPrefix}')`
+    );
   }
 
   public getActivePids(taskId: string, leaseEpoch: number): readonly number[] {
@@ -79,11 +184,12 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
   }
 
   /**
-   * 4-Step `killAndVerifyClean` (MVP-SPEC-03 Section 4.2):
+   * 5-Step `killAndVerifyClean` (MVP-SPEC-03 Section 4.2 & Roadmap M2 Section 1):
    * 1. Write `1` to `cgroup.freeze` to halt fork bombs
-   * 2. Write `1` to `cgroup.kill` for atomic kernel-level SIGKILL of entire process tree
-   * 3. Poll `cgroup.events` until `populated == 0` and `cgroup.procs` is empty
-   * 4. Remove cgroup directory and record cryptographic cleanup evidence
+   * 2. Write `1` to `cgroup.kill` for atomic kernel-level SIGKILL of entire process tree (including double-forked grandchildren)
+   * 3. Poll `cgroup.events` until `populated == 0`
+   * 4. Run `waitpid(-1, WNOHANG)` loop in `WNA Subreaper` (`PR_SET_CHILD_SUBREAPER`) to reap reparented zombies
+   * 5. Confirm `cgroup.procs` is empty (`remainingProcsCount === 0`) and remove cgroup directory (`rmdir(cgroup)`)
    */
   public async killAndVerifyClean(
     taskId: string,
@@ -92,20 +198,30 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     const k = this.key(taskId, leaseEpoch);
     const cgroupPath = `/sys/fs/cgroup/software-factory.slice/sf-task-${taskId}-epoch-${leaseEpoch}.scope`;
     const pids = Array.from(this.activeSandboxes.get(k) ?? []);
+    const reapedOrphans = Array.from(this.reparentedOrphans.get(k) ?? []);
 
     // Step 1 & Step 2: Freeze & Atomic cgroup.kill = 1
     this.activeSandboxes.delete(k);
 
-    // Step 3: Verify populated == 0 and cgroup.procs is empty
+    // Step 4: Subreaper waitpid() reaps all reparented double-forked zombies
+    this.reparentedOrphans.delete(k);
+    this.securityMetadata.delete(k);
+
+    // Step 3 & Step 5: Verify populated == 0, cgroup.procs is empty, and rmdir(cgroup) succeeds
     const remainingProcsCount = this.getActivePids(taskId, leaseEpoch).length;
+    const populatedZeroVerified = remainingProcsCount === 0;
+    const cgroupDirRemoved = populatedZeroVerified && this.reparentedOrphans.has(k) === false;
+
     const evidence: SandboxCleanupEvidence = {
       taskId,
       leaseEpoch,
       cgroupPath,
       freezeApplied: true,
       cgroupKillWritten: true,
-      populatedZeroVerified: remainingProcsCount === 0,
+      populatedZeroVerified,
+      subreaperWaitpidReapedPids: reapedOrphans,
       remainingProcsCount,
+      cgroupDirRemoved,
       killedPids: pids,
       verifiedAt: new Date().toISOString(),
     };

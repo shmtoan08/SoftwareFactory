@@ -19,6 +19,7 @@ import {
   computeTaskExecutionIdempotencyKey,
 } from "@software-factory/shared-types";
 import {
+  type GitTreeChangeEntry,
   type GitTreeImportCandidateInput,
   type TaskContractSpec,
   validateGitTreeImport,
@@ -759,8 +760,8 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   /**
-   * Simulates Git Push to `refs/heads/sf/staging/<task_id>/<lease_epoch>` gated by Pre-Receive Hook
-   * (MVP-SPEC-03 Section 5.1)
+   * Controlled Git Push Gatekeeper (`pre-receive` hook) + 6-Step TrustedImportValidator
+   * (MVP-SPEC-03 Section 5.1-5.2 & Roadmap M2 Section 1)
    */
   public pushStagingGitRefWithGatekeeper(input: {
     project_id: string;
@@ -771,19 +772,45 @@ export class SoftwareFactoryControlPlaneStore {
     agent_commit_hash: string;
     verified_tree_hash: string;
     parent_commit_hashes: readonly string[];
-  }): { allowed: boolean; reason?: string } {
-    const nowMs = this.clockFn().getTime();
-    const expectedRef = `refs/heads/sf/staging/${input.task_id}/${input.lease_epoch}`;
-    if (input.staging_ref !== expectedRef) {
+    changes?: readonly GitTreeChangeEntry[];
+    simulateControlPlaneOutage?: boolean;
+    simulatedGatekeeperLatencyMs?: number;
+  }): {
+    allowed: boolean;
+    error_code?: string;
+    reason?: string;
+    import_id?: string;
+  } {
+    // Step 1a: Fail-Closed on Control Plane / DB outage or > 2000ms timeout
+    if (
+      input.simulateControlPlaneOutage === true ||
+      (input.simulatedGatekeeperLatencyMs !== undefined && input.simulatedGatekeeperLatencyMs > 2000)
+    ) {
       return {
         allowed: false,
-        reason: `Pre-receive denied: staging_ref ${input.staging_ref} does not match ${expectedRef}`,
+        error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+        reason:
+          "Pre-receive Fail-Closed: Control Plane unreachable or exceeded 2000ms hard timeout",
       };
     }
 
+    const nowMs = this.clockFn().getTime();
+    const expectedStagingRef = `refs/heads/sf/staging/${input.task_id}/${input.lease_epoch}`;
+    const expectedVerifyAlias = `refs/factory/Verify/${input.task_id}/${input.lease_epoch}`;
+    if (input.staging_ref !== expectedStagingRef && input.staging_ref !== expectedVerifyAlias) {
+      return {
+        allowed: false,
+        error_code: "ERR_GATEKEEPER_FORBIDDEN_REF",
+        reason: `Pre-receive denied: staging_ref ${input.staging_ref} does not match ${expectedStagingRef} or ${expectedVerifyAlias}`,
+      };
+    }
+
+    // Step 1b: Atomic Lease Active & Real-Time Expiry Check (`expires_at > clock_timestamp()`)
     const lease = this.taskLeases.get(input.lease_id);
+    const task = this.tasks.get(input.task_id);
     if (
       !lease ||
+      !task ||
       lease.project_id !== input.project_id ||
       lease.task_id !== input.task_id ||
       lease.lease_epoch !== input.lease_epoch ||
@@ -793,6 +820,7 @@ export class SoftwareFactoryControlPlaneStore {
     ) {
       return {
         allowed: false,
+        error_code: "ERR_GATEKEEPER_STALE_OR_EXPIRED_LEASE",
         reason: "Pre-receive denied: lease is not ACTIVE or has expired/revoked",
       };
     }
@@ -800,7 +828,30 @@ export class SoftwareFactoryControlPlaneStore {
     const refs = this.gitRefsByProject.get(input.project_id);
     const commits = this.gitCommitsByProject.get(input.project_id);
     if (!refs || !commits) {
-      return { allowed: false, reason: "Project bare repository not found" };
+      return {
+        allowed: false,
+        error_code: "ERR_GATEKEEPER_REPO_NOT_FOUND",
+        reason: "Project bare repository not found",
+      };
+    }
+
+    // Step 2-6: Execute 6-Step TrustedImportValidator right at pre-receive hook
+    const contract = task.task_contract_json as unknown as TaskContractSpec;
+    const validation = validateGitTreeImport({
+      agent_commit_hash: input.agent_commit_hash,
+      verified_tree_hash: input.verified_tree_hash,
+      parent_commit_hashes: input.parent_commit_hashes,
+      expected_base_main_commit_hash: task.base_main_commit_hash,
+      changes: input.changes ?? [],
+      contract,
+    });
+
+    if (!validation.valid) {
+      return {
+        allowed: false,
+        error_code: validation.error_code,
+        reason: `TrustedImportValidator rejected push at pre-receive: [${validation.error_code}] ${validation.message}`,
+      };
     }
 
     commits.set(input.agent_commit_hash, {
@@ -809,8 +860,77 @@ export class SoftwareFactoryControlPlaneStore {
       parents: [...input.parent_commit_hashes],
       taskId: input.task_id,
     });
+    refs.set(expectedStagingRef, input.agent_commit_hash);
     refs.set(input.staging_ref, input.agent_commit_hash);
-    return { allowed: true };
+
+    // Record immediately in `verified_code_imports` when changes were validated at pre-receive (M2 P0-4)
+    let recordedImportId: string | undefined;
+    if (input.changes !== undefined) {
+      const existingImport = this.findVerifiedImportByLeaseAndCommit(
+        lease.lease_id,
+        input.agent_commit_hash
+      );
+      if (existingImport) {
+        recordedImportId = existingImport.import_id;
+      } else {
+        const importRecord: VerifiedCodeImportRecord = {
+          import_id: randomUUID(),
+          project_id: input.project_id,
+          task_id: input.task_id,
+          lease_id: lease.lease_id,
+          lease_epoch: lease.lease_epoch,
+          agent_commit_hash: validation.agent_commit_hash,
+          verified_tree_hash: validation.verified_tree_hash,
+          staging_ref: input.staging_ref,
+          changed_files_count: validation.changed_files_count,
+          deleted_lines_count: validation.deleted_lines_count,
+          created_at: this.clockTimestampIso(),
+        };
+        this.verifiedCodeImports.set(importRecord.import_id, importRecord);
+        recordedImportId = importRecord.import_id;
+      }
+    }
+
+    return {
+      allowed: true,
+      ...(recordedImportId ? { import_id: recordedImportId } : {}),
+    };
+  }
+
+  private findVerifiedImportByLeaseAndCommit(
+    leaseId: string,
+    agentCommitHash: string
+  ): VerifiedCodeImportRecord | undefined {
+    for (const rec of this.verifiedCodeImports.values()) {
+      if (rec.lease_id === leaseId && rec.agent_commit_hash === agentCommitHash) {
+        return rec;
+      }
+    }
+    return undefined;
+  }
+
+  private findLatestVerifiedImportByLease(leaseId: string): VerifiedCodeImportRecord | undefined {
+    let latest: VerifiedCodeImportRecord | undefined;
+    for (const rec of this.verifiedCodeImports.values()) {
+      if (rec.lease_id === leaseId) {
+        latest = rec;
+      }
+    }
+    return latest;
+  }
+
+  public getVerifiedImportsForTask(taskId: string): VerifiedCodeImportRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: VerifiedCodeImportRecord[] = [];
+    for (const rec of this.verifiedCodeImports.values()) {
+      if (rec.project_id === currentProjectId && rec.task_id === taskId) {
+        list.push({ ...rec });
+      }
+    }
+    return list;
   }
 
   /**
@@ -842,10 +962,10 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   /**
-   * LeaseExpiryReconciler & Orphaned Git Push Reconciler (MVP-SPEC-03 Section 3.2)
+   * LeaseExpiryReconciler & Orphaned Git Push Reconciler (MVP-SPEC-03 Section 3.2 & Roadmap M2 P0-4)
    * If a Worker pushed a valid staging commit before its connection died (losing `task.completed`),
-   * the reconciler recovers the orphaned push, validates it via `TrustedImportValidator`, and transitions
-   * the task to `AGENT_COMPLETED` instead of losing the completed work!
+   * the reconciler detects the recorded `verified_code_imports` entry (or validates the staging ref)
+   * and advances the task to `AGENT_COMPLETED` without re-running the Agent!
    */
   public async runLeaseExpiryAndOrphanedPushReconciler(
     orphanedDiffProvider?: (stagingInfo: {
@@ -863,6 +983,7 @@ export class SoftwareFactoryControlPlaneStore {
       lease_id: string;
       task_id: string;
       outcome: "RECOVERED_ORPHANED_PUSH" | "EXPIRED_AND_REQUEUED";
+      import_id?: string;
     }>
   > {
     const scopes = this.listExpiredActiveLeaseScopes(50);
@@ -870,6 +991,7 @@ export class SoftwareFactoryControlPlaneStore {
       lease_id: string;
       task_id: string;
       outcome: "RECOVERED_ORPHANED_PUSH" | "EXPIRED_AND_REQUEUED";
+      import_id?: string;
     }> = [];
 
     for (const scope of scopes) {
@@ -889,6 +1011,37 @@ export class SoftwareFactoryControlPlaneStore {
               return;
             }
 
+            // Path A (M2): Check if pre-receive hook already recorded a VerifiedCodeImportRecord for this lease!
+            const preRecordedImport = this.findLatestVerifiedImportByLease(lease.lease_id);
+            if (preRecordedImport) {
+              lease.status = "COMPLETED";
+              lease.completed_at = nowIso;
+              task.status = "AGENT_COMPLETED";
+              task.active_lease_id = null;
+              task.updated_at = nowIso;
+
+              this.insertOutboxEventInternal(
+                scope.project_id,
+                "task",
+                task.task_id,
+                "task.orphaned_push_recovered",
+                {
+                  task_id: task.task_id,
+                  lease_id: lease.lease_id,
+                  import_id: preRecordedImport.import_id,
+                  agent_commit_hash: preRecordedImport.agent_commit_hash,
+                }
+              );
+              results.push({
+                lease_id: lease.lease_id,
+                task_id: task.task_id,
+                outcome: "RECOVERED_ORPHANED_PUSH",
+                import_id: preRecordedImport.import_id,
+              });
+              return;
+            }
+
+            // Path B: Inspect staging ref via orphanedDiffProvider if not yet in verified_code_imports
             const stagingRef = `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`;
             const refs = this.gitRefsByProject.get(scope.project_id);
             const commits = this.gitCommitsByProject.get(scope.project_id);
@@ -946,6 +1099,7 @@ export class SoftwareFactoryControlPlaneStore {
                     lease_id: lease.lease_id,
                     task_id: task.task_id,
                     outcome: "RECOVERED_ORPHANED_PUSH",
+                    import_id: importRecord.import_id,
                   });
                   return;
                 }
@@ -999,6 +1153,13 @@ export class SoftwareFactoryControlPlaneStore {
     const validation = validateGitTreeImport(input.candidate_input);
     if (!validation.valid) {
       throw new Error(`TrustedImportValidator rejected import: [${validation.error_code}] ${validation.message}`);
+    }
+    const existing = this.findVerifiedImportByLeaseAndCommit(
+      input.lease_id,
+      validation.agent_commit_hash
+    );
+    if (existing) {
+      return { ...existing };
     }
     const nowIso = this.clockTimestampIso();
     const record: VerifiedCodeImportRecord = {

@@ -3,11 +3,12 @@ import type {
   ServerEventAckContract,
   WorkerEventEnvelope,
 } from "@software-factory/shared-types";
+import type { GitTreeChangeEntry } from "@software-factory/task-contract";
 import type { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
 import type { AgentGatewayTransportClient } from "@software-factory/wna";
 
 /**
- * AgentGatewayService (MVP-SPEC-01 Section 2 & MVP-SPEC-03 Section 2-3)
+ * AgentGatewayService (MVP-SPEC-01 Section 2 & MVP-SPEC-03 Section 2-3, Roadmap M2)
  * Mediates all Worker (WNA) traffic using scoped `gateway_service` RLS transactions.
  * Workers never receive direct PostgreSQL credentials.
  */
@@ -65,7 +66,15 @@ export class AgentGatewayService implements AgentGatewayTransportClient {
     agent_commit_hash: string;
     verified_tree_hash: string;
     parent_commit_hashes: readonly string[];
-  }): Promise<{ allowed: boolean; reason?: string }> {
+    changes?: readonly GitTreeChangeEntry[];
+    simulateControlPlaneOutage?: boolean;
+    simulatedGatekeeperLatencyMs?: number;
+  }): Promise<{
+    allowed: boolean;
+    error_code?: string;
+    reason?: string;
+    import_id?: string;
+  }> {
     return this.store.withRlsTransaction(
       {
         currentProjectId: this.projectId,

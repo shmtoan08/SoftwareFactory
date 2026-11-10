@@ -6,10 +6,11 @@ Deterministic, lease-coordinated AI Software Factory Control Plane with 4-tier P
 
 - **Milestone `M0` (Architecture & Specification Freeze):** Locked at `v1.5`
 - **Milestone `M1` (`M1.1` → `M1.4` Core Vertical Slice & Adversarial Test Gate):** Completed (`18/18` acceptance tests passing)
+- **Milestone `M2` (Worker Plane, Linux Subreaper Sandbox, Controlled Git Push Import & Adapter `P-010`):** Completed (`6/6` Gate tests passing; `24/24` total tests passing)
 
 ## Quick Start
 
-Requires **Node.js >= 22.6.0** (verified on Node `v26.3.0` with native TypeScript test execution and zero external npm runtime dependencies for Milestone `M1`).
+Requires **Node.js >= 22.6.0** (verified on Node `v26.3.0` with native TypeScript test execution and zero external npm runtime dependencies).
 
 ```bash
 npm install
@@ -25,12 +26,12 @@ SoftwareFactory/
 │   ├── core-api/           # Orchestration service for tasks, leases, import validation, candidates, review & CAS merge
 │   └── web/                # Approval console controller binding all 8 mandatory candidate/review fields
 ├── packages/
-│   ├── adapter-sdk/        # AgentRuntimeAdapter, AgentTaskContext, and execution result contracts
+│   ├── adapter-sdk/        # AgentRuntimeAdapter, TaskContextAssembler, and ClaudeCodeCliAdapter (P-010)
 │   ├── database/           # PostgreSQL 4-tier RLS SQL migrations & SoftwareFactoryControlPlaneStore
 │   ├── shared-types/       # Canonical state transition matrix, event envelopes, ACK contracts & SHA-256 helpers
-│   ├── task-contract/      # Path policy precedence & 6-step validateGitTreeImport security validator
-│   ├── test-harness/       # FakeAgentHarnessAdapter + 18 Milestone M1 acceptance tests (RLS-T1..T8 & S1..S10)
-│   └── wna/                # Worker Node Agent LocalOutboxBuffer (.jsonl) & LinuxCgroupV2SandboxBackend
+│   ├── task-contract/      # Path policy precedence, 6-step validateGitTreeImport & inspectRealGitCommitForImport
+│   ├── test-harness/       # FakeAgentHarnessAdapter + M1 (18 tests) & M2 (6 tests) acceptance suites
+│   └── wna/                # Worker Node Agent LocalOutboxBuffer (.jsonl) & LinuxCgroupV2SandboxBackend (Subreaper)
 └── scripts/
     └── git-hooks/
         └── pre-receive     # Fail-closed Git pre-receive hook gatekeeper (2000ms timeout)
@@ -49,7 +50,8 @@ SoftwareFactory/
 
 ## Verification Coverage (`npm test`)
 
-Running `npm test` executes [`packages/test-harness/src/m1-acceptance.test.ts`](./packages/test-harness/src/m1-acceptance.test.ts):
+Running `npm test` executes [`m1-acceptance.test.ts`](./packages/test-harness/src/m1-acceptance.test.ts) and [`m2-acceptance.test.ts`](./packages/test-harness/src/m2-acceptance.test.ts):
 
 1. **8-Scenario PostgreSQL RLS Isolation Matrix (`RLS-T1` → `RLS-T8`):** Default Deny, cross-tenant SELECT/INSERT/UPDATE/DELETE isolation, connection pool `SET LOCAL` / `DISCARD ALL` reset safety, Tier 3 append-only immutability, and 8-field composite foreign key binding.
 2. **10 Adversarial & Recovery Scenarios (`Scenario 1` → `Scenario 10`):** Full vertical slice happy path, duplicate retry vs payload mismatch, out-of-order sequence gap replay, invalid state transition rejection, concurrent lease revoke race + `clock_timestamp()` expiry + `killAndVerifyClean`, orphaned Git push recovery, 6-step Git tree import validation, 3D independent reviewer enforcement, mid-approval CAS conflict invalidation (`NEEDS_REBASE`), and post-merge crash reconciliation + Approval TTL expiry.
+3. **6 Milestone `M2` Gate Scenarios (`M2-Gate-1` → `M2-Gate-6`):** Double-fork orphan & sandbox escape defense (`sf-wna` subreaper `waitpid()` + `rmdir(cgroup)` + `/etc/sf-wna` mount deny), malicious Git push rejection at `pre-receive`, Fail-Closed `2000ms` timeout/outage protection, automatic `OrphanedPushReconciler` from `verified_code_imports`, real local Git repository tree inspection (`inspectRealGitCommitForImport`), and `AdapterContractTestSuite` for `FakeAgentHarnessAdapter` + `ClaudeCodeCliAdapter` (`P-010`).

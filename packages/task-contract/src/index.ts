@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+
 export interface TaskContractSpec {
   readonly allowed_files: readonly string[];
   readonly protected_paths?: readonly string[];
@@ -10,6 +12,9 @@ export interface TaskContractSpec {
 
 export const DEFAULT_SYSTEM_FORBIDDEN_PATHS: readonly string[] = [
   ".git/**",
+  ".gitmodules",
+  ".gitattributes",
+  ".githooks/**",
   ".github/workflows/**",
   ".env*",
   "**/*.pem",
@@ -164,6 +169,7 @@ export type GitObjectMode = "100644" | "100755" | "120000" | "160000" | string;
 
 export interface GitTreeChangeEntry {
   readonly path: string;
+  readonly old_path?: string;
   readonly mode: GitObjectMode;
   readonly size_bytes: number;
   readonly is_binary: boolean;
@@ -203,7 +209,7 @@ export type TrustedImportValidationResult =
     };
 
 /**
- * 6-Step TrustedImportValidator (MVP-SPEC-03 Section 5.2)
+ * 6-Step TrustedImportValidator (MVP-SPEC-03 Section 5.2 & Roadmap M2)
  */
 export function validateGitTreeImport(
   input: GitTreeImportCandidateInput
@@ -256,6 +262,14 @@ export function validateGitTreeImport(
         offending_path: entry.path,
       };
     }
+    if (entry.old_path !== undefined && !isSafeRelativePosixPath(entry.old_path)) {
+      return {
+        valid: false,
+        error_code: "ERR_IMPORT_PATH_TRAVERSAL_OR_COLLISION",
+        message: `Unsafe or non-canonical source path in rename/copy: ${entry.old_path}`,
+        offending_path: entry.old_path,
+      };
+    }
     const folded = entry.path.toLowerCase();
     if (lowerCasePaths.has(folded)) {
       return {
@@ -267,7 +281,7 @@ export function validateGitTreeImport(
     }
     lowerCasePaths.add(folded);
 
-    // Step 4: Precedence-Based Path Policy Enforcement
+    // Step 4: Precedence-Based Path Policy Enforcement (on both destination path and source old_path)
     const policyVerdict = evaluatePathPolicyPrecedence(entry.path, input.contract);
     if (!policyVerdict.allowed) {
       return {
@@ -278,6 +292,19 @@ export function validateGitTreeImport(
         }`,
         offending_path: entry.path,
       };
+    }
+    if (entry.old_path !== undefined) {
+      const oldPolicyVerdict = evaluatePathPolicyPrecedence(entry.old_path, input.contract);
+      if (!oldPolicyVerdict.allowed) {
+        return {
+          valid: false,
+          error_code: "ERR_IMPORT_PATH_POLICY_VIOLATION",
+          message: `Path policy rejected rename/copy source ${entry.old_path}: ${oldPolicyVerdict.reason}${
+            oldPolicyVerdict.matchedRule ? ` (rule: ${oldPolicyVerdict.matchedRule})` : ""
+          }`,
+          offending_path: entry.old_path,
+        };
+      }
     }
 
     // Step 5: Binary & Blob Size Guard
@@ -325,3 +352,111 @@ export function validateGitTreeImport(
     deleted_lines_count: totalDeletedLines,
   };
 }
+
+/**
+ * Inspects a real Git repository on disk (`git rev-list`, `git rev-parse`, `git diff-tree`)
+ * and constructs a `GitTreeImportCandidateInput` for `validateGitTreeImport` (Milestone M2).
+ */
+export function inspectRealGitCommitForImport(options: {
+  repoPath: string;
+  expectedBaseMainCommitHash: string;
+  agentCommitHash: string;
+  contract: TaskContractSpec;
+}): GitTreeImportCandidateInput {
+  const git = (args: string[]): string =>
+    execFileSync("git", args, {
+      cwd: options.repoPath,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+
+  // 1. Extract commit + parents (`<commit> <parent1> ...`)
+  const revListLine = git(["rev-list", "--parents", "-n", "1", options.agentCommitHash]);
+  const parts = revListLine.split(/\s+/).filter(Boolean);
+  const parentCommitHashes = parts.slice(1);
+
+  // 2. Extract tree SHA
+  const verifiedTreeHash = git(["rev-parse", `${options.agentCommitHash}^{tree}`]);
+
+  // 3. Extract raw mode/blob changes (`git diff-tree --no-commit-id -r -M --raw`)
+  const rawOutput = git([
+    "diff-tree",
+    "--no-commit-id",
+    "-r",
+    "-M",
+    "--raw",
+    options.expectedBaseMainCommitHash,
+    options.agentCommitHash,
+  ]);
+  const numstatOutput = git([
+    "diff-tree",
+    "--no-commit-id",
+    "-r",
+    "-M",
+    "--numstat",
+    options.expectedBaseMainCommitHash,
+    options.agentCommitHash,
+  ]);
+
+  const numstatByPath = new Map<string, { added: number; deleted: number; isBinary: boolean }>();
+  for (const line of numstatOutput.split("\n").filter(Boolean)) {
+    const cols = line.split("\t");
+    if (cols.length >= 3) {
+      const addedRaw = cols[0]!;
+      const deletedRaw = cols[1]!;
+      const targetPath = cols[cols.length - 1]!;
+      const isBinary = addedRaw === "-" || deletedRaw === "-";
+      numstatByPath.set(targetPath, {
+        added: isBinary ? 0 : Number.parseInt(addedRaw, 10) || 0,
+        deleted: isBinary ? 0 : Number.parseInt(deletedRaw, 10) || 0,
+        isBinary,
+      });
+    }
+  }
+
+  const changes: GitTreeChangeEntry[] = [];
+  for (const line of rawOutput.split("\n").filter(Boolean)) {
+    const [metaPart, ...pathParts] = line.split("\t");
+    if (!metaPart || pathParts.length === 0) {
+      continue;
+    }
+    const metaTokens = metaPart.replace(/^:/, "").split(/\s+/);
+    const oldMode = metaTokens[0] ?? "100644";
+    const newMode = metaTokens[1] ?? "100644";
+    const newBlobSha = metaTokens[3] ?? "0000000000000000000000000000000000000000";
+    const statusToken = metaTokens[4] ?? "M";
+
+    const isRenameOrCopy = statusToken.startsWith("R") || statusToken.startsWith("C");
+    const oldPath = isRenameOrCopy && pathParts.length >= 2 ? pathParts[0] : undefined;
+    const targetPath = isRenameOrCopy && pathParts.length >= 2 ? pathParts[1]! : pathParts[0]!;
+
+    const effectiveMode = newMode === "000000" ? oldMode : newMode;
+    let sizeBytes = 0;
+    if (newMode !== "000000" && newMode !== "160000" && !/^0+$/.test(newBlobSha)) {
+      const sizeStr = git(["cat-file", "-s", newBlobSha]);
+      sizeBytes = Number.parseInt(sizeStr, 10) || 0;
+    }
+
+    const stat = numstatByPath.get(targetPath) ?? { added: 0, deleted: 0, isBinary: false };
+    changes.push({
+      path: targetPath,
+      ...(oldPath !== undefined ? { old_path: oldPath } : {}),
+      mode: effectiveMode,
+      size_bytes: sizeBytes,
+      is_binary: stat.isBinary,
+      added_lines: stat.added,
+      deleted_lines: stat.deleted,
+      blob_sha: newBlobSha,
+    });
+  }
+
+  return {
+    agent_commit_hash: options.agentCommitHash,
+    verified_tree_hash: verifiedTreeHash,
+    parent_commit_hashes: parentCommitHashes,
+    expected_base_main_commit_hash: options.expectedBaseMainCommitHash,
+    changes,
+    contract: options.contract,
+  };
+}
+
