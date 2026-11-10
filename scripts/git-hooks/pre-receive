@@ -3,7 +3,8 @@
 # Software Factory v1.5 — Fail-Closed Git Pre-Receive Hook Gatekeeper
 # Spec Reference: MVP-SPEC-03 Section 5.1
 # Enforces 2000ms hard timeout and restricts Worker pushes exclusively to
-# refs/heads/sf/staging/<task_id>/<lease_epoch> with an ACTIVE lease.
+# refs/heads/sf/staging/<task_id>/<lease_epoch> (or refs/factory/Verify/<task_id>/<lease_epoch>)
+# with a valid per-lease token (`SF_GIT_LEASE_TOKEN`).
 # =============================================================================
 set -euo pipefail
 
@@ -15,6 +16,23 @@ if [[ -z "${LEASE_TOKEN}" ]]; then
   exit 1
 fi
 
+REPO_PATH="$(pwd)"
+GIT_OBJ_DIR="${GIT_OBJECT_DIRECTORY:-}"
+GIT_ALT_OBJ_DIRS="${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}"
+
+resp_file="$(mktemp)"
+cleanup() {
+  rm -f "${resp_file}"
+}
+trap cleanup EXIT
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "${s}"
+}
+
 while read -r old_sha new_sha ref_name; do
   # Never allow ref deletion
   if [[ "${new_sha}" =~ ^0+$ ]]; then
@@ -22,22 +40,32 @@ while read -r old_sha new_sha ref_name; do
     exit 1
   fi
 
-  # Never allow direct push to refs/heads/main from Worker transport
-  if [[ ! "${ref_name}" =~ ^(refs/heads/sf/staging|refs/factory/Verify)/[0-9a-fA-F-]+/[0-9]+$ ]]; then
+  # Never allow direct push to refs/heads/main or arbitrary refs from Worker transport
+  if [[ ! "${ref_name}" =~ ^(refs/heads/sf/staging|refs/factory/Verify)/[0-9a-fA-F-]+/(0|[1-9][0-9]*)$ ]]; then
     echo "ERROR [SF-PRE-RECEIVE]: Push to '${ref_name}' is forbidden. Only refs/heads/sf/staging/<task_id>/<lease_epoch> or refs/factory/Verify/<task_id>/<lease_epoch> is allowed." >&2
     exit 1
   fi
 
+  payload=$(printf '{"old_sha":"%s","new_sha":"%s","ref_name":"%s","repo_path":"%s","git_object_directory":"%s","git_alternate_object_directories":"%s"}' \
+    "$(json_escape "${old_sha}")" \
+    "$(json_escape "${new_sha}")" \
+    "$(json_escape "${ref_name}")" \
+    "$(json_escape "${REPO_PATH}")" \
+    "$(json_escape "${GIT_OBJ_DIR}")" \
+    "$(json_escape "${GIT_ALT_OBJ_DIRS}")")
+
   # Query Agent Gateway with strict 2000ms timeout (Fail-Closed on timeout or non-200)
-  http_code=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+  http_code=$(curl --silent --output "${resp_file}" --write-out "%{http_code}" \
     --max-time 2 \
     -X POST "${GATEWAY_PRE_RECEIVE_URL}" \
     -H "Authorization: Bearer ${LEASE_TOKEN}" \
     -H "Content-Type: application/json" \
-    -d "{\"old_sha\":\"${old_sha}\",\"new_sha\":\"${new_sha}\",\"ref_name\":\"${ref_name}\"}" || echo "000")
+    -d "${payload}" || true)
+  http_code="${http_code:-000}"
 
   if [[ "${http_code}" != "200" ]]; then
-    echo "ERROR [SF-PRE-RECEIVE]: Lease authorization failed or timed out (HTTP ${http_code}) for '${ref_name}'. Failing closed." >&2
+    body="$(cat "${resp_file}" 2>/dev/null || true)"
+    echo "ERROR [SF-PRE-RECEIVE]: Lease authorization failed or timed out (HTTP ${http_code}) for '${ref_name}': ${body}" >&2
     exit 1
   fi
 done

@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS projects (
   name TEXT NOT NULL,
   repo_bare_path TEXT NOT NULL,
   default_branch TEXT NOT NULL DEFAULT 'main',
+  approval_ttl_seconds INTEGER NOT NULL DEFAULT 86400 CHECK (approval_ttl_seconds > 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
@@ -57,7 +58,7 @@ CREATE TABLE IF NOT EXISTS project_memberships (
   membership_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id UUID NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
   principal_id TEXT NOT NULL,
-  member_role TEXT NOT NULL CHECK (member_role IN ('PROJECT_ADMIN', 'APPROVER', 'DEVELOPER', 'VIEWER')),
+  member_role TEXT NOT NULL CHECK (member_role IN ('ORG_ADMIN', 'PROJECT_APPROVER', 'DEVELOPER', 'AUDITOR')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   CONSTRAINT uq_project_membership UNIQUE (project_id, principal_id)
 );
@@ -70,14 +71,23 @@ CREATE TABLE IF NOT EXISTS tasks (
   task_contract_json JSONB NOT NULL,
   status TEXT NOT NULL CHECK (
     status IN (
-      'QUEUED', 'LEASED', 'ACCEPTED', 'IN_PROGRESS', 'AGENT_COMPLETED',
-      'CANDIDATE_BUILT', 'VERIFIED_PASS', 'VERIFIED_FAIL',
-      'REVIEWED_PASS', 'REVIEWED_FAIL', 'APPROVED', 'REJECTED',
-      'MERGED', 'NEEDS_REBASE', 'FAILED'
+      'Ready',
+      'Leased',
+      'ExecutingInTarget',
+      'BuildingMergeCandidate',
+      'VerifyingInDocker',
+      'UnderIndependentReview',
+      'AwaitingHumanApproval',
+      'AtomicCasMerge',
+      'MergedAndCompleted',
+      'ReworkRequired',
+      'ManualIntervention'
     )
   ),
   base_main_commit_hash CHAR(40) NOT NULL,
   current_attempt_no INTEGER NOT NULL DEFAULT 0 CHECK (current_attempt_no >= 0),
+  rework_count INTEGER NOT NULL DEFAULT 0 CHECK (rework_count >= 0),
+  max_rework_cycles INTEGER NOT NULL DEFAULT 3 CHECK (max_rework_cycles >= 1),
   active_lease_id UUID NULL,
   active_lease_epoch BIGINT NOT NULL DEFAULT 0 CHECK (active_lease_epoch >= 0),
   active_merge_candidate_id UUID NULL,
@@ -207,21 +217,26 @@ CREATE TABLE IF NOT EXISTS review_artifacts (
   reviewer_model TEXT NOT NULL,
   developer_principal_id TEXT NOT NULL,
   reviewer_principal_id TEXT NOT NULL,
-  developer_session_id TEXT NULL,
-  reviewer_session_id TEXT NULL,
+  developer_session_id TEXT NOT NULL,
+  reviewer_session_id TEXT NOT NULL,
   verdict TEXT NOT NULL CHECK (verdict IN ('PASS', 'FAIL')),
   is_invalidated BOOLEAN NOT NULL DEFAULT FALSE,
   invalidated_reason TEXT NULL,
   findings_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   CONSTRAINT chk_independent_reviewer_model CHECK (
-    (writer_provider, writer_model) IS DISTINCT FROM (reviewer_provider, reviewer_model)
+    (lower(btrim(writer_provider)), lower(btrim(writer_model))) IS DISTINCT FROM
+    (lower(btrim(reviewer_provider)), lower(btrim(reviewer_model)))
   ),
   CONSTRAINT chk_independent_reviewer_principal CHECK (
-    developer_principal_id IS DISTINCT FROM reviewer_principal_id
+    NULLIF(btrim(developer_principal_id), '') IS NOT NULL
+    AND NULLIF(btrim(reviewer_principal_id), '') IS NOT NULL
+    AND lower(btrim(developer_principal_id)) IS DISTINCT FROM lower(btrim(reviewer_principal_id))
   ),
   CONSTRAINT chk_independent_reviewer_session CHECK (
-    developer_session_id IS NULL OR reviewer_session_id IS NULL OR developer_session_id IS DISTINCT FROM reviewer_session_id
+    NULLIF(btrim(developer_session_id), '') IS NOT NULL
+    AND NULLIF(btrim(reviewer_session_id), '') IS NOT NULL
+    AND btrim(developer_session_id) IS DISTINCT FROM btrim(reviewer_session_id)
   ),
   CONSTRAINT fk_ra_verification FOREIGN KEY (
     verification_run_id, project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash
@@ -246,7 +261,7 @@ CREATE TABLE IF NOT EXISTS approval_decisions (
   verification_run_id UUID NOT NULL,
   review_artifact_id UUID NOT NULL,
   approver_principal_id TEXT NOT NULL,
-  decision TEXT NOT NULL CHECK (decision IN ('APPROVED', 'REJECTED')),
+  decision TEXT NOT NULL CHECK (decision IN ('APPROVED', 'REJECTED', 'REQUEST_CHANGES')),
   status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'CONSUMED', 'INVALIDATED', 'EXPIRED')),
   invalidated_reason TEXT NULL,
   approved_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -303,7 +318,7 @@ RETURNS TABLE (project_id UUID, lease_id UUID, task_id UUID)
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
   SELECT l.project_id, l.lease_id, l.task_id
   FROM task_leases l
@@ -316,7 +331,7 @@ $$;
 REVOKE ALL ON FUNCTION list_expired_active_lease_scopes(INTEGER) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION list_expired_active_lease_scopes(INTEGER) TO app_runtime;
 
--- 8. Enable and FORCE Row-Level Security on All 10 Tables
+-- 8. Enable and FORCE Row-Level Security on All 12 Tables
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects FORCE ROW LEVEL SECURITY;
 
@@ -353,7 +368,7 @@ ALTER TABLE outbox_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY;
 
--- 9. 4-Tier RLS Policies (MVP-SPEC-02 Section 7)
+-- 9. 4-Tier RLS Policies (MVP-SPEC-02 Section 3)
 -- Tier 1: projects & project_memberships
 DROP POLICY IF EXISTS projects_select_policy ON projects;
 CREATE POLICY projects_select_policy ON projects

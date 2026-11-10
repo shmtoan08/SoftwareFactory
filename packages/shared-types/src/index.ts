@@ -1,32 +1,28 @@
 import { createHash } from "node:crypto";
 
 /**
- * Canonical Task Statuses (MVP-SPEC-01 Section 4.1 & MVP-SPEC-02 Section 4)
+ * Canonical Task Statuses (MVP-SPEC-01 Section 4 & MVP-SPEC-02 Section 2)
  */
 export type TaskStatus =
-  | "QUEUED"
-  | "LEASED"
-  | "ACCEPTED"
-  | "IN_PROGRESS"
-  | "AGENT_COMPLETED"
-  | "CANDIDATE_BUILT"
-  | "VERIFIED_PASS"
-  | "VERIFIED_FAIL"
-  | "REVIEWED_PASS"
-  | "REVIEWED_FAIL"
-  | "APPROVED"
-  | "REJECTED"
-  | "MERGED"
-  | "NEEDS_REBASE"
-  | "FAILED";
+  | "Ready"
+  | "Leased"
+  | "ExecutingInTarget"
+  | "BuildingMergeCandidate"
+  | "VerifyingInDocker"
+  | "UnderIndependentReview"
+  | "AwaitingHumanApproval"
+  | "AtomicCasMerge"
+  | "MergedAndCompleted"
+  | "ReworkRequired"
+  | "ManualIntervention";
 
 /**
- * Canonical Lease Statuses (MVP-SPEC-02 Section 5)
+ * Canonical Lease Statuses (MVP-SPEC-02 Section 2)
  */
 export type LeaseStatus = "ACTIVE" | "COMPLETED" | "EXPIRED" | "REVOKED";
 
 /**
- * Canonical Worker Event Types (MVP-SPEC-03 Section 2.1)
+ * Canonical Worker Event Types (MVP-SPEC-03 Section 1.1)
  */
 export type WorkerEventType =
   | "task.accepted"
@@ -45,29 +41,41 @@ export const TERMINAL_WORKER_EVENT_TYPES: ReadonlySet<WorkerEventType> = new Set
 ]);
 
 /**
- * Deterministic Task State Transition Matrix (MVP-SPEC-01 Section 4.1 & MVP-SPEC-03 Section 2.1)
+ * Deterministic Task State Transition Matrix (MVP-SPEC-01 Section 4)
  */
 export const STATE_TRANSITION_MATRIX: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
-  QUEUED: ["LEASED", "FAILED"],
-  LEASED: ["ACCEPTED", "QUEUED", "FAILED"],
-  ACCEPTED: ["IN_PROGRESS", "QUEUED", "FAILED"],
-  IN_PROGRESS: ["IN_PROGRESS", "AGENT_COMPLETED", "QUEUED", "FAILED"],
-  AGENT_COMPLETED: ["CANDIDATE_BUILT", "FAILED"],
-  CANDIDATE_BUILT: ["VERIFIED_PASS", "VERIFIED_FAIL", "NEEDS_REBASE", "FAILED"],
-  VERIFIED_PASS: ["REVIEWED_PASS", "REVIEWED_FAIL", "NEEDS_REBASE"],
-  VERIFIED_FAIL: ["QUEUED", "FAILED"],
-  REVIEWED_PASS: ["APPROVED", "REJECTED", "NEEDS_REBASE"],
-  REVIEWED_FAIL: ["QUEUED", "FAILED"],
-  APPROVED: ["MERGED", "NEEDS_REBASE", "REVIEWED_PASS"],
-  REJECTED: ["QUEUED", "FAILED"],
-  NEEDS_REBASE: ["CANDIDATE_BUILT", "QUEUED", "FAILED"],
-  MERGED: [],
-  FAILED: ["QUEUED"],
+  Ready: ["Leased", "ManualIntervention"],
+  Leased: ["Leased", "ExecutingInTarget", "Ready", "ReworkRequired", "ManualIntervention"],
+  ExecutingInTarget: [
+    "ExecutingInTarget",
+    "BuildingMergeCandidate",
+    "Ready",
+    "ReworkRequired",
+    "ManualIntervention",
+  ],
+  BuildingMergeCandidate: ["VerifyingInDocker", "ReworkRequired", "ManualIntervention"],
+  VerifyingInDocker: ["UnderIndependentReview", "ReworkRequired", "ManualIntervention"],
+  UnderIndependentReview: ["AwaitingHumanApproval", "ReworkRequired", "ManualIntervention"],
+  AwaitingHumanApproval: [
+    "AtomicCasMerge",
+    "ReworkRequired",
+    "ManualIntervention",
+    "BuildingMergeCandidate",
+  ],
+  AtomicCasMerge: [
+    "MergedAndCompleted",
+    "BuildingMergeCandidate",
+    "AwaitingHumanApproval",
+    "ManualIntervention",
+  ],
+  MergedAndCompleted: [],
+  ReworkRequired: ["Leased", "Ready", "ManualIntervention"],
+  ManualIntervention: ["Ready", "ReworkRequired"],
 };
 
 /**
  * Maps each WorkerEventType to its allowed source task statuses and resulting target task status
- * (MVP-SPEC-03 Section 2.1)
+ * (MVP-SPEC-01 Section 4 & MVP-SPEC-03 Section 1.1)
  */
 export const WORKER_EVENT_STATE_TRANSITIONS: Readonly<
   Record<
@@ -80,29 +88,29 @@ export const WORKER_EVENT_STATE_TRANSITIONS: Readonly<
   >
 > = {
   "task.accepted": {
-    allowedFrom: ["LEASED"],
-    targetStatus: "ACCEPTED",
+    allowedFrom: ["Leased"],
+    targetStatus: "Leased",
   },
   "task.started": {
-    allowedFrom: ["ACCEPTED"],
-    targetStatus: "IN_PROGRESS",
+    allowedFrom: ["Leased", "ExecutingInTarget"],
+    targetStatus: "ExecutingInTarget",
   },
   "task.progress": {
-    allowedFrom: ["IN_PROGRESS"],
-    targetStatus: "IN_PROGRESS",
+    allowedFrom: ["ExecutingInTarget"],
+    targetStatus: "ExecutingInTarget",
   },
   "task.heartbeat": {
-    allowedFrom: ["LEASED", "ACCEPTED", "IN_PROGRESS"],
+    allowedFrom: ["Leased", "ExecutingInTarget"],
     targetStatus: "UNCHANGED",
   },
   "task.completed": {
-    allowedFrom: ["IN_PROGRESS"],
-    targetStatus: "AGENT_COMPLETED",
+    allowedFrom: ["ExecutingInTarget"],
+    targetStatus: "BuildingMergeCandidate",
     closesLeaseAs: "COMPLETED",
   },
   "task.failed": {
-    allowedFrom: ["LEASED", "ACCEPTED", "IN_PROGRESS"],
-    targetStatus: "FAILED",
+    allowedFrom: ["Leased", "ExecutingInTarget"],
+    targetStatus: "ReworkRequired",
     closesLeaseAs: "REVOKED",
   },
 };
@@ -112,7 +120,7 @@ export function isValidTaskStateTransition(from: TaskStatus, to: TaskStatus): bo
 }
 
 /**
- * Worker Event Envelope (MVP-SPEC-03 Section 2.1)
+ * Worker Event Envelope (MVP-SPEC-03 Section 1.1)
  */
 export interface WorkerEventEnvelope<TPayload extends Record<string, unknown> = Record<string, unknown>> {
   readonly schema_version: "1.5";
@@ -132,7 +140,7 @@ export interface WorkerEventEnvelope<TPayload extends Record<string, unknown> = 
 }
 
 /**
- * Server Event ACK / Reject Contract (MVP-SPEC-03 Section 2.2)
+ * Server Event ACK / Reject Contract (MVP-SPEC-03 Section 1.2)
  */
 export type ServerEventAckStatus =
   | "ACCEPTED"
@@ -164,7 +172,7 @@ export interface ServerEventAckContract {
 }
 
 /**
- * Reconnect Sync Response Contract (MVP-SPEC-03 Section 3.1)
+ * Reconnect Sync Response Contract (MVP-SPEC-03 Section 2.2)
  */
 export interface LeaseSyncStatusResponse {
   readonly lease_id: string;
@@ -177,7 +185,7 @@ export interface LeaseSyncStatusResponse {
 }
 
 /**
- * Database Entity Interfaces (MVP-SPEC-02 Sections 4-6)
+ * Database Entity Interfaces (MVP-SPEC-02 Section 2)
  */
 export interface TaskRecord {
   task_id: string;
@@ -187,6 +195,8 @@ export interface TaskRecord {
   status: TaskStatus;
   base_main_commit_hash: string;
   current_attempt_no: number;
+  rework_count: number;
+  max_rework_cycles: number;
   active_lease_id: string | null;
   active_lease_epoch: number;
   active_merge_candidate_id: string | null;
@@ -282,8 +292,8 @@ export interface ReviewArtifactRecord {
   verified_tree_hash: string;
   developer_principal_id: string;
   reviewer_principal_id: string;
-  developer_session_id?: string;
-  reviewer_session_id?: string;
+  developer_session_id: string;
+  reviewer_session_id: string;
   writer_provider: string;
   writer_model: string;
   reviewer_provider: string;
@@ -296,7 +306,7 @@ export interface ReviewArtifactRecord {
 }
 
 /**
- * 8-Field Cryptographically Bound Human Approval Record (MVP-SPEC-02 Section 6 & MVP-SPEC-04 Section 3.1)
+ * 8-Field Cryptographically Bound Human Approval Record (MVP-SPEC-02 Section 2 & MVP-SPEC-04 Section 4)
  */
 export interface ApprovalDecisionRecord {
   approval_id: string;
@@ -310,7 +320,7 @@ export interface ApprovalDecisionRecord {
   verification_run_id: string;
   review_artifact_id: string;
   approver_principal_id: string;
-  decision: "APPROVED" | "REJECTED";
+  decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
   status: "ACTIVE" | "CONSUMED" | "INVALIDATED" | "EXPIRED";
   invalidated_reason: string | null;
   approved_at: string;
@@ -330,17 +340,35 @@ export interface OutboxEventRecord {
 }
 
 /**
- * Deterministic Canonical JSON serialization (sorts object keys recursively)
+ * Deterministic Canonical Serialization for Cryptographic Hashing (FIX-25).
+ * Preserves distinct canonical tokens for `undefined`, `NaN`, `+/-Infinity`, and `bigint`
+ * in both standalone values and array slots so `[undefined]` and `[null]` never collide.
  */
 export function canonicalizeJson(value: unknown): string {
   if (value === undefined) {
-    return "null";
+    return "undefined";
+  }
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) {
+      return "NaN";
+    }
+    if (!Number.isFinite(value)) {
+      return value > 0 ? "Infinity" : "-Infinity";
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value === "bigint") {
+    return `${value.toString()}n`;
   }
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
-    return `[${value.map((item) => (item === undefined ? "null" : canonicalizeJson(item))).join(",")}]`;
+    const items: string[] = [];
+    for (let i = 0; i < value.length; i++) {
+      items.push(canonicalizeJson(value[i]));
+    }
+    return `[${items.join(",")}]`;
   }
   const record = value as Record<string, unknown>;
   const sortedKeys = Object.keys(record).sort();

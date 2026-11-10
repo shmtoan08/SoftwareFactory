@@ -37,7 +37,13 @@ jobs:
           cache: "npm"
 
       - name: Install Dependencies
-        run: npm ci || npm install --no-audit
+        run: npm ci
+
+      - name: Lint Check
+        run: npm run lint
+
+      - name: Secret Scanning
+        run: npm run scan:secrets
 
       - name: TypeScript Typecheck
         run: npm run typecheck
@@ -50,8 +56,8 @@ jobs:
           PGUSER: factory_admin
           PGPASSWORD: factory_secret_password
         run: |
-          psql -f packages/database/migrations/0001_mvp_core_schema_and_rls.sql
-          psql -f packages/database/migrations/0002_rls_verification_matrix.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0001_mvp_core_schema_and_rls.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
       - name: Execute Full Test Suite
         run: npm test

@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type ApprovalDecisionRecord,
-  type LeaseStatus,
   type LeaseSyncStatusResponse,
   type MergeCandidateRecord,
   type OutboxEventRecord,
@@ -39,11 +38,17 @@ export interface RlsSessionContext {
   currentRole: AppSessionRole;
 }
 
+export type ProjectMemberRole =
+  | "ORG_ADMIN"
+  | "PROJECT_APPROVER"
+  | "DEVELOPER"
+  | "AUDITOR";
+
 export interface ProjectMembershipRecord {
   membership_id: string;
   project_id: string;
   principal_id: string;
-  member_role: "PROJECT_ADMIN" | "APPROVER" | "DEVELOPER" | "VIEWER";
+  member_role: ProjectMemberRole;
   created_at: string;
 }
 
@@ -62,6 +67,7 @@ export interface ProjectRecord {
   name: string;
   repo_bare_path: string;
   default_branch: string;
+  approval_ttl_seconds: number;
   main_ref_commit_hash: string;
   created_at: string;
   updated_at: string;
@@ -230,9 +236,14 @@ export class SoftwareFactoryControlPlaneStore {
     repo_bare_path: string;
     initial_main_commit_hash: string;
     initial_main_tree_hash?: string;
+    approval_ttl_seconds?: number;
   }): ProjectRecord {
     if (this.getCurrentRlsSession().currentRole !== "system_admin_role") {
       throw new PostgresRlsError("42501", "Only system_admin_role can insert into projects");
+    }
+    const approvalTtlSeconds = input.approval_ttl_seconds ?? 86_400;
+    if (!Number.isInteger(approvalTtlSeconds) || approvalTtlSeconds <= 0) {
+      throw new PostgresRlsError("23514", "approval_ttl_seconds must be a positive integer");
     }
     const now = this.clockTimestampIso();
     const project_id = input.project_id ?? randomUUID();
@@ -242,6 +253,7 @@ export class SoftwareFactoryControlPlaneStore {
       name: input.name,
       repo_bare_path: input.repo_bare_path,
       default_branch: "main",
+      approval_ttl_seconds: approvalTtlSeconds,
       main_ref_commit_hash: input.initial_main_commit_hash,
       created_at: now,
       updated_at: now,
@@ -268,7 +280,7 @@ export class SoftwareFactoryControlPlaneStore {
   public addProjectMembership(input: {
     project_id: string;
     principal_id: string;
-    member_role: "PROJECT_ADMIN" | "APPROVER" | "DEVELOPER" | "VIEWER";
+    member_role: ProjectMemberRole;
   }): ProjectMembershipRecord {
     const role = this.getCurrentRlsSession().currentRole;
     if (role !== "system_admin_role" && role !== "core_api_service") {
@@ -289,17 +301,27 @@ export class SoftwareFactoryControlPlaneStore {
     return this.projectMemberships.get(`${projectId}:${principalId}`) ?? null;
   }
 
+  public getProjectById(projectId: string): ProjectRecord | null {
+    const project = this.projects.get(projectId);
+    return project ? { ...project } : null;
+  }
+
   public createTask(input: {
     task_id?: string;
     project_id: string;
     title: string;
     task_contract: TaskContractSpec;
     base_main_commit_hash?: string;
+    max_rework_cycles?: number;
   }): TaskRecord {
     this.assertWritePermissionForProject(input.project_id);
     const project = this.projects.get(input.project_id);
     if (!project) {
       throw new PostgresRlsError("23503", `Project ${input.project_id} does not exist`);
+    }
+    const maxReworkCycles = input.max_rework_cycles ?? 3;
+    if (!Number.isInteger(maxReworkCycles) || maxReworkCycles < 1) {
+      throw new PostgresRlsError("23514", "max_rework_cycles must be >= 1");
     }
     const now = this.clockTimestampIso();
     const task_id = input.task_id ?? randomUUID();
@@ -308,9 +330,11 @@ export class SoftwareFactoryControlPlaneStore {
       project_id: input.project_id,
       title: input.title,
       task_contract_json: input.task_contract as unknown as Record<string, unknown>,
-      status: "QUEUED",
+      status: "Ready",
       base_main_commit_hash: input.base_main_commit_hash ?? project.main_ref_commit_hash,
       current_attempt_no: 0,
+      rework_count: 0,
+      max_rework_cycles: maxReworkCycles,
       active_lease_id: null,
       active_lease_epoch: 0,
       active_merge_candidate_id: null,
@@ -394,7 +418,7 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   // ===========================================================================
-  // Lease Grant, Canonical Lock Event Submission & Revocation (MVP-SPEC-03)
+  // Lease Grant, Canonical Lock Event Submission & Revocation (MVP-SPEC-02 §4 & MVP-SPEC-03 §1)
   // ===========================================================================
 
   public async grantTaskLease(input: {
@@ -411,8 +435,19 @@ export class SoftwareFactoryControlPlaneStore {
     }
 
     return this.withSerializedLock(`task:${task.task_id}`, () => {
-      if (task.status !== "QUEUED") {
+      if (task.status !== "Ready" && task.status !== "ReworkRequired") {
         throw new Error(`Cannot grant lease when task is in status ${task.status}`);
+      }
+      if (task.status === "ReworkRequired") {
+        if (task.rework_count >= task.max_rework_cycles) {
+          task.status = "ManualIntervention";
+          task.updated_at = this.clockTimestampIso();
+          throw new PostgresRlsError(
+            "23514",
+            `Max rework cycles (${task.max_rework_cycles}) exceeded for task ${task.task_id}; moved to ManualIntervention`
+          );
+        }
+        task.rework_count += 1;
       }
       // Enforce uq_one_active_lease_per_task
       for (const l of this.taskLeases.values()) {
@@ -459,7 +494,7 @@ export class SoftwareFactoryControlPlaneStore {
       };
 
       this.taskLeases.set(lease_id, lease);
-      task.status = "LEASED";
+      task.status = "Leased";
       task.current_attempt_no = nextAttemptNo;
       task.active_lease_id = lease_id;
       task.active_lease_epoch = nextEpoch;
@@ -505,7 +540,7 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   /**
-   * Atomic Worker Event Processing Transaction (MVP-SPEC-03 Section 2.3)
+   * Atomic Worker Event Processing Transaction (MVP-SPEC-02 Section 4 & MVP-SPEC-03 Section 1.2)
    * Linearization point: Canonical row-level lock acquisition on `task_leases` -> `tasks`
    * evaluated against real-time `clock_timestamp()`.
    */
@@ -536,7 +571,7 @@ export class SoftwareFactoryControlPlaneStore {
           lease_status: "REVOKED",
           acked_sequence_no: 0,
           expected_next_seq: 0,
-          task_status: task?.status ?? "FAILED",
+          task_status: task?.status ?? "ManualIntervention",
           lease_expires_at: null,
           server_clock_timestamp: nowIso,
           error_code: "ERR_STALE_LEASE",
@@ -550,8 +585,8 @@ export class SoftwareFactoryControlPlaneStore {
         lease.status = "EXPIRED";
         if (task.active_lease_id === lease.lease_id) {
           task.active_lease_id = null;
-          if (task.status === "LEASED" || task.status === "ACCEPTED" || task.status === "IN_PROGRESS") {
-            task.status = "QUEUED";
+          if (task.status === "Leased" || task.status === "ExecutingInTarget") {
+            task.status = "Ready";
           }
           task.updated_at = nowIso;
         }
@@ -758,7 +793,7 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   /**
-   * Atomic Lease Revocation Transaction (MVP-SPEC-03 Section 2.4)
+   * Atomic Lease Revocation Transaction (MVP-SPEC-02 Section 4 & MVP-SPEC-03 Section 1.2)
    * Acquires the exact same canonical lock (`task_leases` -> `tasks`).
    */
   public async revokeTaskLease(input: {
@@ -785,8 +820,8 @@ export class SoftwareFactoryControlPlaneStore {
       }
       if (task.active_lease_id === lease.lease_id) {
         task.active_lease_id = null;
-        if (task.status === "LEASED" || task.status === "ACCEPTED" || task.status === "IN_PROGRESS") {
-          task.status = input.requeueTask ? "QUEUED" : "FAILED";
+        if (task.status === "Leased" || task.status === "ExecutingInTarget") {
+          task.status = input.requeueTask ? "Ready" : "ManualIntervention";
         }
         task.updated_at = nowIso;
       }
@@ -810,9 +845,9 @@ export class SoftwareFactoryControlPlaneStore {
 
   /**
    * Controlled Git Push Gatekeeper (`pre-receive` hook) + 6-Step TrustedImportValidator
-   * (MVP-SPEC-03 Section 5.1-5.2 & Roadmap M2 Section 1)
+   * (MVP-SPEC-03 Section 5.1-5.2)
    */
-  public pushStagingGitRefWithGatekeeper(input: {
+  public async pushStagingGitRefWithGatekeeper(input: {
     project_id: string;
     task_id: string;
     lease_id: string;
@@ -823,18 +858,16 @@ export class SoftwareFactoryControlPlaneStore {
     parent_commit_hashes: readonly string[];
     changes?: readonly GitTreeChangeEntry[];
     simulateControlPlaneOutage?: boolean;
-    simulatedGatekeeperLatencyMs?: number;
-  }): {
+    deadlineMs?: number;
+    authorizeCheckHook?: (signal: AbortSignal) => Promise<void>;
+  }): Promise<{
     allowed: boolean;
     error_code?: string;
     reason?: string;
     import_id?: string;
-  } {
-    const startMs = Date.now();
-
-    // Step 1a: Fail-Closed on Control Plane / DB outage or > 2000ms timeout (FIX-16)
-    const simulatedLatency = input.simulatedGatekeeperLatencyMs ?? 0;
-    if (input.simulateControlPlaneOutage === true || simulatedLatency > 2000) {
+  }> {
+    const deadlineMs = input.deadlineMs ?? 2000;
+    if (input.simulateControlPlaneOutage === true || deadlineMs <= 0) {
       return {
         allowed: false,
         error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
@@ -843,124 +876,171 @@ export class SoftwareFactoryControlPlaneStore {
       };
     }
 
-    const nowMs = this.clockFn().getTime();
-    const expectedStagingRef = `refs/heads/sf/staging/${input.task_id}/${input.lease_epoch}`;
-    const expectedVerifyAlias = `refs/factory/Verify/${input.task_id}/${input.lease_epoch}`;
-    if (input.staging_ref !== expectedStagingRef && input.staging_ref !== expectedVerifyAlias) {
-      return {
-        allowed: false,
-        error_code: "ERR_GATEKEEPER_FORBIDDEN_REF",
-        reason: `Pre-receive denied: staging_ref ${input.staging_ref} does not match ${expectedStagingRef} or ${expectedVerifyAlias}`,
-      };
-    }
+    const startMs = Date.now();
+    const abortController = new AbortController();
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-    // Step 1b: Atomic Lease Active & Real-Time Expiry Check (`expires_at > clock_timestamp()`)
-    const lease = this.taskLeases.get(input.lease_id);
-    const task = this.tasks.get(input.task_id);
-    if (
-      !lease ||
-      !task ||
-      lease.project_id !== input.project_id ||
-      lease.task_id !== input.task_id ||
-      lease.lease_epoch !== input.lease_epoch ||
-      lease.status !== "ACTIVE" ||
-      lease.revoked_at !== null ||
-      new Date(lease.expires_at).getTime() <= nowMs
-    ) {
-      return {
-        allowed: false,
-        error_code: "ERR_GATEKEEPER_STALE_OR_EXPIRED_LEASE",
-        reason: "Pre-receive denied: lease is not ACTIVE or has expired/revoked",
-      };
-    }
-
-    const refs = this.gitRefsByProject.get(input.project_id);
-    const commits = this.gitCommitsByProject.get(input.project_id);
-    if (!refs || !commits) {
-      return {
-        allowed: false,
-        error_code: "ERR_GATEKEEPER_REPO_NOT_FOUND",
-        reason: "Project bare repository not found",
-      };
-    }
-
-    // Reject pushes that omit changes metadata (FIX-10)
-    if (!input.changes) {
-      return {
-        allowed: false,
-        error_code: "ERR_GATEKEEPER_MISSING_CHANGES",
-        reason:
-          "Pre-receive denied: Git changes manifest is required for TrustedImportValidator verification",
-      };
-    }
-
-    // Step 2-6: Execute 6-Step TrustedImportValidator right at pre-receive hook
-    const contract = task.task_contract_json as unknown as TaskContractSpec;
-    const validation = validateGitTreeImport({
-      agent_commit_hash: input.agent_commit_hash,
-      verified_tree_hash: input.verified_tree_hash,
-      parent_commit_hashes: input.parent_commit_hashes,
-      expected_base_main_commit_hash: task.base_main_commit_hash,
-      changes: input.changes,
-      contract,
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        abortController.abort(new Error("ERR_GATEKEEPER_TIMEOUT"));
+        reject(new Error("ERR_GATEKEEPER_TIMEOUT"));
+      }, deadlineMs);
     });
 
-    if (!validation.valid) {
-      return {
-        allowed: false,
-        error_code: validation.error_code,
-        reason: `TrustedImportValidator rejected push at pre-receive: [${validation.error_code}] ${validation.message}`,
-      };
-    }
+    const runVerification = async (): Promise<{
+      allowed: boolean;
+      error_code?: string;
+      reason?: string;
+      import_id?: string;
+    }> => {
+      if (input.authorizeCheckHook) {
+        await input.authorizeCheckHook(abortController.signal);
+      }
+      if (abortController.signal.aborted || Date.now() - startMs > deadlineMs) {
+        return {
+          allowed: false,
+          error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+          reason: `Pre-receive hard timeout exceeded: gatekeeper exceeded ${deadlineMs}ms deadline`,
+        };
+      }
 
-    const totalElapsedMs = (Date.now() - startMs) + simulatedLatency;
-    if (totalElapsedMs > 2000) {
+      const nowMs = this.clockFn().getTime();
+      const expectedStagingRef = `refs/heads/sf/staging/${input.task_id}/${input.lease_epoch}`;
+      const expectedVerifyAlias = `refs/factory/Verify/${input.task_id}/${input.lease_epoch}`;
+      if (input.staging_ref !== expectedStagingRef && input.staging_ref !== expectedVerifyAlias) {
+        return {
+          allowed: false,
+          error_code: "ERR_GATEKEEPER_FORBIDDEN_REF",
+          reason: `Pre-receive denied: staging_ref ${input.staging_ref} does not match ${expectedStagingRef} or ${expectedVerifyAlias}`,
+        };
+      }
+
+      // Step 1b: Atomic Lease Active & Real-Time Expiry Check (`expires_at > clock_timestamp()`)
+      const lease = this.taskLeases.get(input.lease_id);
+      const task = this.tasks.get(input.task_id);
+      if (
+        !lease ||
+        !task ||
+        lease.project_id !== input.project_id ||
+        lease.task_id !== input.task_id ||
+        lease.lease_epoch !== input.lease_epoch ||
+        lease.status !== "ACTIVE" ||
+        lease.revoked_at !== null ||
+        new Date(lease.expires_at).getTime() <= nowMs
+      ) {
+        return {
+          allowed: false,
+          error_code: "ERR_GATEKEEPER_STALE_OR_EXPIRED_LEASE",
+          reason: "Pre-receive denied: lease is not ACTIVE or has expired/revoked",
+        };
+      }
+
+      const refs = this.gitRefsByProject.get(input.project_id);
+      const commits = this.gitCommitsByProject.get(input.project_id);
+      if (!refs || !commits) {
+        return {
+          allowed: false,
+          error_code: "ERR_GATEKEEPER_REPO_NOT_FOUND",
+          reason: "Project bare repository not found",
+        };
+      }
+
+      // Reject pushes that omit changes metadata (FIX-10)
+      if (!input.changes) {
+        return {
+          allowed: false,
+          error_code: "ERR_GATEKEEPER_MISSING_CHANGES",
+          reason:
+            "Pre-receive denied: Git changes manifest is required for TrustedImportValidator verification",
+        };
+      }
+
+      // Step 2-6: Execute 6-Step TrustedImportValidator right at pre-receive hook (also rejects changes: [])
+      const contract = task.task_contract_json as unknown as TaskContractSpec;
+      const validation = validateGitTreeImport({
+        agent_commit_hash: input.agent_commit_hash,
+        verified_tree_hash: input.verified_tree_hash,
+        parent_commit_hashes: input.parent_commit_hashes,
+        expected_base_main_commit_hash: task.base_main_commit_hash,
+        changes: input.changes,
+        contract,
+      });
+
+      if (!validation.valid) {
+        return {
+          allowed: false,
+          error_code: validation.error_code,
+          reason: `TrustedImportValidator rejected push at pre-receive: [${validation.error_code}] ${validation.message}`,
+        };
+      }
+
+      // Re-check deadline right before persisting git ref / verified_code_imports
+      const elapsedMs = Date.now() - startMs;
+      if (abortController.signal.aborted || elapsedMs > deadlineMs) {
+        return {
+          allowed: false,
+          error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+          reason: `Pre-receive hard timeout exceeded: execution took ${elapsedMs}ms (> ${deadlineMs}ms)`,
+        };
+      }
+
+      commits.set(input.agent_commit_hash, {
+        commitHash: input.agent_commit_hash,
+        treeHash: input.verified_tree_hash,
+        parents: [...input.parent_commit_hashes],
+        taskId: input.task_id,
+      });
+      refs.set(expectedStagingRef, input.agent_commit_hash);
+      refs.set(input.staging_ref, input.agent_commit_hash);
+
+      // Record immediately in `verified_code_imports` when changes were validated at pre-receive
+      let recordedImportId: string | undefined;
+      const existingImport = this.findVerifiedImportByLeaseAndCommit(
+        lease.lease_id,
+        input.agent_commit_hash
+      );
+      if (existingImport) {
+        recordedImportId = existingImport.import_id;
+      } else {
+        const importRecord: VerifiedCodeImportRecord = {
+          import_id: randomUUID(),
+          project_id: input.project_id,
+          task_id: input.task_id,
+          lease_id: lease.lease_id,
+          lease_epoch: lease.lease_epoch,
+          agent_commit_hash: validation.agent_commit_hash,
+          verified_tree_hash: validation.verified_tree_hash,
+          staging_ref: input.staging_ref,
+          changed_files_count: validation.changed_files_count,
+          deleted_lines_count: validation.deleted_lines_count,
+          created_at: this.clockTimestampIso(),
+        };
+        this.verifiedCodeImports.set(importRecord.import_id, importRecord);
+        recordedImportId = importRecord.import_id;
+      }
+
+      return {
+        allowed: true,
+        ...(recordedImportId ? { import_id: recordedImportId } : {}),
+      };
+    };
+
+    const verificationPromise = runVerification();
+    verificationPromise.catch(() => {});
+
+    try {
+      return await Promise.race([verificationPromise, timeoutPromise]);
+    } catch {
       return {
         allowed: false,
         error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
-        reason: `Pre-receive hard timeout exceeded: execution took ${totalElapsedMs}ms (> 2000ms)`,
+        reason: `Pre-receive Fail-Closed: Control Plane unreachable or exceeded ${deadlineMs}ms hard timeout`,
       };
+    } finally {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+      }
     }
-
-    commits.set(input.agent_commit_hash, {
-      commitHash: input.agent_commit_hash,
-      treeHash: input.verified_tree_hash,
-      parents: [...input.parent_commit_hashes],
-      taskId: input.task_id,
-    });
-    refs.set(expectedStagingRef, input.agent_commit_hash);
-    refs.set(input.staging_ref, input.agent_commit_hash);
-
-    // Record immediately in `verified_code_imports` when changes were validated at pre-receive (M2 P0-4)
-    let recordedImportId: string | undefined;
-    const existingImport = this.findVerifiedImportByLeaseAndCommit(
-      lease.lease_id,
-      input.agent_commit_hash
-    );
-    if (existingImport) {
-      recordedImportId = existingImport.import_id;
-    } else {
-      const importRecord: VerifiedCodeImportRecord = {
-        import_id: randomUUID(),
-        project_id: input.project_id,
-        task_id: input.task_id,
-        lease_id: lease.lease_id,
-        lease_epoch: lease.lease_epoch,
-        agent_commit_hash: validation.agent_commit_hash,
-        verified_tree_hash: validation.verified_tree_hash,
-        staging_ref: input.staging_ref,
-        changed_files_count: validation.changed_files_count,
-        deleted_lines_count: validation.deleted_lines_count,
-        created_at: this.clockTimestampIso(),
-      };
-      this.verifiedCodeImports.set(importRecord.import_id, importRecord);
-      recordedImportId = importRecord.import_id;
-    }
-
-    return {
-      allowed: true,
-      ...(recordedImportId ? { import_id: recordedImportId } : {}),
-    };
   }
 
   private findVerifiedImportByLeaseAndCommit(
@@ -975,14 +1055,37 @@ export class SoftwareFactoryControlPlaneStore {
     return undefined;
   }
 
-  private findLatestVerifiedImportByLease(
-    leaseId: string,
-    stagingRef?: string
-  ): VerifiedCodeImportRecord | undefined {
+  /**
+   * Strictly matches a VerifiedCodeImportRecord against project, task, lease, lease_epoch,
+   * canonical staging ref format, and live Git ref SHA pointer (FIX-27).
+   */
+  private findMatchingVerifiedImportForReconciler(input: {
+    projectId: string;
+    taskId: string;
+    leaseId: string;
+    leaseEpoch: number;
+  }): VerifiedCodeImportRecord | undefined {
+    const expectedStagingRef = `refs/heads/sf/staging/${input.taskId}/${input.leaseEpoch}`;
+    const expectedVerifyAlias = `refs/factory/Verify/${input.taskId}/${input.leaseEpoch}`;
+    const refs = this.gitRefsByProject.get(input.projectId);
+    if (!refs) {
+      return undefined;
+    }
+
     let latest: VerifiedCodeImportRecord | undefined;
     for (const rec of this.verifiedCodeImports.values()) {
-      if (rec.lease_id === leaseId && (!stagingRef || rec.staging_ref === stagingRef)) {
-        if (!latest || new Date(rec.created_at).getTime() >= new Date(latest.created_at).getTime()) {
+      if (
+        rec.project_id === input.projectId &&
+        rec.task_id === input.taskId &&
+        rec.lease_id === input.leaseId &&
+        rec.lease_epoch === input.leaseEpoch &&
+        (rec.staging_ref === expectedStagingRef || rec.staging_ref === expectedVerifyAlias) &&
+        refs.get(rec.staging_ref) === rec.agent_commit_hash
+      ) {
+        if (
+          !latest ||
+          new Date(rec.created_at).getTime() >= new Date(latest.created_at).getTime()
+        ) {
           latest = rec;
         }
       }
@@ -1033,10 +1136,10 @@ export class SoftwareFactoryControlPlaneStore {
   }
 
   /**
-   * LeaseExpiryReconciler & Orphaned Git Push Reconciler (MVP-SPEC-03 Section 3.2 & Roadmap M2 P0-4)
+   * LeaseExpiryReconciler & Orphaned Git Push Reconciler (MVP-SPEC-03 Section 3.2)
    * If a Worker pushed a valid staging commit before its connection died (losing `task.completed`),
-   * the reconciler detects the recorded `verified_code_imports` entry (or validates the staging ref)
-   * and advances the task to `AGENT_COMPLETED` without re-running the Agent!
+   * the reconciler verifies the `verified_code_imports` entry against the live staging ref
+   * and advances the task to `BuildingMergeCandidate` without re-running the Agent.
    */
   public async runLeaseExpiryAndOrphanedPushReconciler(
     orphanedDiffProvider?: (stagingInfo: {
@@ -1082,15 +1185,17 @@ export class SoftwareFactoryControlPlaneStore {
               return;
             }
 
-            // Path A (M2): Check if pre-receive hook already recorded a VerifiedCodeImportRecord for this lease!
-            const expectedStagingRef = `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`;
-            const preRecordedImport =
-              this.findLatestVerifiedImportByLease(lease.lease_id, expectedStagingRef) ??
-              this.findLatestVerifiedImportByLease(lease.lease_id);
+            // Path A: Match pre-recorded VerifiedCodeImport strictly by staging ref & live Git commit hash (FIX-27)
+            const preRecordedImport = this.findMatchingVerifiedImportForReconciler({
+              projectId: scope.project_id,
+              taskId: task.task_id,
+              leaseId: lease.lease_id,
+              leaseEpoch: lease.lease_epoch,
+            });
             if (preRecordedImport) {
               lease.status = "COMPLETED";
               lease.completed_at = nowIso;
-              task.status = "AGENT_COMPLETED";
+              task.status = "BuildingMergeCandidate";
               task.active_lease_id = null;
               task.updated_at = nowIso;
 
@@ -1117,9 +1222,15 @@ export class SoftwareFactoryControlPlaneStore {
 
             // Path B: Inspect staging ref via orphanedDiffProvider if not yet in verified_code_imports
             const stagingRef = `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`;
+            const verifyRef = `refs/factory/Verify/${task.task_id}/${lease.lease_epoch}`;
             const refs = this.gitRefsByProject.get(scope.project_id);
             const commits = this.gitCommitsByProject.get(scope.project_id);
-            const stagingCommitHash = refs?.get(stagingRef);
+            const matchedRef = refs?.get(stagingRef)
+              ? stagingRef
+              : refs?.get(verifyRef)
+              ? verifyRef
+              : stagingRef;
+            const stagingCommitHash = refs?.get(matchedRef);
             const commitMeta = stagingCommitHash ? commits?.get(stagingCommitHash) : undefined;
 
             if (stagingCommitHash && commitMeta && orphanedDiffProvider) {
@@ -1128,7 +1239,7 @@ export class SoftwareFactoryControlPlaneStore {
                 task_id: task.task_id,
                 lease_id: lease.lease_id,
                 lease_epoch: lease.lease_epoch,
-                staging_ref: stagingRef,
+                staging_ref: matchedRef,
                 agent_commit_hash: stagingCommitHash,
                 verified_tree_hash: commitMeta.treeHash,
                 parent_commit_hashes: commitMeta.parents,
@@ -1136,7 +1247,7 @@ export class SoftwareFactoryControlPlaneStore {
               if (candidateInput) {
                 const validation = validateGitTreeImport(candidateInput);
                 if (validation.valid) {
-                  // Recover orphaned push into verified_code_imports and advance task to AGENT_COMPLETED!
+                  // Recover orphaned push into verified_code_imports and advance task to BuildingMergeCandidate
                   const importRecord: VerifiedCodeImportRecord = {
                     import_id: randomUUID(),
                     project_id: scope.project_id,
@@ -1145,7 +1256,7 @@ export class SoftwareFactoryControlPlaneStore {
                     lease_epoch: lease.lease_epoch,
                     agent_commit_hash: validation.agent_commit_hash,
                     verified_tree_hash: validation.verified_tree_hash,
-                    staging_ref: stagingRef,
+                    staging_ref: matchedRef,
                     changed_files_count: validation.changed_files_count,
                     deleted_lines_count: validation.deleted_lines_count,
                     created_at: nowIso,
@@ -1153,7 +1264,7 @@ export class SoftwareFactoryControlPlaneStore {
                   this.verifiedCodeImports.set(importRecord.import_id, importRecord);
                   lease.status = "COMPLETED";
                   lease.completed_at = nowIso;
-                  task.status = "AGENT_COMPLETED";
+                  task.status = "BuildingMergeCandidate";
                   task.active_lease_id = null;
                   task.updated_at = nowIso;
 
@@ -1180,11 +1291,11 @@ export class SoftwareFactoryControlPlaneStore {
               }
             }
 
-            // Otherwise mark lease EXPIRED and requeue task
+            // Otherwise mark lease EXPIRED and requeue task back to Ready
             lease.status = "EXPIRED";
             if (task.active_lease_id === lease.lease_id) {
               task.active_lease_id = null;
-              task.status = "QUEUED";
+              task.status = "Ready";
               task.updated_at = nowIso;
             }
             this.insertOutboxEventInternal(
@@ -1224,17 +1335,100 @@ export class SoftwareFactoryControlPlaneStore {
     candidate_input: GitTreeImportCandidateInput;
   }): VerifiedCodeImportRecord {
     this.assertWritePermissionForProject(input.project_id);
+
+    const task = this.tasks.get(input.task_id);
+    const lease = this.taskLeases.get(input.lease_id);
+    if (!task || task.project_id !== input.project_id) {
+      throw new PostgresRlsError(
+        "23503",
+        `Task ${input.task_id} not found for project ${input.project_id}`
+      );
+    }
+    if (!lease || lease.project_id !== input.project_id || lease.task_id !== input.task_id) {
+      throw new PostgresRlsError(
+        "23503",
+        `Lease ${input.lease_id} not found for task ${input.task_id} in project ${input.project_id}`
+      );
+    }
+    if (lease.lease_epoch !== input.lease_epoch) {
+      throw new PostgresRlsError(
+        "23514",
+        `Lease epoch mismatch: expected ${lease.lease_epoch}, got ${input.lease_epoch}`
+      );
+    }
+
+    const expectedStagingRef = `refs/heads/sf/staging/${input.task_id}/${input.lease_epoch}`;
+    const expectedVerifyAlias = `refs/factory/Verify/${input.task_id}/${input.lease_epoch}`;
+    if (input.staging_ref !== expectedStagingRef && input.staging_ref !== expectedVerifyAlias) {
+      throw new PostgresRlsError(
+        "23514",
+        `Invalid staging_ref ${input.staging_ref}; expected ${expectedStagingRef} or ${expectedVerifyAlias}`
+      );
+    }
+
+    // Lease authority & real-time expiry fencing (FIX-08)
+    const nowMs = this.clockFn().getTime();
+    const isExpired = new Date(lease.expires_at).getTime() <= nowMs;
+    if (
+      lease.status === "REVOKED" ||
+      lease.status === "EXPIRED" ||
+      lease.revoked_at !== null ||
+      (lease.status === "ACTIVE" && isExpired)
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `Lease ${input.lease_id} (status=${lease.status}) is revoked or expired and cannot record verified_code_imports`
+      );
+    }
+
+    if (input.candidate_input.expected_base_main_commit_hash !== task.base_main_commit_hash) {
+      throw new PostgresRlsError(
+        "23514",
+        `Candidate expected_base_main_commit_hash ${input.candidate_input.expected_base_main_commit_hash} does not match task base_main_commit_hash ${task.base_main_commit_hash}`
+      );
+    }
+
     const validation = validateGitTreeImport(input.candidate_input);
     if (!validation.valid) {
-      throw new Error(`TrustedImportValidator rejected import: [${validation.error_code}] ${validation.message}`);
+      throw new PostgresRlsError(
+        "23514",
+        `TrustedImportValidator rejected import: [${validation.error_code}] ${validation.message}`
+      );
     }
+
     const existing = this.findVerifiedImportByLeaseAndCommit(
       input.lease_id,
       validation.agent_commit_hash
     );
     if (existing) {
-      return { ...existing };
+      if (
+        existing.project_id !== input.project_id ||
+        existing.task_id !== input.task_id ||
+        existing.lease_epoch !== input.lease_epoch ||
+        existing.staging_ref !== input.staging_ref ||
+        existing.verified_tree_hash !== validation.verified_tree_hash
+      ) {
+        throw new PostgresRlsError(
+          "23514",
+          `Conflicting VerifiedCodeImport already exists for lease ${input.lease_id}`
+        );
+      }
+      if (lease.status === "ACTIVE" || (lease.status === "COMPLETED" && task.status === "BuildingMergeCandidate")) {
+        return { ...existing };
+      }
+      throw new PostgresRlsError(
+        "23514",
+        `Cannot reuse VerifiedCodeImport while task is in status ${task.status} and lease is ${lease.status}`
+      );
     }
+
+    if (lease.status !== "ACTIVE") {
+      throw new PostgresRlsError(
+        "23514",
+        `Cannot record new VerifiedCodeImport on non-ACTIVE lease (status=${lease.status})`
+      );
+    }
+
     const nowIso = this.clockTimestampIso();
     const record: VerifiedCodeImportRecord = {
       import_id: randomUUID(),
@@ -1255,8 +1449,8 @@ export class SoftwareFactoryControlPlaneStore {
 
   /**
    * Candidate-First Creation (`C_candidate`).
-   * Automatically supersedes any older candidate on the same task and invalidates stale reviews/approvals!
-   * (MVP-SPEC-04 Section 2.3 & Section 3.1)
+   * Automatically supersedes any older candidate on the same task and invalidates stale reviews/approvals.
+   * (MVP-SPEC-04 Section 1 & Section 3.1)
    */
   public createMergeCandidate(input: {
     project_id: string;
@@ -1273,15 +1467,27 @@ export class SoftwareFactoryControlPlaneStore {
       throw new PostgresRlsError("23503", "Task or VerifiedCodeImport not found for project");
     }
 
-    // Verify import belongs to this task (FIX-12)
     if (imp.task_id !== input.task_id) {
       throw new PostgresRlsError("23503", "Import does not belong to the specified task");
     }
 
-    // Verify candidate base matches current main ref (FIX-12)
+    if (input.verified_tree_hash !== imp.verified_tree_hash) {
+      throw new PostgresRlsError(
+        "23514",
+        `Candidate verified_tree_hash ${input.verified_tree_hash} does not match import ${imp.verified_tree_hash}`
+      );
+    }
+
+    // Fail-closed: require refs/heads/main to exist and match candidate base commit (FIX-12)
     const refs = this.gitRefsByProject.get(input.project_id);
     const currentMainSha = refs?.get("refs/heads/main");
-    if (currentMainSha && input.base_main_commit_hash !== currentMainSha) {
+    if (!refs || !currentMainSha) {
+      throw new PostgresRlsError(
+        "23503",
+        `Project ${input.project_id} is missing required refs/heads/main pointer`
+      );
+    }
+    if (input.base_main_commit_hash !== currentMainSha) {
       throw new PostgresRlsError(
         "23514",
         `Candidate base_main_commit_hash ${input.base_main_commit_hash} does not match current main ${currentMainSha}`
@@ -1325,8 +1531,7 @@ export class SoftwareFactoryControlPlaneStore {
       mergeCandidateId: candidate.merge_candidate_id,
     });
 
-    task.status = "CANDIDATE_BUILT";
-    task.base_main_commit_hash = input.base_main_commit_hash;
+    task.status = "VerifyingInDocker";
     task.active_merge_candidate_id = candidate.merge_candidate_id;
     task.updated_at = nowIso;
 
@@ -1397,15 +1602,22 @@ export class SoftwareFactoryControlPlaneStore {
       created_at: nowIso,
     };
     this.verificationRuns.set(record.verification_run_id, record);
-    task.status = input.verdict === "PASS" ? "VERIFIED_PASS" : "VERIFIED_FAIL";
+    task.status =
+      input.verdict === "PASS"
+        ? "UnderIndependentReview"
+        : task.rework_count < task.max_rework_cycles
+        ? "ReworkRequired"
+        : "ManualIntervention";
     task.updated_at = nowIso;
     return { ...record };
   }
 
   /**
-   * 3D Independent Reviewer Artifact Recording (MVP-SPEC-04 Section 2)
-   * Enforces `chk_independent_reviewer_model`: `(writer_provider, writer_model) IS DISTINCT FROM (reviewer_provider, reviewer_model)`.
-   * Enforces `chk_independent_reviewer_principal`: developer and reviewer must be distinct principals (FIX-03).
+   * 3D Independent Reviewer Artifact Recording (MVP-SPEC-04 Section 3.1)
+   * Enforces:
+   * 1. Model independence: `(writer_provider, writer_model) IS DISTINCT FROM (reviewer_provider, reviewer_model)`
+   * 2. Principal independence: non-empty distinct `developer_principal_id` & `reviewer_principal_id`
+   * 3. Session independence: non-empty distinct `developer_session_id` & `reviewer_session_id` (FIX-03)
    */
   public recordReviewArtifact(input: {
     project_id: string;
@@ -1418,16 +1630,27 @@ export class SoftwareFactoryControlPlaneStore {
     writer_model: string;
     reviewer_provider: string;
     reviewer_model: string;
-    developer_principal_id?: string;
-    reviewer_principal_id?: string;
-    developer_session_id?: string;
-    reviewer_session_id?: string;
+    developer_principal_id: string;
+    reviewer_principal_id: string;
+    developer_session_id: string;
+    reviewer_session_id: string;
     verdict: "PASS" | "FAIL";
     findings_json?: ReadonlyArray<Record<string, unknown>>;
   }): ReviewArtifactRecord {
     this.assertWritePermissionForProject(input.project_id);
 
     // Dimension 1: Model Identity Independence Check
+    if (
+      !input.writer_provider?.trim() ||
+      !input.writer_model?.trim() ||
+      !input.reviewer_provider?.trim() ||
+      !input.reviewer_model?.trim()
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "review_artifacts requires non-empty writer and reviewer provider/model identifiers"
+      );
+    }
     if (
       input.writer_provider.trim().toLowerCase() === input.reviewer_provider.trim().toLowerCase() &&
       input.writer_model.trim().toLowerCase() === input.reviewer_model.trim().toLowerCase()
@@ -1439,9 +1662,15 @@ export class SoftwareFactoryControlPlaneStore {
     }
 
     // Dimension 2: Principal Identity Independence Check (FIX-03)
-    const devPrincipal = input.developer_principal_id ?? "agent-writer-principal";
-    const revPrincipal = input.reviewer_principal_id ?? "reviewer-principal";
-    if (devPrincipal.trim().toLowerCase() === revPrincipal.trim().toLowerCase()) {
+    const devPrincipal = typeof input.developer_principal_id === "string" ? input.developer_principal_id.trim() : "";
+    const revPrincipal = typeof input.reviewer_principal_id === "string" ? input.reviewer_principal_id.trim() : "";
+    if (!devPrincipal || !revPrincipal) {
+      throw new PostgresRlsError(
+        "23514",
+        'new row for relation "review_artifacts" violates NOT NULL / non-empty constraint on developer_principal_id and reviewer_principal_id'
+      );
+    }
+    if (devPrincipal.toLowerCase() === revPrincipal.toLowerCase()) {
       throw new PostgresRlsError(
         "23514",
         `new row violates check constraint "chk_independent_reviewer_principal": developer (${devPrincipal}) must be distinct from reviewer (${revPrincipal})`
@@ -1449,14 +1678,18 @@ export class SoftwareFactoryControlPlaneStore {
     }
 
     // Dimension 3: Session Independence Check (FIX-03)
-    if (
-      input.developer_session_id &&
-      input.reviewer_session_id &&
-      input.developer_session_id === input.reviewer_session_id
-    ) {
+    const devSession = typeof input.developer_session_id === "string" ? input.developer_session_id.trim() : "";
+    const revSession = typeof input.reviewer_session_id === "string" ? input.reviewer_session_id.trim() : "";
+    if (!devSession || !revSession) {
       throw new PostgresRlsError(
         "23514",
-        `new row violates check constraint "chk_independent_reviewer_session": developer session (${input.developer_session_id}) must be distinct from reviewer session`
+        'new row for relation "review_artifacts" violates NOT NULL / non-empty constraint on developer_session_id and reviewer_session_id'
+      );
+    }
+    if (devSession === revSession) {
+      throw new PostgresRlsError(
+        "23514",
+        `new row violates check constraint "chk_independent_reviewer_session": developer session (${devSession}) must be distinct from reviewer session`
       );
     }
 
@@ -1496,8 +1729,8 @@ export class SoftwareFactoryControlPlaneStore {
       reviewer_model: input.reviewer_model,
       developer_principal_id: devPrincipal,
       reviewer_principal_id: revPrincipal,
-      developer_session_id: input.developer_session_id ?? null,
-      reviewer_session_id: input.reviewer_session_id ?? null,
+      developer_session_id: devSession,
+      reviewer_session_id: revSession,
       verdict: input.verdict,
       is_invalidated: false,
       invalidated_reason: null,
@@ -1505,14 +1738,20 @@ export class SoftwareFactoryControlPlaneStore {
       created_at: nowIso,
     };
     this.reviewArtifacts.set(record.review_artifact_id, record);
-    task.status = input.verdict === "PASS" ? "REVIEWED_PASS" : "REVIEWED_FAIL";
+    task.status =
+      input.verdict === "PASS"
+        ? "AwaitingHumanApproval"
+        : task.rework_count < task.max_rework_cycles
+        ? "ReworkRequired"
+        : "ManualIntervention";
     task.updated_at = nowIso;
     return { ...record };
   }
 
   /**
-   * 8-Field Cryptographically Bound Human Approval (MVP-SPEC-02 Section 6 & MVP-SPEC-04 Section 3.1)
-   * Enforces RLS-T8 (Composite FK cross-tenant & 8-field exact binding) + Approval TTL window.
+   * 8-Field Cryptographically Bound Human Approval (MVP-SPEC-02 Section 2 & MVP-SPEC-04 Section 4)
+   * Enforces fail-closed RBAC membership (`PROJECT_APPROVER` | `ORG_ADMIN`), RLS-T8 8-field FK binding,
+   * `REQUEST_CHANGES` rework transitions, and project-configured `approval_ttl_seconds` TTL window.
    */
   public submitHumanApproval(input: {
     project_id: string;
@@ -1525,17 +1764,28 @@ export class SoftwareFactoryControlPlaneStore {
     verification_run_id: string;
     review_artifact_id: string;
     approver_principal_id: string;
-    decision: "APPROVED" | "REJECTED";
+    decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+    feedback?: string;
     ttl_ms?: number;
   }): ApprovalDecisionRecord {
     this.assertWritePermissionForProject(input.project_id);
 
-    // Verify approver membership authorization if project has configured members (FIX-11)
+    const project = this.projects.get(input.project_id);
+    if (!project) {
+      throw new PostgresRlsError("23503", `Project ${input.project_id} not found`);
+    }
+
+    // Fail-closed project membership & RBAC verification (FIX-11)
     const membership = this.getProjectMembership(input.project_id, input.approver_principal_id);
-    if (membership && membership.member_role !== "APPROVER" && membership.member_role !== "PROJECT_ADMIN") {
+    if (
+      !membership ||
+      (membership.member_role !== "PROJECT_APPROVER" && membership.member_role !== "ORG_ADMIN")
+    ) {
       throw new PostgresRlsError(
         "42501",
-        `Principal ${input.approver_principal_id} with role ${membership.member_role} is not authorized to approve in project ${input.project_id}`
+        `Principal ${input.approver_principal_id} (${
+          membership ? `role=${membership.member_role}` : "no project membership"
+        }) is not authorized to approve in project ${input.project_id}`
       );
     }
 
@@ -1544,7 +1794,7 @@ export class SoftwareFactoryControlPlaneStore {
     const vr = this.verificationRuns.get(input.verification_run_id);
     const task = this.tasks.get(input.task_id);
 
-    // Enforce maximum 1 ACTIVE approval per candidate (FIX-11 / uq_one_active_approval_per_candidate)
+    // Enforce maximum 1 ACTIVE approval per candidate (uq_one_active_approval_per_candidate)
     for (const ad of this.approvalDecisions.values()) {
       if (ad.merge_candidate_id === input.merge_candidate_id && ad.status === "ACTIVE") {
         throw new PostgresRlsError(
@@ -1554,11 +1804,11 @@ export class SoftwareFactoryControlPlaneStore {
       }
     }
 
-    // Enforce task status is REVIEWED_PASS before receiving human approval (FIX-11)
-    if (task && task.status !== "REVIEWED_PASS") {
+    // Enforce task status is AwaitingHumanApproval before receiving human approval
+    if (task && task.project_id === input.project_id && task.status !== "AwaitingHumanApproval") {
       throw new PostgresRlsError(
         "23514",
-        `Task must be in REVIEWED_PASS status to receive human approval, got ${task.status}`
+        `Task must be in AwaitingHumanApproval status to receive human approval, got ${task.status}`
       );
     }
 
@@ -1587,13 +1837,13 @@ export class SoftwareFactoryControlPlaneStore {
     ) {
       throw new PostgresRlsError(
         "23503",
-        "insert or update on table \"approval_decisions\" violates composite 8-field foreign key constraint"
+        'insert or update on table "approval_decisions" violates composite 8-field foreign key constraint'
       );
     }
 
     const nowDate = this.clockFn();
     const nowIso = nowDate.toISOString();
-    const ttlMs = input.ttl_ms ?? 24 * 60 * 60 * 1000; // Default 24h TTL
+    const ttlMs = input.ttl_ms ?? project.approval_ttl_seconds * 1000;
     if (ttlMs <= 0) {
       throw new PostgresRlsError("23514", "chk_approval_ttl_window: expires_at must be > approved_at");
     }
@@ -1611,16 +1861,39 @@ export class SoftwareFactoryControlPlaneStore {
       review_artifact_id: input.review_artifact_id,
       approver_principal_id: input.approver_principal_id,
       decision: input.decision,
-      status: "ACTIVE",
+      status: input.decision === "APPROVED" ? "ACTIVE" : "CONSUMED",
       invalidated_reason: null,
       approved_at: nowIso,
       expires_at: new Date(nowDate.getTime() + ttlMs).toISOString(),
-      consumed_at: null,
+      consumed_at: input.decision === "APPROVED" ? null : nowIso,
     };
 
     this.approvalDecisions.set(record.approval_id, record);
-    task.status = input.decision === "APPROVED" ? "APPROVED" : "REJECTED";
+    if (input.decision === "APPROVED") {
+      task.status = "AtomicCasMerge";
+    } else if (input.decision === "REQUEST_CHANGES") {
+      task.status =
+        task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+    } else {
+      task.status = "ManualIntervention";
+    }
     task.updated_at = nowIso;
+
+    this.insertOutboxEventInternal(
+      input.project_id,
+      "approval_decision",
+      record.approval_id,
+      "human.approval_decided",
+      {
+        task_id: task.task_id,
+        merge_candidate_id: mc.merge_candidate_id,
+        decision: input.decision,
+        approver_principal_id: input.approver_principal_id,
+        resulting_task_status: task.status,
+        ...(input.feedback ? { feedback: input.feedback } : {}),
+      }
+    );
+
     return { ...record };
   }
 
@@ -1637,14 +1910,19 @@ export class SoftwareFactoryControlPlaneStore {
     }
   }
 
+  public deleteGitRefForTest(projectId: string, refName: string): void {
+    const refs = this.gitRefsByProject.get(projectId);
+    refs?.delete(refName);
+  }
+
   /**
-   * 6-Step Post-Merge Reconciler & Atomic CAS Merge (`MVP-SPEC-04` Section 3.2 & Section 3.3)
+   * 6-Step Post-Merge Reconciler & Atomic CAS Merge (MVP-SPEC-04 Section 5.1 & Section 5.2)
    * Handles:
-   * - Already `MERGED` idempotent return
-   * - Crash after `git update-ref` succeeded (`currentMainSha === merge_candidate_hash` or ancestor with matching trailers) -> reconciles DB to `MERGED` without re-running CAS!
-   * - Approval TTL expiry (`expires_at <= clock_timestamp()`) -> marks approval `EXPIRED` and transitions task to `REVIEWED_PASS`
-   * - CAS conflict (`currentMainSha !== base_main_commit_hash`) -> marks candidate superseded, invalidates review & approval, and transitions task to `NEEDS_REBASE`
-   * - Clean CAS (`currentMainSha === base_main_commit_hash`) -> atomically updates `refs/heads/main` to `merge_candidate_hash`, marks approval `CONSUMED`, and transitions task to `MERGED`.
+   * - Already `MergedAndCompleted` idempotent return
+   * - Crash after `git update-ref` succeeded (`currentMainSha === merge_candidate_hash`) -> reconciles DB to `MergedAndCompleted`
+   * - Approval TTL expiry (`expires_at <= clock_timestamp()`) -> marks approval `EXPIRED` and transitions task to `AwaitingHumanApproval`
+   * - CAS conflict (`currentMainSha !== base_main_commit_hash`) -> marks candidate superseded, invalidates review & approval, updates `base_main_commit_hash`, and transitions task to `BuildingMergeCandidate`
+   * - Clean CAS (`currentMainSha === base_main_commit_hash`) -> atomically updates `refs/heads/main` to `merge_candidate_hash`, marks approval `CONSUMED`, and transitions task to `MergedAndCompleted`.
    */
   public async executeAtomicCasMergeOrReconcile(input: {
     project_id: string;
@@ -1672,20 +1950,32 @@ export class SoftwareFactoryControlPlaneStore {
       if (approval.decision !== "APPROVED") {
         throw new Error(`Cannot merge candidate with decision ${approval.decision}`);
       }
-      if (approval.task_id !== input.task_id || approval.merge_candidate_id !== input.merge_candidate_id) {
+      if (
+        approval.project_id !== input.project_id ||
+        approval.task_id !== input.task_id ||
+        approval.merge_candidate_id !== input.merge_candidate_id
+      ) {
         throw new Error("Approval decision does not bind to the specified task and merge candidate");
       }
-      if (task.status !== "APPROVED" && task.status !== "MERGED") {
-        throw new Error(`Task must be in APPROVED status for CAS merge, current status is ${task.status}`);
+      if (task.status !== "AtomicCasMerge" && task.status !== "MergedAndCompleted") {
+        throw new Error(
+          `Task must be in AtomicCasMerge status for CAS merge, current status is ${task.status}`
+        );
       }
 
-      const currentMainSha = refs.get("refs/heads/main")!;
+      const currentMainSha = refs.get("refs/heads/main");
+      if (!currentMainSha) {
+        throw new PostgresRlsError(
+          "23503",
+          `Project ${input.project_id} is missing required refs/heads/main pointer`
+        );
+      }
 
-      // Step 1: If DB already recorded MERGED, return idempotently
-      if (task.status === "MERGED" && task.merged_commit_hash) {
+      // Step 1: If DB already recorded MergedAndCompleted, return idempotently
+      if (task.status === "MergedAndCompleted" && task.merged_commit_hash) {
         return {
           status: "RECONCILED_ALREADY_MERGED",
-          task_status: "MERGED",
+          task_status: "MergedAndCompleted",
           merged_commit_hash: task.merged_commit_hash,
           main_ref_commit_hash: currentMainSha,
         };
@@ -1698,7 +1988,7 @@ export class SoftwareFactoryControlPlaneStore {
           approval.status = "CONSUMED";
           approval.consumed_at = nowIso;
         }
-        task.status = "MERGED";
+        task.status = "MergedAndCompleted";
         task.merged_commit_hash = mc.merge_candidate_hash;
         task.merged_at = nowIso;
         task.updated_at = nowIso;
@@ -1717,7 +2007,7 @@ export class SoftwareFactoryControlPlaneStore {
 
         return {
           status: "RECONCILED_ALREADY_MERGED",
-          task_status: "MERGED",
+          task_status: "MergedAndCompleted",
           merged_commit_hash: mc.merge_candidate_hash,
           main_ref_commit_hash: currentMainSha,
         };
@@ -1732,7 +2022,7 @@ export class SoftwareFactoryControlPlaneStore {
           approval.status = "EXPIRED";
           approval.invalidated_reason = "APPROVAL_TTL_EXPIRED";
         }
-        task.status = "REVIEWED_PASS";
+        task.status = "AwaitingHumanApproval";
         task.updated_at = nowIso;
 
         return {
@@ -1751,13 +2041,14 @@ export class SoftwareFactoryControlPlaneStore {
           mc.merge_candidate_id,
           `CAS_MAIN_MOVED_FROM_${mc.base_main_commit_hash}_TO_${currentMainSha}`
         );
-        task.status = "NEEDS_REBASE";
+        task.status = "BuildingMergeCandidate";
+        task.base_main_commit_hash = currentMainSha;
         task.active_merge_candidate_id = null;
         task.updated_at = nowIso;
 
         return {
           status: "CAS_CONFLICT_NEEDS_REBASE",
-          task_status: "NEEDS_REBASE",
+          task_status: "BuildingMergeCandidate",
           merged_commit_hash: null,
           main_ref_commit_hash: currentMainSha,
           invalidated_approval_id: approval.approval_id,
@@ -1771,7 +2062,7 @@ export class SoftwareFactoryControlPlaneStore {
 
       approval.status = "CONSUMED";
       approval.consumed_at = nowIso;
-      task.status = "MERGED";
+      task.status = "MergedAndCompleted";
       task.merged_commit_hash = mc.merge_candidate_hash;
       task.merged_at = nowIso;
       task.updated_at = nowIso;
@@ -1791,7 +2082,7 @@ export class SoftwareFactoryControlPlaneStore {
 
       return {
         status: "MERGED_BY_CAS",
-        task_status: "MERGED",
+        task_status: "MergedAndCompleted",
         merged_commit_hash: mc.merge_candidate_hash,
         main_ref_commit_hash: mc.merge_candidate_hash,
       };

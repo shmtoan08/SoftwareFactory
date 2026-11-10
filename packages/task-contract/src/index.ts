@@ -209,6 +209,7 @@ export type TrustedImportValidationResult =
   | {
       readonly valid: false;
       readonly error_code:
+        | "ERR_IMPORT_EMPTY_CHANGES"
         | "ERR_IMPORT_LINEAGE_MISMATCH"
         | "ERR_IMPORT_FORBIDDEN_GIT_MODE"
         | "ERR_IMPORT_PATH_TRAVERSAL_OR_COLLISION"
@@ -225,6 +226,14 @@ export type TrustedImportValidationResult =
 export function validateGitTreeImport(
   input: GitTreeImportCandidateInput
 ): TrustedImportValidationResult {
+  if (!input.changes || input.changes.length === 0) {
+    return {
+      valid: false,
+      error_code: "ERR_IMPORT_EMPTY_CHANGES",
+      message: "Import candidate must include at least one changed file; empty changes are rejected",
+    };
+  }
+
   // Step 1: Single-Parent Lineage Check
   if (
     input.parent_commit_hashes.length !== 1 ||
@@ -397,10 +406,25 @@ export function inspectRealGitCommitForImport(options: {
   expectedBaseMainCommitHash: string;
   agentCommitHash: string;
   contract: TaskContractSpec;
+  gitDir?: string;
+  gitObjectDirectory?: string;
+  gitAlternateObjectDirectories?: string;
 }): GitTreeImportCandidateInput {
+  const gitEnv: NodeJS.ProcessEnv = { ...process.env };
+  if (options.gitDir) {
+    gitEnv.GIT_DIR = options.gitDir;
+  }
+  if (options.gitObjectDirectory) {
+    gitEnv.GIT_OBJECT_DIRECTORY = options.gitObjectDirectory;
+  }
+  if (options.gitAlternateObjectDirectories) {
+    gitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES = options.gitAlternateObjectDirectories;
+  }
+
   const git = (args: string[], inputStdin?: string): string =>
     execFileSync("git", args, {
       cwd: options.repoPath,
+      env: gitEnv,
       encoding: "utf8",
       stdio: inputStdin !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
       input: inputStdin,

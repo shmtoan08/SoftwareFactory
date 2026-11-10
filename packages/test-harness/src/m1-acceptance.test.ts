@@ -8,7 +8,6 @@ import {
   type WorkerEventEnvelope,
   computeCanonicalPayloadSha256,
   computeEventIdempotencyKey,
-  computeTaskExecutionIdempotencyKey,
   sha256Hex,
 } from "../../shared-types/src/index.ts";
 import {
@@ -18,6 +17,7 @@ import {
 } from "../../task-contract/src/index.ts";
 import {
   PostgresRlsError,
+  type ProjectMemberRole,
   SoftwareFactoryControlPlaneStore,
 } from "../../database/src/index.ts";
 import {
@@ -25,7 +25,7 @@ import {
   LocalOutboxBuffer,
 } from "../../wna/src/index.ts";
 import { AgentGatewayService } from "../../../apps/agent-gateway/src/index.ts";
-import { CoreApiService } from "../../../apps/core-api/src/index.ts";
+import { type CoreApiAuthContext, CoreApiService } from "../../../apps/core-api/src/index.ts";
 import { WebApprovalConsoleController } from "../../../apps/web/src/index.ts";
 import { FakeAgentHarnessAdapter } from "./index.ts";
 
@@ -74,10 +74,52 @@ function createTestEnvironment(initialNow = new Date("2026-11-10T09:00:00.000Z")
       });
       projectAId = pA.project_id;
       projectBId = pB.project_id;
+
+      for (const [principal_id, member_role] of [
+        ["operator-1", "ORG_ADMIN"],
+        ["op-1", "ORG_ADMIN"],
+        ["dev-1", "DEVELOPER"],
+        ["dev-a", "DEVELOPER"],
+        ["tech-lead-01", "PROJECT_APPROVER"],
+        ["approver-1", "PROJECT_APPROVER"],
+        ["approver-2", "PROJECT_APPROVER"],
+        ["approver-a", "PROJECT_APPROVER"],
+        ["auditor-1", "AUDITOR"],
+      ] as const) {
+        store.addProjectMembership({
+          project_id: projectAId,
+          principal_id,
+          member_role,
+        });
+      }
+
+      for (const [principal_id, member_role] of [
+        ["dev-b", "DEVELOPER"],
+        ["approver-b", "PROJECT_APPROVER"],
+      ] as const) {
+        store.addProjectMembership({
+          project_id: projectBId,
+          principal_id,
+          member_role,
+        });
+      }
     }
   );
 
   const coreApi = new CoreApiService(store);
+  const issueAuth = (
+    projectId: string,
+    principalId: string,
+    roles: readonly ProjectMemberRole[],
+    ttlMs = 3_600_000
+  ): CoreApiAuthContext =>
+    coreApi.issueAuthContext({
+      projectId,
+      principalId,
+      roles,
+      ttlMs,
+    });
+
   const gatewayA = new AgentGatewayService({
     store,
     projectId: projectAId,
@@ -98,13 +140,23 @@ function createTestEnvironment(initialNow = new Date("2026-11-10T09:00:00.000Z")
     projectBId,
     advanceClockMs,
     getCurrentClock: () => currentNow,
+    issueAuth,
+    authDev1: issueAuth(projectAId, "dev-1", ["DEVELOPER"]),
+    authDevA: issueAuth(projectAId, "dev-a", ["DEVELOPER"]),
+    authDevB: issueAuth(projectBId, "dev-b", ["DEVELOPER"]),
+    authOp1: issueAuth(projectAId, "operator-1", ["ORG_ADMIN"]),
+    authShortOp: issueAuth(projectAId, "op-1", ["ORG_ADMIN"]),
+    authTechLead: issueAuth(projectAId, "tech-lead-01", ["PROJECT_APPROVER"]),
+    authApprover1: issueAuth(projectAId, "approver-1", ["PROJECT_APPROVER"]),
+    authApproverA: issueAuth(projectAId, "approver-a", ["PROJECT_APPROVER"]),
+    authApproverB: issueAuth(projectBId, "approver-b", ["PROJECT_APPROVER"]),
   };
 }
 
 describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matrix (RLS-T1 .. RLS-T8)", () => {
   it("RLS-T1: Default Deny when app.current_project_id is unset or empty", async () => {
-    const { store, coreApi, projectAId } = createTestEnvironment();
-    await coreApi.createTask(projectAId, "dev-1", {
+    const { store, coreApi, projectAId, authDev1 } = createTestEnvironment();
+    await coreApi.createTask(projectAId, authDev1, {
       title: "Task Alpha 1",
       task_contract: DEFAULT_CONTRACT,
     });
@@ -126,12 +178,12 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
   });
 
   it("RLS-T2: Cross-Tenant SELECT Isolation (Project B cannot see Project A rows)", async () => {
-    const { store, coreApi, projectAId, projectBId } = createTestEnvironment();
-    const taskA = await coreApi.createTask(projectAId, "dev-a", {
+    const { store, coreApi, projectAId, projectBId, authDevA, authDevB } = createTestEnvironment();
+    const taskA = await coreApi.createTask(projectAId, authDevA, {
       title: "Alpha Secret Task",
       task_contract: DEFAULT_CONTRACT,
     });
-    const taskB = await coreApi.createTask(projectBId, "dev-b", {
+    const taskB = await coreApi.createTask(projectBId, authDevB, {
       title: "Beta Task",
       task_contract: DEFAULT_CONTRACT,
     });
@@ -173,8 +225,8 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
   });
 
   it("RLS-T4: Cross-Tenant UPDATE Returns 0 Rows and Leaves Target Row Untouched", async () => {
-    const { store, coreApi, projectAId, projectBId } = createTestEnvironment();
-    const taskA = await coreApi.createTask(projectAId, "dev-a", {
+    const { store, coreApi, projectAId, projectBId, authDevA } = createTestEnvironment();
+    const taskA = await coreApi.createTask(projectAId, authDevA, {
       title: "Original Alpha Title",
       task_contract: DEFAULT_CONTRACT,
     });
@@ -202,8 +254,8 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
   });
 
   it("RLS-T5: Cross-Tenant DELETE Blocked (Project B cannot delete Project A rows)", async () => {
-    const { store, coreApi, projectAId, projectBId } = createTestEnvironment();
-    const taskA = await coreApi.createTask(projectAId, "dev-a", {
+    const { store, coreApi, projectAId, projectBId, authDevA } = createTestEnvironment();
+    const taskA = await coreApi.createTask(projectAId, authDevA, {
       title: "Task Alpha",
       task_contract: DEFAULT_CONTRACT,
     });
@@ -221,8 +273,8 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
   });
 
   it("RLS-T6: Connection Pool Reuse Safety (SET LOCAL Resets on Transaction Completion / DISCARD ALL)", async () => {
-    const { store, coreApi, projectAId } = createTestEnvironment();
-    await coreApi.createTask(projectAId, "dev-a", {
+    const { store, coreApi, projectAId, authDevA } = createTestEnvironment();
+    await coreApi.createTask(projectAId, authDevA, {
       title: "Scoped Task",
       task_contract: DEFAULT_CONTRACT,
     });
@@ -244,12 +296,12 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
   });
 
   it("RLS-T7: Tier 3 Append-Only Evidence Immutability (processed_worker_events Prohibits DELETE with 42501)", async () => {
-    const { store, coreApi, gatewayA, projectAId } = createTestEnvironment();
-    const taskA = await coreApi.createTask(projectAId, "dev-a", {
+    const { store, coreApi, gatewayA, projectAId, authDevA } = createTestEnvironment();
+    const taskA = await coreApi.createTask(projectAId, authDevA, {
       title: "Task Alpha Evidence",
       task_contract: DEFAULT_CONTRACT,
     });
-    const leaseA = await coreApi.dispatchTaskLease(projectAId, "dev-a", {
+    const leaseA = await coreApi.dispatchTaskLease(projectAId, authDevA, {
       task_id: taskA.task_id,
       worker_id: "worker-1",
     });
@@ -286,12 +338,20 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
   });
 
   it("RLS-T8: Composite 8-Field Foreign Key Prevents Cross-Tenant or Mismatched Hash Approval Binding", async () => {
-    const { coreApi, gatewayA, projectAId, projectBId } = createTestEnvironment();
-    const taskA = await coreApi.createTask(projectAId, "dev-a", {
+    const {
+      coreApi,
+      gatewayA,
+      projectAId,
+      projectBId,
+      authDevA,
+      authApproverA,
+      authApproverB,
+    } = createTestEnvironment();
+    const taskA = await coreApi.createTask(projectAId, authDevA, {
       title: "Task Alpha",
       task_contract: DEFAULT_CONTRACT,
     });
-    const leaseA = await coreApi.dispatchTaskLease(projectAId, "dev-a", {
+    const leaseA = await coreApi.dispatchTaskLease(projectAId, authDevA, {
       task_id: taskA.task_id,
       worker_id: "worker-1",
     });
@@ -301,7 +361,7 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
     const verifiedTree = "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222";
     const candidateHash = "cccc3333cccc3333cccc3333cccc3333cccc3333";
 
-    await gatewayA.authorizeAndPushStagingRef({
+    const pushRes = await gatewayA.authorizeAndPushStagingRef({
       task_id: taskA.task_id,
       lease_id: leaseA.lease_id,
       lease_epoch: leaseA.lease_epoch,
@@ -309,9 +369,21 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
       agent_commit_hash: agentCommit,
       verified_tree_hash: verifiedTree,
       parent_commit_hashes: [INITIAL_MAIN_SHA],
+      changes: [
+        {
+          path: "src/feature.ts",
+          mode: "100644",
+          size_bytes: 256,
+          is_binary: false,
+          added_lines: 15,
+          deleted_lines: 2,
+          blob_sha: "dddd4444dddd4444dddd4444dddd4444dddd4444",
+        },
+      ],
     });
+    assert.equal(pushRes.allowed, true);
 
-    const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, "dev-a", {
+    const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, authDevA, {
       task_id: taskA.task_id,
       lease_id: leaseA.lease_id,
       lease_epoch: leaseA.lease_epoch,
@@ -339,7 +411,7 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
     });
 
     const { verificationRun, reviewArtifact } =
-      await coreApi.recordVerificationAndIndependentReview(projectAId, "dev-a", {
+      await coreApi.recordVerificationAndIndependentReview(projectAId, authDevA, {
         task_id: taskA.task_id,
         merge_candidate_id: mergeCandidate.merge_candidate_id,
         merge_candidate_hash: candidateHash,
@@ -353,13 +425,17 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
         writer_model: "claude-3-7-sonnet",
         reviewer_provider: "openai",
         reviewer_model: "gpt-4.1",
+        developer_principal_id: "wna-writer-01",
+        reviewer_principal_id: "independent-reviewer-01",
+        developer_session_id: "sess-writer-rls-t8",
+        reviewer_session_id: "sess-reviewer-rls-t8",
         review_verdict: "PASS",
       });
 
     // Attempt 1: Cross-tenant binding from Project B referencing Project A's candidate -> rejected 23503
     await assert.rejects(
       async () =>
-        coreApi.submitHumanApproval(projectBId, "approver-b", {
+        coreApi.submitHumanApproval(projectBId, authApproverB, {
           task_id: taskA.task_id,
           merge_candidate_id: mergeCandidate.merge_candidate_id,
           agent_commit_hash: agentCommit,
@@ -376,7 +452,7 @@ describe("Milestone M1 Gate — Part 1: 8-Scenario PostgreSQL RLS Isolation Matr
     // Attempt 2: Tampered verified_tree_hash in 8-field approval payload -> rejected 23503
     await assert.rejects(
       async () =>
-        coreApi.submitHumanApproval(projectAId, "approver-a", {
+        coreApi.submitHumanApproval(projectAId, authApproverA, {
           task_id: taskA.task_id,
           merge_candidate_id: mergeCandidate.merge_candidate_id,
           agent_commit_hash: agentCommit,
@@ -402,17 +478,19 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       sandboxBackend,
       fakeAgent,
       projectAId,
+      authOp1,
+      authTechLead,
     } = createTestEnvironment();
 
     const tempDir = mkdtempSync(join(tmpdir(), "sf-outbox-s1-"));
     try {
-      const task = await coreApi.createTask(projectAId, "operator-1", {
+      const task = await coreApi.createTask(projectAId, authOp1, {
         title: "Implement deterministic lease coordinator",
         task_contract: DEFAULT_CONTRACT,
       });
-      assert.equal(task.status, "QUEUED");
+      assert.equal(task.status, "Ready");
 
-      const lease = await coreApi.dispatchTaskLease(projectAId, "operator-1", {
+      const lease = await coreApi.dispatchTaskLease(projectAId, authOp1, {
         task_id: task.task_id,
         worker_id: "wna-node-01",
       });
@@ -453,6 +531,8 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
         taskContract: DEFAULT_CONTRACT,
       };
       const execResult = await fakeAgent.parseExecutionResult(agentCtx, 0, "done", "");
+      assert.ok(execResult.agentCommitHash);
+      assert.ok(execResult.verifiedTreeHash);
 
       // Push to staging ref while lease is ACTIVE
       const stagingRef = `refs/heads/sf/staging/${task.task_id}/${lease.lease_epoch}`;
@@ -466,13 +546,13 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
         parent_commit_hashes: [INITIAL_MAIN_SHA],
         changes: [
           {
-            path: "src/calculator.ts",
+            path: "src/coordinator.ts",
             mode: "100644",
-            size_bytes: 120,
-            added_lines: 10,
-            deleted_lines: 0,
+            size_bytes: 1024,
+            added_lines: 45,
+            deleted_lines: 5,
             is_binary: false,
-            blob_sha: INITIAL_MAIN_SHA,
+            blob_sha: sha256Hex("blob-1").slice(0, 40),
           },
         ],
       });
@@ -488,12 +568,12 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       const acks = await outbox.sendOrReplay(gatewayA);
       assert.equal(acks.length, 5);
       assert.equal(acks[4]?.ack_status, "ACCEPTED");
-      assert.equal(acks[4]?.task_status, "AGENT_COMPLETED");
+      assert.equal(acks[4]?.task_status, "BuildingMergeCandidate");
       assert.equal(acks[4]?.lease_status, "COMPLETED");
 
       // Import & Build Candidate C_candidate
       const candidateHash = sha256Hex(`candidate:${execResult.agentCommitHash}:${INITIAL_MAIN_SHA}`).slice(0, 40);
-      const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, "operator-1", {
+      const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, authOp1, {
         task_id: task.task_id,
         lease_id: lease.lease_id,
         lease_epoch: lease.lease_epoch,
@@ -520,9 +600,9 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
         },
       });
 
-      // Verify & 3D Independent Review (Anthropic writer != OpenAI reviewer)
+      // Verify & 3D Independent Review (Anthropic writer != Google reviewer)
       const { verificationRun, reviewArtifact } =
-        await coreApi.recordVerificationAndIndependentReview(projectAId, "operator-1", {
+        await coreApi.recordVerificationAndIndependentReview(projectAId, authOp1, {
           task_id: task.task_id,
           merge_candidate_id: mergeCandidate.merge_candidate_id,
           merge_candidate_hash: mergeCandidate.merge_candidate_hash,
@@ -536,12 +616,16 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
           writer_model: execResult.writerModel,
           reviewer_provider: "google",
           reviewer_model: "gemini-2.5-pro",
+          developer_principal_id: "wna-writer-s1",
+          reviewer_principal_id: "independent-reviewer-s1",
+          developer_session_id: "sess-writer-s1",
+          reviewer_session_id: "sess-reviewer-s1",
           review_verdict: "PASS",
         });
 
       // 8-Field Human Approval via Web Console Controller
       const approval = await webConsole.approveCandidateWith8FieldBinding({
-        approverPrincipalId: "tech-lead-01",
+        auth: authTechLead,
         candidate: mergeCandidate,
         verificationRun,
         reviewArtifact,
@@ -549,20 +633,20 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       assert.equal(approval.status, "ACTIVE");
 
       // Execute Atomic CAS Merge
-      const mergeResult = await coreApi.executeCasMerge(projectAId, "operator-1", {
+      const mergeResult = await coreApi.executeCasMerge(projectAId, authOp1, {
         task_id: task.task_id,
         merge_candidate_id: mergeCandidate.merge_candidate_id,
         approval_id: approval.approval_id,
       });
       assert.equal(mergeResult.status, "MERGED_BY_CAS");
-      assert.equal(mergeResult.task_status, "MERGED");
+      assert.equal(mergeResult.task_status, "MergedAndCompleted");
       assert.equal(mergeResult.main_ref_commit_hash, candidateHash);
 
       const finalTask = await store.withRlsTransaction(
         { currentProjectId: projectAId, currentRole: "core_api_service" },
         () => store.getTaskById(task.task_id)
       );
-      assert.equal(finalTask?.status, "MERGED");
+      assert.equal(finalTask?.status, "MergedAndCompleted");
       assert.equal(finalTask?.merged_commit_hash, candidateHash);
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
@@ -570,12 +654,12 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
   });
 
   it("Scenario 2: Duplicate Event Retry & Payload Tampering Detection (200 DUPLICATE_RETRY_NOP vs 409 ERR_IDEMPOTENCY_PAYLOAD_MISMATCH)", async () => {
-    const { store, coreApi, gatewayA, projectAId } = createTestEnvironment();
-    const task = await coreApi.createTask(projectAId, "op-1", {
+    const { store, coreApi, gatewayA, projectAId, authShortOp } = createTestEnvironment();
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "Idempotency test",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-1",
     });
@@ -637,12 +721,12 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
   });
 
   it("Scenario 3: Out-of-Order Sequence Gap Rejection (seq=1 -> seq=3 returns 409 ERR_SEQ_GAP) & Automatic LocalOutboxBuffer Gap Replay", async () => {
-    const { coreApi, gatewayA, sandboxBackend, projectAId } = createTestEnvironment();
-    const task = await coreApi.createTask(projectAId, "op-1", {
+    const { coreApi, gatewayA, sandboxBackend, projectAId, authShortOp } = createTestEnvironment();
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "Out of order sequence test",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-1",
     });
@@ -658,7 +742,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     });
 
     const ev1 = outbox.enqueueEvent("task.accepted", { seq: 1 });
-    const _ev2 = outbox.enqueueEvent("task.started", { seq: 2 });
+    outbox.enqueueEvent("task.started", { seq: 2 });
     const ev3 = outbox.enqueueEvent("task.progress", { seq: 3 });
 
     // Send seq=1 directly
@@ -679,16 +763,16 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     assert.equal(acks.length, 2);
     assert.equal(acks[0]?.acked_sequence_no, 2);
     assert.equal(acks[1]?.acked_sequence_no, 3);
-    assert.equal(acks[1]?.task_status, "IN_PROGRESS");
+    assert.equal(acks[1]?.task_status, "ExecutingInTarget");
   });
 
-  it("Scenario 4: Invalid State Transition Rejection (task.completed directly from LEASED without task.accepted/started -> 422 ERR_INVALID_STATE_TRANSITION)", async () => {
-    const { coreApi, gatewayA, projectAId } = createTestEnvironment();
-    const task = await coreApi.createTask(projectAId, "op-1", {
+  it("Scenario 4: Invalid State Transition Rejection (task.completed directly from Leased without task.accepted/started -> 422 ERR_INVALID_STATE_TRANSITION)", async () => {
+    const { coreApi, gatewayA, projectAId, authShortOp } = createTestEnvironment();
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "Invalid state transition test",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-1",
     });
@@ -703,7 +787,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       lease_epoch: lease.lease_epoch,
       worker_id: lease.worker_id,
       sequence_no: 1,
-      event_type: "task.completed", // Illegal from LEASED!
+      event_type: "task.completed", // Illegal from Leased!
       task_execution_idempotency_key: lease.task_execution_idempotency_key,
       event_idempotency_key: computeEventIdempotencyKey(
         lease.lease_id,
@@ -728,20 +812,21 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       sandboxBackend,
       projectAId,
       advanceClockMs,
+      authShortOp,
     } = createTestEnvironment();
 
-    const task = await coreApi.createTask(projectAId, "op-1", {
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "Concurrency race & cgroup kill test",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease1 = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease1 = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-zombie-1",
       heartbeat_interval_ms: 10_000,
       lease_ttl_ms: 30_000,
     });
 
-    // Spawn simulated agent + grandchild processes inside Linux cgroup v2 sandbox
+    // Spawn simulated agent + grandchild processes inside simulated cgroup v2 sandbox
     sandboxBackend.spawnProcessInSandbox({
       taskId: task.task_id,
       leaseEpoch: lease1.lease_epoch,
@@ -762,7 +847,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     outbox1.enqueueEvent("task.accepted", { step: 1 });
 
     // Fire Revoke Lease and Worker Event concurrently on the same task lock:
-    const revokePromise = coreApi.revokeTaskLease(projectAId, "op-1", {
+    const revokePromise = coreApi.revokeTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       lease_id: lease1.lease_id,
       reason: "OPERATOR_PREEMPT_AND_REVOKE",
@@ -781,10 +866,12 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     const cleanupEvidence = sandboxBackend.getLastCleanupEvidence(task.task_id, lease1.lease_epoch);
     assert.ok(cleanupEvidence);
     assert.equal(cleanupEvidence.populatedZeroVerified, true);
+    assert.equal(cleanupEvidence.backendMode, "simulated-cgroup-v2");
+    assert.equal(cleanupEvidence.isSimulated, true);
     assert.deepEqual(cleanupEvidence.killedPids, [50001, 50002, 50003]);
 
     // Also verify clock_timestamp() expiry during a re-leased attempt (epoch = 2)
-    const lease2 = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease2 = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-2",
       heartbeat_interval_ms: 10_000,
@@ -823,12 +910,13 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
   });
 
   it("Scenario 6: Orphaned Git Push Recovery When Worker Crashes Before Sending task.completed", async () => {
-    const { store, coreApi, gatewayA, projectAId, advanceClockMs } = createTestEnvironment();
-    const task = await coreApi.createTask(projectAId, "op-1", {
+    const { store, coreApi, gatewayA, projectAId, advanceClockMs, authShortOp } =
+      createTestEnvironment();
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "Recover orphaned staging push",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-crash-after-push",
       heartbeat_interval_ms: 10_000,
@@ -894,7 +982,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     // Lease expires after 35s
     advanceClockMs(35_000);
 
-    // Run LeaseExpiryReconciler -> detects valid staging push and recovers task to AGENT_COMPLETED!
+    // Run LeaseExpiryReconciler -> detects valid staging push and recovers task to BuildingMergeCandidate!
     const reconciled = await store.runLeaseExpiryAndOrphanedPushReconciler((stagingInfo) => ({
       agent_commit_hash: stagingInfo.agent_commit_hash,
       verified_tree_hash: stagingInfo.verified_tree_hash,
@@ -921,7 +1009,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       { currentProjectId: projectAId, currentRole: "core_api_service" },
       () => store.getTaskById(task.task_id)
     );
-    assert.equal(recoveredTask?.status, "AGENT_COMPLETED");
+    assert.equal(recoveredTask?.status, "BuildingMergeCandidate");
   });
 
   it("Scenario 7: TrustedImportValidator 6-Step Defense (Path Precedence forbidden > protected > allowed > Default Deny, Symlinks 120000, Submodules 160000, Binary/Size & Abnormal Diff)", () => {
@@ -1030,12 +1118,12 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
   });
 
   it("Scenario 8: 3D Independent Reviewer Guard Rejects Same Provider+Model as Writer (23514 chk_independent_reviewer_model)", async () => {
-    const { coreApi, gatewayA, projectAId } = createTestEnvironment();
-    const task = await coreApi.createTask(projectAId, "op-1", {
+    const { coreApi, gatewayA, projectAId, authShortOp } = createTestEnvironment();
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "3D Reviewer independence check",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-1",
     });
@@ -1045,7 +1133,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     const verifiedTree = "3434343434343434343434343434343434343434";
     const candidateHash = "5656565656565656565656565656565656565656";
 
-    await gatewayA.authorizeAndPushStagingRef({
+    const pushRes = await gatewayA.authorizeAndPushStagingRef({
       task_id: task.task_id,
       lease_id: lease.lease_id,
       lease_epoch: lease.lease_epoch,
@@ -1053,9 +1141,21 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       agent_commit_hash: agentCommit,
       verified_tree_hash: verifiedTree,
       parent_commit_hashes: [INITIAL_MAIN_SHA],
+      changes: [
+        {
+          path: "src/module.ts",
+          mode: "100644",
+          size_bytes: 200,
+          is_binary: false,
+          added_lines: 10,
+          deleted_lines: 0,
+          blob_sha: sha256Hex("module").slice(0, 40),
+        },
+      ],
     });
+    assert.equal(pushRes.allowed, true);
 
-    const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, "op-1", {
+    const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, authShortOp, {
       task_id: task.task_id,
       lease_id: lease.lease_id,
       lease_epoch: lease.lease_epoch,
@@ -1085,7 +1185,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     // Attempting to review with identical (writer_provider, writer_model) == (reviewer_provider, reviewer_model) -> rejected 23514!
     await assert.rejects(
       async () =>
-        coreApi.recordVerificationAndIndependentReview(projectAId, "op-1", {
+        coreApi.recordVerificationAndIndependentReview(projectAId, authShortOp, {
           task_id: task.task_id,
           merge_candidate_id: mergeCandidate.merge_candidate_id,
           merge_candidate_hash: candidateHash,
@@ -1099,19 +1199,24 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
           writer_model: "claude-3-7-sonnet",
           reviewer_provider: "anthropic",
           reviewer_model: "claude-3-7-sonnet", // Self-review forbidden!
+          developer_principal_id: "wna-writer-s8",
+          reviewer_principal_id: "independent-reviewer-s8",
+          developer_session_id: "sess-writer-s8",
+          reviewer_session_id: "sess-reviewer-s8",
           review_verdict: "PASS",
         }),
       (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
     );
   });
 
-  it("Scenario 9: CAS Conflict When main Advances Mid-Approval -> Invalidates Old Approval, Marks Task NEEDS_REBASE, and Requires Re-Verification + Re-Approval on New Candidate", async () => {
-    const { store, coreApi, gatewayA, webConsole, projectAId } = createTestEnvironment();
-    const task = await coreApi.createTask(projectAId, "op-1", {
+  it("Scenario 9: CAS Conflict When main Advances Mid-Approval -> Invalidates Old Approval, Marks Task BuildingMergeCandidate, and Requires Re-Verification + Re-Approval on New Candidate", async () => {
+    const { store, coreApi, gatewayA, webConsole, projectAId, authShortOp, authApprover1 } =
+      createTestEnvironment();
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "CAS conflict & candidate re-approval test",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-1",
     });
@@ -1121,7 +1226,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     const treeV1 = "bbbb0000bbbb0000bbbb0000bbbb0000bbbb0000";
     const candidateHashV1 = "cccc0000cccc0000cccc0000cccc0000cccc0000";
 
-    await gatewayA.authorizeAndPushStagingRef({
+    const pushRes = await gatewayA.authorizeAndPushStagingRef({
       task_id: task.task_id,
       lease_id: lease.lease_id,
       lease_epoch: lease.lease_epoch,
@@ -1129,9 +1234,21 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       agent_commit_hash: agentCommit,
       verified_tree_hash: treeV1,
       parent_commit_hashes: [INITIAL_MAIN_SHA],
+      changes: [
+        {
+          path: "src/app.ts",
+          mode: "100644",
+          size_bytes: 300,
+          is_binary: false,
+          added_lines: 12,
+          deleted_lines: 1,
+          blob_sha: sha256Hex("app-v1").slice(0, 40),
+        },
+      ],
     });
+    assert.equal(pushRes.allowed, true);
 
-    const { mergeCandidate: mc1 } = await coreApi.importAndBuildCandidate(projectAId, "op-1", {
+    const { mergeCandidate: mc1 } = await coreApi.importAndBuildCandidate(projectAId, authShortOp, {
       task_id: task.task_id,
       lease_id: lease.lease_id,
       lease_epoch: lease.lease_epoch,
@@ -1159,7 +1276,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     });
 
     const { verificationRun: vr1, reviewArtifact: ra1 } =
-      await coreApi.recordVerificationAndIndependentReview(projectAId, "op-1", {
+      await coreApi.recordVerificationAndIndependentReview(projectAId, authShortOp, {
         task_id: task.task_id,
         merge_candidate_id: mc1.merge_candidate_id,
         merge_candidate_hash: mc1.merge_candidate_hash,
@@ -1173,11 +1290,15 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
         writer_model: "claude-3-7-sonnet",
         reviewer_provider: "openai",
         reviewer_model: "gpt-4.1",
+        developer_principal_id: "wna-writer-s9",
+        reviewer_principal_id: "independent-reviewer-s9",
+        developer_session_id: "sess-writer-s9",
+        reviewer_session_id: "sess-reviewer-s9",
         review_verdict: "PASS",
       });
 
     const approval1 = await webConsole.approveCandidateWith8FieldBinding({
-      approverPrincipalId: "approver-1",
+      auth: authApprover1,
       candidate: mc1,
       verificationRun: vr1,
       reviewArtifact: ra1,
@@ -1187,16 +1308,22 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     const newMainSha = "9999000099990000999900009999000099990000";
     store.forceSetMainRefCommitHashForTest(projectAId, newMainSha);
 
-    // Execute CAS Merge -> must detect CAS conflict, invalidate approval1 & ra1, and transition task to NEEDS_REBASE
-    const casConflictResult = await coreApi.executeCasMerge(projectAId, "op-1", {
+    // Execute CAS Merge -> must detect CAS conflict, invalidate approval1 & ra1, and transition task to BuildingMergeCandidate
+    const casConflictResult = await coreApi.executeCasMerge(projectAId, authShortOp, {
       task_id: task.task_id,
       merge_candidate_id: mc1.merge_candidate_id,
       approval_id: approval1.approval_id,
     });
 
     assert.equal(casConflictResult.status, "CAS_CONFLICT_NEEDS_REBASE");
-    assert.equal(casConflictResult.task_status, "NEEDS_REBASE");
+    assert.equal(casConflictResult.task_status, "BuildingMergeCandidate");
     assert.equal(casConflictResult.invalidated_approval_id, approval1.approval_id);
+
+    const updatedTask = await store.withRlsTransaction(
+      { currentProjectId: projectAId, currentRole: "core_api_service" },
+      () => store.getTaskById(task.task_id)
+    );
+    assert.equal(updatedTask?.base_main_commit_hash, newMainSha);
 
     const checkInvalidatedApproval = await store.withRlsTransaction(
       { currentProjectId: projectAId, currentRole: "core_api_service" },
@@ -1219,13 +1346,15 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       webConsole,
       projectAId,
       advanceClockMs,
+      authShortOp,
+      authApprover1,
     } = createTestEnvironment();
 
-    const task = await coreApi.createTask(projectAId, "op-1", {
+    const task = await coreApi.createTask(projectAId, authShortOp, {
       title: "Post-merge reconciler & TTL guard test",
       task_contract: DEFAULT_CONTRACT,
     });
-    const lease = await coreApi.dispatchTaskLease(projectAId, "op-1", {
+    const lease = await coreApi.dispatchTaskLease(projectAId, authShortOp, {
       task_id: task.task_id,
       worker_id: "worker-1",
     });
@@ -1235,7 +1364,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     const verifiedTree = "ffff2222ffff2222ffff2222ffff2222ffff2222";
     const candidateHash = "abcd3333abcd3333abcd3333abcd3333abcd3333";
 
-    await gatewayA.authorizeAndPushStagingRef({
+    const pushRes = await gatewayA.authorizeAndPushStagingRef({
       task_id: task.task_id,
       lease_id: lease.lease_id,
       lease_epoch: lease.lease_epoch,
@@ -1243,9 +1372,21 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
       agent_commit_hash: agentCommit,
       verified_tree_hash: verifiedTree,
       parent_commit_hashes: [INITIAL_MAIN_SHA],
+      changes: [
+        {
+          path: "src/reconcile.ts",
+          mode: "100644",
+          size_bytes: 400,
+          is_binary: false,
+          added_lines: 18,
+          deleted_lines: 0,
+          blob_sha: sha256Hex("reconcile").slice(0, 40),
+        },
+      ],
     });
+    assert.equal(pushRes.allowed, true);
 
-    const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, "op-1", {
+    const { mergeCandidate } = await coreApi.importAndBuildCandidate(projectAId, authShortOp, {
       task_id: task.task_id,
       lease_id: lease.lease_id,
       lease_epoch: lease.lease_epoch,
@@ -1273,7 +1414,7 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     });
 
     const { verificationRun, reviewArtifact } =
-      await coreApi.recordVerificationAndIndependentReview(projectAId, "op-1", {
+      await coreApi.recordVerificationAndIndependentReview(projectAId, authShortOp, {
         task_id: task.task_id,
         merge_candidate_id: mergeCandidate.merge_candidate_id,
         merge_candidate_hash: candidateHash,
@@ -1287,12 +1428,16 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
         writer_model: "claude-3-7-sonnet",
         reviewer_provider: "openai",
         reviewer_model: "gpt-4.1",
+        developer_principal_id: "wna-writer-s10",
+        reviewer_principal_id: "independent-reviewer-s10",
+        developer_session_id: "sess-writer-s10",
+        reviewer_session_id: "sess-reviewer-s10",
         review_verdict: "PASS",
       });
 
-    // Part A: Approval with 60s TTL that expires before CAS Merge -> returns APPROVAL_EXPIRED
+    // Part A: Approval with 60s TTL that expires before CAS Merge -> returns APPROVAL_EXPIRED and returns task to AwaitingHumanApproval
     const shortApproval = await webConsole.approveCandidateWith8FieldBinding({
-      approverPrincipalId: "approver-1",
+      auth: authApprover1,
       candidate: mergeCandidate,
       verificationRun,
       reviewArtifact,
@@ -1300,17 +1445,17 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     });
     advanceClockMs(61_000);
 
-    const expiredMergeAttempt = await coreApi.executeCasMerge(projectAId, "op-1", {
+    const expiredMergeAttempt = await coreApi.executeCasMerge(projectAId, authShortOp, {
       task_id: task.task_id,
       merge_candidate_id: mergeCandidate.merge_candidate_id,
       approval_id: shortApproval.approval_id,
     });
     assert.equal(expiredMergeAttempt.status, "APPROVAL_EXPIRED");
-    assert.equal(expiredMergeAttempt.task_status, "REVIEWED_PASS");
+    assert.equal(expiredMergeAttempt.task_status, "AwaitingHumanApproval");
 
     // Part B: Issue fresh approval, then simulate crash AFTER `git update-ref refs/heads/main <candidateHash>` succeeded
     const freshApproval = await webConsole.approveCandidateWith8FieldBinding({
-      approverPrincipalId: "approver-1",
+      auth: authApprover1,
       candidate: mergeCandidate,
       verificationRun,
       reviewArtifact,
@@ -1320,14 +1465,14 @@ describe("Milestone M1 Gate — Part 2: 10 Adversarial & Recovery Scenarios (Fak
     // Simulate that Git `refs/heads/main` was already updated to `candidateHash` before DB transaction crashed
     store.forceSetMainRefCommitHashForTest(projectAId, candidateHash);
 
-    // Retry executeCasMerge -> Post-Merge Reconciler detects `currentMainSha === candidateHash` and reconciles DB to MERGED!
-    const reconciledMerge = await coreApi.executeCasMerge(projectAId, "op-1", {
+    // Retry executeCasMerge -> Post-Merge Reconciler detects `currentMainSha === candidateHash` and reconciles DB to MergedAndCompleted!
+    const reconciledMerge = await coreApi.executeCasMerge(projectAId, authShortOp, {
       task_id: task.task_id,
       merge_candidate_id: mergeCandidate.merge_candidate_id,
       approval_id: freshApproval.approval_id,
     });
     assert.equal(reconciledMerge.status, "RECONCILED_ALREADY_MERGED");
-    assert.equal(reconciledMerge.task_status, "MERGED");
+    assert.equal(reconciledMerge.task_status, "MergedAndCompleted");
     assert.equal(reconciledMerge.merged_commit_hash, candidateHash);
   });
 });

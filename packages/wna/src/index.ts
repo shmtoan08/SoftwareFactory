@@ -1,5 +1,16 @@
-import { mkdirSync, appendFileSync, readFileSync, existsSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  accessSync,
+  appendFileSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { dirname, join, posix } from "node:path";
 import {
   type LeaseSyncStatusResponse,
   type ServerEventAckContract,
@@ -31,6 +42,9 @@ export interface SandboxCleanupEvidence {
   readonly taskId: string;
   readonly leaseEpoch: number;
   readonly backendMode: "linux-cgroup-v2" | "simulated-cgroup-v2";
+  readonly isSimulated: boolean;
+  readonly realKernelOperationsExecuted: boolean;
+  readonly realProcessGroupKilled: boolean;
   readonly cgroupPath: string;
   readonly freezeApplied: boolean;
   readonly cgroupKillWritten: boolean;
@@ -55,6 +69,13 @@ export interface SandboxBackend {
   getActivePids(taskId: string, leaseEpoch: number): readonly number[];
 }
 
+export interface RealProcessSpawnResult {
+  readonly pid: number;
+  readonly executionMode: "real-cgroup-v2" | "real-process";
+  readonly cgroupPath: string;
+  readonly exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+}
+
 /**
  * Derives a deterministic UID/GID in the user namespace (10000..29999) based on the task_id
  * to ensure two different tasks never share the same sandbox UID (FIX-15).
@@ -68,28 +89,109 @@ export function deriveTaskRunnerUid(taskId: string): number {
 }
 
 /**
- * Linux Cgroups v2 + Subreaper Sandbox Backend (MVP-SPEC-03 Section 4.2 & Roadmap M2)
- * Implements:
- * - WNA Supervisor running as `sf-wna` with `prctl(PR_SET_CHILD_SUBREAPER, 1)`
- * - Per-epoch sandbox running as `sf-task-runner` in isolated `mount`, `pid`, `ipc`, `uts` namespaces
- * - Strict mount isolation blocking `/etc/sf-wna` and cross-task worktree access
- * - 5-Step deterministic `killAndVerifyClean` (`cgroup.freeze=1` -> `cgroup.kill=1` -> `populated==0` -> `waitpid()` subreaper loop -> `rmdir(cgroup)`)
+ * Checks whether genuine Linux kernel cgroups v2 control files are present and writable.
+ */
+export function probeLinuxCgroupV2Support(cgroupRoot = "/sys/fs/cgroup"): {
+  readonly supported: boolean;
+  readonly cgroupRoot: string;
+  readonly reason?: string;
+} {
+  if (process.platform !== "linux") {
+    return {
+      supported: false,
+      cgroupRoot,
+      reason: `Host platform '${process.platform}' is not Linux`,
+    };
+  }
+  const controllersPath = join(cgroupRoot, "cgroup.controllers");
+  if (!existsSync(cgroupRoot) || !existsSync(controllersPath)) {
+    return {
+      supported: false,
+      cgroupRoot,
+      reason: `Linux cgroup v2 hierarchy not mounted at ${cgroupRoot}`,
+    };
+  }
+  try {
+    accessSync(cgroupRoot, constants.W_OK);
+    return { supported: true, cgroupRoot };
+  } catch (err: unknown) {
+    return {
+      supported: false,
+      cgroupRoot,
+      reason: `Insufficient privileges to write to ${cgroupRoot}: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/**
+ * Linux Cgroups v2 + Subreaper Sandbox Backend (MVP-SPEC-03 Section 4.1-4.3, FIX-05)
+ *
+ * Strictly separates synthetic state-machine testing (`spawnProcessInSandbox`, which ALWAYS
+ * reports `backendMode: "simulated-cgroup-v2"`, `isSimulated: true`, `realKernelOperationsExecuted: false`)
+ * from real OS child-process supervision (`spawnRealProcessInSandbox`) and real kernel cgroup v2
+ * freeze/kill/events/rmdir enforcement (when `requireKernelCgroup: true` on Linux).
  */
 export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
   private activeSandboxes: Map<string, Set<number>> = new Map();
   private reparentedOrphans: Map<string, Set<number>> = new Map();
   private securityMetadata: Map<string, SandboxSecurityMetadata> = new Map();
+  private sandboxExecutionMode: Map<string, "simulated" | "real-process" | "real-cgroup-v2"> =
+    new Map();
+  private managedProcesses: Map<
+    string,
+    Array<{
+      pid: number;
+      child: ChildProcess;
+      exited: boolean;
+      exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+    }>
+  > = new Map();
   private cleanupHistory: Map<string, SandboxCleanupEvidence> = new Map();
-  private readonly isRealLinux: boolean;
+  private readonly cgroupRoot: string;
 
-  constructor() {
-    this.isRealLinux = process.platform === "linux" && existsSync("/sys/fs/cgroup");
+  constructor(options?: { cgroupRoot?: string }) {
+    this.cgroupRoot = options?.cgroupRoot ?? "/sys/fs/cgroup";
   }
 
   private key(taskId: string, leaseEpoch: number): string {
     return `${taskId}:${leaseEpoch}`;
   }
 
+  private getCgroupPath(taskId: string, leaseEpoch: number): string {
+    return join(
+      this.cgroupRoot,
+      "software-factory.slice",
+      `sf-task-${taskId}-epoch-${leaseEpoch}.scope`
+    );
+  }
+
+  private ensureSecurityMetadata(
+    taskId: string,
+    leaseEpoch: number,
+    worktreePath?: string
+  ): void {
+    const k = this.key(taskId, leaseEpoch);
+    if (!this.securityMetadata.has(k)) {
+      const mountedWorktreePath =
+        worktreePath ?? `/var/lib/software-factory/worktrees/${taskId}/epoch-${leaseEpoch}`;
+      const taskUid = deriveTaskRunnerUid(taskId);
+      this.securityMetadata.set(k, {
+        supervisorUser: "sf-wna",
+        subreaperEnabled: true,
+        sandboxUser: "sf-task-runner",
+        sandboxUid: taskUid,
+        sandboxGid: taskUid,
+        namespaces: ["mount", "pid", "ipc", "uts"],
+        mountedWorktreePath,
+        ephemeralGitPushRef: `refs/heads/sf/staging/${taskId}/${leaseEpoch}`,
+      });
+    }
+  }
+
+  /**
+   * Registers synthetic PIDs for fast unit tests.
+   * NEVER claims `backendMode: "linux-cgroup-v2"` — always marks cleanup as simulated!
+   */
   public spawnProcessInSandbox(input: {
     taskId: string;
     leaseEpoch: number;
@@ -107,33 +209,113 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
 
     const orphanSet = this.reparentedOrphans.get(k) ?? new Set<number>();
     for (const orphanPid of input.doubleForkOrphanPids ?? []) {
-      // Double-forked process remains inside the cgroup v2 leaf AND is reparented to the WNA Subreaper
       set.add(orphanPid);
       orphanSet.add(orphanPid);
     }
 
     this.activeSandboxes.set(k, set);
     this.reparentedOrphans.set(k, orphanSet);
-
-    const mountedWorktreePath =
-      input.worktreePath ?? `/var/lib/software-factory/worktrees/${input.taskId}/epoch-${input.leaseEpoch}`;
-    const taskUid = deriveTaskRunnerUid(input.taskId);
-    this.securityMetadata.set(k, {
-      supervisorUser: "sf-wna",
-      subreaperEnabled: true,
-      sandboxUser: "sf-task-runner",
-      sandboxUid: taskUid,
-      sandboxGid: taskUid,
-      namespaces: ["mount", "pid", "ipc", "uts"],
-      mountedWorktreePath,
-      ephemeralGitPushRef: `refs/heads/sf/staging/${input.taskId}/${input.leaseEpoch}`,
-    });
+    if (!this.sandboxExecutionMode.has(k)) {
+      this.sandboxExecutionMode.set(k, "simulated");
+    }
+    this.ensureSecurityMetadata(input.taskId, input.leaseEpoch, input.worktreePath);
   }
 
   /**
-   * Simulates a double-fork (`fork() -> setsid() -> fork() -> parent exits`) inside the sandbox.
-   * Because `WNA Supervisor` sets `prctl(PR_SET_CHILD_SUBREAPER, 1)` and cgroups v2 is hierarchical,
-   * the grandchild cannot escape the cgroup or reparent to PID 1 (`init`).
+   * Spawns a real OS subprocess inside a detached process group with clean `env -i` environment.
+   * When `requireKernelCgroup: true`, fails closed unless genuine Linux cgroups v2 operations succeed.
+   */
+  public spawnRealProcessInSandbox(input: {
+    taskId: string;
+    leaseEpoch: number;
+    command: string;
+    args: readonly string[];
+    sanitizedEnv: Readonly<Record<string, string>>;
+    cwd: string;
+    worktreePath?: string;
+    requireKernelCgroup?: boolean;
+  }): RealProcessSpawnResult {
+    const k = this.key(input.taskId, input.leaseEpoch);
+    const cgroupPath = this.getCgroupPath(input.taskId, input.leaseEpoch);
+    let executionMode: "real-cgroup-v2" | "real-process" = "real-process";
+
+    if (input.requireKernelCgroup) {
+      const probe = probeLinuxCgroupV2Support(this.cgroupRoot);
+      if (!probe.supported) {
+        throw new Error(`ERR_LINUX_CGROUP_V2_UNAVAILABLE: ${probe.reason}`);
+      }
+      mkdirSync(cgroupPath, { recursive: true });
+      executionMode = "real-cgroup-v2";
+    }
+
+    const child = spawn(input.command, [...input.args], {
+      cwd: input.cwd,
+      env: { ...input.sanitizedEnv },
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const pid = child.pid;
+    if (pid === undefined) {
+      throw new Error("ERR_SANDBOX_SPAWN_FAILED: OS failed to assign PID to child process");
+    }
+
+    if (executionMode === "real-cgroup-v2") {
+      try {
+        writeFileSync(join(cgroupPath, "cgroup.procs"), String(pid), "utf8");
+      } catch (err: unknown) {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // best effort
+        }
+        throw new Error(
+          `ERR_LINUX_CGROUP_V2_UNAVAILABLE: Failed to attach PID ${pid} to ${cgroupPath}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    }
+
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => {
+        child.once("exit", (code, signal) => {
+          resolve({ code, signal });
+        });
+      }
+    );
+
+    const record = {
+      pid,
+      child,
+      exited: false,
+      exitPromise,
+    };
+    void exitPromise.then(() => {
+      record.exited = true;
+    });
+
+    const procs = this.managedProcesses.get(k) ?? [];
+    procs.push(record);
+    this.managedProcesses.set(k, procs);
+
+    const pidSet = this.activeSandboxes.get(k) ?? new Set<number>();
+    pidSet.add(pid);
+    this.activeSandboxes.set(k, pidSet);
+
+    this.sandboxExecutionMode.set(k, executionMode);
+    this.ensureSecurityMetadata(input.taskId, input.leaseEpoch, input.worktreePath ?? input.cwd);
+
+    return {
+      pid,
+      executionMode,
+      cgroupPath,
+      exitPromise,
+    };
+  }
+
+  /**
+   * Registers a simulated double-fork orphan PID for unit testing.
    */
   public spawnDoubleForkOrphanInSandbox(
     taskId: string,
@@ -147,6 +329,9 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     orphanSet.add(orphanPid);
     this.activeSandboxes.set(k, set);
     this.reparentedOrphans.set(k, orphanSet);
+    if (!this.sandboxExecutionMode.has(k)) {
+      this.sandboxExecutionMode.set(k, "simulated");
+    }
   }
 
   public getSandboxSecurityMetadata(
@@ -157,9 +342,8 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
   }
 
   /**
-   * Verifies Mount Namespace & UID Isolation (`P1-6` / Roadmap M2 Gate Condition 1):
-   * Sandboxed processes (`sf-task-runner`) can ONLY access their own `mountedWorktreePath` and `/tmp`.
-   * Any attempt to access `/etc/sf-wna` (WNA credentials) or another task's worktree throws `EACCES`.
+   * Verifies Mount Namespace & UID Isolation (`MVP-SPEC-03` Section 4.1 & `FIX-15`):
+   * Resolves POSIX `..` segments before enforcing allowlist so path traversal cannot bypass prefix checks.
    */
   public assertSandboxPathAccess(
     taskId: string,
@@ -170,13 +354,16 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     if (!meta) {
       throw new Error(`EACCES: Sandbox for ${taskId} (epoch ${leaseEpoch}) is not active`);
     }
-    const normalized = requestedPath.replace(/\\/g, "/");
+    if (requestedPath.includes("\0")) {
+      throw new Error("EACCES: Null byte forbidden in sandbox path");
+    }
+    const normalized = posix.resolve("/", requestedPath.replace(/\\/g, "/"));
     if (normalized === "/etc/sf-wna" || normalized.startsWith("/etc/sf-wna/")) {
       throw new Error(
         `EACCES: Mount namespace isolation denied access to WNA credential path '${normalized}' for user '${meta.sandboxUser}'`
       );
     }
-    const allowedPrefix = meta.mountedWorktreePath.replace(/\/+$/, "");
+    const allowedPrefix = posix.resolve("/", meta.mountedWorktreePath.replace(/\\/g, "/"));
     if (
       normalized === allowedPrefix ||
       normalized.startsWith(`${allowedPrefix}/`) ||
@@ -202,39 +389,150 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     return this.cleanupHistory.get(this.key(taskId, leaseEpoch));
   }
 
+  private isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
-   * 5-Step `killAndVerifyClean` (MVP-SPEC-03 Section 4.2 & Roadmap M2 Section 1):
-   * 1. Write `1` to `cgroup.freeze` to halt fork bombs
-   * 2. Write `1` to `cgroup.kill` for atomic kernel-level SIGKILL of entire process tree (including double-forked grandchildren)
-   * 3. Poll `cgroup.events` until `populated == 0`
-   * 4. Run `waitpid(-1, WNOHANG)` loop in `WNA Subreaper` (`PR_SET_CHILD_SUBREAPER`) to reap reparented zombies
-   * 5. Confirm `cgroup.procs` is empty (`remainingProcsCount === 0`) and remove cgroup directory (`rmdir(cgroup)`)
+   * 5-Step `killAndVerifyClean` (MVP-SPEC-03 Section 4.2, FIX-05):
+   * - For `real-cgroup-v2`: executes real writes to `cgroup.freeze`, `cgroup.kill`, polls `cgroup.events`, awaits exit/reaping, and calls `rmdir(cgroup)`.
+   * - For `real-process`: sends real OS `SIGKILL` to the process group (`-pid`) and verifies OS termination via `waitpid`/`exitPromise` + `kill(pid, 0)`. Marks `isSimulated: true`, `backendMode: "simulated-cgroup-v2"` because kernel cgroupfs was not exercised.
+   * - For `simulated`: clears tracked state and explicitly reports `isSimulated: true`, `realKernelOperationsExecuted: false`.
    */
   public async killAndVerifyClean(
     taskId: string,
     leaseEpoch: number
   ): Promise<SandboxCleanupEvidence> {
     const k = this.key(taskId, leaseEpoch);
-    const cgroupPath = `/sys/fs/cgroup/software-factory.slice/sf-task-${taskId}-epoch-${leaseEpoch}.scope`;
+    const mode = this.sandboxExecutionMode.get(k) ?? "simulated";
+    const cgroupPath = this.getCgroupPath(taskId, leaseEpoch);
     const pids = Array.from(this.activeSandboxes.get(k) ?? []);
+    const managed = this.managedProcesses.get(k) ?? [];
+
+    if (mode === "real-cgroup-v2") {
+      writeFileSync(join(cgroupPath, "cgroup.freeze"), "1", "utf8");
+      writeFileSync(join(cgroupPath, "cgroup.kill"), "1", "utf8");
+
+      const deadline = Date.now() + 5000;
+      let populatedZeroVerified = false;
+      while (Date.now() < deadline) {
+        const events = readFileSync(join(cgroupPath, "cgroup.events"), "utf8");
+        if (/^populated\s+0$/m.test(events)) {
+          populatedZeroVerified = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+
+      const reapedPids: number[] = [];
+      for (const proc of managed) {
+        await proc.exitPromise;
+        reapedPids.push(proc.pid);
+      }
+
+      const remainingPids = readFileSync(join(cgroupPath, "cgroup.procs"), "utf8")
+        .split(/\s+/)
+        .filter(Boolean);
+      const remainingProcsCount = remainingPids.length;
+      if (remainingProcsCount === 0) {
+        rmdirSync(cgroupPath);
+      }
+      const cgroupDirRemoved = !existsSync(cgroupPath);
+
+      this.activeSandboxes.delete(k);
+      this.managedProcesses.delete(k);
+      this.reparentedOrphans.delete(k);
+      this.securityMetadata.delete(k);
+      this.sandboxExecutionMode.delete(k);
+
+      const evidence: SandboxCleanupEvidence = {
+        taskId,
+        leaseEpoch,
+        backendMode: "linux-cgroup-v2",
+        isSimulated: false,
+        realKernelOperationsExecuted: true,
+        realProcessGroupKilled: true,
+        cgroupPath,
+        freezeApplied: true,
+        cgroupKillWritten: true,
+        populatedZeroVerified,
+        subreaperWaitpidReapedPids: reapedPids,
+        remainingProcsCount,
+        cgroupDirRemoved,
+        killedPids: pids,
+        verifiedAt: new Date().toISOString(),
+      };
+      this.cleanupHistory.set(k, evidence);
+      return evidence;
+    }
+
+    if (mode === "real-process") {
+      const reapedPids: number[] = [];
+      for (const proc of managed) {
+        try {
+          process.kill(-proc.pid, "SIGKILL");
+        } catch {
+          try {
+            proc.child.kill("SIGKILL");
+          } catch {
+            // already exited
+          }
+        }
+        await Promise.race([proc.exitPromise, new Promise((r) => setTimeout(r, 3000))]);
+        reapedPids.push(proc.pid);
+      }
+
+      const remainingAlive = pids.filter((pid) => this.isPidAlive(pid)).length;
+      this.activeSandboxes.delete(k);
+      this.managedProcesses.delete(k);
+      this.reparentedOrphans.delete(k);
+      this.securityMetadata.delete(k);
+      this.sandboxExecutionMode.delete(k);
+
+      const evidence: SandboxCleanupEvidence = {
+        taskId,
+        leaseEpoch,
+        backendMode: "simulated-cgroup-v2",
+        isSimulated: true,
+        realKernelOperationsExecuted: false,
+        realProcessGroupKilled: true,
+        cgroupPath,
+        freezeApplied: false,
+        cgroupKillWritten: false,
+        populatedZeroVerified: remainingAlive === 0,
+        subreaperWaitpidReapedPids: reapedPids,
+        remainingProcsCount: remainingAlive,
+        cgroupDirRemoved: false,
+        killedPids: pids,
+        verifiedAt: new Date().toISOString(),
+      };
+      this.cleanupHistory.set(k, evidence);
+      return evidence;
+    }
+
+    // Synthetic/Simulated Sandbox Cleanup — NEVER claims linux-cgroup-v2!
     const reapedOrphans = Array.from(this.reparentedOrphans.get(k) ?? []);
-
-    // Step 1 & Step 2: Freeze & Atomic cgroup.kill = 1
     this.activeSandboxes.delete(k);
-
-    // Step 4: Subreaper waitpid() reaps all reparented double-forked zombies
     this.reparentedOrphans.delete(k);
     this.securityMetadata.delete(k);
+    this.sandboxExecutionMode.delete(k);
 
-    // Step 3 & Step 5: Verify populated == 0, cgroup.procs is empty, and rmdir(cgroup) succeeds
     const remainingProcsCount = this.getActivePids(taskId, leaseEpoch).length;
     const populatedZeroVerified = remainingProcsCount === 0;
-    const cgroupDirRemoved = populatedZeroVerified && this.reparentedOrphans.has(k) === false;
+    const cgroupDirRemoved = populatedZeroVerified && !this.reparentedOrphans.has(k);
 
     const evidence: SandboxCleanupEvidence = {
       taskId,
       leaseEpoch,
-      backendMode: this.isRealLinux ? "linux-cgroup-v2" : "simulated-cgroup-v2",
+      backendMode: "simulated-cgroup-v2",
+      isSimulated: true,
+      realKernelOperationsExecuted: false,
+      realProcessGroupKilled: false,
       cgroupPath,
       freezeApplied: true,
       cgroupKillWritten: true,
@@ -250,6 +548,8 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
   }
 }
 
+export class SimulatedCgroupV2SandboxBackend extends LinuxCgroupV2SandboxBackend {}
+
 export interface OutboxJournalEntry {
   readonly sequence_no: number;
   readonly envelope: WorkerEventEnvelope;
@@ -262,7 +562,7 @@ export interface AgentGatewayTransportClient {
 }
 
 /**
- * LocalOutboxBuffer (MVP-SPEC-03 Section 3.1)
+ * LocalOutboxBuffer (MVP-SPEC-03 Section 2.1)
  * Append-only `.jsonl` Write-Ahead Outbox (`0600` permissions, `256 KB` line limit, `50 MB` quota)
  * with automatic gap replay (`expected_next_seq`) and automatic zombie sandbox termination on `409 ERR_STALE_LEASE`.
  */
@@ -465,7 +765,7 @@ export class LocalOutboxBuffer {
   }
 
   /**
-   * Reconnect Synchronization Protocol (MVP-SPEC-03 Section 3.1):
+   * Reconnect Synchronization Protocol (MVP-SPEC-03 Section 2.2):
    * Calls `getLeaseSyncStatus` and replays all unacknowledged events starting at `expected_next_seq`.
    */
   public async syncAndReplayAfterReconnect(

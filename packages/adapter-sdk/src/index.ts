@@ -1,4 +1,3 @@
-import { sha256Hex } from "@software-factory/shared-types";
 import {
   DEFAULT_MAX_CHANGED_FILES,
   DEFAULT_MAX_DELETED_LINES,
