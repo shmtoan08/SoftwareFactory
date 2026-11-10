@@ -13,7 +13,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { SnapshotRetentionClass } from "@software-factory/shared-types";
 
 export const DEFAULT_EPHEMERAL_SNAPSHOT_TTL_MS = 14 * 24 * 60 * 60 * 1000; // 14 days
@@ -42,6 +42,7 @@ export type BuildMergeCandidateResult =
       readonly snapshotSha256?: string;
       readonly snapshotSizeBytes?: number;
       readonly snapshotRetentionClass?: SnapshotRetentionClass;
+      readonly snapshotCreated?: boolean;
     }
   | {
       readonly ok: false;
@@ -372,6 +373,46 @@ export class ImmutableSourceSnapshotStore {
     return updated;
   }
 
+  public getExpectedSnapshotPath(mergeCandidateHash: string, verifiedTreeHash: string): string {
+    return join(this.storageDir, mergeCandidateHash, `snapshot-${verifiedTreeHash}.tar`);
+  }
+
+  public deleteSnapshot(snapshotPath: string): boolean {
+    const absTar = resolve(snapshotPath);
+    const metaPath = this.getMetaPath(absTar);
+    let manifest: SnapshotManifest | null = null;
+    if (existsSync(metaPath)) {
+      try {
+        manifest = JSON.parse(readFileSync(metaPath, "utf8")) as SnapshotManifest;
+      } catch {
+        manifest = null;
+      }
+    }
+    if (manifest?.retentionClass === "MERGED_PERMANENT") {
+      return false;
+    }
+
+    let deleted = false;
+    if (existsSync(absTar)) {
+      chmodSync(absTar, 0o600);
+      unlinkSync(absTar);
+      deleted = true;
+    }
+    if (existsSync(metaPath)) {
+      unlinkSync(metaPath);
+      deleted = true;
+    }
+    try {
+      const parentDir = dirname(absTar);
+      if (parentDir !== this.storageDir && existsSync(parentDir) && readdirSync(parentDir).length === 0) {
+        rmdirSync(parentDir);
+      }
+    } catch {
+      // ignore empty-dir cleanup issues
+    }
+    return deleted;
+  }
+
   public pruneExpiredSnapshots(now: Date = new Date()): SnapshotGcResult {
     const deletedPaths: string[] = [];
     const retainedPermanentPaths: string[] = [];
@@ -384,30 +425,53 @@ export class ImmutableSourceSnapshotStore {
         continue;
       }
       const candDir = join(this.storageDir, sub.name);
-      for (const file of readdirSync(candDir)) {
+      let candFiles: string[];
+      try {
+        candFiles = readdirSync(candDir);
+      } catch {
+        continue;
+      }
+      for (const file of candFiles) {
         if (!file.endsWith(".meta.json")) {
           continue;
         }
         const metaPath = join(candDir, file);
-        const manifest = JSON.parse(readFileSync(metaPath, "utf8")) as SnapshotManifest;
+        let manifest: SnapshotManifest;
+        try {
+          const parsed = JSON.parse(readFileSync(metaPath, "utf8")) as unknown;
+          if (
+            typeof parsed !== "object" ||
+            parsed === null ||
+            typeof (parsed as { snapshotPath?: unknown }).snapshotPath !== "string"
+          ) {
+            continue;
+          }
+          manifest = parsed as SnapshotManifest;
+        } catch {
+          // Skip corrupted .meta.json so GC can continue cleaning valid snapshots
+          continue;
+        }
         if (manifest.retentionClass === "MERGED_PERMANENT") {
           retainedPermanentPaths.push(manifest.snapshotPath);
           continue;
         }
         const expMs = manifest.expiresAt ? Date.parse(manifest.expiresAt) : Number.POSITIVE_INFINITY;
+        if (Number.isNaN(expMs)) {
+          continue;
+        }
         if (expMs <= nowMs) {
-          if (existsSync(manifest.snapshotPath)) {
-            chmodSync(manifest.snapshotPath, 0o600);
-            unlinkSync(manifest.snapshotPath);
-          }
-          unlinkSync(metaPath);
-          deletedPaths.push(manifest.snapshotPath);
           try {
+            if (existsSync(manifest.snapshotPath)) {
+              chmodSync(manifest.snapshotPath, 0o600);
+              unlinkSync(manifest.snapshotPath);
+            }
+            unlinkSync(metaPath);
+            deletedPaths.push(manifest.snapshotPath);
             if (readdirSync(candDir).length === 0) {
               rmdirSync(candDir);
             }
           } catch {
-            // ignore non-empty cleanup errors
+            // Isolate per-entry GC deletion errors
           }
         } else {
           retainedActivePaths.push(manifest.snapshotPath);
@@ -527,10 +591,15 @@ export function buildRealGitMergeCandidate(
   }
 
   const candidateRef = input.candidateRef ?? `refs/factory/candidates/${input.taskId}`;
-  git(["update-ref", candidateRef, mergeCandidateHash]);
 
   let snapshotInfo: SnapshotManifest | undefined;
+  let snapshotCreated = false;
   if (input.snapshotStore) {
+    const expectedPath = input.snapshotStore.getExpectedSnapshotPath(
+      mergeCandidateHash,
+      verifiedTreeHash
+    );
+    const existedBefore = existsSync(expectedPath) && existsSync(`${expectedPath}.meta.json`);
     snapshotInfo = input.snapshotStore.exportFromGitCommit({
       repoPath: input.repoPath,
       gitDir: input.gitDir,
@@ -538,6 +607,20 @@ export function buildRealGitMergeCandidate(
       verifiedTreeHash,
       createdAt: input.createdAt,
     });
+    snapshotCreated = !existedBefore;
+  }
+
+  try {
+    git(["update-ref", candidateRef, mergeCandidateHash]);
+  } catch (err) {
+    if (input.snapshotStore && snapshotCreated && snapshotInfo) {
+      try {
+        input.snapshotStore.deleteSnapshot(snapshotInfo.snapshotPath);
+      } catch {
+        // best-effort cleanup if update-ref fails
+      }
+    }
+    throw err;
   }
 
   return {
@@ -553,6 +636,7 @@ export function buildRealGitMergeCandidate(
           snapshotSha256: snapshotInfo.snapshotSha256,
           snapshotSizeBytes: snapshotInfo.snapshotSizeBytes,
           snapshotRetentionClass: snapshotInfo.retentionClass,
+          snapshotCreated,
         }
       : {}),
   };

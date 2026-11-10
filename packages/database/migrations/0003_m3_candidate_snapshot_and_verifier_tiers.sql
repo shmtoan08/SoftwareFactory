@@ -98,21 +98,19 @@ BEGIN
       CHECK (trusted_policy_sha256 IS NULL OR trusted_policy_sha256 ~ '^[0-9a-f]{64}$');
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'chk_vr_pass_consistency'
-  ) THEN
-    ALTER TABLE verification_runs
-      ADD CONSTRAINT chk_vr_pass_consistency
-      CHECK (
-        (
-          verdict = 'PASS'
-          AND overall_status = 'PASSED'
-          AND tier2_baseline_tamper_detected = FALSE
-          AND tier1_trusted_acceptance_passed IS DISTINCT FROM FALSE
-          AND tier2_protected_baseline_passed IS DISTINCT FROM FALSE
-        )
-        OR verdict = 'FAIL'
-      );
-  END IF;
+  ALTER TABLE verification_runs DROP CONSTRAINT IF EXISTS chk_vr_pass_consistency;
+  ALTER TABLE verification_runs
+    ADD CONSTRAINT chk_vr_pass_consistency
+    CHECK (
+      (
+        verdict = 'PASS'
+        AND overall_status = 'PASSED'
+        AND tier2_baseline_tamper_detected = FALSE
+        AND tier1_trusted_acceptance_passed IS DISTINCT FROM FALSE
+        AND tier2_protected_baseline_passed IS DISTINCT FROM FALSE
+        AND tier3_agent_tests_passed IS DISTINCT FROM FALSE
+      )
+      OR verdict = 'FAIL'
+    );
 END
 $$;

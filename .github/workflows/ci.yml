@@ -59,6 +59,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0001_mvp_core_schema_and_rls.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
+          psql -v ON_ERROR_STOP=1 -c "DO \$\$ DECLARE v_caught boolean := false; BEGIN BEGIN INSERT INTO verification_runs (verification_run_id, project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash, verifier_image_digest, verdict, overall_status, tier1_trusted_acceptance_passed, tier2_protected_baseline_passed, tier3_agent_tests_passed, exit_code, duration_ms, report_sha256) VALUES (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), '5555555555555555555555555555555555555555', '4444444444444444444444444444444444444444', 'sha256:test', 'PASS', 'PASSED', true, true, false, 0, 10, repeat('a', 64)); EXCEPTION WHEN check_violation THEN v_caught := true; END; IF NOT v_caught THEN RAISE EXCEPTION 'chk_vr_pass_consistency failed to reject PASS with tier3_agent_tests_passed=FALSE'; END IF; END \$\$;"
 
       - name: Prepare Optional Docker Verifier Base Image
         run: docker pull node:22-alpine || true

@@ -102,7 +102,12 @@ export interface RealProcessSpawnResult {
   readonly executionMode: "real-cgroup-v2" | "real-process";
   readonly cgroupPath: string;
   readonly securityMetadata: SandboxSecurityMetadata;
-  readonly exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  readonly exitPromise: Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+    stdoutTail?: string;
+    stderrTail?: string;
+  }>;
 }
 
 interface SupervisorReadyPayload {
@@ -134,7 +139,12 @@ interface ManagedProcessRecord {
   readonly supDir?: string;
   exited: boolean;
   reapedPidsFromFile: number[];
-  readonly exitPromise: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  readonly exitPromise: Promise<{
+    code: number | null;
+    signal: NodeJS.Signals | null;
+    stdoutTail?: string;
+    stderrTail?: string;
+  }>;
 }
 
 const DEFAULT_MASKED_PATHS: readonly string[] = ["/etc/sf-wna", "/var/lib/sf-wna/outbox"];
@@ -647,13 +657,36 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         throw new Error("ERR_SANDBOX_SPAWN_FAILED: OS failed to assign PID to child process");
       }
 
-      const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-        (resolveExit) => {
-          child.once("exit", (code, signal) => {
-            resolveExit({ code, signal });
-          });
+      let nonLinuxStdoutTail = "";
+      let nonLinuxStderrTail = "";
+      child.stdout?.on("data", (chunk: Buffer) => {
+        nonLinuxStdoutTail += chunk.toString("utf8");
+        if (nonLinuxStdoutTail.length > 8192) {
+          nonLinuxStdoutTail = nonLinuxStdoutTail.slice(-8192);
         }
-      );
+      });
+      child.stderr?.on("data", (chunk: Buffer) => {
+        nonLinuxStderrTail += chunk.toString("utf8");
+        if (nonLinuxStderrTail.length > 8192) {
+          nonLinuxStderrTail = nonLinuxStderrTail.slice(-8192);
+        }
+      });
+
+      const exitPromise = new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+        stdoutTail?: string;
+        stderrTail?: string;
+      }>((resolveExit) => {
+        child.once("close", (code, signal) => {
+          resolveExit({
+            code,
+            signal,
+            stdoutTail: nonLinuxStdoutTail.slice(-2048),
+            stderrTail: nonLinuxStderrTail.slice(-2048),
+          });
+        });
+      });
 
       const record: ManagedProcessRecord = {
         pid,
@@ -757,24 +790,37 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         throw new Error("ERR_SANDBOX_SPAWN_FAILED: OS failed to assign PID to supervisor");
       }
 
-      // Drain stdout/stderr asynchronously so pipe buffers never block child execution
+      // Capture rolling stdout/stderr tails asynchronously so pipe buffers never block child execution
+      let supStdoutTail = "";
       let supStderrTail = "";
-      supChild.stdout?.on("data", () => {
-        // discard/drain output
+      supChild.stdout?.on("data", (chunk: Buffer) => {
+        supStdoutTail += chunk.toString("utf8");
+        if (supStdoutTail.length > 8192) {
+          supStdoutTail = supStdoutTail.slice(-8192);
+        }
       });
       supChild.stderr?.on("data", (chunk: Buffer) => {
-        if (supStderrTail.length < 4096) {
-          supStderrTail += chunk.toString("utf8");
+        supStderrTail += chunk.toString("utf8");
+        if (supStderrTail.length > 8192) {
+          supStderrTail = supStderrTail.slice(-8192);
         }
       });
 
-      const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-        (resolveExit) => {
-          supChild!.once("exit", (code, signal) => {
-            resolveExit({ code, signal });
+      const exitPromise = new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+        stdoutTail?: string;
+        stderrTail?: string;
+      }>((resolveExit) => {
+        supChild!.once("close", (code, signal) => {
+          resolveExit({
+            code,
+            signal,
+            stdoutTail: supStdoutTail.slice(-2048),
+            stderrTail: supStderrTail.slice(-2048),
           });
-        }
-      );
+        });
+      });
 
       let ready: SupervisorReadyPayload | null = null;
       const deadline = Date.now() + 5000;

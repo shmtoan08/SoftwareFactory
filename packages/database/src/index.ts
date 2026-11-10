@@ -1705,7 +1705,8 @@ export class SoftwareFactoryControlPlaneStore {
       (overallStatus !== "PASSED" ||
         tamperDetected ||
         input.tier1_trusted_acceptance_passed === false ||
-        input.tier2_protected_baseline_passed === false)
+        input.tier2_protected_baseline_passed === false ||
+        input.tier3_agent_tests_passed === false)
     ) {
       throw new PostgresRlsError(
         "23514",
@@ -1713,7 +1714,7 @@ export class SoftwareFactoryControlPlaneStore {
           tamperDetected
         )}, tier1=${String(input.tier1_trusted_acceptance_passed)}, tier2=${String(
           input.tier2_protected_baseline_passed
-        )}`
+        )}, tier3=${String(input.tier3_agent_tests_passed)}`
       );
     }
 
@@ -1729,13 +1730,25 @@ export class SoftwareFactoryControlPlaneStore {
       verdict: input.verdict,
       overall_status: overallStatus,
       tier1_trusted_acceptance_passed:
-        input.tier1_trusted_acceptance_passed ?? (input.verdict === "PASS" ? true : null),
+        input.tier1_trusted_acceptance_passed !== undefined
+          ? input.tier1_trusted_acceptance_passed
+          : input.verdict === "PASS"
+          ? true
+          : null,
       tier2_protected_baseline_passed:
-        input.tier2_protected_baseline_passed ?? (input.verdict === "PASS" ? true : null),
+        input.tier2_protected_baseline_passed !== undefined
+          ? input.tier2_protected_baseline_passed
+          : input.verdict === "PASS"
+          ? true
+          : null,
       tier2_baseline_tamper_detected: tamperDetected,
       tampered_baseline_paths: [...(input.tampered_baseline_paths ?? [])],
       tier3_agent_tests_passed:
-        input.tier3_agent_tests_passed ?? (input.verdict === "PASS" ? true : null),
+        input.tier3_agent_tests_passed !== undefined
+          ? input.tier3_agent_tests_passed
+          : input.verdict === "PASS"
+          ? true
+          : null,
       tier3_assertions: structuredClone(input.tier3_assertions ?? []),
       infra_retry_count: infraRetryCount,
       execution_backend: input.execution_backend ?? "docker",

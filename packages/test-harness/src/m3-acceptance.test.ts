@@ -9,6 +9,8 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,7 +37,9 @@ import {
   extractTier3AssertionEvidence,
   probeDockerVerifierSupport,
   probeLinuxHardlinkSymlinkSysctls,
+  sanitizeVerifierEnv,
 } from "../../verifier/src/index.ts";
+import { LinuxCgroupV2SandboxBackend } from "../../wna/src/index.ts";
 import { CoreApiService } from "../../../apps/core-api/src/index.ts";
 import { WebApprovalConsoleController } from "../../../apps/web/src/index.ts";
 
@@ -1295,6 +1299,448 @@ describe("Milestone M3 Acceptance Gate Suite (Candidate Builder + 3-Tier Trusted
         verified.mergeCandidate.snapshot_path!,
       ]);
       assert.equal(existsSync(verified.mergeCandidate.snapshot_path!), true);
+    } finally {
+      rmSync(fx.rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("M3-Gate-9 (Review Medium fixes): Symlink in candidate yields persisted FAIL verdict without crash, and PASS consistency rejects tier3_agent_tests_passed=false", async () => {
+    const fx = setupRealGitRepoFixture();
+    try {
+      // 1. Medium #1: Repo main contains a symlink (`link -> /etc/hostname`) alongside valid agent edit
+      symlinkSync("/etc/hostname", join(fx.mainWorkDir, "link"));
+      fx.gitAt(fx.mainWorkDir, ["add", "link"]);
+      fx.gitAt(fx.mainWorkDir, ["commit", "-m", "chore: add symlink to main"]);
+      fx.gitAt(fx.mainWorkDir, ["push", "origin", "main"]);
+      const mainWithSymlinkSha = fx.gitAt(fx.bareRepoDir, ["rev-parse", "refs/heads/main"]);
+      fx.store.forceSetMainRefCommitHashForTest(fx.projectId, mainWithSymlinkSha);
+
+      fx.gitAt(fx.agentWorkDir, ["pull", "origin", "main"]);
+      writeFileSync(
+        join(fx.agentWorkDir, "src", "pricing.mjs"),
+        [
+          "export function calculateDiscount(amount, opts = {}) {",
+          "  if (amount <= 0) throw new Error('amount must be positive');",
+          "  return opts.vip ? Math.round(amount * 0.75) : Math.round(amount * 0.8);",
+          "}",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      fx.gitAt(fx.agentWorkDir, ["add", "src/pricing.mjs"]);
+      fx.gitAt(fx.agentWorkDir, ["commit", "-m", "feat: valid vip discount with repo symlink"]);
+      const agentSymlinkSha = fx.gitAt(fx.agentWorkDir, ["rev-parse", "HEAD"]);
+
+      const task1 = await fx.coreApi.createTask(fx.projectId, fx.authOp1, {
+        title: "Candidate symlink graceful FAIL verdict",
+        task_contract: fx.contract,
+        base_main_commit_hash: mainWithSymlinkSha,
+      });
+      const lease1 = await fx.coreApi.dispatchTaskLease(fx.projectId, fx.authOp1, {
+        task_id: task1.task_id,
+        worker_id: "worker-symlink-cand",
+      });
+      const stagingRef1 = `refs/factory/Verify/${task1.task_id}/${lease1.lease_epoch}`;
+      fx.gitAt(fx.agentWorkDir, ["push", "origin", `${agentSymlinkSha}:${stagingRef1}`]);
+
+      // Must NOT throw HardlinkCacheViolationError; must record structured FAIL & move task to ReworkRequired
+      const candSymlinkRes = await fx.coreApi.buildAndVerifyMergeCandidateFromGit(
+        fx.projectId,
+        fx.authOp1,
+        {
+          task_id: task1.task_id,
+          lease_id: lease1.lease_id,
+          lease_epoch: lease1.lease_epoch,
+          staging_ref: stagingRef1,
+          agent_commit_hash: agentSymlinkSha,
+          repo_path: fx.bareRepoDir,
+          verifier: fx.verifier,
+          trusted_acceptance_dir: fx.trustedAcceptanceDir,
+          execution_mode: "subprocess",
+          tier1_command: {
+            command: process.execPath,
+            args: ["--test", join(fx.trustedAcceptanceDir, "pricing.acceptance.spec.mjs")],
+          },
+        }
+      );
+      assert.equal(candSymlinkRes.ok, true);
+      if (!candSymlinkRes.ok) return;
+      assert.equal(candSymlinkRes.allRuns.length, 1);
+      assert.equal(candSymlinkRes.finalRun.verdict, "FAIL");
+      assert.equal(candSymlinkRes.finalRun.overall_status, "FAILED_ACCEPTANCE");
+      assert.equal(candSymlinkRes.taskStatus, "ReworkRequired");
+      assert.match(
+        candSymlinkRes.retryResult.finalResult.errorMessage ?? "",
+        /ERR_CANDIDATE_SYMLINK_PROHIBITED.*\blink\b/
+      );
+
+      // Symlink inside trustedAcceptanceDir also yields structured FAIL verdict without uncaught crash
+      const symlinkPolicyDir = join(fx.rootDir, "policy-with-symlink");
+      mkdirSync(symlinkPolicyDir, { recursive: true });
+      writeFileSync(join(symlinkPolicyDir, "ok.txt"), "ok\n", "utf8");
+      symlinkSync("/etc/hostname", join(symlinkPolicyDir, "policy-link"));
+      const policySymlinkAttempt = await fx.verifier.runSingleAttempt({
+        projectId: fx.projectId,
+        taskId: task1.task_id,
+        mergeCandidateId: candSymlinkRes.mergeCandidate.merge_candidate_id,
+        mergeCandidateHash: candSymlinkRes.mergeCandidate.merge_candidate_hash,
+        verifiedTreeHash: candSymlinkRes.mergeCandidate.verified_tree_hash,
+        baseMainCommitHash: candSymlinkRes.mergeCandidate.base_main_commit_hash,
+        taskContract: fx.contract,
+        snapshotPath: candSymlinkRes.mergeCandidate.snapshot_path!,
+        snapshotSha256: candSymlinkRes.mergeCandidate.snapshot_sha256!,
+        trustedAcceptanceDir: symlinkPolicyDir,
+        repoPath: fx.bareRepoDir,
+        executionMode: "subprocess",
+        tier1Command: { command: process.execPath, args: ["--version"] },
+      });
+      assert.equal(policySymlinkAttempt.verdict, "FAIL");
+      assert.equal(policySymlinkAttempt.overallStatus, "FAILED_ACCEPTANCE");
+      assert.equal(policySymlinkAttempt.trustedPolicyMatched, false);
+
+      // 2. Medium #2: chk_vr_pass_consistency rejects PASS when tier3_agent_tests_passed is false
+      await assert.rejects(
+        () =>
+          fx.store.withRlsTransaction(
+            {
+              currentProjectId: fx.projectId,
+              currentPrincipalId: "op-1",
+              currentRole: "core_api_service",
+            },
+            () =>
+              fx.store.recordVerificationRun({
+                project_id: fx.projectId,
+                task_id: task1.task_id,
+                merge_candidate_id: candSymlinkRes.mergeCandidate.merge_candidate_id,
+                merge_candidate_hash: candSymlinkRes.mergeCandidate.merge_candidate_hash,
+                verified_tree_hash: candSymlinkRes.mergeCandidate.verified_tree_hash,
+                verifier_image_digest: "sha256:forge-tier3",
+                verdict: "PASS",
+                overall_status: "PASSED",
+                tier1_trusted_acceptance_passed: true,
+                tier2_protected_baseline_passed: true,
+                tier3_agent_tests_passed: false,
+                exit_code: 0,
+                duration_ms: 15,
+                report_sha256: sha256Hex("forged-tier3-pass"),
+              })
+          ),
+        (err: unknown) =>
+          err instanceof PostgresRlsError &&
+          err.sqlState === "23514" &&
+          /chk_vr_pass_consistency/.test(err.message)
+      );
+    } finally {
+      rmSync(fx.rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("M3-Gate-10 (Review Minor fixes #1..#8): Snapshot tamper classification, supervisor stdio tails, null skipped tiers, GC isolation, DB failure compensation, detached CAS promotion, symlink target hashing, and NODE_OPTIONS blocking", async () => {
+    const fx = setupRealGitRepoFixture(new Date("2026-11-01T00:00:00.000Z"));
+    try {
+      const task = await fx.coreApi.createTask(fx.projectId, fx.authOp1, {
+        title: "Minor review fixes regression",
+        task_contract: fx.contract,
+        base_main_commit_hash: fx.baseMainSha,
+      });
+      const lease = await fx.coreApi.dispatchTaskLease(fx.projectId, fx.authOp1, {
+        task_id: task.task_id,
+        worker_id: "worker-minors",
+      });
+
+      writeFileSync(
+        join(fx.agentWorkDir, "src", "pricing.mjs"),
+        [
+          "export function calculateDiscount(amount, opts = {}) {",
+          "  if (amount <= 0) throw new Error('amount must be positive');",
+          "  return opts.vip ? Math.round(amount * 0.75) : Math.round(amount * 0.8);",
+          "}",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      fx.gitAt(fx.agentWorkDir, ["add", "src/pricing.mjs"]);
+      fx.gitAt(fx.agentWorkDir, ["commit", "-m", "feat: valid vip implementation"]);
+      const agentCommitSha = fx.gitAt(fx.agentWorkDir, ["rev-parse", "HEAD"]);
+      const stagingRef = `refs/factory/Verify/${task.task_id}/${lease.lease_epoch}`;
+      fx.gitAt(fx.agentWorkDir, ["push", "origin", `${agentCommitSha}:${stagingRef}`]);
+
+      // Minor #3 + #8 + null preservation: Tier 1 only (tier2 & tier3 omitted) + extra_env NODE_OPTIONS stripped
+      const verified = await fx.coreApi.buildAndVerifyMergeCandidateFromGit(
+        fx.projectId,
+        fx.authOp1,
+        {
+          task_id: task.task_id,
+          lease_id: lease.lease_id,
+          lease_epoch: lease.lease_epoch,
+          staging_ref: stagingRef,
+          agent_commit_hash: agentCommitSha,
+          repo_path: fx.bareRepoDir,
+          verifier: fx.verifier,
+          trusted_acceptance_dir: fx.trustedAcceptanceDir,
+          execution_mode: "subprocess",
+          extra_env: {
+            NODE_OPTIONS: "--require=/tmp/nonexistent-injector.js",
+            LD_PRELOAD: "/tmp/nonexistent.so",
+            SAFE_VERIFIER_VAR: "ok",
+          },
+          tier1_command: {
+            command: process.execPath,
+            args: [
+              "-e",
+              [
+                "const assert = require('node:assert/strict');",
+                "assert.equal(process.env.NODE_OPTIONS, undefined);",
+                "assert.equal(process.env.LD_PRELOAD, undefined);",
+                "assert.equal(process.env.SAFE_VERIFIER_VAR, 'ok');",
+              ].join(" "),
+            ],
+          },
+        }
+      );
+      assert.equal(verified.ok, true);
+      if (!verified.ok) return;
+      assert.equal(verified.finalRun.verdict, "PASS");
+      assert.equal(verified.finalRun.tier1_trusted_acceptance_passed, true);
+      assert.equal(verified.finalRun.tier2_protected_baseline_passed, null);
+      assert.equal(verified.finalRun.tier3_agent_tests_passed, null);
+      assert.equal(verified.retryResult.finalResult.tier2ProtectedBaselinePassed, null);
+      assert.equal(verified.retryResult.finalResult.tier3AgentTestsPassed, null);
+
+      const directSanitized = sanitizeVerifierEnv(process.env, {
+        NODE_OPTIONS: "--inspect",
+        BASH_ENV: "/tmp/evil.sh",
+        PERL5OPT: "-Mfoo",
+        RUBYOPT: "-rfoo",
+        SAFE_CUSTOM_FLAG: "yes",
+      });
+      assert.equal(directSanitized.NODE_OPTIONS, undefined);
+      assert.equal(directSanitized.BASH_ENV, undefined);
+      assert.equal(directSanitized.PERL5OPT, undefined);
+      assert.equal(directSanitized.RUBYOPT, undefined);
+      assert.equal(directSanitized.SAFE_CUSTOM_FLAG, "yes");
+
+      // Minor #1: Snapshot WORM mode / SHA-256 tamper fails immediately with TEST_TAMPERING_DETECTED (1 attempt, not INFRA_ERROR x3)
+      const snapPath = verified.mergeCandidate.snapshot_path!;
+      chmodSync(snapPath, 0o644);
+      const modeTamperRes = await fx.verifier.verifyCandidateWithRetries({
+        projectId: fx.projectId,
+        taskId: task.task_id,
+        mergeCandidateId: verified.mergeCandidate.merge_candidate_id,
+        mergeCandidateHash: verified.mergeCandidate.merge_candidate_hash,
+        verifiedTreeHash: verified.mergeCandidate.verified_tree_hash,
+        baseMainCommitHash: verified.mergeCandidate.base_main_commit_hash,
+        taskContract: fx.contract,
+        snapshotPath: snapPath,
+        snapshotSha256: verified.mergeCandidate.snapshot_sha256!,
+        trustedAcceptanceDir: fx.trustedAcceptanceDir,
+        repoPath: fx.bareRepoDir,
+        executionMode: "subprocess",
+        maxInfraRetries: 2,
+        tier1Command: { command: process.execPath, args: ["--version"] },
+      });
+      chmodSync(snapPath, 0o444);
+      assert.equal(modeTamperRes.attempts.length, 1);
+      assert.equal(modeTamperRes.finalResult.overallStatus, "TEST_TAMPERING_DETECTED");
+      assert.equal(modeTamperRes.finalResult.verdict, "FAIL");
+      assert.equal(modeTamperRes.finalResult.exitCode, 1);
+
+      const shaTamperRes = await fx.verifier.verifyCandidateWithRetries({
+        projectId: fx.projectId,
+        taskId: task.task_id,
+        mergeCandidateId: verified.mergeCandidate.merge_candidate_id,
+        mergeCandidateHash: verified.mergeCandidate.merge_candidate_hash,
+        verifiedTreeHash: verified.mergeCandidate.verified_tree_hash,
+        baseMainCommitHash: verified.mergeCandidate.base_main_commit_hash,
+        taskContract: fx.contract,
+        snapshotPath: snapPath,
+        snapshotSha256: "f".repeat(64),
+        trustedAcceptanceDir: fx.trustedAcceptanceDir,
+        repoPath: fx.bareRepoDir,
+        executionMode: "subprocess",
+        maxInfraRetries: 2,
+        tier1Command: { command: process.execPath, args: ["--version"] },
+      });
+      assert.equal(shaTamperRes.attempts.length, 1);
+      assert.equal(shaTamperRes.finalResult.overallStatus, "TEST_TAMPERING_DETECTED");
+
+      // Minor #2: WNA sandbox / linux-supervisor preserves stdoutTail and stderrTail
+      const sandboxBackend = new LinuxCgroupV2SandboxBackend();
+      const tailTaskId = "minor-2-tail-check";
+      const tailWorkDir = join(fx.rootDir, "tail-work");
+      mkdirSync(tailWorkDir, { recursive: true });
+      try {
+        const spawned = sandboxBackend.spawnRealProcessInSandbox({
+          taskId: tailTaskId,
+          leaseEpoch: 1,
+          command: process.execPath,
+          args: [
+            "-e",
+            "console.log('SF_STDOUT_SENTINEL'); console.error('SF_STDERR_SENTINEL');",
+          ],
+          cwd: tailWorkDir,
+          worktreePath: tailWorkDir,
+          sanitizedEnv: sanitizeVerifierEnv(process.env),
+          isolateNamespaces: false,
+          dropPrivileges: false,
+        });
+        const exitOutcome = await spawned.exitPromise;
+        assert.equal(exitOutcome.code, 0);
+        assert.match(exitOutcome.stdoutTail ?? "", /SF_STDOUT_SENTINEL/);
+        assert.match(exitOutcome.stderrTail ?? "", /SF_STDERR_SENTINEL/);
+      } finally {
+        await sandboxBackend.killAndVerifyClean(tailTaskId, 1);
+      }
+
+      const verifierSandboxTail = await fx.verifier.runSingleAttempt({
+        projectId: fx.projectId,
+        taskId: task.task_id,
+        mergeCandidateId: verified.mergeCandidate.merge_candidate_id,
+        mergeCandidateHash: verified.mergeCandidate.merge_candidate_hash,
+        verifiedTreeHash: verified.mergeCandidate.verified_tree_hash,
+        baseMainCommitHash: verified.mergeCandidate.base_main_commit_hash,
+        taskContract: fx.contract,
+        snapshotPath: snapPath,
+        snapshotSha256: verified.mergeCandidate.snapshot_sha256!,
+        trustedAcceptanceDir: fx.trustedAcceptanceDir,
+        repoPath: fx.bareRepoDir,
+        executionMode: process.platform === "linux" ? "sandbox" : "subprocess",
+        tier1Command: {
+          command: process.execPath,
+          args: [
+            "-e",
+            "console.log('VERIFIER_OUT_TAIL'); console.error('VERIFIER_ERR_TAIL');",
+          ],
+        },
+      });
+      assert.match(verifierSandboxTail.tierOutcomes[0]?.stdoutTail ?? "", /VERIFIER_OUT_TAIL/);
+      assert.match(verifierSandboxTail.tierOutcomes[0]?.stderrTail ?? "", /VERIFIER_ERR_TAIL/);
+
+      // Minor #4: Corrupted .meta.json does not halt pruneExpiredSnapshots GC for remaining snapshots
+      const isolatedStoreDir = join(fx.rootDir, "gc-isolated-store");
+      const isolatedStore = new ImmutableSourceSnapshotStore({ storageDir: isolatedStoreDir });
+      mkdirSync(join(isolatedStoreDir, "corrupt-candidate"), { recursive: true });
+      writeFileSync(
+        join(isolatedStoreDir, "corrupt-candidate", "snapshot-corrupt.tar.meta.json"),
+        "{not-valid-json",
+        "utf8"
+      );
+      const validExpiredBuilt = buildRealGitMergeCandidate({
+        repoPath: fx.bareRepoDir,
+        taskId: "gc-valid-expired",
+        agentCommitHash: agentCommitSha,
+        snapshotStore: isolatedStore,
+        createdAt: new Date("2026-11-01T00:00:00.000Z"),
+      });
+      assert.equal(validExpiredBuilt.ok, true);
+      if (!validExpiredBuilt.ok) return;
+      const gcRes = isolatedStore.pruneExpiredSnapshots(new Date("2026-11-20T00:00:00.000Z"));
+      assert.deepEqual(gcRes.deletedPaths, [validExpiredBuilt.snapshotPath!]);
+      assert.equal(existsSync(validExpiredBuilt.snapshotPath!), false);
+
+      // Minor #6: executeCasMerge succeeds even if local snapshot .meta.json manifest is missing
+      const reviewArtifact = await fx.store.withRlsTransaction(
+        {
+          currentProjectId: fx.projectId,
+          currentPrincipalId: "op-1",
+          currentRole: "core_api_service",
+        },
+        () =>
+          fx.store.recordReviewArtifact({
+            project_id: fx.projectId,
+            task_id: task.task_id,
+            merge_candidate_id: verified.mergeCandidate.merge_candidate_id,
+            verification_run_id: verified.finalRun.verification_run_id,
+            merge_candidate_hash: verified.mergeCandidate.merge_candidate_hash,
+            verified_tree_hash: verified.mergeCandidate.verified_tree_hash,
+            writer_provider: "anthropic",
+            writer_model: "claude-3-7-sonnet",
+            reviewer_provider: "google",
+            reviewer_model: "gemini-2.5-pro",
+            developer_principal_id: "dev-agent-minor6",
+            reviewer_principal_id: "rev-agent-minor6",
+            developer_session_id: "sess-dev-minor6",
+            reviewer_session_id: "sess-rev-minor6",
+            verdict: "PASS",
+          })
+      );
+      const approval = await fx.webConsole.approveCandidateWith8FieldBinding({
+        auth: fx.authApprover1,
+        candidate: verified.mergeCandidate,
+        verificationRun: verified.finalRun,
+        reviewArtifact,
+      });
+      unlinkSync(`${snapPath}.meta.json`);
+      const casRes = await fx.coreApi.executeCasMerge(fx.projectId, fx.authOp1, {
+        task_id: task.task_id,
+        merge_candidate_id: verified.mergeCandidate.merge_candidate_id,
+        approval_id: approval.approval_id,
+      });
+      assert.equal(casRes.status, "MERGED_BY_CAS");
+      assert.equal(casRes.task_status, "MergedAndCompleted");
+
+      // Minor #5: buildMergeCandidateFromGit rolls back candidate ref + snapshot when createMergeCandidate fails
+      const latestMainSha = fx.gitAt(fx.bareRepoDir, ["rev-parse", "refs/heads/main"]);
+      fx.store.forceSetMainRefCommitHashForTest(fx.projectId, latestMainSha);
+      fx.gitAt(fx.agentWorkDir, ["reset", "--hard", latestMainSha]);
+      writeFileSync(join(fx.agentWorkDir, "src", "minor5.mjs"), "export const m5 = 1;\n", "utf8");
+      fx.gitAt(fx.agentWorkDir, ["add", "src/minor5.mjs"]);
+      fx.gitAt(fx.agentWorkDir, ["commit", "-m", "feat: minor 5 agent commit"]);
+      const m5AgentSha = fx.gitAt(fx.agentWorkDir, ["rev-parse", "HEAD"]);
+
+      const taskComp = await fx.coreApi.createTask(fx.projectId, fx.authOp1, {
+        title: "Minor 5 orphan ref/snapshot compensation",
+        task_contract: fx.contract,
+        base_main_commit_hash: latestMainSha,
+      });
+      const leaseComp = await fx.coreApi.dispatchTaskLease(fx.projectId, fx.authOp1, {
+        task_id: taskComp.task_id,
+        worker_id: "worker-m5-comp",
+      });
+      const stagingRefComp = `refs/factory/Verify/${taskComp.task_id}/${leaseComp.lease_epoch}`;
+      fx.gitAt(fx.agentWorkDir, ["push", "origin", `${m5AgentSha}:${stagingRefComp}`]);
+
+      // Advance bare Git main WITHOUT updating DB main pointer -> createMergeCandidate throws 23514 after Git build
+      fx.gitAt(fx.mainWorkDir, ["pull", "origin", "main"]);
+      writeFileSync(join(fx.mainWorkDir, "README.md"), "# Advanced main without DB sync\n", "utf8");
+      fx.gitAt(fx.mainWorkDir, ["add", "README.md"]);
+      fx.gitAt(fx.mainWorkDir, ["commit", "-m", "docs: advance bare main"]);
+      fx.gitAt(fx.mainWorkDir, ["push", "origin", "main"]);
+
+      const compSnapDir = join(fx.rootDir, "comp-snap-store");
+      const compSnapStore = new ImmutableSourceSnapshotStore({ storageDir: compSnapDir });
+      await assert.rejects(
+        () =>
+          fx.coreApi.buildMergeCandidateFromGit(fx.projectId, fx.authOp1, {
+            task_id: taskComp.task_id,
+            lease_id: leaseComp.lease_id,
+            lease_epoch: leaseComp.lease_epoch,
+            staging_ref: stagingRefComp,
+            agent_commit_hash: m5AgentSha,
+            repo_path: fx.bareRepoDir,
+            snapshot_store: compSnapStore,
+          }),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+      const allRefsAfterFailure = fx.gitAt(fx.bareRepoDir, ["show-ref"]);
+      assert.equal(
+        allRefsAfterFailure.includes(`refs/factory/candidates/${taskComp.task_id}`),
+        false
+      );
+      const gcComp = compSnapStore.pruneExpiredSnapshots(new Date("2026-12-31T00:00:00.000Z"));
+      assert.equal(gcComp.deletedPaths.length, 0);
+      assert.equal(gcComp.retainedActivePaths.length, 0);
+      assert.equal(gcComp.retainedPermanentPaths.length, 0);
+
+      // Minor #7: computeDirectorySha256 changes when symlink target changes
+      const symHashDir = join(fx.rootDir, "sym-hash-dir");
+      mkdirSync(symHashDir, { recursive: true });
+      symlinkSync("target-v1.txt", join(symHashDir, "policy-link"));
+      const shaTarget1 = computeDirectorySha256(symHashDir);
+      unlinkSync(join(symHashDir, "policy-link"));
+      symlinkSync("target-v2.txt", join(symHashDir, "policy-link"));
+      const shaTarget2 = computeDirectorySha256(symHashDir);
+      assert.notEqual(shaTarget1, shaTarget2);
     } finally {
       rmSync(fx.rootDir, { recursive: true, force: true });
     }

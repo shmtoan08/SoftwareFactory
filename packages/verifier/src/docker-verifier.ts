@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,7 +23,10 @@ import {
 } from "@software-factory/shared-types";
 import { type TaskContractSpec, matchesAnyGlob } from "@software-factory/task-contract";
 import { LinuxCgroupV2SandboxBackend } from "@software-factory/wna";
-import { ImmutableSourceSnapshotStore } from "./candidate-builder.ts";
+import {
+  ImmutableSourceSnapshotStore,
+  SnapshotIntegrityError,
+} from "./candidate-builder.ts";
 
 export class DockerVerifierUnavailableError extends Error {
   public readonly code = "ERR_DOCKER_VERIFIER_UNAVAILABLE";
@@ -147,6 +151,15 @@ export const FORBIDDEN_VERIFIER_ENV_PATTERNS: readonly RegExp[] = [
   /^NPM_TOKEN$/i,
   /^SF_CONTROL_PLANE_/i,
   /^SF_WNA_/i,
+  /^NODE_OPTIONS$/i,
+  /^LD_PRELOAD$/i,
+  /^LD_LIBRARY_PATH$/i,
+  /^DYLD_/i,
+  /^PYTHONPATH$/i,
+  /^PERL5OPT$/i,
+  /^RUBYOPT$/i,
+  /^BASH_ENV$/i,
+  /^ENV$/i,
   /_SECRET$/i,
   /_TOKEN$/i,
   /_KEY$/i,
@@ -357,7 +370,8 @@ export function computeDirectorySha256(dirPath: string): string {
     const absFile = join(absDir, ...relPath.split("/"));
     const st = lstatSync(absFile);
     if (st.isSymbolicLink()) {
-      hash.update(`L\0${relPath}\0`);
+      const target = readlinkSync(absFile);
+      hash.update(`L\0${relPath}\0${target}\0`);
     } else if (st.isFile()) {
       const bytes = readFileSync(absFile);
       hash.update(`F\0${relPath}\0${bytes.byteLength}\0`);
@@ -367,6 +381,18 @@ export function computeDirectorySha256(dirPath: string): string {
   }
 
   return hash.digest("hex");
+}
+
+function findSymlinksInDirectory(rootDir: string): string[] {
+  const absRoot = resolve(rootDir);
+  const symlinks: string[] = [];
+  for (const relPath of collectFilesRecursively(absRoot)) {
+    const st = lstatSync(join(absRoot, ...relPath.split("/")));
+    if (st.isSymbolicLink()) {
+      symlinks.push(relPath);
+    }
+  }
+  return symlinks;
 }
 
 /**
@@ -663,13 +689,20 @@ async function runHostCommandWithTimeout(options: {
 
       try {
         const res = await spawned.exitPromise;
+        const signalSuffix = res.signal ? `signal:${res.signal}` : "";
+        const rawStderr = res.stderrTail ?? "";
+        const stderrCombined = rawStderr
+          ? signalSuffix
+            ? `${rawStderr}\n${signalSuffix}`
+            : rawStderr
+          : signalSuffix;
         return {
           exitCode: res.code,
           timedOut,
           infraError: !timedOut && res.code === null && res.signal !== null,
           durationMs: Date.now() - startMs,
-          stdoutTail: "",
-          stderrTail: res.signal ? `signal:${res.signal}` : "",
+          stdoutTail: (res.stdoutTail ?? "").slice(-2048),
+          stderrTail: stderrCombined.slice(-2048),
         };
       } finally {
         clearTimeout(timer);
@@ -855,7 +888,7 @@ function restoreDirectoryWritableRecursive(dirPath: string): void {
     try {
       if (entry.isDirectory()) {
         restoreDirectoryWritableRecursive(full);
-      } else {
+      } else if (entry.isFile()) {
         chmodSync(full, 0o644);
       }
     } catch {
@@ -1001,10 +1034,16 @@ export class Docker3TierVerifier {
           targetDir: baselineDir,
         });
       } catch (err) {
+        const isSnapshotTamper =
+          err instanceof SnapshotIntegrityError &&
+          (err.code === "ERR_SNAPSHOT_INTEGRITY_MISMATCH" ||
+            err.code === "ERR_SNAPSHOT_NOT_READONLY" ||
+            err.code === "ERR_SNAPSHOT_CONTAINS_GIT_METADATA" ||
+            err.code === "ERR_SNAPSHOT_UNSAFE_ARCHIVE_MEMBER");
         return finalizeReport({
           attemptIndex,
           verdict: "FAIL",
-          overallStatus: "INFRA_ERROR",
+          overallStatus: isSnapshotTamper ? "TEST_TAMPERING_DETECTED" : "INFRA_ERROR",
           verifierImageDigest,
           executionBackend,
           isDockerIsolated: useDocker,
@@ -1020,7 +1059,7 @@ export class Docker3TierVerifier {
           tier3AgentTestsPassed: null,
           tier3Assertions: [],
           tierOutcomes: [],
-          exitCode: 125,
+          exitCode: isSnapshotTamper ? 1 : 125,
           errorMessage: err instanceof Error ? err.message : String(err),
         });
       }
@@ -1117,14 +1156,128 @@ export class Docker3TierVerifier {
         });
       }
 
-      // Step 4: Prepare non-hardlinked ephemeral run directory + read-only acceptance/deps copies
-      copyDirectoryWithoutHardlinks(baselineDir, runDir);
-      copyDirectoryWithoutHardlinks(input.trustedAcceptanceDir, roAcceptanceDir);
+      // Step 4: Reject symlinks in candidate & prepare non-hardlinked ephemeral run directory + read-only copies
+      const candidateSymlinks = findSymlinksInDirectory(baselineDir);
+      if (candidateSymlinks.length > 0) {
+        return finalizeReport({
+          attemptIndex,
+          verdict: "FAIL",
+          overallStatus: "FAILED_ACCEPTANCE",
+          verifierImageDigest,
+          executionBackend,
+          isDockerIsolated: useDocker,
+          hermeticNetworkDisabled: networkDisabled,
+          hardlinkCacheForbidden: true,
+          kernelSysctls,
+          trustedPolicySha256: actualPolicySha,
+          trustedPolicyMatched: true,
+          tier1TrustedAcceptancePassed: null,
+          tier2ProtectedBaselinePassed: null,
+          tier2BaselineTamperDetected: false,
+          tamperedBaselinePaths: [],
+          tier3AgentTestsPassed: null,
+          tier3Assertions: [],
+          tierOutcomes: [],
+          exitCode: 1,
+          errorMessage: `ERR_CANDIDATE_SYMLINK_PROHIBITED: Symbolic links prohibited inside candidate workspace: ${candidateSymlinks.join(
+            ", "
+          )}`,
+        });
+      }
+
+      try {
+        copyDirectoryWithoutHardlinks(baselineDir, runDir);
+      } catch (err) {
+        if (err instanceof HardlinkCacheViolationError) {
+          return finalizeReport({
+            attemptIndex,
+            verdict: "FAIL",
+            overallStatus: "FAILED_ACCEPTANCE",
+            verifierImageDigest,
+            executionBackend,
+            isDockerIsolated: useDocker,
+            hermeticNetworkDisabled: networkDisabled,
+            hardlinkCacheForbidden: true,
+            kernelSysctls,
+            trustedPolicySha256: actualPolicySha,
+            trustedPolicyMatched: true,
+            tier1TrustedAcceptancePassed: null,
+            tier2ProtectedBaselinePassed: null,
+            tier2BaselineTamperDetected: false,
+            tamperedBaselinePaths: [],
+            tier3AgentTestsPassed: null,
+            tier3Assertions: [],
+            tierOutcomes: [],
+            exitCode: 1,
+            errorMessage: err.message,
+          });
+        }
+        throw err;
+      }
+
+      try {
+        copyDirectoryWithoutHardlinks(input.trustedAcceptanceDir, roAcceptanceDir);
+      } catch (err) {
+        if (err instanceof HardlinkCacheViolationError) {
+          return finalizeReport({
+            attemptIndex,
+            verdict: "FAIL",
+            overallStatus: "FAILED_ACCEPTANCE",
+            verifierImageDigest,
+            executionBackend,
+            isDockerIsolated: useDocker,
+            hermeticNetworkDisabled: networkDisabled,
+            hardlinkCacheForbidden: true,
+            kernelSysctls,
+            trustedPolicySha256: actualPolicySha,
+            trustedPolicyMatched: false,
+            tier1TrustedAcceptancePassed: false,
+            tier2ProtectedBaselinePassed: null,
+            tier2BaselineTamperDetected: false,
+            tamperedBaselinePaths: [],
+            tier3AgentTestsPassed: null,
+            tier3Assertions: [],
+            tierOutcomes: [],
+            exitCode: 1,
+            errorMessage: err.message,
+          });
+        }
+        throw err;
+      }
+
       if (input.depsCacheDir && existsSync(input.depsCacheDir)) {
         roDepsDir = join(workRoot, "deps-cache-ro");
-        copyDirectoryWithoutHardlinks(input.depsCacheDir, roDepsDir);
-        assertZeroHardlinkSharing(runDir, input.depsCacheDir);
-        assertZeroHardlinkSharing(runDir, roDepsDir);
+        try {
+          copyDirectoryWithoutHardlinks(input.depsCacheDir, roDepsDir);
+          assertZeroHardlinkSharing(runDir, input.depsCacheDir);
+          assertZeroHardlinkSharing(runDir, roDepsDir);
+        } catch (err) {
+          if (err instanceof HardlinkCacheViolationError) {
+            return finalizeReport({
+              attemptIndex,
+              verdict: "FAIL",
+              overallStatus: "TEST_TAMPERING_DETECTED",
+              verifierImageDigest,
+              executionBackend,
+              isDockerIsolated: useDocker,
+              hermeticNetworkDisabled: networkDisabled,
+              hardlinkCacheForbidden: true,
+              kernelSysctls,
+              trustedPolicySha256: actualPolicySha,
+              trustedPolicyMatched: true,
+              tier1TrustedAcceptancePassed: null,
+              tier2ProtectedBaselinePassed: null,
+              tier2BaselineTamperDetected: false,
+              tamperedBaselinePaths: [],
+              tier3AgentTestsPassed: null,
+              tier3Assertions: [],
+              tierOutcomes: [],
+              exitCode: 1,
+              errorMessage: err.message,
+            });
+          }
+          throw err;
+        }
         setDirectoryReadOnlyRecursive(roDepsDir);
       }
       setDirectoryReadOnlyRecursive(baselineDir);
@@ -1261,7 +1414,7 @@ export class Docker3TierVerifier {
         });
       }
 
-      let tier2Passed: boolean | null = true;
+      let tier2Passed: boolean | null = null;
       if (input.tier2Command) {
         const tier2Out = await executeTier(2, input.tier2Command);
         tierOutcomes.push(tier2Out);
@@ -1316,7 +1469,7 @@ export class Docker3TierVerifier {
         tier2Passed = tier2Out.passed;
       }
 
-      let tier3Passed: boolean | null = true;
+      let tier3Passed: boolean | null = null;
       if (input.tier3Command) {
         const tier3Out = await executeTier(3, input.tier3Command);
         tierOutcomes.push(tier3Out);
@@ -1402,7 +1555,8 @@ export class Docker3TierVerifier {
         }
       }
 
-      const allPassed = tier1Out.passed === true && tier2Passed === true && tier3Passed === true;
+      const allPassed =
+        tier1Out.passed === true && tier2Passed !== false && tier3Passed !== false;
       return finalizeReport({
         attemptIndex,
         verdict: allPassed ? "PASS" : "FAIL",

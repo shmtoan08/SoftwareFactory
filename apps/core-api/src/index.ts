@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import type {
   ApprovalDecisionRecord,
@@ -25,6 +26,7 @@ import {
   Docker3TierVerifier,
   ImmutableSourceSnapshotStore,
   type RetryableVerificationResult,
+  SnapshotIntegrityError,
   type TierCommandSpec,
   buildRealGitMergeCandidate,
 } from "@software-factory/verifier";
@@ -542,7 +544,7 @@ export class CoreApiService {
     const verified = this.authorize(auth, projectId, MUTATION_ROLES);
     const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
 
-    return this.store.withRlsTransaction(
+    const { verifiedImport, clockIso } = await this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
@@ -555,14 +557,14 @@ export class CoreApiService {
         }
 
         const existingImports = this.store.getVerifiedImportsForTask(input.task_id);
-        let verifiedImport = existingImports.find(
+        let foundImport = existingImports.find(
           (rec) =>
             rec.lease_id === input.lease_id &&
             rec.lease_epoch === input.lease_epoch &&
             rec.agent_commit_hash === input.agent_commit_hash
         );
 
-        if (!verifiedImport) {
+        if (!foundImport) {
           const candidateInput =
             input.candidate_input ??
             inspectRealGitCommitForImport({
@@ -572,7 +574,7 @@ export class CoreApiService {
               agentCommitHash: input.agent_commit_hash,
               contract: task.task_contract_json as unknown as TaskContractSpec,
             });
-          verifiedImport = this.store.recordVerifiedCodeImport({
+          foundImport = this.store.recordVerifiedCodeImport({
             project_id: projectId,
             task_id: input.task_id,
             lease_id: input.lease_id,
@@ -582,16 +584,50 @@ export class CoreApiService {
           });
         }
 
-        const buildResult = buildRealGitMergeCandidate({
-          repoPath: input.repo_path,
-          gitDir: input.git_dir,
-          taskId: input.task_id,
-          agentCommitHash: input.agent_commit_hash,
-          snapshotStore,
-          createdAt: new Date(this.store.clockTimestampIso()),
-        });
+        return {
+          verifiedImport: foundImport,
+          clockIso: this.store.clockTimestampIso(),
+        };
+      }
+    );
 
-        if (!buildResult.ok) {
+    const gitEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(input.git_dir ? { GIT_DIR: input.git_dir } : {}),
+    };
+    const candidateRef = `refs/factory/candidates/${input.task_id}`;
+    let previousCandidateRefSha: string | null = null;
+    try {
+      previousCandidateRefSha =
+        execFileSync("git", ["rev-parse", "--verify", "--quiet", candidateRef], {
+          cwd: input.repo_path,
+          env: gitEnv,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 10_000,
+        }).trim() || null;
+    } catch {
+      previousCandidateRefSha = null;
+    }
+
+    const buildResult = buildRealGitMergeCandidate({
+      repoPath: input.repo_path,
+      gitDir: input.git_dir,
+      taskId: input.task_id,
+      agentCommitHash: input.agent_commit_hash,
+      candidateRef,
+      snapshotStore,
+      createdAt: new Date(clockIso),
+    });
+
+    if (!buildResult.ok) {
+      return this.store.withRlsTransaction(
+        {
+          currentProjectId: projectId,
+          currentPrincipalId: verified.principalId,
+          currentRole: "core_api_service",
+        },
+        () => {
           const conflictRes = this.store.markMergeConflictReworkRequired({
             project_id: projectId,
             task_id: input.task_id,
@@ -602,36 +638,75 @@ export class CoreApiService {
             conflict_summary: buildResult.conflictSummary,
           });
           return {
-            ok: false,
-            reason: "MERGE_CONFLICT",
+            ok: false as const,
+            reason: "MERGE_CONFLICT" as const,
             verifiedImport,
             taskStatus: conflictRes.task_status,
             conflictedFiles: conflictRes.conflicted_files,
             conflictSummary: buildResult.conflictSummary,
           };
         }
+      );
+    }
 
-        const mergeCandidate = this.store.createMergeCandidate({
-          project_id: projectId,
-          task_id: input.task_id,
-          import_id: verifiedImport.import_id,
-          base_main_commit_hash: buildResult.baseMainCommitHash,
-          merge_candidate_hash: buildResult.mergeCandidateHash,
-          verified_tree_hash: buildResult.verifiedTreeHash,
-          snapshot_path: buildResult.snapshotPath ?? null,
-          snapshot_sha256: buildResult.snapshotSha256 ?? null,
-          snapshot_size_bytes: buildResult.snapshotSizeBytes ?? null,
-          snapshot_retention_class: buildResult.snapshotRetentionClass ?? "EPHEMERAL_14D",
-        });
+    try {
+      const mergeCandidate = await this.store.withRlsTransaction(
+        {
+          currentProjectId: projectId,
+          currentPrincipalId: verified.principalId,
+          currentRole: "core_api_service",
+        },
+        () =>
+          this.store.createMergeCandidate({
+            project_id: projectId,
+            task_id: input.task_id,
+            import_id: verifiedImport.import_id,
+            base_main_commit_hash: buildResult.baseMainCommitHash,
+            merge_candidate_hash: buildResult.mergeCandidateHash,
+            verified_tree_hash: buildResult.verifiedTreeHash,
+            snapshot_path: buildResult.snapshotPath ?? null,
+            snapshot_sha256: buildResult.snapshotSha256 ?? null,
+            snapshot_size_bytes: buildResult.snapshotSizeBytes ?? null,
+            snapshot_retention_class: buildResult.snapshotRetentionClass ?? "EPHEMERAL_14D",
+          })
+      );
 
-        return {
-          ok: true,
-          verifiedImport,
-          mergeCandidate,
-          candidateBuild: buildResult,
-        };
+      return {
+        ok: true,
+        verifiedImport,
+        mergeCandidate,
+        candidateBuild: buildResult,
+      };
+    } catch (err) {
+      // Compensate Git ref & newly created snapshot so DB errors leave zero orphan artifacts
+      try {
+        if (previousCandidateRefSha) {
+          execFileSync("git", ["update-ref", buildResult.candidateRef, previousCandidateRefSha], {
+            cwd: input.repo_path,
+            env: gitEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 10_000,
+          });
+        } else {
+          execFileSync("git", ["update-ref", "-d", buildResult.candidateRef], {
+            cwd: input.repo_path,
+            env: gitEnv,
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 10_000,
+          });
+        }
+      } catch {
+        // best-effort Git ref compensation
       }
-    );
+      if (snapshotStore && buildResult.snapshotCreated && buildResult.snapshotPath) {
+        try {
+          snapshotStore.deleteSnapshot(buildResult.snapshotPath);
+        } catch {
+          // best-effort snapshot cleanup
+        }
+      }
+      throw err;
+    }
   }
 
   public async verifyMergeCandidate(
@@ -892,34 +967,44 @@ export class CoreApiService {
   ): Promise<CasMergeResult> {
     const verified = this.authorize(auth, projectId, MUTATION_ROLES);
     const snapshotStore = input.snapshot_store ?? this.snapshotStore;
-    return this.store.withRlsTransaction(
+    const { res, snapshotPath, clockIso } = await this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
       async () => {
-        const res = await this.store.executeAtomicCasMergeOrReconcile({
+        const casRes = await this.store.executeAtomicCasMergeOrReconcile({
           project_id: projectId,
           task_id: input.task_id,
           merge_candidate_id: input.merge_candidate_id,
           approval_id: input.approval_id,
         });
-        if (snapshotStore) {
-          const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
-          if (mc?.snapshot_path) {
-            if (res.status === "MERGED_BY_CAS" || res.status === "RECONCILED_ALREADY_MERGED") {
-              snapshotStore.markMergedPermanent(mc.snapshot_path);
-            } else if (res.status === "CAS_CONFLICT_NEEDS_REBASE") {
-              snapshotStore.markInvalidatedOrSuperseded(
-                mc.snapshot_path,
-                new Date(this.store.clockTimestampIso())
-              );
-            }
-          }
-        }
-        return res;
+        const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
+        return {
+          res: casRes,
+          snapshotPath: mc?.snapshot_path ?? null,
+          clockIso: this.store.clockTimestampIso(),
+        };
       }
     );
+
+    if (snapshotStore && snapshotPath) {
+      try {
+        if (res.status === "MERGED_BY_CAS" || res.status === "RECONCILED_ALREADY_MERGED") {
+          snapshotStore.markMergedPermanent(snapshotPath);
+        } else if (res.status === "CAS_CONFLICT_NEEDS_REBASE") {
+          snapshotStore.markInvalidatedOrSuperseded(snapshotPath, new Date(clockIso));
+        }
+      } catch (err) {
+        if (
+          !(err instanceof SnapshotIntegrityError && err.code === "ERR_SNAPSHOT_NOT_FOUND")
+        ) {
+          // CAS merge is already durably committed in DB/Git; do not throw back and appear failed on local manifest I/O drift.
+        }
+      }
+    }
+
+    return res;
   }
 }
