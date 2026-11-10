@@ -346,7 +346,9 @@ static int apply_mount_mask(const char *masked_path) {
       return -1;
     }
     if (mount("tmpfs", mnt, "tmpfs", 0, "size=4k,mode=0700") != 0) {
+      int saved = errno;
       rmdir(mnt);
+      errno = saved;
       return -1;
     }
     char empty_file[64];
@@ -584,98 +586,99 @@ static size_t collect_proc_descendants(pid_t root_pid, pid_t *out_pids, size_t m
   return desc_count;
 }
 
-static int run_probe(const char *test_mask_dir) {
-  bool subreaper_ok = (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0);
+typedef struct {
+  bool ns_ok;
+  bool user_ns_used;
+  bool mask_ok;
+  int err_num;
+  char reason[256];
+} NsProbeResult;
+
+static void probe_ns_in_fork(const char *test_mask_dir, NsProbeResult *out) {
+  memset(out, 0, sizeof(*out));
   int sv[2];
-  if (pipe(sv) != 0) {
-    printf("{\"subreaperSupported\":%s,\"namespacesSupported\":false,\"userNamespaceUsed\":false,"
-           "\"mountMaskSupported\":false,\"reason\":\"pipe failed\"}\n",
-           subreaper_ok ? "true" : "false");
-    return 0;
+  if (pipe2(sv, O_CLOEXEC) != 0) {
+    out->err_num = errno;
+    snprintf(out->reason, sizeof(out->reason), "pipe failed: %.200s", strerror(errno));
+    return;
   }
 
   pid_t child = fork();
   if (child < 0) {
+    out->err_num = errno;
+    snprintf(out->reason, sizeof(out->reason), "fork failed: %.200s", strerror(errno));
     close(sv[0]);
     close(sv[1]);
-    printf("{\"subreaperSupported\":%s,\"namespacesSupported\":false,\"userNamespaceUsed\":false,"
-           "\"mountMaskSupported\":false,\"reason\":\"fork failed\"}\n",
-           subreaper_ok ? "true" : "false");
-    return 0;
+    return;
   }
 
   if (child == 0) {
     close(sv[0]);
+    NsProbeResult r;
+    memset(&r, 0, sizeof(r));
     uid_t host_uid = getuid();
     gid_t host_gid = getgid();
     bool is_root = (geteuid() == 0);
-    bool user_ns_used = false;
     int flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS;
     if (!is_root) {
       flags |= CLONE_NEWUSER;
-      user_ns_used = true;
+      r.user_ns_used = true;
     }
 
-    char reason[256] = "";
-    bool ns_ok = false;
-    bool mask_ok = false;
     if (unshare(flags) != 0) {
-      snprintf(reason, sizeof(reason), "unshare failed: %.200s", strerror(errno));
+      r.err_num = errno;
+      snprintf(r.reason, sizeof(r.reason), "unshare failed: %.200s", strerror(r.err_num));
     } else {
       bool id_ok = true;
-      if (user_ns_used) {
+      if (r.user_ns_used) {
         (void)write_str_file("/proc/self/setgroups", "deny");
         char mapbuf[64];
         snprintf(mapbuf, sizeof(mapbuf), "0 %lu 1\n", (unsigned long)host_uid);
         if (write_str_file("/proc/self/uid_map", mapbuf) != 0) {
           id_ok = false;
-          snprintf(reason, sizeof(reason), "uid_map write failed: %.200s", strerror(errno));
+          r.err_num = errno;
+          snprintf(r.reason, sizeof(r.reason), "uid_map write failed: %.200s", strerror(r.err_num));
         } else {
           snprintf(mapbuf, sizeof(mapbuf), "0 %lu 1\n", (unsigned long)host_gid);
           if (write_str_file("/proc/self/gid_map", mapbuf) != 0) {
             id_ok = false;
-            snprintf(reason, sizeof(reason), "gid_map write failed: %.200s", strerror(errno));
+            r.err_num = errno;
+            snprintf(r.reason, sizeof(r.reason), "gid_map write failed: %.200s",
+                     strerror(r.err_num));
           }
         }
       }
       if (id_ok) {
         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
-          snprintf(reason, sizeof(reason), "mount MS_PRIVATE failed: %.200s", strerror(errno));
+          r.err_num = errno;
+          snprintf(r.reason, sizeof(r.reason), "mount MS_PRIVATE failed: %.200s",
+                   strerror(r.err_num));
         } else {
-          ns_ok = true;
+          r.ns_ok = true;
           if (test_mask_dir && test_mask_dir[0]) {
             if (mount("tmpfs", test_mask_dir, "tmpfs",
                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
-              mask_ok = true;
+              r.mask_ok = true;
             } else {
-              snprintf(reason, sizeof(reason), "tmpfs mask mount failed: %.200s", strerror(errno));
+              r.err_num = errno;
+              snprintf(r.reason, sizeof(r.reason), "tmpfs mask mount failed: %.200s",
+                       strerror(r.err_num));
             }
           }
         }
       }
     }
 
-    FILE *out = fdopen(sv[1], "w");
-    if (out) {
-      fprintf(out,
-              "{\"subreaperSupported\":%s,\"namespacesSupported\":%s,\"userNamespaceUsed\":%s,"
-              "\"mountMaskSupported\":%s,\"reason\":",
-              subreaper_ok ? "true" : "false", ns_ok ? "true" : "false",
-              user_ns_used ? "true" : "false", mask_ok ? "true" : "false");
-      json_write_escaped(out, reason);
-      fputs("}\n", out);
-      fclose(out);
-    } else {
-      close(sv[1]);
-    }
+    (void)write_all_fd(sv[1], &r, sizeof(r));
+    close(sv[1]);
     _exit(0);
   }
 
   close(sv[1]);
-  char rbuf[1024];
   size_t off = 0;
-  while (off + 1 < sizeof(rbuf)) {
-    ssize_t n = read(sv[0], rbuf + off, sizeof(rbuf) - 1 - off);
+  char *dst = (char *)out;
+  while (off < sizeof(*out)) {
+    ssize_t n = read(sv[0], dst + off, sizeof(*out) - off);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -691,14 +694,25 @@ static int run_probe(const char *test_mask_dir) {
   int st = 0;
   while (waitpid(child, &st, 0) < 0 && errno == EINTR) {
   }
-  rbuf[off] = '\0';
-  if (off == 0) {
-    printf("{\"subreaperSupported\":%s,\"namespacesSupported\":false,\"userNamespaceUsed\":false,"
-           "\"mountMaskSupported\":false,\"reason\":\"probe child returned empty\"}\n",
-           subreaper_ok ? "true" : "false");
-  } else {
-    fputs(rbuf, stdout);
+  if (off != sizeof(*out)) {
+    memset(out, 0, sizeof(*out));
+    out->err_num = EIO;
+    snprintf(out->reason, sizeof(out->reason), "probe child exited unexpectedly");
   }
+}
+
+static int run_probe(const char *test_mask_dir) {
+  bool subreaper_ok = (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0);
+  NsProbeResult res;
+  probe_ns_in_fork(test_mask_dir, &res);
+  bool has_mask_test = (test_mask_dir && test_mask_dir[0]);
+  bool ns_supported = res.ns_ok && (!has_mask_test || res.mask_ok);
+  printf("{\"subreaperSupported\":%s,\"namespacesSupported\":%s,\"userNamespaceUsed\":%s,"
+         "\"mountMaskSupported\":%s,\"reason\":",
+         subreaper_ok ? "true" : "false", ns_supported ? "true" : "false",
+         res.user_ns_used ? "true" : "false", res.mask_ok ? "true" : "false");
+  json_write_escaped(stdout, res.reason);
+  fputs("}\n", stdout);
   return 0;
 }
 
@@ -855,58 +869,61 @@ int main(int argc, char **argv) {
     gid_t host_gid = getgid();
 
     if (cfg.isolate_ns) {
-      int ns_flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS;
-      if (!host_is_root) {
-        ns_flags |= CLONE_NEWUSER;
-        user_ns_used = true;
-      }
-      if (unshare(ns_flags) != 0) {
+      NsProbeResult ns_probe;
+      probe_ns_in_fork(NULL, &ns_probe);
+      if (!ns_probe.ns_ok) {
         if (cfg.require_ns) {
+          const char *msg = ns_probe.reason[0]
+                                ? ns_probe.reason
+                                : strerror(ns_probe.err_num ? ns_probe.err_num : EPERM);
+          send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", msg);
+          close(meta_pipe[1]);
+          _exit(1);
+        }
+      } else {
+        int ns_flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS;
+        if (!host_is_root) {
+          ns_flags |= CLONE_NEWUSER;
+          user_ns_used = true;
+        }
+        if (unshare(ns_flags) != 0) {
           send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", strerror(errno));
           close(meta_pipe[1]);
           _exit(1);
         }
-        user_ns_used = false;
-      } else {
-        bool ns_setup_ok = true;
         if (user_ns_used) {
           (void)write_str_file("/proc/self/setgroups", "deny");
           char mapbuf[64];
           snprintf(mapbuf, sizeof(mapbuf), "0 %lu 1\n", (unsigned long)host_uid);
           if (write_str_file("/proc/self/uid_map", mapbuf) != 0) {
-            ns_setup_ok = false;
-          } else {
-            snprintf(mapbuf, sizeof(mapbuf), "0 %lu 1\n", (unsigned long)host_gid);
-            if (write_str_file("/proc/self/gid_map", mapbuf) != 0) {
-              ns_setup_ok = false;
-            }
-          }
-        }
-        if (!ns_setup_ok) {
-          send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", strerror(errno));
-          close(meta_pipe[1]);
-          _exit(1);
-        }
-        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
-          if (cfg.require_ns) {
             send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", strerror(errno));
             close(meta_pipe[1]);
             _exit(1);
           }
-        } else {
-          ns_applied = true;
-          for (size_t i = 0; i < cfg.mask_count; i++) {
-            int mrc = apply_mount_mask(cfg.masked_paths[i]);
-            if (mrc == 0 && applied_masks) {
-              applied_masks[applied_mask_cnt++] = cfg.masked_paths[i];
-            } else if (mrc < 0 && cfg.require_ns) {
-              char msg[1024];
-              snprintf(msg, sizeof(msg), "Failed to mask %.500s: %.200s", cfg.masked_paths[i],
-                       strerror(errno));
-              send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", msg);
-              close(meta_pipe[1]);
-              _exit(1);
-            }
+          snprintf(mapbuf, sizeof(mapbuf), "0 %lu 1\n", (unsigned long)host_gid);
+          if (write_str_file("/proc/self/gid_map", mapbuf) != 0) {
+            send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", strerror(errno));
+            close(meta_pipe[1]);
+            _exit(1);
+          }
+        }
+        if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+          send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", strerror(errno));
+          close(meta_pipe[1]);
+          _exit(1);
+        }
+        ns_applied = true;
+        for (size_t i = 0; i < cfg.mask_count; i++) {
+          int mrc = apply_mount_mask(cfg.masked_paths[i]);
+          if (mrc == 0 && applied_masks) {
+            applied_masks[applied_mask_cnt++] = cfg.masked_paths[i];
+          } else if (mrc < 0 && cfg.require_ns) {
+            char msg[1024];
+            snprintf(msg, sizeof(msg), "Failed to mask %.500s: %.200s", cfg.masked_paths[i],
+                     strerror(errno));
+            send_pipe_error(meta_pipe[1], "ERR_LINUX_NAMESPACE_UNAVAILABLE", msg);
+            close(meta_pipe[1]);
+            _exit(1);
           }
         }
       }
