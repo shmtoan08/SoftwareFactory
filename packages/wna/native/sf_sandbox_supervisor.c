@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
@@ -1387,6 +1388,21 @@ int main(int argc, char **argv) {
     }
   }
 
+  struct rusage ru;
+  memset(&ru, 0, sizeof(ru));
+  unsigned long long cpu_usage_usec = 0ULL;
+  unsigned long long peak_memory_bytes = 0ULL;
+  if (getrusage(RUSAGE_CHILDREN, &ru) == 0) {
+    cpu_usage_usec =
+        (unsigned long long)ru.ru_utime.tv_sec * 1000000ULL +
+        (unsigned long long)ru.ru_utime.tv_usec +
+        (unsigned long long)ru.ru_stime.tv_sec * 1000000ULL +
+        (unsigned long long)ru.ru_stime.tv_usec;
+    if (ru.ru_maxrss > 0) {
+      peak_memory_bytes = (unsigned long long)ru.ru_maxrss * 1024ULL;
+    }
+  }
+
   size_t rcap = 65536;
   char *rbuf = (char *)malloc(rcap);
   if (rbuf) {
@@ -1399,7 +1415,9 @@ int main(int argc, char **argv) {
         }
         fprintf(rf, "%ld", (long)reaped_pids[i]);
       }
-      fprintf(rf, "],\"workerExitCode\":%d}\n", main_exit_code);
+      fprintf(rf,
+              "],\"workerExitCode\":%d,\"cpuUsageUsec\":%llu,\"peakMemoryBytes\":%llu}\n",
+              main_exit_code, cpu_usage_usec, peak_memory_bytes);
       long pos = ftell(rf);
       fclose(rf);
       if (pos > 0) {

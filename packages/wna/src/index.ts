@@ -21,6 +21,9 @@ import { dirname, join, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   type LeaseSyncStatusResponse,
+  type ResourceUsageMetricRecord,
+  type ResourceUsageMetricsSource,
+  type ResourceUsagePhase,
   type ServerEventAckContract,
   type WorkerEventEnvelope,
   type WorkerEventType,
@@ -33,6 +36,18 @@ export const MAX_OUTBOX_LINE_BYTES = 262_144; // 256 KB
 export const MAX_OUTBOX_FILE_BYTES = 52_428_800; // 50 MB
 
 export type LinuxNamespaceKind = "user" | "mount" | "pid" | "ipc" | "uts";
+
+export interface SandboxResourceMetricsSnapshot {
+  readonly taskId: string;
+  readonly leaseEpoch: number;
+  readonly wallTimeMs: number;
+  readonly cpuUsageUsec: number;
+  readonly peakMemoryBytes: number;
+  readonly backendMode: SandboxSecurityMetadata["backendMode"];
+  readonly metricsSource: ResourceUsageMetricsSource;
+  readonly cgroupPath: string;
+  readonly pid: number | null;
+}
 
 export interface SandboxSecurityMetadata {
   readonly isSimulated: boolean;
@@ -131,16 +146,21 @@ interface SupervisorReadyPayload {
 interface SupervisorReapPayload {
   readonly reapedPids?: readonly number[];
   readonly workerExitCode?: number;
+  readonly cpuUsageUsec?: number;
+  readonly peakMemoryBytes?: number;
 }
 
 interface ManagedProcessRecord {
   readonly pid: number;
   readonly supervisorPid?: number;
   readonly child: ChildProcess;
+  readonly startedAtMs: number;
   readonly reapFilePath?: string;
   readonly supDir?: string;
   exited: boolean;
   reapedPidsFromFile: number[];
+  rusageCpuUsec?: number;
+  rusagePeakMemoryBytes?: number;
   readonly exitPromise: Promise<{
     code: number | null;
     signal: NodeJS.Signals | null;
@@ -497,6 +517,9 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     new Map();
   private managedProcesses: Map<string, ManagedProcessRecord[]> = new Map();
   private cleanupHistory: Map<string, SandboxCleanupEvidence> = new Map();
+  private resourceMetricsHistory: Map<string, SandboxResourceMetricsSnapshot> = new Map();
+  private sandboxStartedAtMs: Map<string, number> = new Map();
+  private sandboxEndedAtMs: Map<string, number> = new Map();
   private readonly cgroupRoot: string;
 
   constructor(options?: { cgroupRoot?: string }) {
@@ -631,6 +654,10 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     const hostUid = typeof process.getuid === "function" ? process.getuid() : null;
     const hostGid = typeof process.getgid === "function" ? process.getgid() : null;
     const hostUsername = getCurrentHostUsername(hostUid);
+    const spawnStartedAtMs = Date.now();
+    if (!this.sandboxStartedAtMs.has(k)) {
+      this.sandboxStartedAtMs.set(k, spawnStartedAtMs);
+    }
 
     if (process.platform !== "linux") {
       if (input.requireSubreaper) {
@@ -683,6 +710,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         stderrTail?: string;
       }>((resolveExit) => {
         child.once("close", (code, signal) => {
+          this.sandboxEndedAtMs.set(k, Date.now());
           resolveExit({
             code,
             signal,
@@ -695,6 +723,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       const record: ManagedProcessRecord = {
         pid,
         child,
+        startedAtMs: spawnStartedAtMs,
         exited: false,
         reapedPidsFromFile: [],
         exitPromise,
@@ -821,6 +850,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         stderrTail?: string;
       }>((resolveExit) => {
         supChild!.once("close", (code, signal) => {
+          this.sandboxEndedAtMs.set(k, Date.now());
           resolveExit({
             code,
             signal,
@@ -871,6 +901,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         pid: workerPid,
         supervisorPid: supPid,
         child: supChild,
+        startedAtMs: spawnStartedAtMs,
         reapFilePath: reapPath,
         supDir,
         exited: false,
@@ -889,6 +920,12 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
               record.reapedPidsFromFile = parsedReap.reapedPids.filter((p) =>
                 Number.isInteger(p)
               );
+            }
+            if (typeof parsedReap.cpuUsageUsec === "number" && parsedReap.cpuUsageUsec >= 0) {
+              record.rusageCpuUsec = Math.round(parsedReap.cpuUsageUsec);
+            }
+            if (typeof parsedReap.peakMemoryBytes === "number" && parsedReap.peakMemoryBytes >= 0) {
+              record.rusagePeakMemoryBytes = Math.round(parsedReap.peakMemoryBytes);
             }
           } catch {
             // ignore
@@ -1085,6 +1122,12 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
               }
             }
           }
+          if (typeof parsed.cpuUsageUsec === "number" && parsed.cpuUsageUsec >= 0) {
+            proc.rusageCpuUsec = Math.round(parsed.cpuUsageUsec);
+          }
+          if (typeof parsed.peakMemoryBytes === "number" && parsed.peakMemoryBytes >= 0) {
+            proc.rusagePeakMemoryBytes = Math.round(parsed.peakMemoryBytes);
+          }
         } catch {
           // ignore
         }
@@ -1097,6 +1140,120 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       }
     }
     return Array.from(reaped);
+  }
+
+  private collectLiveResourceMetrics(
+    taskId: string,
+    leaseEpoch: number
+  ): SandboxResourceMetricsSnapshot | null {
+    const k = this.key(taskId, leaseEpoch);
+    const meta = this.securityMetadata.get(k);
+    const managed = this.managedProcesses.get(k) ?? [];
+    const mode = this.sandboxExecutionMode.get(k);
+    if (!meta && managed.length === 0 && !mode) {
+      return null;
+    }
+
+    const startedAt = this.sandboxStartedAtMs.get(k) ?? managed[0]?.startedAtMs ?? Date.now();
+    const endedAt = this.sandboxEndedAtMs.get(k) ?? Date.now();
+    const wallTimeMs = Math.max(0, endedAt - startedAt);
+    const cgroupPath = this.getCgroupPath(taskId, leaseEpoch);
+
+    let cpuUsageUsec = 0;
+    let peakMemoryBytes = 0;
+    let metricsSource: ResourceUsageMetricsSource = "wall-clock-only";
+
+    if (mode === "real-cgroup-v2") {
+      try {
+        const cpuStat = readFileSync(join(cgroupPath, "cpu.stat"), "utf8");
+        const usageMatch = cpuStat.match(/^usage_usec\s+(\d+)$/m);
+        if (usageMatch?.[1]) {
+          cpuUsageUsec = Number.parseInt(usageMatch[1], 10);
+          metricsSource = "cgroup-v2";
+        }
+      } catch {
+        // cgroup cpu.stat unavailable
+      }
+      try {
+        const peakPath = existsSync(join(cgroupPath, "memory.peak"))
+          ? join(cgroupPath, "memory.peak")
+          : join(cgroupPath, "memory.current");
+        const memRaw = readFileSync(peakPath, "utf8").trim();
+        const memVal = Number.parseInt(memRaw, 10);
+        if (Number.isFinite(memVal) && memVal >= 0) {
+          peakMemoryBytes = memVal;
+        }
+      } catch {
+        // cgroup memory unavailable
+      }
+    }
+
+    if (metricsSource === "wall-clock-only" && managed.length > 0) {
+      let sawRusage = false;
+      let totalCpu = 0;
+      let maxMem = 0;
+      for (const proc of managed) {
+        if (proc.reapFilePath && existsSync(proc.reapFilePath)) {
+          try {
+            const parsed = JSON.parse(
+              readFileSync(proc.reapFilePath, "utf8")
+            ) as SupervisorReapPayload;
+            if (typeof parsed.cpuUsageUsec === "number" && parsed.cpuUsageUsec >= 0) {
+              proc.rusageCpuUsec = Math.round(parsed.cpuUsageUsec);
+            }
+            if (typeof parsed.peakMemoryBytes === "number" && parsed.peakMemoryBytes >= 0) {
+              proc.rusagePeakMemoryBytes = Math.round(parsed.peakMemoryBytes);
+            }
+          } catch {
+            // ignore
+          }
+        }
+        if (proc.rusageCpuUsec !== undefined || proc.rusagePeakMemoryBytes !== undefined) {
+          sawRusage = true;
+          totalCpu += proc.rusageCpuUsec ?? 0;
+          maxMem = Math.max(maxMem, proc.rusagePeakMemoryBytes ?? 0);
+        }
+      }
+      if (sawRusage) {
+        metricsSource = "process-rusage";
+        cpuUsageUsec = totalCpu;
+        peakMemoryBytes = maxMem;
+      }
+    }
+
+    const backendMode: SandboxSecurityMetadata["backendMode"] =
+      meta?.backendMode ??
+      (mode === "real-cgroup-v2"
+        ? "linux-cgroup-v2"
+        : mode === "real-process"
+        ? managed.some((m) => m.supervisorPid !== undefined)
+          ? "linux-supervisor"
+          : "real-process"
+        : "simulated-cgroup-v2");
+
+    return {
+      taskId,
+      leaseEpoch,
+      wallTimeMs,
+      cpuUsageUsec,
+      peakMemoryBytes,
+      backendMode,
+      metricsSource,
+      cgroupPath,
+      pid: meta?.workerPid ?? managed[0]?.pid ?? null,
+    };
+  }
+
+  /**
+   * Reads honest execution metrics (`AC-12a`) from Linux cgroups v2, supervisor `getrusage`, or wall clock.
+   * Never fabricates CPU or memory values if kernel telemetry is unavailable on the host OS.
+   */
+  public readMetrics(taskId: string, leaseEpoch: number): SandboxResourceMetricsSnapshot | null {
+    const k = this.key(taskId, leaseEpoch);
+    if (this.sandboxExecutionMode.has(k) || this.managedProcesses.has(k)) {
+      return this.collectLiveResourceMetrics(taskId, leaseEpoch);
+    }
+    return this.resourceMetricsHistory.get(k) ?? null;
   }
 
   /**
@@ -1189,6 +1346,11 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         trackedPids.add(p);
       }
 
+      const preCleanupSnapshot = this.collectLiveResourceMetrics(taskId, leaseEpoch);
+      if (preCleanupSnapshot) {
+        this.resourceMetricsHistory.set(k, preCleanupSnapshot);
+      }
+
       const remainingPids = readFileSync(join(cgroupPath, "cgroup.procs"), "utf8")
         .split(/\s+/)
         .filter(Boolean);
@@ -1204,6 +1366,8 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       this.reparentedOrphans.delete(k);
       this.securityMetadata.delete(k);
       this.sandboxExecutionMode.delete(k);
+      this.sandboxStartedAtMs.delete(k);
+      this.sandboxEndedAtMs.delete(k);
 
       const evidence: SandboxCleanupEvidence = {
         taskId,
@@ -1283,6 +1447,11 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         trackedPids.add(p);
       }
 
+      const preCleanupSnapshot = this.collectLiveResourceMetrics(taskId, leaseEpoch);
+      if (preCleanupSnapshot) {
+        this.resourceMetricsHistory.set(k, preCleanupSnapshot);
+      }
+
       const allTracked = Array.from(trackedPids);
       const remainingAlive = allTracked.filter((pid) => this.isPidAlive(pid)).length;
       this.cleanupManagedTempDirs(managed);
@@ -1291,6 +1460,8 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       this.reparentedOrphans.delete(k);
       this.securityMetadata.delete(k);
       this.sandboxExecutionMode.delete(k);
+      this.sandboxStartedAtMs.delete(k);
+      this.sandboxEndedAtMs.delete(k);
 
       const hasLinuxSupervisor = managed.some((proc) => proc.supervisorPid !== undefined);
       const evidence: SandboxCleanupEvidence = {
@@ -1315,11 +1486,17 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     }
 
     // Synthetic/Simulated Sandbox Cleanup — NEVER claims linux-cgroup-v2 or kernel cgroup writes!
+    const preCleanupSnapshot = this.collectLiveResourceMetrics(taskId, leaseEpoch);
+    if (preCleanupSnapshot) {
+      this.resourceMetricsHistory.set(k, preCleanupSnapshot);
+    }
     const reapedOrphans = Array.from(this.reparentedOrphans.get(k) ?? []);
     this.activeSandboxes.delete(k);
     this.reparentedOrphans.delete(k);
     this.securityMetadata.delete(k);
     this.sandboxExecutionMode.delete(k);
+    this.sandboxStartedAtMs.delete(k);
+    this.sandboxEndedAtMs.delete(k);
 
     const remainingProcsCount = this.getActivePids(taskId, leaseEpoch).length;
     const populatedZeroVerified = remainingProcsCount === 0;
@@ -1357,6 +1534,20 @@ export interface OutboxJournalEntry {
 export interface AgentGatewayTransportClient {
   submitEvent(envelope: WorkerEventEnvelope): Promise<ServerEventAckContract>;
   getLeaseSyncStatus(leaseId: string): Promise<LeaseSyncStatusResponse>;
+  reportResourceUsageMetric?(input: {
+    project_id: string;
+    task_id: string;
+    lease_id: string;
+    lease_epoch: number;
+    attempt_no?: number;
+    rework_cycle?: number;
+    phase: ResourceUsagePhase;
+    wall_time_ms: number;
+    cpu_usage_usec: number;
+    peak_memory_bytes: number;
+    sandbox_backend_mode: string;
+    metrics_source: ResourceUsageMetricsSource;
+  }): Promise<ResourceUsageMetricRecord>;
 }
 
 /**
@@ -1599,3 +1790,6 @@ export class LocalOutboxBuffer {
     }
   }
 }
+
+export * from "./daemon.ts";
+

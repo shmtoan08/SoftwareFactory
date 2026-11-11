@@ -1,18 +1,26 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
-import type {
-  ApprovalDecisionRecord,
-  ApprovalRequestRecord,
-  MergeCandidateRecord,
-  MergeOperationRecord,
-  ReviewArtifactRecord,
-  ReviewSessionRecord,
-  TaskLeaseRecord,
-  TaskRecord,
-  TaskStatus,
-  VerificationRunRecord,
-  VerifiedCodeImportRecord,
+import {
+  type ApprovalDecisionRecord,
+  type ApprovalRequestRecord,
+  type CandidateBoundLineage,
+  type M5AcceptanceCriterionReport,
+  type M5EnvironmentCapabilities,
+  type M5EvidenceBundle,
+  type M5FaultRecoveryScenarioReport,
+  type MergeCandidateRecord,
+  type MergeOperationRecord,
+  type ResourceUsageMetricRecord,
+  type ReviewArtifactRecord,
+  type ReviewSessionRecord,
+  type TaskLeaseRecord,
+  type TaskRecord,
+  type TaskStatus,
+  type VerificationRunRecord,
+  type VerifiedCodeImportRecord,
+  canonicalizeJson,
+  sha256Hex,
 } from "@software-factory/shared-types";
 import {
   type GitTreeImportCandidateInput,
@@ -21,9 +29,11 @@ import {
 } from "@software-factory/task-contract";
 import {
   type CasMergeResult,
+  type ControlPlaneStore,
   PostgresRlsError,
   type ProjectMemberRole,
-  type SoftwareFactoryControlPlaneStore,
+  type ProjectMembershipRecord,
+  type RecordResourceUsageMetricInput,
 } from "@software-factory/database";
 import {
   type BuildMergeCandidateResult,
@@ -43,7 +53,7 @@ import type {
   AgentGatewayService,
   IssuedReviewerSessionCredential,
 } from "@software-factory/agent-gateway";
-import type { LinuxCgroupV2SandboxBackend } from "@software-factory/wna";
+import { LinuxCgroupV2SandboxBackend } from "@software-factory/wna";
 
 export interface CoreApiWarning {
   readonly code: string;
@@ -69,6 +79,7 @@ export interface ApprovalCenterBundle {
   readonly activeApprovalRequest: ApprovalRequestRecord | null;
   readonly approvalDecisions: readonly ApprovalDecisionRecord[];
   readonly mergeOperations: readonly MergeOperationRecord[];
+  readonly resourceUsageMetrics?: readonly ResourceUsageMetricRecord[];
   readonly liveMainCommitHash: string | null;
   readonly staleBaseDetected: boolean;
   readonly isExpiredAtNow: boolean;
@@ -100,6 +111,7 @@ export interface ApprovalCenterBundle {
     readonly approvalDecisions: readonly ApprovalDecisionRecord[];
     readonly mergeOperations: readonly MergeOperationRecord[];
   };
+  readonly fullLineage?: CandidateBoundLineage;
 }
 
 export interface CoreApiAuthContext {
@@ -113,6 +125,12 @@ export interface CoreApiAuthContext {
   readonly signatureHex: string;
 }
 
+const READ_ROLES: readonly ProjectMemberRole[] = [
+  "AUDITOR",
+  "DEVELOPER",
+  "PROJECT_APPROVER",
+  "ORG_ADMIN",
+];
 const MUTATION_ROLES: readonly ProjectMemberRole[] = [
   "DEVELOPER",
   "PROJECT_APPROVER",
@@ -298,14 +316,14 @@ export class CoreApiTokenAuthenticator {
  * 8-Field Human Approval, and Atomic CAS Merge + Post-Merge Reconciler.
  */
 export class CoreApiService {
-  private readonly store: SoftwareFactoryControlPlaneStore;
+  private readonly store: ControlPlaneStore;
   public readonly authenticator: CoreApiTokenAuthenticator;
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
   public readonly warnings: CoreApiWarning[] = [];
   private readonly onWarning?: (warning: CoreApiWarning) => void;
 
   constructor(
-    store: SoftwareFactoryControlPlaneStore,
+    store: ControlPlaneStore,
     options?: {
       authenticator?: CoreApiTokenAuthenticator;
       authSigningSecret?: string;
@@ -321,7 +339,12 @@ export class CoreApiService {
       options?.authenticator ??
       new CoreApiTokenAuthenticator({
         signingSecret: options?.authSigningSecret,
-        clockFn: options?.clockFn ?? (() => new Date(this.store.clockTimestampIso())),
+        clockFn:
+          options?.clockFn ??
+          (() => {
+            const iso = this.store.clockTimestampIso();
+            return typeof iso === "string" ? new Date(iso) : new Date();
+          }),
       });
   }
 
@@ -394,13 +417,12 @@ export class CoreApiService {
     return this.authenticator.issueAuthContext(input);
   }
 
-  private authorize(
-    auth: CoreApiAuthContext,
+  private assertMembershipRole(
+    verified: CoreApiAuthContext,
+    membership: ProjectMembershipRecord | null,
     targetProjectId: string,
     requiredRoles: readonly ProjectMemberRole[]
   ): CoreApiAuthContext {
-    const verified = this.authenticator.verifyAuthContext(auth, targetProjectId, requiredRoles);
-    const membership = this.store.getProjectMembership(targetProjectId, verified.principalId);
     if (
       !membership ||
       !requiredRoles.includes(membership.member_role) ||
@@ -416,7 +438,70 @@ export class CoreApiService {
     return verified;
   }
 
-  public async createTask(
+  private withAuthorizedRlsTransaction<T>(
+    auth: CoreApiAuthContext,
+    targetProjectId: string,
+    requiredRoles: readonly ProjectMemberRole[],
+    fn: (verified: CoreApiAuthContext) => Promise<T> | T
+  ): Promise<T> {
+    let verified: CoreApiAuthContext;
+    try {
+      verified = this.authenticator.verifyAuthContext(auth, targetProjectId, requiredRoles);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: targetProjectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => {
+        const membershipOrPromise = this.store.getProjectMembership(
+          targetProjectId,
+          verified.principalId
+        );
+        if (
+          membershipOrPromise &&
+          typeof (membershipOrPromise as PromiseLike<unknown>).then === "function"
+        ) {
+          return (membershipOrPromise as Promise<ProjectMembershipRecord | null>).then(
+            (membership) => {
+              this.assertMembershipRole(verified, membership, targetProjectId, requiredRoles);
+              return fn(verified);
+            }
+          );
+        }
+        this.assertMembershipRole(
+          verified,
+          membershipOrPromise as ProjectMembershipRecord | null,
+          targetProjectId,
+          requiredRoles
+        );
+        return fn(verified);
+      }
+    );
+  }
+
+  private async authorize(
+    auth: CoreApiAuthContext,
+    targetProjectId: string,
+    requiredRoles: readonly ProjectMemberRole[]
+  ): Promise<CoreApiAuthContext> {
+    const verified = this.authenticator.verifyAuthContext(auth, targetProjectId, requiredRoles);
+    const membership = await this.store.withRlsTransaction(
+      {
+        currentProjectId: targetProjectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => this.store.getProjectMembership(targetProjectId, verified.principalId)
+    );
+    return this.assertMembershipRole(verified, membership, targetProjectId, requiredRoles);
+  }
+
+  public createTask(
     projectId: string,
     auth: CoreApiAuthContext,
     input: {
@@ -426,25 +511,34 @@ export class CoreApiService {
       max_rework_cycles?: number;
     }
   ): Promise<TaskRecord> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
-    return this.store.withRlsTransaction(
-      {
-        currentProjectId: projectId,
-        currentPrincipalId: verified.principalId,
-        currentRole: "core_api_service",
-      },
-      () =>
-        this.store.createTask({
-          project_id: projectId,
-          title: input.title,
-          task_contract: input.task_contract,
-          base_main_commit_hash: input.base_main_commit_hash,
-          max_rework_cycles: input.max_rework_cycles,
-        })
+    return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
+      this.store.createTask({
+        project_id: projectId,
+        title: input.title,
+        task_contract: input.task_contract,
+        base_main_commit_hash: input.base_main_commit_hash,
+        max_rework_cycles: input.max_rework_cycles,
+      })
     );
   }
 
-  public async dispatchTaskLease(
+  public getTask(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    taskId: string
+  ): Promise<TaskRecord | null> {
+    return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES, () =>
+      this.store.getTaskById(taskId)
+    );
+  }
+
+  public listTasks(projectId: string, auth: CoreApiAuthContext): Promise<TaskRecord[]> {
+    return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES, () =>
+      this.store.selectVisibleTasks()
+    );
+  }
+
+  public dispatchTaskLease(
     projectId: string,
     auth: CoreApiAuthContext,
     input: {
@@ -454,22 +548,15 @@ export class CoreApiService {
       lease_ttl_ms?: number;
     }
   ): Promise<TaskLeaseRecord> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
-    return this.store.withRlsTransaction(
-      {
-        currentProjectId: projectId,
-        currentPrincipalId: verified.principalId,
-        currentRole: "core_api_service",
-      },
-      () =>
-        this.store.grantTaskLease({
-          project_id: projectId,
-          ...input,
-        })
+    return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
+      this.store.grantTaskLease({
+        project_id: projectId,
+        ...input,
+      })
     );
   }
 
-  public async revokeTaskLease(
+  public revokeTaskLease(
     projectId: string,
     auth: CoreApiAuthContext,
     input: {
@@ -479,18 +566,11 @@ export class CoreApiService {
       requeueTask?: boolean;
     }
   ): Promise<TaskLeaseRecord> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
-    return this.store.withRlsTransaction(
-      {
-        currentProjectId: projectId,
-        currentPrincipalId: verified.principalId,
-        currentRole: "core_api_service",
-      },
-      () =>
-        this.store.revokeTaskLease({
-          project_id: projectId,
-          ...input,
-        })
+    return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
+      this.store.revokeTaskLease({
+        project_id: projectId,
+        ...input,
+      })
     );
   }
 
@@ -510,15 +590,15 @@ export class CoreApiService {
     verifiedImport: VerifiedCodeImportRecord;
     mergeCandidate: MergeCandidateRecord;
   }> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
     return this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const verifiedImport = this.store.recordVerifiedCodeImport({
+      async () => {
+        const verifiedImport = await this.store.recordVerifiedCodeImport({
           project_id: projectId,
           task_id: input.task_id,
           lease_id: input.lease_id,
@@ -526,7 +606,7 @@ export class CoreApiService {
           staging_ref: input.staging_ref,
           candidate_input: input.candidate_input,
         });
-        const mergeCandidate = this.store.createMergeCandidate({
+        const mergeCandidate = await this.store.createMergeCandidate({
           project_id: projectId,
           task_id: input.task_id,
           import_id: verifiedImport.import_id,
@@ -567,15 +647,15 @@ export class CoreApiService {
     verificationRun: VerificationRunRecord;
     reviewArtifact: ReviewArtifactRecord;
   }> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
     return this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const verificationRun = this.store.recordVerificationRun({
+      async () => {
+        const verificationRun = await this.store.recordVerificationRun({
           project_id: projectId,
           task_id: input.task_id,
           merge_candidate_id: input.merge_candidate_id,
@@ -588,7 +668,7 @@ export class CoreApiService {
           report_sha256: input.report_sha256,
         });
 
-        const reviewArtifact = this.store.recordReviewArtifact({
+        const reviewArtifact = await this.store.recordReviewArtifact({
           project_id: projectId,
           task_id: input.task_id,
           merge_candidate_id: input.merge_candidate_id,
@@ -633,15 +713,15 @@ export class CoreApiService {
       current_main_commit_hash?: string;
     }
   ): Promise<ApprovalDecisionRecord> {
-    const verified = this.authorize(auth, projectId, APPROVAL_ROLES);
+    const verified = await this.authorize(auth, projectId, APPROVAL_ROLES);
     return this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const project = this.store.getProjectById(projectId);
+      async () => {
+        const project = await this.store.getProjectById(projectId);
         const repoPath = input.repo_path ?? project?.repo_bare_path;
         let liveMainSha = input.current_main_commit_hash;
         if (!liveMainSha && this.isRealGitRepoOnDisk(repoPath, input.git_dir)) {
@@ -698,7 +778,7 @@ export class CoreApiService {
         readonly conflictSummary: string;
       }
   > {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
     const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
 
     const { verifiedImport, clockIso } = await this.store.withRlsTransaction(
@@ -707,13 +787,13 @@ export class CoreApiService {
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const task = this.store.getTaskById(input.task_id);
+      async () => {
+        const task = await this.store.getTaskById(input.task_id);
         if (!task) {
           throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project`);
         }
 
-        const existingImports = this.store.getVerifiedImportsForTask(input.task_id);
+        const existingImports = await this.store.getVerifiedImportsForTask(input.task_id);
         let foundImport = existingImports.find(
           (rec) =>
             rec.lease_id === input.lease_id &&
@@ -731,7 +811,7 @@ export class CoreApiService {
               agentCommitHash: input.agent_commit_hash,
               contract: task.task_contract_json as unknown as TaskContractSpec,
             });
-          foundImport = this.store.recordVerifiedCodeImport({
+          foundImport = await this.store.recordVerifiedCodeImport({
             project_id: projectId,
             task_id: input.task_id,
             lease_id: input.lease_id,
@@ -743,7 +823,7 @@ export class CoreApiService {
 
         return {
           verifiedImport: foundImport,
-          clockIso: this.store.clockTimestampIso(),
+          clockIso: await this.store.clockTimestampIso(),
         };
       }
     );
@@ -784,8 +864,8 @@ export class CoreApiService {
           currentPrincipalId: verified.principalId,
           currentRole: "core_api_service",
         },
-        () => {
-          const conflictRes = this.store.markMergeConflictReworkRequired({
+        async () => {
+          const conflictRes = await this.store.markMergeConflictReworkRequired({
             project_id: projectId,
             task_id: input.task_id,
             import_id: verifiedImport.import_id,
@@ -897,7 +977,7 @@ export class CoreApiService {
     readonly retryResult: RetryableVerificationResult;
     readonly taskStatus: TaskStatus;
   }> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
 
     const { task, candidate, resolvedRepoPath } = await this.store.withRlsTransaction(
       {
@@ -905,10 +985,10 @@ export class CoreApiService {
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const project = this.store.getProjectById(projectId);
-        const t = this.store.getTaskById(input.task_id);
-        const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
+      async () => {
+        const project = await this.store.getProjectById(projectId);
+        const t = await this.store.getTaskById(input.task_id);
+        const mc = await this.store.getMergeCandidateById(input.merge_candidate_id);
         if (!t || !mc || mc.task_id !== t.task_id) {
           throw new PostgresRlsError(
             "23503",
@@ -1007,7 +1087,32 @@ export class CoreApiService {
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => this.store.getTaskById(task.task_id)
+      async () => {
+        const t = await this.store.getTaskById(task.task_id);
+        const leases = await this.store.listTaskLeasesForTask(task.task_id);
+        const latestLease = leases[leases.length - 1] ?? null;
+        const totalWallTimeMs = Math.max(
+          0,
+          Math.round(
+            retryResult.attempts.reduce((sum, a) => sum + a.durationMs, 0) || finalRun.duration_ms
+          )
+        );
+        await this.store.recordResourceUsageMetric({
+          project_id: projectId,
+          task_id: task.task_id,
+          lease_id: t?.active_lease_id ?? latestLease?.lease_id ?? null,
+          lease_epoch: t?.active_lease_epoch ?? latestLease?.lease_epoch ?? 0,
+          attempt_no: Math.max(1, t?.current_attempt_no ?? 1),
+          rework_cycle: t?.rework_count ?? 0,
+          phase: "VERIFIER",
+          wall_time_ms: totalWallTimeMs,
+          cpu_usage_usec: 0,
+          peak_memory_bytes: 0,
+          sandbox_backend_mode: finalRun.execution_backend ?? "host-subprocess",
+          metrics_source: "wall-clock-only",
+        });
+        return t;
+      }
     );
 
     return {
@@ -1158,7 +1263,7 @@ export class CoreApiService {
     readonly taskStatus: TaskStatus;
     readonly issuedCredential: IssuedReviewerSessionCredential;
   }> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
 
     const { task, candidate, verificationRun, project } = await this.store.withRlsTransaction(
       {
@@ -1166,14 +1271,20 @@ export class CoreApiService {
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const p = this.store.getProjectById(projectId);
-        const t = this.store.getTaskById(input.task_id);
-        const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
-        const vr = this.store
-          .listVerificationRunsForTask(input.task_id)
-          .find((r) => r.verification_run_id === input.verification_run_id);
-        if (!p || !t || !mc || !vr || mc.task_id !== t.task_id || vr.merge_candidate_id !== mc.merge_candidate_id) {
+      async () => {
+        const p = await this.store.getProjectById(projectId);
+        const t = await this.store.getTaskById(input.task_id);
+        const mc = await this.store.getMergeCandidateById(input.merge_candidate_id);
+        const runs = await this.store.listVerificationRunsForTask(input.task_id);
+        const vr = runs.find((r) => r.verification_run_id === input.verification_run_id);
+        if (
+          !p ||
+          !t ||
+          !mc ||
+          !vr ||
+          mc.task_id !== t.task_id ||
+          vr.merge_candidate_id !== mc.merge_candidate_id
+        ) {
           throw new PostgresRlsError(
             "23503",
             `Task ${input.task_id}, candidate ${input.merge_candidate_id}, or verification run ${input.verification_run_id} not found`
@@ -1209,11 +1320,14 @@ export class CoreApiService {
     });
 
     const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
+    const reviewerSandbox =
+      input.sandbox_backend ??
+      (!input.reviewer_service ? new LinuxCgroupV2SandboxBackend() : undefined);
     const reviewerService =
       input.reviewer_service ??
       new IndependentReviewerService({
         snapshotStore,
-        sandboxBackend: input.sandbox_backend,
+        sandboxBackend: reviewerSandbox,
       });
 
     const reviewSessionId = issuedCredential.claims.reviewerSessionId;
@@ -1241,7 +1355,12 @@ export class CoreApiService {
         })
     );
 
-    const effectiveRepoPath = input.repo_path ?? (this.isRealGitRepoOnDisk(project.repo_bare_path, input.git_dir) ? project.repo_bare_path : undefined);
+    const effectiveRepoPath =
+      input.repo_path ??
+      (this.isRealGitRepoOnDisk(project.repo_bare_path, input.git_dir)
+        ? project.repo_bare_path
+        : undefined);
+    const reviewStartMs = Date.now();
     let executionResult: IndependentReviewExecutionResult;
     try {
       executionResult = await reviewerService.executeIndependentReview({
@@ -1269,7 +1388,7 @@ export class CoreApiService {
         gitDir: input.git_dir,
         tier3TestFiles: input.tier3_test_files,
         snapshotStore,
-        sandboxBackend: input.sandbox_backend,
+        sandboxBackend: reviewerSandbox,
         evaluator: input.evaluator,
         probeReadOnlyEnforcement: input.probe_read_only_enforcement,
         ...(input.extra_forbidden_context ?? {}),
@@ -1292,14 +1411,18 @@ export class CoreApiService {
       throw err;
     }
 
+    const reviewWallFallbackMs = Math.max(0, Date.now() - reviewStartMs);
+    const reviewerMetricsSnap =
+      reviewerSandbox?.readMetrics(`review-${startedSession.review_session_id}`, 1) ?? null;
+
     return this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const completedSession = this.store.completeReviewSession({
+      async () => {
+        const completedSession = await this.store.completeReviewSession({
           project_id: projectId,
           review_session_id: startedSession.review_session_id,
           status: "COMPLETED",
@@ -1310,7 +1433,7 @@ export class CoreApiService {
           sandbox_cgroup_path: executionResult.sandboxCgroupPath,
         });
 
-        const reviewArtifact = this.store.recordReviewArtifact({
+        const reviewArtifact = await this.store.recordReviewArtifact({
           project_id: projectId,
           task_id: task.task_id,
           merge_candidate_id: candidate.merge_candidate_id,
@@ -1337,11 +1460,28 @@ export class CoreApiService {
           findings_json: executionResult.findings as unknown as ReadonlyArray<Record<string, unknown>>,
         });
 
+        const leases = await this.store.listTaskLeasesForTask(task.task_id);
+        const latestLease = leases[leases.length - 1] ?? null;
+        await this.store.recordResourceUsageMetric({
+          project_id: projectId,
+          task_id: task.task_id,
+          lease_id: task.active_lease_id ?? latestLease?.lease_id ?? null,
+          lease_epoch: task.active_lease_epoch ?? latestLease?.lease_epoch ?? 0,
+          attempt_no: Math.max(1, task.current_attempt_no ?? 1),
+          rework_cycle: task.rework_count ?? 0,
+          phase: "REVIEWER",
+          wall_time_ms: reviewerMetricsSnap?.wallTimeMs ?? reviewWallFallbackMs,
+          cpu_usage_usec: reviewerMetricsSnap?.cpuUsageUsec ?? 0,
+          peak_memory_bytes: reviewerMetricsSnap?.peakMemoryBytes ?? 0,
+          sandbox_backend_mode: executionResult.sandboxBackendMode,
+          metrics_source: reviewerMetricsSnap?.metricsSource ?? "wall-clock-only",
+        });
+
         const approvalRequest =
           executionResult.verdict === "PASS"
-            ? this.store.getLatestApprovalRequestForCandidate(candidate.merge_candidate_id)
+            ? await this.store.getLatestApprovalRequestForCandidate(candidate.merge_candidate_id)
             : null;
-        const updatedTask = this.store.getTaskById(task.task_id);
+        const updatedTask = await this.store.getTaskById(task.task_id);
 
         return {
           reviewSession: completedSession,
@@ -1381,7 +1521,7 @@ export class CoreApiService {
         readonly conflictSummary: string;
       }
   > {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
     const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
 
     const { task, verifiedImport, repoPath, clockIso } = await this.store.withRlsTransaction(
@@ -1390,9 +1530,9 @@ export class CoreApiService {
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const p = this.store.getProjectById(projectId);
-        const t = this.store.getTaskById(input.task_id);
+      async () => {
+        const p = await this.store.getProjectById(projectId);
+        const t = await this.store.getTaskById(input.task_id);
         if (!p || !t) {
           throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project`);
         }
@@ -1402,7 +1542,7 @@ export class CoreApiService {
             `rebuildMergeCandidateAfterCasConflict requires task status BuildingMergeCandidate, got ${t.status}`
           );
         }
-        const imports = this.store.getVerifiedImportsForTask(t.task_id);
+        const imports = await this.store.getVerifiedImportsForTask(t.task_id);
         const imp = input.import_id
           ? imports.find((rec) => rec.import_id === input.import_id)
           : imports[imports.length - 1];
@@ -1422,7 +1562,7 @@ export class CoreApiService {
           task: t,
           verifiedImport: imp,
           repoPath: resolvedRepo,
-          clockIso: this.store.clockTimestampIso(),
+          clockIso: await this.store.clockTimestampIso(),
         };
       }
     );
@@ -1463,8 +1603,8 @@ export class CoreApiService {
           currentPrincipalId: verified.principalId,
           currentRole: "core_api_service",
         },
-        () => {
-          const conflictRes = this.store.markMergeConflictReworkRequired({
+        async () => {
+          const conflictRes = await this.store.markMergeConflictReworkRequired({
             project_id: projectId,
             task_id: task.task_id,
             import_id: verifiedImport.import_id,
@@ -1554,21 +1694,21 @@ export class CoreApiService {
       git_dir?: string;
     }
   ): Promise<ApprovalCenterBundle> {
-    const verified = this.authorize(auth, projectId, APPROVAL_ROLES);
+    const verified = await this.authorize(auth, projectId, APPROVAL_ROLES);
     return this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
         currentRole: "core_api_service",
       },
-      () => {
-        const project = this.store.getProjectById(projectId);
-        const task = this.store.getTaskById(input.task_id);
+      async () => {
+        const project = await this.store.getProjectById(projectId);
+        const task = await this.store.getTaskById(input.task_id);
         if (!project || !task) {
           throw new PostgresRlsError("23503", `Project ${projectId} or task ${input.task_id} not found`);
         }
 
-        const candidates = this.store.listMergeCandidatesForTask(task.task_id);
+        const candidates = await this.store.listMergeCandidatesForTask(task.task_id);
         const activeCandidate =
           (task.active_merge_candidate_id
             ? candidates.find((c) => c.merge_candidate_id === task.active_merge_candidate_id)
@@ -1576,7 +1716,7 @@ export class CoreApiService {
           candidates.find((c) => !c.is_superseded) ??
           (candidates.length > 0 ? candidates[candidates.length - 1]! : null);
 
-        const runs = this.store.listVerificationRunsForTask(task.task_id);
+        const runs = await this.store.listVerificationRunsForTask(task.task_id);
         const latestVerificationRun =
           (activeCandidate
             ? runs
@@ -1585,7 +1725,7 @@ export class CoreApiService {
             : undefined) ??
           (runs.length > 0 ? runs[runs.length - 1]! : null);
 
-        const sessions = this.store.listReviewSessionsForTask(task.task_id);
+        const sessions = await this.store.listReviewSessionsForTask(task.task_id);
         const latestReviewSession =
           (activeCandidate
             ? sessions
@@ -1594,7 +1734,7 @@ export class CoreApiService {
             : undefined) ??
           (sessions.length > 0 ? sessions[sessions.length - 1]! : null);
 
-        const artifacts = this.store.listReviewArtifactsForTask(task.task_id);
+        const artifacts = await this.store.listReviewArtifactsForTask(task.task_id);
         const latestReviewArtifact =
           (activeCandidate
             ? artifacts
@@ -1603,7 +1743,7 @@ export class CoreApiService {
             : undefined) ??
           (artifacts.length > 0 ? artifacts[artifacts.length - 1]! : null);
 
-        const requests = this.store.listApprovalRequestsForTask(task.task_id);
+        const requests = await this.store.listApprovalRequestsForTask(task.task_id);
         const activeApprovalRequest =
           (activeCandidate
             ? requests
@@ -1612,9 +1752,10 @@ export class CoreApiService {
             : undefined) ??
           (requests.length > 0 ? requests[requests.length - 1]! : null);
 
-        const approvalDecisions = this.store.listApprovalDecisionsForTask(task.task_id);
-        const mergeOperations = this.store.listMergeOperationsForTask(task.task_id);
-        const imports = this.store.getVerifiedImportsForTask(task.task_id);
+        const approvalDecisions = await this.store.listApprovalDecisionsForTask(task.task_id);
+        const mergeOperations = await this.store.listMergeOperationsForTask(task.task_id);
+        const resourceUsageMetrics = await this.store.listResourceUsageMetricsForTask(task.task_id);
+        const imports = await this.store.getVerifiedImportsForTask(task.task_id);
         const verifiedImport =
           (activeCandidate
             ? imports.find((i) => i.import_id === activeCandidate.import_id)
@@ -1625,7 +1766,10 @@ export class CoreApiService {
         const hasRealRepo = this.isRealGitRepoOnDisk(effectiveRepo, input.git_dir);
         const liveMainCommitHash = hasRealRepo
           ? this.createRealGitCasBridge(effectiveRepo, input.git_dir).getCurrentMainHead()
-          : this.store.getMainRefCommitHash();
+          : await this.store.getMainRefCommitHash();
+
+        const fullLineage =
+          (await this.store.getCandidateBoundLineage(task.task_id, liveMainCommitHash)) ?? undefined;
 
         const staleBaseDetected = Boolean(
           activeCandidate &&
@@ -1633,7 +1777,7 @@ export class CoreApiService {
             activeCandidate.base_main_commit_hash !== liveMainCommitHash
         );
 
-        const nowMs = new Date(this.store.clockTimestampIso()).getTime();
+        const nowMs = new Date(await this.store.clockTimestampIso()).getTime();
         const isPendingRequest = activeApprovalRequest?.status === "PENDING";
         const expiresAtMs = isPendingRequest
           ? Date.parse(activeApprovalRequest.expires_at)
@@ -1720,6 +1864,7 @@ export class CoreApiService {
           activeApprovalRequest,
           approvalDecisions,
           mergeOperations,
+          resourceUsageMetrics,
           liveMainCommitHash,
           staleBaseDetected,
           isExpiredAtNow,
@@ -1740,6 +1885,7 @@ export class CoreApiService {
             approvalDecisions,
             mergeOperations,
           },
+          fullLineage,
         };
       }
     );
@@ -1759,7 +1905,7 @@ export class CoreApiService {
       snapshot_store?: ImmutableSourceSnapshotStore;
     }
   ): Promise<CasMergeResult> {
-    const verified = this.authorize(auth, projectId, MUTATION_ROLES);
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
     const snapshotStore = input.snapshot_store ?? this.snapshotStore;
     const { res, snapshotPath, clockIso } = await this.store.withRlsTransaction(
       {
@@ -1768,7 +1914,7 @@ export class CoreApiService {
         currentRole: "core_api_service",
       },
       async () => {
-        const project = this.store.getProjectById(projectId);
+        const project = await this.store.getProjectById(projectId);
         const resolvedRepoPath = input.repo_path ?? project?.repo_bare_path;
         const hasRealGitRepo = this.isRealGitRepoOnDisk(resolvedRepoPath, input.git_dir);
         if (input.require_real_git && !hasRealGitRepo) {
@@ -1790,11 +1936,11 @@ export class CoreApiService {
           gitBridge,
           simulateCrashAfterGitUpdateRef: input.simulateCrashAfterGitUpdateRef,
         });
-        const mc = this.store.getMergeCandidateById(input.merge_candidate_id);
+        const mc = await this.store.getMergeCandidateById(input.merge_candidate_id);
         return {
           res: casRes,
           snapshotPath: mc?.snapshot_path ?? null,
-          clockIso: this.store.clockTimestampIso(),
+          clockIso: await this.store.clockTimestampIso(),
         };
       }
     );
@@ -1825,4 +1971,146 @@ export class CoreApiService {
 
     return res;
   }
+
+  public async recordResourceUsageMetric(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: Omit<RecordResourceUsageMetricInput, "project_id">
+  ): Promise<ResourceUsageMetricRecord> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () =>
+        this.store.recordResourceUsageMetric({
+          ...input,
+          project_id: projectId,
+        })
+    );
+  }
+
+  public async listResourceUsageMetrics(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    taskId: string
+  ): Promise<ResourceUsageMetricRecord[]> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      () => this.store.listResourceUsageMetricsForTask(taskId)
+    );
+  }
+
+  public async getCandidateBoundLineage(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      repo_path?: string;
+      git_dir?: string;
+    }
+  ): Promise<CandidateBoundLineage> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: projectId,
+        currentPrincipalId: verified.principalId,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        const project = await this.store.getProjectById(projectId);
+        if (!project) {
+          throw new PostgresRlsError("23503", `Project ${projectId} not found`);
+        }
+        const effectiveRepo = input.repo_path ?? project.repo_bare_path;
+        const hasRealRepo = this.isRealGitRepoOnDisk(effectiveRepo, input.git_dir);
+        const liveMainHead = hasRealRepo
+          ? this.createRealGitCasBridge(effectiveRepo, input.git_dir).getCurrentMainHead()
+          : await this.store.getMainRefCommitHash();
+
+        const lineage = await this.store.getCandidateBoundLineage(input.task_id, liveMainHead);
+        if (!lineage) {
+          throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project ${projectId}`);
+        }
+        return lineage;
+      }
+    );
+  }
+
+  public async runOrphanedPushReconciler(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    orphanedDiffProvider?: Parameters<ControlPlaneStore["runLeaseExpiryAndOrphanedPushReconciler"]>[0]
+  ) {
+    await this.authorize(auth, projectId, MUTATION_ROLES);
+    const allResults = await this.store.runLeaseExpiryAndOrphanedPushReconciler(orphanedDiffProvider);
+    const visibleTaskIds = new Set(
+      (
+        await this.store.withRlsTransaction(
+          {
+            currentProjectId: projectId,
+            currentPrincipalId: auth.principalId,
+            currentRole: "core_api_service",
+          },
+          () => this.store.selectVisibleTasks()
+        )
+      ).map((t) => t.task_id)
+    );
+    return allResults.filter((r) => visibleTaskIds.has(r.task_id));
+  }
+
+  public exportM5EvidenceBundle(input: {
+    lineage: CandidateBoundLineage;
+    criteria: readonly M5AcceptanceCriterionReport[];
+    faultRecoveryReports: readonly M5FaultRecoveryScenarioReport[];
+    environmentCapabilities: M5EnvironmentCapabilities;
+    generatedAt?: string;
+  }): M5EvidenceBundle {
+    return buildM5EvidenceBundle(input);
+  }
 }
+
+export function buildM5EvidenceBundle(input: {
+  lineage: CandidateBoundLineage;
+  criteria: readonly M5AcceptanceCriterionReport[];
+  faultRecoveryReports: readonly M5FaultRecoveryScenarioReport[];
+  environmentCapabilities: M5EnvironmentCapabilities;
+  generatedAt?: string;
+}): M5EvidenceBundle {
+  const generatedAt = input.generatedAt ?? new Date().toISOString();
+  const unsigned = {
+    schemaVersion: "1.5" as const,
+    milestone: "M5" as const,
+    generatedAt,
+    environmentCapabilities: input.environmentCapabilities,
+    verticalSliceSummary: {
+      projectId: input.lineage.projectId,
+      taskId: input.lineage.taskId,
+      taskStatus: input.lineage.task.status,
+      mainHeadCommitHash: input.lineage.mainHeadCommitHash,
+      mergeCandidateHash: input.lineage.mergeCandidate?.merge_candidate_hash ?? null,
+      verifiedTreeHash: input.lineage.mergeCandidate?.verified_tree_hash ?? null,
+      agentCommitHash: input.lineage.verifiedImport?.agent_commit_hash ?? null,
+      reworkCount: input.lineage.task.rework_count,
+      leaseEpochsObserved: input.lineage.taskLeases.length,
+    },
+    criteria: input.criteria,
+    faultRecoveryReports: input.faultRecoveryReports,
+    lineage: input.lineage,
+    resourceUsageMetrics: input.lineage.resourceUsageMetrics,
+  };
+  const bundleSha256 = sha256Hex(canonicalizeJson(unsigned));
+  return {
+    ...unsigned,
+    bundleSha256,
+  };
+}
+
+export * from "./http-server.ts";

@@ -251,6 +251,7 @@ export interface VerifiedCodeImportRecord {
   staging_ref: string;
   changed_files_count: number;
   deleted_lines_count: number;
+  recovered_by_reconciler?: boolean;
   created_at: string;
 }
 
@@ -458,6 +459,120 @@ export interface OutboxEventRecord {
   payload_json: Record<string, unknown>;
   published_at: string | null;
   created_at: string;
+}
+
+/**
+ * Milestone M5: Baseline Execution Resource Usage Metrics (`AC-12a` & `M5-AC6`)
+ */
+export type ResourceUsagePhase = "DEVELOPER" | "VERIFIER" | "REVIEWER";
+
+export type ResourceUsageMetricsSource =
+  | "cgroup-v2"
+  | "process-rusage"
+  | "wall-clock-only";
+
+export interface ResourceUsageMetricRecord {
+  metric_id: string;
+  project_id: string;
+  task_id: string;
+  lease_id: string | null;
+  lease_epoch: number;
+  attempt_no: number;
+  rework_cycle: number;
+  phase: ResourceUsagePhase;
+  wall_time_ms: number;
+  cpu_usage_usec: number;
+  peak_memory_bytes: number;
+  sandbox_backend_mode: string;
+  metrics_source: ResourceUsageMetricsSource;
+  recorded_at: string;
+}
+
+/**
+ * Milestone M5: Complete End-to-End Task Lineage (`AC-11a` & `M5-AC8`)
+ */
+export interface CandidateBoundLineage {
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly mainHeadCommitHash: string | null;
+  readonly gitLogHeadMatchesCandidate: boolean;
+  readonly task: TaskRecord;
+  readonly taskContract: Record<string, unknown>;
+  readonly taskLeases: readonly TaskLeaseRecord[];
+  readonly processedEvents: readonly ProcessedWorkerEventRecord[];
+  readonly processedEventsCount: number;
+  readonly resourceUsageMetrics: readonly ResourceUsageMetricRecord[];
+  readonly verifiedImport: VerifiedCodeImportRecord | null;
+  readonly allMergeCandidates: readonly MergeCandidateRecord[];
+  readonly mergeCandidate: MergeCandidateRecord | null;
+  readonly verificationRun: VerificationRunRecord | null;
+  readonly reviewSession: ReviewSessionRecord | null;
+  readonly reviewArtifact: ReviewArtifactRecord | null;
+  readonly approvalRequest: ApprovalRequestRecord | null;
+  readonly approvalDecisions: readonly ApprovalDecisionRecord[];
+  readonly activeOrConsumedApproval: ApprovalDecisionRecord | null;
+  readonly mergeOperations: readonly MergeOperationRecord[];
+  readonly hashBindingVerified: boolean;
+  readonly lineageComplete: boolean;
+  readonly missingLinks: readonly string[];
+}
+
+export type M5CriterionId =
+  | "M5-AC1"
+  | "M5-AC2"
+  | "M5-AC3"
+  | "M5-AC4"
+  | "M5-AC5"
+  | "M5-AC6"
+  | "M5-AC7"
+  | "M5-AC8";
+
+export interface M5AcceptanceCriterionReport {
+  readonly criterionId: M5CriterionId;
+  readonly name: string;
+  readonly status: "PASS" | "FAIL";
+  readonly summary: string;
+  readonly evidence: Readonly<Record<string, unknown>>;
+}
+
+export interface M5FaultRecoveryScenarioReport {
+  readonly scenarioId: "M5-AC7a" | "M5-AC7b" | "M5-AC7c" | "M5-AC7d";
+  readonly title: string;
+  readonly passed: boolean;
+  readonly details: string;
+  readonly evidence: Readonly<Record<string, unknown>>;
+}
+
+export interface M5EnvironmentCapabilities {
+  readonly platform: string;
+  readonly nodeVersion: string;
+  readonly dockerAvailable: boolean;
+  readonly cgroupV2Available: boolean;
+  readonly linuxNamespacesAvailable: boolean;
+  readonly postgresLiveTested: boolean;
+}
+
+export interface M5EvidenceBundle {
+  readonly schemaVersion: "1.5";
+  readonly milestone: "M5";
+  readonly generatedAt: string;
+  readonly environmentCapabilities: M5EnvironmentCapabilities;
+  readonly verticalSliceSummary: {
+    readonly projectId: string;
+    readonly taskId: string;
+    readonly taskStatus: TaskStatus;
+    readonly mainHeadCommitHash: string | null;
+    readonly mergeCandidateHash: string | null;
+    readonly verifiedTreeHash: string | null;
+    readonly agentCommitHash: string | null;
+    readonly reworkCount: number;
+    readonly leaseEpochsObserved: number;
+  };
+  readonly criteria: readonly M5AcceptanceCriterionReport[];
+  readonly faultRecoveryReports: readonly M5FaultRecoveryScenarioReport[];
+  readonly lineage: CandidateBoundLineage;
+  readonly resourceUsageMetrics: readonly ResourceUsageMetricRecord[];
+  readonly bundleSha256: string;
 }
 
 /**

@@ -50,7 +50,7 @@ jobs:
       - name: TypeScript Typecheck
         run: npm run typecheck
 
-      - name: Verify PostgreSQL Migrations & RLS Matrix (RLS-T1..RLS-T8)
+      - name: Verify PostgreSQL Migrations & RLS Matrix (RLS-T1..RLS-T8 + M4/M5)
         env:
           PGHOST: 127.0.0.1
           PGPORT: 5432
@@ -62,6 +62,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
           psql -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
@@ -96,6 +98,7 @@ jobs:
             v_caught BOOLEAN := false;
           BEGIN
             -- Pre-clean any stale fixtures in FK-safe dependency order
+            DELETE FROM resource_usage_metrics WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM merge_operations WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM approval_decisions WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM approval_requests WHERE project_id IN (v_proj_a, v_proj_b);
@@ -201,6 +204,47 @@ jobs:
             ) VALUES
               (v_mo_a, v_proj_a, v_task_a, v_cand_a, v_ad_a, 'merge:' || v_proj_a || ':' || v_task_a || ':' || repeat('5', 40) || ':' || v_ad_a, repeat('1', 40), repeat('5', 40), repeat('4', 40), 'IN_PROGRESS'),
               (v_mo_b, v_proj_b, v_task_b, v_cand_b, v_ad_b, 'merge:' || v_proj_b || ':' || v_task_b || ':' || repeat('f', 40) || ':' || v_ad_b, repeat('2', 40), repeat('f', 40), repeat('e', 40), 'IN_PROGRESS');
+
+            INSERT INTO resource_usage_metrics (
+              metric_id, project_id, task_id, lease_id, lease_epoch,
+              attempt_no, rework_cycle, phase, wall_time_ms,
+              cpu_usage_usec, peak_memory_bytes, sandbox_backend_mode, metrics_source
+            ) VALUES
+              (gen_random_uuid(), v_proj_a, v_task_a, v_lease_a, 1, 1, 0, 'DEVELOPER', 250, 15000, 67108864, 'linux-supervisor', 'cgroup-v2'),
+              (gen_random_uuid(), v_proj_b, v_task_b, v_lease_b, 1, 1, 0, 'DEVELOPER', 300, 18000, 67108864, 'linux-supervisor', 'cgroup-v2');
+
+            -- M5 checks: chk_projects_main_ref_sha1, recovered_by_reconciler, resource_usage_metrics CHECK constraints
+            v_caught := false;
+            BEGIN
+              UPDATE projects SET main_ref_commit_hash = 'not-a-valid-sha1' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'chk_projects_main_ref_sha1 failed to reject invalid SHA-1';
+            END IF;
+
+            IF NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_name = 'verified_code_imports' AND column_name = 'recovered_by_reconciler'
+            ) THEN
+              RAISE EXCEPTION 'Missing verified_code_imports.recovered_by_reconciler column';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO resource_usage_metrics (
+                metric_id, project_id, task_id, lease_id, lease_epoch,
+                attempt_no, rework_cycle, phase, wall_time_ms,
+                cpu_usage_usec, peak_memory_bytes, sandbox_backend_mode, metrics_source
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_task_a, v_lease_a, 1,
+                1, 0, 'INVALID_PHASE', 10, 10, 1024, 'linux-supervisor', 'cgroup-v2'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'resource_usage_metrics phase CHECK failed to reject INVALID_PHASE';
+            END IF;
 
             -- M3 check: PASS verdict requires tier3_agent_tests_passed = TRUE
             v_caught := false;
@@ -357,19 +401,22 @@ jobs:
           END
           $$;
 
-          -- M4-FIX-07: Seeded Multi-Tenant RLS, Column GRANT & DISCARD ALL Probes under app_runtime
+          -- M4-FIX-07 & M5: Seeded Multi-Tenant RLS, Column GRANT & DISCARD ALL Probes under app_runtime
           BEGIN;
           SET LOCAL ROLE app_runtime;
           DO $$
           DECLARE
-            v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
-            v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
-            v_task_b UUID := 'b4444444-4444-4444-4444-444444444444';
-            v_cand_b UUID := 'e4444444-4444-4444-4444-444444444444';
-            v_vr_b   UUID := 'f4444444-4444-4444-4444-444444444444';
-            v_ra_a   UUID := '23333333-3333-3333-3333-333333333333';
-            v_ra_b   UUID := '24444444-4444-4444-4444-444444444444';
-            v_ad_b   UUID := '64444444-4444-4444-4444-444444444444';
+            v_proj_a  UUID := '33333333-3333-3333-3333-333333333333';
+            v_proj_b  UUID := '44444444-4444-4444-4444-444444444444';
+            v_task_a  UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_task_b  UUID := 'b4444444-4444-4444-4444-444444444444';
+            v_lease_a UUID := 'c3333333-3333-3333-3333-333333333333';
+            v_lease_b UUID := 'c4444444-4444-4444-4444-444444444444';
+            v_cand_b  UUID := 'e4444444-4444-4444-4444-444444444444';
+            v_vr_b    UUID := 'f4444444-4444-4444-4444-444444444444';
+            v_ra_a    UUID := '23333333-3333-3333-3333-333333333333';
+            v_ra_b    UUID := '24444444-4444-4444-4444-444444444444';
+            v_ad_b    UUID := '64444444-4444-4444-4444-444444444444';
             v_cnt INTEGER;
             v_caught BOOLEAN;
             tbl TEXT;
@@ -381,6 +428,8 @@ jobs:
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'approval_requests RLS default deny failed (saw %)', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM merge_operations;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'merge_operations RLS default deny failed (saw %)', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM resource_usage_metrics;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'resource_usage_metrics RLS default deny failed (saw %)', v_cnt; END IF;
 
             -- 2. Scoped to Project A as core_api_service
             PERFORM set_config('app.current_project_id', v_proj_a::text, true);
@@ -401,6 +450,21 @@ jobs:
             IF v_cnt <> 1 THEN RAISE EXCEPTION 'merge_operations tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM merge_operations WHERE project_id = v_proj_b;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'merge_operations leaked Project B rows to Project A'; END IF;
+
+            SELECT count(*) INTO v_cnt FROM resource_usage_metrics;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'resource_usage_metrics tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM resource_usage_metrics WHERE project_id = v_proj_b;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'resource_usage_metrics leaked Project B rows to Project A'; END IF;
+
+            -- Same-tenant INSERT into resource_usage_metrics succeeds for core_api_service
+            INSERT INTO resource_usage_metrics (
+              metric_id, project_id, task_id, lease_id, lease_epoch,
+              attempt_no, rework_cycle, phase, wall_time_ms,
+              cpu_usage_usec, peak_memory_bytes, sandbox_backend_mode, metrics_source
+            ) VALUES (
+              gen_random_uuid(), v_proj_a, v_task_a, v_lease_a, 1,
+              1, 0, 'VERIFIER', 40, 1200, 16777216, 'docker', 'cgroup-v2'
+            );
 
             -- 3. Cross-tenant INSERT blocked (42501 insufficient_privilege)
             v_caught := false;
@@ -446,7 +510,21 @@ jobs:
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into merge_operations was not blocked'; END IF;
 
-            -- 4. Cross-tenant UPDATE affects 0 rows
+            v_caught := false;
+            BEGIN
+              INSERT INTO resource_usage_metrics (
+                metric_id, project_id, task_id, lease_id, lease_epoch,
+                attempt_no, rework_cycle, phase, wall_time_ms,
+                cpu_usage_usec, peak_memory_bytes, sandbox_backend_mode, metrics_source
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_task_b, v_lease_b, 1,
+                1, 0, 'VERIFIER', 40, 1200, 16777216, 'docker', 'cgroup-v2'
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into resource_usage_metrics was not blocked'; END IF;
+
+            -- 4. Cross-tenant UPDATE affects 0 rows & projects_core_api_main_ref_update scoping
             UPDATE review_sessions SET status = 'REVOKED' WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified review_sessions rows: %', v_cnt; END IF;
@@ -459,8 +537,25 @@ jobs:
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified merge_operations rows: %', v_cnt; END IF;
 
-            -- 5. DELETE denied on M4 tables for app_runtime
-            FOREACH tbl IN ARRAY ARRAY['review_sessions', 'approval_requests', 'merge_operations']
+            UPDATE projects SET main_ref_commit_hash = repeat('9', 40) WHERE project_id = v_proj_a;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'projects_core_api_main_ref_update failed for Project A: got %', v_cnt; END IF;
+
+            UPDATE projects SET main_ref_commit_hash = repeat('9', 40) WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant projects UPDATE modified Project B rows: %', v_cnt; END IF;
+
+            -- 5. Append-only UPDATE denied on resource_usage_metrics, DELETE denied on M4 & M5 tables for app_runtime
+            v_caught := false;
+            BEGIN
+              UPDATE resource_usage_metrics SET wall_time_ms = 0 WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on resource_usage_metrics';
+            END IF;
+
+            FOREACH tbl IN ARRAY ARRAY['review_sessions', 'approval_requests', 'merge_operations', 'resource_usage_metrics']
             LOOP
               v_caught := false;
               BEGIN
@@ -515,16 +610,19 @@ jobs:
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked approval_requests rows: %', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM merge_operations;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked merge_operations rows: %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM resource_usage_metrics;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked resource_usage_metrics rows: %', v_cnt; END IF;
           END
           $$;
           COMMIT;
 
-          -- Cleanup M4 CI fixtures cleanly as owner
+          -- Cleanup M4/M5 CI fixtures cleanly as owner
           DO $$
           DECLARE
             v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
             v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
           BEGIN
+            DELETE FROM resource_usage_metrics WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM merge_operations WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM approval_decisions WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM approval_requests WHERE project_id IN (v_proj_a, v_proj_b);
@@ -540,7 +638,7 @@ jobs:
             DELETE FROM audit_logs WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM project_memberships WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM projects WHERE project_id IN (v_proj_a, v_proj_b);
-            RAISE NOTICE 'M4 Seeded Multi-Tenant RLS, Column-GRANT & Composite FK Matrix PASSED.';
+            RAISE NOTICE 'M4 & M5 Seeded Multi-Tenant RLS, Column-GRANT & Composite FK Matrix PASSED.';
           END
           $$;
           SQL
@@ -616,9 +714,11 @@ jobs:
           $$;
           SQL
 
-          # 3. Apply upgraded HEAD 0004 twice (upgrade + idempotent re-run) on pre-populated DB
+          # 3. Apply upgraded HEAD 0004 & 0005 twice (upgrade + idempotent re-run) on pre-populated DB
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
           # 4. Assert upgraded constraints actually replaced the old definitions
@@ -717,7 +817,7 @@ jobs:
               RAISE EXCEPTION 'Upgraded 10-column fk_ad_approval_request failed to reject mismatched approval_request_id';
             END IF;
 
-            RAISE NOTICE 'M4 Upgrade Path Verification (86076639 -> HEAD) PASSED.';
+            RAISE NOTICE 'M4 & M5 Upgrade Path Verification (86076639 -> HEAD) PASSED.';
           END
           $$;
           SQL
@@ -728,4 +828,10 @@ jobs:
         run: docker pull node:22-alpine || true
 
       - name: Execute Full Test Suite
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGDATABASE: software_factory_test
+          PGUSER: factory_admin
+          PGPASSWORD: factory_secret_password
         run: npm test

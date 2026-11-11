@@ -3,11 +3,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
+  type CandidateBoundLineage,
   type LeaseSyncStatusResponse,
   type MergeCandidateRecord,
   type MergeOperationRecord,
   type OutboxEventRecord,
   type ProcessedWorkerEventRecord,
+  type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
   type ReviewArtifactStatus,
   type ReviewSessionRecord,
@@ -33,92 +35,22 @@ import {
   type TaskContractSpec,
   validateGitTreeImport,
 } from "@software-factory/task-contract";
+import {
+  ApprovalExpiredOrStaleError,
+  type CasMergeResult,
+  type ControlPlaneStore,
+  PostgresRlsError,
+  type ProjectMemberRole,
+  type ProjectMembershipRecord,
+  type ProjectRecord,
+  type RecordResourceUsageMetricInput,
+  type RlsSessionContext,
+  SimulatedPostMergeCrashError,
+} from "./types.ts";
+import { buildCandidateBoundLineage } from "./postgres-pool.ts";
 
-export type AppSessionRole =
-  | "anonymous"
-  | "core_api_service"
-  | "gateway_service"
-  | "outbox_relay_service"
-  | "system_admin_role";
-
-export interface RlsSessionContext {
-  currentProjectId: string | null;
-  currentPrincipalId: string | null;
-  currentRole: AppSessionRole;
-}
-
-export type ProjectMemberRole =
-  | "ORG_ADMIN"
-  | "PROJECT_APPROVER"
-  | "DEVELOPER"
-  | "AUDITOR";
-
-export interface ProjectMembershipRecord {
-  membership_id: string;
-  project_id: string;
-  principal_id: string;
-  member_role: ProjectMemberRole;
-  created_at: string;
-}
-
-export class PostgresRlsError extends Error {
-  public readonly sqlState: string;
-  constructor(sqlState: "42501" | "23503" | "23505" | "23514", message: string) {
-    super(message);
-    this.name = "PostgresRlsError";
-    this.sqlState = sqlState;
-  }
-}
-
-export class ApprovalExpiredOrStaleError extends Error {
-  public readonly code = "ERR_APPROVAL_EXPIRED_OR_STALE" as const;
-  public readonly httpStatus = 409 as const;
-  public readonly sqlState = "23514" as const;
-  public readonly approvalRequestStatus?: string;
-
-  constructor(message: string, approvalRequestStatus?: string) {
-    super(message);
-    this.name = "ApprovalExpiredOrStaleError";
-    this.approvalRequestStatus = approvalRequestStatus;
-  }
-}
-
-export class SimulatedPostMergeCrashError extends Error {
-  public readonly code = "ERR_SIMULATED_POST_MERGE_CRASH" as const;
-  public readonly mergeOpId?: string;
-
-  constructor(message: string, mergeOpId?: string) {
-    super(message);
-    this.name = "SimulatedPostMergeCrashError";
-    this.mergeOpId = mergeOpId;
-  }
-}
-
-export interface ProjectRecord {
-  project_id: string;
-  slug: string;
-  name: string;
-  repo_bare_path: string;
-  default_branch: string;
-  approval_ttl_seconds: number;
-  main_ref_commit_hash: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface CasMergeResult {
-  readonly status:
-    | "MERGED_BY_CAS"
-    | "RECONCILED_ALREADY_MERGED"
-    | "CAS_CONFLICT_NEEDS_REBASE"
-    | "APPROVAL_EXPIRED";
-  readonly task_status: TaskStatus;
-  readonly merged_commit_hash: string | null;
-  readonly main_ref_commit_hash: string;
-  readonly invalidated_approval_id?: string;
-  readonly merge_op_id?: string;
-  readonly reconciled_after_lost_response?: boolean;
-}
+export * from "./types.ts";
+export * from "./postgres-pool.ts";
 
 /**
  * SoftwareFactoryControlPlaneStore implements the PostgreSQL 4-Tier RLS Engine,
@@ -126,7 +58,7 @@ export interface CasMergeResult {
  * Lease/Event Coordinator, 3D Independent Reviewer Guard, 8-Field Approval Binding & TTL,
  * and Idempotent Atomic CAS Merge + Post-Merge Reconciler (MVP-SPEC-02, MVP-SPEC-03, MVP-SPEC-04).
  */
-export class SoftwareFactoryControlPlaneStore {
+export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   private clockFn: () => Date;
   private readonly asyncLocalStorage = new AsyncLocalStorage<RlsSessionContext>();
   private defaultSession: RlsSessionContext = {
@@ -154,6 +86,7 @@ export class SoftwareFactoryControlPlaneStore {
   private approvalRequests: Map<string, ApprovalRequestRecord> = new Map();
   private approvalDecisions: Map<string, ApprovalDecisionRecord> = new Map();
   private mergeOperations: Map<string, MergeOperationRecord> = new Map();
+  private resourceUsageMetrics: Map<string, ResourceUsageMetricRecord> = new Map();
   private outboxEvents: Map<string, OutboxEventRecord> = new Map();
 
   // Simulated bare Git repository state per project: ref -> commit_hash, and commit_hash -> metadata
@@ -1051,6 +984,7 @@ export class SoftwareFactoryControlPlaneStore {
           staging_ref: input.staging_ref,
           changed_files_count: validation.changed_files_count,
           deleted_lines_count: validation.deleted_lines_count,
+          recovered_by_reconciler: false,
           created_at: this.clockTimestampIso(),
         };
         this.verifiedCodeImports.set(importRecord.import_id, importRecord);
@@ -1231,6 +1165,7 @@ export class SoftwareFactoryControlPlaneStore {
               leaseEpoch: lease.lease_epoch,
             });
             if (preRecordedImport) {
+              preRecordedImport.recovered_by_reconciler = true;
               lease.status = "COMPLETED";
               lease.completed_at = nowIso;
               task.status = "BuildingMergeCandidate";
@@ -1297,6 +1232,7 @@ export class SoftwareFactoryControlPlaneStore {
                     staging_ref: matchedRef,
                     changed_files_count: validation.changed_files_count,
                     deleted_lines_count: validation.deleted_lines_count,
+                    recovered_by_reconciler: true,
                     created_at: nowIso,
                   };
                   this.verifiedCodeImports.set(importRecord.import_id, importRecord);
@@ -1479,6 +1415,7 @@ export class SoftwareFactoryControlPlaneStore {
       staging_ref: input.staging_ref,
       changed_files_count: validation.changed_files_count,
       deleted_lines_count: validation.deleted_lines_count,
+      recovered_by_reconciler: false,
       created_at: nowIso,
     };
     this.verifiedCodeImports.set(record.import_id, record);
@@ -3184,6 +3121,113 @@ export class SoftwareFactoryControlPlaneStore {
       }
     }
     return list;
+  }
+
+  public listTaskLeasesForTask(taskId: string): TaskLeaseRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: TaskLeaseRecord[] = [];
+    for (const l of this.taskLeases.values()) {
+      if (l.project_id === currentProjectId && l.task_id === taskId) {
+        list.push({ ...l });
+      }
+    }
+    list.sort((a, b) => a.lease_epoch - b.lease_epoch);
+    return list;
+  }
+
+  public listProcessedWorkerEventsForTask(taskId: string): ProcessedWorkerEventRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ProcessedWorkerEventRecord[] = [];
+    for (const ev of this.processedWorkerEvents.values()) {
+      if (ev.project_id === currentProjectId && ev.task_id === taskId) {
+        list.push({ ...ev });
+      }
+    }
+    list.sort((a, b) => a.lease_epoch - b.lease_epoch || a.sequence_no - b.sequence_no);
+    return list;
+  }
+
+  public recordResourceUsageMetric(
+    input: RecordResourceUsageMetricInput
+  ): ResourceUsageMetricRecord {
+    this.assertWritePermissionForProject(input.project_id);
+    const task = this.tasks.get(input.task_id);
+    if (!task || task.project_id !== input.project_id) {
+      throw new PostgresRlsError("23503", `Task ${input.task_id} not found for project ${input.project_id}`);
+    }
+    if (input.lease_id) {
+      const lease = this.taskLeases.get(input.lease_id);
+      if (!lease || lease.project_id !== input.project_id) {
+        throw new PostgresRlsError("23503", `Lease ${input.lease_id} not found for project ${input.project_id}`);
+      }
+    }
+    if (!input.sandbox_backend_mode.trim()) {
+      throw new PostgresRlsError("23514", "sandbox_backend_mode must be non-empty");
+    }
+    const record: ResourceUsageMetricRecord = {
+      metric_id: randomUUID(),
+      project_id: input.project_id,
+      task_id: input.task_id,
+      lease_id: input.lease_id ?? null,
+      lease_epoch: Math.max(0, Math.round(input.lease_epoch)),
+      attempt_no: Math.max(1, Math.round(input.attempt_no ?? task.current_attempt_no ?? 1)),
+      rework_cycle: Math.max(0, Math.round(input.rework_cycle ?? task.rework_count ?? 0)),
+      phase: input.phase,
+      wall_time_ms: Math.max(0, Math.round(input.wall_time_ms)),
+      cpu_usage_usec: Math.max(0, Math.round(input.cpu_usage_usec)),
+      peak_memory_bytes: Math.max(0, Math.round(input.peak_memory_bytes)),
+      sandbox_backend_mode: input.sandbox_backend_mode.trim(),
+      metrics_source: input.metrics_source,
+      recorded_at: this.clockTimestampIso(),
+    };
+    this.resourceUsageMetrics.set(record.metric_id, record);
+    return { ...record };
+  }
+
+  public listResourceUsageMetricsForTask(taskId: string): ResourceUsageMetricRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ResourceUsageMetricRecord[] = [];
+    for (const m of this.resourceUsageMetrics.values()) {
+      if (m.project_id === currentProjectId && m.task_id === taskId) {
+        list.push({ ...m });
+      }
+    }
+    return list;
+  }
+
+  public getCandidateBoundLineage(
+    taskId: string,
+    liveMainHeadHash?: string | null
+  ): CandidateBoundLineage | null {
+    const task = this.getTaskById(taskId);
+    if (!task) {
+      return null;
+    }
+    return buildCandidateBoundLineage({
+      task,
+      mainHeadCommitHash:
+        liveMainHeadHash !== undefined ? liveMainHeadHash : this.getMainRefCommitHash(),
+      taskLeases: this.listTaskLeasesForTask(taskId),
+      processedEvents: this.listProcessedWorkerEventsForTask(taskId),
+      resourceUsageMetrics: this.listResourceUsageMetricsForTask(taskId),
+      imports: this.getVerifiedImportsForTask(taskId),
+      allMergeCandidates: this.listMergeCandidatesForTask(taskId),
+      verificationRuns: this.listVerificationRunsForTask(taskId),
+      reviewSessions: this.listReviewSessionsForTask(taskId),
+      reviewArtifacts: this.listReviewArtifactsForTask(taskId),
+      approvalRequests: this.listApprovalRequestsForTask(taskId),
+      approvalDecisions: this.listApprovalDecisionsForTask(taskId),
+      mergeOperations: this.listMergeOperationsForTask(taskId),
+    });
   }
 
   public listOutboxEventsForProject(): OutboxEventRecord[] {

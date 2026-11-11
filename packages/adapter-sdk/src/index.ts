@@ -1,12 +1,18 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { dirname, resolve } from "node:path";
 import {
   DEFAULT_MAX_CHANGED_FILES,
   DEFAULT_MAX_DELETED_LINES,
   DEFAULT_SYSTEM_FORBIDDEN_PATHS,
   type TaskContractSpec,
 } from "@software-factory/task-contract";
+import { LiveModelProviderClient, type ModelProviderConfig } from "./model-providers.ts";
+
+export * from "./model-providers.ts";
 
 /**
- * AgentRuntimeAdapter Interface (MVP-SPEC-03 Section 4.4 & Roadmap M2)
+ * AgentRuntimeAdapter Interface (MVP-SPEC-03 Section 4.4 & Roadmap M2/M5)
  */
 export interface AgentTaskContext {
   readonly projectId: string;
@@ -17,6 +23,9 @@ export interface AgentTaskContext {
   readonly baseMainCommitHash: string;
   readonly taskTitle: string;
   readonly taskContract: TaskContractSpec;
+  readonly reworkCycle?: number;
+  readonly previousFailureFeedbackMd?: string | null;
+  readonly modelProviderConfig?: ModelProviderConfig;
   readonly ephemeralGitPushToken?: string;
   readonly hostEnvironmentToSanitize?: Readonly<Record<string, string | undefined>>;
 }
@@ -40,7 +49,7 @@ export interface AgentExecutionResult {
 }
 
 export interface AgentRuntimeAdapter {
-  readonly runtimeId: "claude-code-cli" | "fake-agent-harness";
+  readonly runtimeId: "claude-code-cli" | "fake-agent-harness" | "workspace-coding-agent";
   readonly writerProvider: string;
   readonly writerModel: string;
 
@@ -95,9 +104,10 @@ export class TaskContextAssembler {
     const maxChanged = ctx.taskContract.max_changed_files ?? DEFAULT_MAX_CHANGED_FILES;
     const maxDeleted = ctx.taskContract.max_deleted_lines ?? DEFAULT_MAX_DELETED_LINES;
 
-    const promptInstruction = [
+    const lines = [
       `# Software Factory Task Execution Contract`,
       `Task ID: ${ctx.taskId} (Epoch: ${ctx.leaseEpoch})`,
+      `Rework Cycle: ${ctx.reworkCycle ?? 0}`,
       `Title: ${ctx.taskTitle}`,
       `Base Commit: ${ctx.baseMainCommitHash}`,
       `Allowed Files: ${ctx.taskContract.allowed_files.join(", ")}`,
@@ -105,12 +115,16 @@ export class TaskContextAssembler {
       `Forbidden Paths: ${forbiddenPaths.join(", ")}`,
       `Diff Limits: max_changed_files=${maxChanged}, max_deleted_lines=${maxDeleted}`,
       `Target Staging Ref: ${canonicalStagingRef}`,
-    ].join("\n");
+    ];
+    if (ctx.previousFailureFeedbackMd && ctx.previousFailureFeedbackMd.trim().length > 0) {
+      lines.push(`# Previous Failure / Rework Feedback\n${ctx.previousFailureFeedbackMd.trim()}`);
+    }
+    const promptInstruction = lines.join("\n");
 
     // Strictly build from an empty environment (`env -i` semantics):
     // Never copy host/WNA secrets even if `hostEnvironmentToSanitize` contains them.
     const sanitizedEnv: Record<string, string> = {
-      PATH: "/usr/local/bin:/usr/bin:/bin",
+      PATH: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
       HOME: `/tmp/sf-task-runner-${ctx.taskId}-${ctx.leaseEpoch}`,
       LANG: "C.UTF-8",
       USER: "sf-task-runner",
@@ -236,4 +250,191 @@ export class ClaudeCodeCliAdapter implements AgentRuntimeAdapter {
       stderrTail: stderr.slice(-2048),
     };
   }
+}
+
+export interface WorkspaceFileEdit {
+  readonly path: string;
+  readonly content: string;
+}
+
+const WORKSPACE_AGENT_INLINE_RUNNER = [
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'const { execFileSync } = require("node:child_process");',
+  'const payload = JSON.parse(Buffer.from(process.argv[1], "base64").toString("utf8"));',
+  'const root = path.resolve(payload.worktreePath);',
+  'const addedPaths = [];',
+  'for (const file of payload.files) {',
+  '  const abs = path.resolve(root, file.path);',
+  '  if (abs !== root && !abs.startsWith(root + path.sep)) {',
+  '    throw new Error("Path traversal blocked: " + file.path);',
+  '  }',
+  '  fs.mkdirSync(path.dirname(abs), { recursive: true });',
+  '  fs.writeFileSync(abs, file.content, "utf8");',
+  '  addedPaths.push(file.path);',
+  '}',
+  'execFileSync("git", ["add", ...addedPaths], { cwd: root, stdio: "pipe" });',
+  'execFileSync("git", ["-c", "user.name=" + payload.authorName, "-c", "user.email=" + payload.authorEmail, "commit", "--allow-empty", "-m", payload.commitMessage], { cwd: root, stdio: "pipe" });',
+  'const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();',
+  'const tree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root, encoding: "utf8" }).trim();',
+  'process.stdout.write(JSON.stringify({ agent_commit_hash: head, verified_tree_hash: tree }) + "\\n");',
+].join(" ");
+
+/**
+ * Live Workspace Coding Agent Runtime Adapter (`M5`).
+ * Executes inside `LinuxCgroupV2SandboxBackend` using clean `env -i` environment variables,
+ * optionally consults a configured `LiveModelProviderClient` in the supervisor layer (never passing API keys
+ * into the sandbox), writes target source/test edits to the isolated worktree, creates a real signed/attributed
+ * `git commit`, and returns exact SHA-1 commit & tree hashes.
+ */
+export class WorkspaceCodingAgentAdapter implements AgentRuntimeAdapter {
+  public readonly runtimeId = "workspace-coding-agent" as const;
+  public readonly writerProvider: string;
+  public readonly writerModel: string;
+  private readonly defaultTimeoutMs: number;
+  private readonly editsResolver?: (
+    ctx: AgentTaskContext
+  ) => Promise<readonly WorkspaceFileEdit[]> | readonly WorkspaceFileEdit[];
+  private readonly modelClient?: LiveModelProviderClient;
+
+  constructor(options?: {
+    writerProvider?: string;
+    writerModel?: string;
+    timeoutMs?: number;
+    modelClient?: LiveModelProviderClient;
+    editsResolver?: (
+      ctx: AgentTaskContext
+    ) => Promise<readonly WorkspaceFileEdit[]> | readonly WorkspaceFileEdit[];
+  }) {
+    this.writerProvider = options?.writerProvider ?? options?.modelClient?.config.provider ?? "anthropic";
+    this.writerModel = options?.writerModel ?? options?.modelClient?.config.model ?? "claude-3-7-sonnet-20250219";
+    this.defaultTimeoutMs = options?.timeoutMs ?? 60_000;
+    this.modelClient = options?.modelClient;
+    this.editsResolver = options?.editsResolver;
+  }
+
+  public async prepareInvocation(ctx: AgentTaskContext): Promise<AgentInvocationPlan> {
+    const assembled = TaskContextAssembler.assemble(ctx);
+    let files: readonly WorkspaceFileEdit[] = [];
+    if (this.editsResolver) {
+      files = await this.editsResolver(ctx);
+    } else if (this.modelClient) {
+      const resp = await this.modelClient.complete({
+        systemPrompt:
+          'You are an autonomous coding agent. Output JSON array of file edits: [{"path":"...","content":"..."}]',
+        userPrompt: assembled.promptInstruction,
+      });
+      const raw = resp.contentText.trim();
+      const s = raw.indexOf("[");
+      const e = raw.lastIndexOf("]");
+      if (s !== -1 && e > s) {
+        files = JSON.parse(raw.slice(s, e + 1)) as WorkspaceFileEdit[];
+      }
+    }
+
+    const payload = {
+      worktreePath: ctx.worktreePath,
+      commitMessage: `sf(${ctx.taskId.slice(0, 8)}): epoch ${ctx.leaseEpoch} rework ${ctx.reworkCycle ?? 0} - ${ctx.taskTitle}`,
+      authorName: `sf-agent-${this.writerProvider}`,
+      authorEmail: `agent+${ctx.leaseEpoch}@software-factory.local`,
+      files,
+    };
+
+    const payloadB64 = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+    return {
+      binaryPath: process.execPath,
+      args: ["-e", WORKSPACE_AGENT_INLINE_RUNNER, payloadB64],
+      sanitizedEnv: assembled.sanitizedEnv,
+      timeoutMs: this.defaultTimeoutMs,
+    };
+  }
+
+  public async parseExecutionResult(
+    _ctx: AgentTaskContext,
+    rawExitCode: number,
+    stdout: string,
+    stderr: string
+  ): Promise<AgentExecutionResult> {
+    const lines = stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      const line = lines[i]!;
+      if (line.startsWith("{") && line.endsWith("}")) {
+        try {
+          const json = JSON.parse(line) as Record<string, unknown>;
+          if (
+            typeof json.agent_commit_hash === "string" &&
+            /^[0-9a-f]{40}$/i.test(json.agent_commit_hash) &&
+            typeof json.verified_tree_hash === "string" &&
+            /^[0-9a-f]{40}$/i.test(json.verified_tree_hash)
+          ) {
+            return {
+              exitCode: rawExitCode,
+              agentCommitHash: json.agent_commit_hash.toLowerCase(),
+              verifiedTreeHash: json.verified_tree_hash.toLowerCase(),
+              writerProvider: this.writerProvider,
+              writerModel: this.writerModel,
+              stdoutTail: stdout.slice(-2048),
+              stderrTail: stderr.slice(-2048),
+            };
+          }
+        } catch {
+          // continue searching lines
+        }
+      }
+    }
+
+    return {
+      exitCode: rawExitCode !== 0 ? rawExitCode : 1,
+      agentCommitHash: null,
+      verifiedTreeHash: null,
+      writerProvider: this.writerProvider,
+      writerModel: this.writerModel,
+      stdoutTail: stdout.slice(-2048),
+      stderrTail: stderr.slice(-2048),
+      error: "WorkspaceCodingAgentAdapter failed to parse valid 40-char commit/tree SHA from child stdout",
+    };
+  }
+}
+
+export function applyWorkspaceEditsSync(
+  worktreePath: string,
+  files: readonly WorkspaceFileEdit[],
+  commitMessage: string
+): { readonly commitHash: string; readonly treeHash: string } {
+  const root = resolve(worktreePath);
+  for (const file of files) {
+    const abs = resolve(root, file.path);
+    if (abs !== root && !abs.startsWith(`${root}/`) && !abs.startsWith(`${root}\\`)) {
+      throw new Error(`Path traversal blocked: ${file.path}`);
+    }
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, file.content, "utf8");
+  }
+  execFileSync("git", ["add", ...files.map((f) => f.path)], { cwd: root, stdio: "pipe" });
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=sf-agent",
+      "-c",
+      "user.email=agent@software-factory.local",
+      "commit",
+      "--allow-empty",
+      "-m",
+      commitMessage,
+    ],
+    { cwd: root, stdio: "pipe" }
+  );
+  const commitHash = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: root,
+    encoding: "utf8",
+  }).trim();
+  const treeHash = execFileSync("git", ["rev-parse", "HEAD^{tree}"], {
+    cwd: root,
+    encoding: "utf8",
+  }).trim();
+  return { commitHash, treeHash };
 }

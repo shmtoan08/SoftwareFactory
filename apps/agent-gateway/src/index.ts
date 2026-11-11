@@ -2,6 +2,7 @@ import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type {
   LeaseSyncStatusResponse,
+  ResourceUsageMetricRecord,
   ServerEventAckContract,
   WorkerEventEnvelope,
 } from "@software-factory/shared-types";
@@ -10,7 +11,10 @@ import {
   type TaskContractSpec,
   inspectRealGitCommitForImport,
 } from "@software-factory/task-contract";
-import type { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
+import type {
+  ControlPlaneStore,
+  RecordResourceUsageMetricInput,
+} from "@software-factory/database";
 import type { AgentGatewayTransportClient } from "@software-factory/wna";
 
 export interface LeasePushTokenClaims {
@@ -109,10 +113,11 @@ export class EphemeralGitPushTokenService {
     return `${payloadB64}.${sigB64}`;
   }
 
-  public verifyLeasePushToken(
-    token: string,
-    expectedRefName: string
-  ): { readonly valid: true; readonly claims: LeasePushTokenClaims } | { readonly valid: false; readonly reason: string } {
+  public verifyWorkerBearerToken(
+    token: string
+  ):
+    | { readonly valid: true; readonly claims: LeasePushTokenClaims }
+    | { readonly valid: false; readonly reason: string } {
     if (!token || typeof token !== "string") {
       return { valid: false, reason: "Missing lease push token" };
     }
@@ -153,6 +158,19 @@ export class EphemeralGitPushTokenService {
       return { valid: false, reason: "Lease push token has expired" };
     }
 
+    return { valid: true, claims };
+  }
+
+  public verifyLeasePushToken(
+    token: string,
+    expectedRefName: string
+  ): { readonly valid: true; readonly claims: LeasePushTokenClaims } | { readonly valid: false; readonly reason: string } {
+    const tokenRes = this.verifyWorkerBearerToken(token);
+    if (!tokenRes.valid) {
+      return tokenRes;
+    }
+
+    const { claims } = tokenRes;
     const refMatch = expectedRefName.match(STAGING_REF_PATTERN);
     if (!refMatch) {
       return { valid: false, reason: `Ref '${expectedRefName}' is not a valid staging ref` };
@@ -318,13 +336,13 @@ export class EphemeralReviewerCredentialService {
  * strictly isolated `ROLE_REVIEWER_READONLY` credentials for Independent Reviewers.
  */
 export class AgentGatewayService implements AgentGatewayTransportClient {
-  private readonly store: SoftwareFactoryControlPlaneStore;
+  private readonly store: ControlPlaneStore;
   private readonly projectId: string;
   private readonly workerPrincipalId: string;
   public readonly reviewerCredentialService: EphemeralReviewerCredentialService;
 
   constructor(options: {
-    store: SoftwareFactoryControlPlaneStore;
+    store: ControlPlaneStore;
     projectId: string;
     workerPrincipalId?: string;
     reviewerCredentialService?: EphemeralReviewerCredentialService;
@@ -448,13 +466,26 @@ export class AgentGatewayService implements AgentGatewayTransportClient {
         currentPrincipalId: this.workerPrincipalId,
         currentRole: "gateway_service",
       },
-      () => {
-        const sync = this.store.getLeaseSyncStatus(leaseId);
+      async () => {
+        const sync = await this.store.getLeaseSyncStatus(leaseId);
         if (!sync) {
           throw new Error(`Lease ${leaseId} not found in project ${this.projectId}`);
         }
         return sync;
       }
+    );
+  }
+
+  public async reportResourceUsageMetric(
+    input: RecordResourceUsageMetricInput
+  ): Promise<ResourceUsageMetricRecord> {
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: input.project_id || this.projectId,
+        currentPrincipalId: this.workerPrincipalId,
+        currentRole: "gateway_service",
+      },
+      () => this.store.recordResourceUsageMetric(input)
     );
   }
 
@@ -503,14 +534,23 @@ export interface PreReceiveHttpRequestBody {
   readonly changes?: readonly GitTreeChangeEntry[];
 }
 
+export interface GatewayTransientFaultHook {
+  /** Simulates network failure / 503 BEFORE committing `sequence_no` in Control Plane (fires once per seq). */
+  readonly failBeforeCommitSeq?: Set<number>;
+  /** Commits `sequence_no` durably in DB, then drops/503s the HTTP response (fires once per seq) so reconnect sync+replay triggers. */
+  readonly dropAfterCommitSeq?: Set<number>;
+}
+
 /**
- * Real HTTP endpoint (`POST /internal/v1/git/pre-receive-verify`) backing `scripts/git-hooks/pre-receive`
- * (`MVP-SPEC-03` Section 5.1, `FIX-14`, `FIX-16`).
- * Validates per-lease HMAC Bearer tokens, inspects incoming Git commits (including quarantine `GIT_OBJECT_DIRECTORY`),
- * runs `pushStagingGitRefWithGatekeeper` under a real async deadline race, and fails closed on errors/timeouts.
+ * Real HTTP Gateway Server (`MVP-SPEC-03` Section 1-2 & 5.1, `FIX-14`, `FIX-16`, `M5`):
+ * - `POST /internal/v1/git/pre-receive-verify`: fail-closed Git pre-receive hook endpoint.
+ * - `POST /api/v1/gateway/events`: WNA outbox event ingestion with scoped `gateway_service` RLS.
+ * - `GET  /api/v1/gateway/leases/:leaseId/sync`: Reconnect sequence sync (`expected_next_seq`).
+ * - `POST /api/v1/gateway/leases/:leaseId/metrics`: Baseline resource usage metrics (`AC-12a`).
+ * - `GET  /health`: Liveness probe.
  */
 export class AgentGatewayHttpServer {
-  private readonly store: SoftwareFactoryControlPlaneStore;
+  private readonly store: ControlPlaneStore;
   private readonly tokenService: EphemeralGitPushTokenService;
   private readonly host: string;
   private readonly requestedPort: number;
@@ -518,15 +558,17 @@ export class AgentGatewayHttpServer {
   public deadlineMs: number;
   public simulateControlPlaneOutage: boolean;
   public authorizeCheckHook?: (signal: AbortSignal) => Promise<void>;
+  public transientFaultHook?: GatewayTransientFaultHook;
 
   constructor(options: {
-    store: SoftwareFactoryControlPlaneStore;
+    store: ControlPlaneStore;
     tokenService: EphemeralGitPushTokenService;
     host?: string;
     port?: number;
     deadlineMs?: number;
     simulateControlPlaneOutage?: boolean;
     authorizeCheckHook?: (signal: AbortSignal) => Promise<void>;
+    transientFaultHook?: GatewayTransientFaultHook;
   }) {
     this.store = options.store;
     this.tokenService = options.tokenService;
@@ -535,15 +577,18 @@ export class AgentGatewayHttpServer {
     this.deadlineMs = options.deadlineMs ?? 2000;
     this.simulateControlPlaneOutage = options.simulateControlPlaneOutage ?? false;
     this.authorizeCheckHook = options.authorizeCheckHook;
+    this.transientFaultHook = options.transientFaultHook;
   }
 
-  public async start(): Promise<{ port: number; url: string }> {
+  public async start(): Promise<{ port: number; url: string; baseUrl: string }> {
     if (this.server) {
       const addr = this.server.address();
       if (addr && typeof addr === "object") {
+        const baseUrl = `http://${this.host}:${addr.port}`;
         return {
           port: addr.port,
-          url: `http://${this.host}:${addr.port}/internal/v1/git/pre-receive-verify`,
+          url: `${baseUrl}/internal/v1/git/pre-receive-verify`,
+          baseUrl,
         };
       }
     }
@@ -564,9 +609,11 @@ export class AgentGatewayHttpServer {
     if (!addr || typeof addr !== "object") {
       throw new Error("Failed to resolve bound port for AgentGatewayHttpServer");
     }
+    const baseUrl = `http://${this.host}:${addr.port}`;
     return {
       port: addr.port,
-      url: `http://${this.host}:${addr.port}/internal/v1/git/pre-receive-verify`,
+      url: `${baseUrl}/internal/v1/git/pre-receive-verify`,
+      baseUrl,
     };
   }
 
@@ -590,7 +637,7 @@ export class AgentGatewayHttpServer {
     });
   }
 
-  private sendJson(res: ServerResponse, statusCode: number, body: Record<string, unknown>): void {
+  private sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
     const payload = JSON.stringify(body);
     res.writeHead(statusCode, {
       "Content-Type": "application/json",
@@ -600,7 +647,7 @@ export class AgentGatewayHttpServer {
     res.end(payload);
   }
 
-  private async readJsonBody(req: IncomingMessage): Promise<PreReceiveHttpRequestBody> {
+  private async readJsonBody<T>(req: IncomingMessage): Promise<T> {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     for await (const chunk of req) {
@@ -611,19 +658,57 @@ export class AgentGatewayHttpServer {
       }
       chunks.push(buf);
     }
-    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as PreReceiveHttpRequestBody;
+    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+  }
+
+  private extractBearerToken(req: IncomingMessage): string | null {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return null;
+    }
+    const token = authHeader.slice("Bearer ".length).trim();
+    return token.length > 0 ? token : null;
   }
 
   private async routeRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== "POST" || req.url !== "/internal/v1/git/pre-receive-verify") {
-      this.sendJson(res, 404, {
-        allowed: false,
-        error_code: "ERR_NOT_FOUND",
-        reason: "Endpoint not found",
-      });
+    const method = req.method ?? "GET";
+    const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+
+    if (method === "GET" && pathname === "/health") {
+      this.sendJson(res, 200, { ok: true, service: "agent-gateway" });
       return;
     }
 
+    if (method === "POST" && pathname === "/internal/v1/git/pre-receive-verify") {
+      await this.handlePreReceiveVerify(req, res);
+      return;
+    }
+
+    if (method === "POST" && pathname === "/api/v1/gateway/events") {
+      await this.handleSubmitWorkerEvent(req, res);
+      return;
+    }
+
+    const syncMatch = pathname.match(/^\/api\/v1\/gateway\/leases\/([^/]+)\/sync$/);
+    if (method === "GET" && syncMatch?.[1]) {
+      await this.handleLeaseSync(req, res, decodeURIComponent(syncMatch[1]));
+      return;
+    }
+
+    const metricsMatch = pathname.match(/^\/api\/v1\/gateway\/leases\/([^/]+)\/metrics$/);
+    if (method === "POST" && metricsMatch?.[1]) {
+      await this.handleReportMetric(req, res, decodeURIComponent(metricsMatch[1]));
+      return;
+    }
+
+    this.sendJson(res, 404, {
+      allowed: false,
+      error_code: "ERR_NOT_FOUND",
+      reason: "Endpoint not found",
+    });
+  }
+
+  private async handlePreReceiveVerify(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (this.simulateControlPlaneOutage) {
       this.sendJson(res, 503, {
         allowed: false,
@@ -633,8 +718,8 @@ export class AgentGatewayHttpServer {
       return;
     }
 
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    const token = this.extractBearerToken(req);
+    if (!token) {
       this.sendJson(res, 401, {
         allowed: false,
         error_code: "ERR_UNAUTHORIZED",
@@ -642,11 +727,10 @@ export class AgentGatewayHttpServer {
       });
       return;
     }
-    const token = authHeader.slice("Bearer ".length).trim();
 
     let body: PreReceiveHttpRequestBody;
     try {
-      body = await this.readJsonBody(req);
+      body = await this.readJsonBody<PreReceiveHttpRequestBody>(req);
     } catch {
       this.sendJson(res, 400, {
         allowed: false,
@@ -685,8 +769,8 @@ export class AgentGatewayHttpServer {
           currentRole: "gateway_service",
         },
         async () => {
-          const project = this.store.getProjectById(claims.projectId);
-          const task = this.store.getTaskById(claims.taskId);
+          const project = await this.store.getProjectById(claims.projectId);
+          const task = await this.store.getTaskById(claims.taskId);
           if (!project || !task) {
             return {
               allowed: false,
@@ -733,18 +817,327 @@ export class AgentGatewayHttpServer {
       );
 
       if (result.allowed) {
-        this.sendJson(res, 200, result as unknown as Record<string, unknown>);
+        this.sendJson(res, 200, result);
         return;
       }
       const status =
         result.error_code === "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE" ? 504 : 403;
-      this.sendJson(res, status, result as unknown as Record<string, unknown>);
+      this.sendJson(res, status, result);
     } catch (err: unknown) {
       this.sendJson(res, 500, {
         allowed: false,
         error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
         reason: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  private async handleSubmitWorkerEvent(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (this.simulateControlPlaneOutage) {
+      this.sendJson(res, 503, {
+        error_code: "ERR_GATEWAY_UNAVAILABLE",
+        reason: "Control Plane unavailable",
+      });
+      return;
+    }
+
+    const token = this.extractBearerToken(req);
+    if (!token) {
+      this.sendJson(res, 401, {
+        error_code: "ERR_UNAUTHORIZED",
+        reason: "Missing Bearer worker token",
+      });
+      return;
+    }
+    const auth = this.tokenService.verifyWorkerBearerToken(token);
+    if (!auth.valid) {
+      this.sendJson(res, 403, {
+        error_code: "ERR_INVALID_WORKER_TOKEN",
+        reason: auth.reason,
+      });
+      return;
+    }
+
+    let envelope: WorkerEventEnvelope;
+    try {
+      envelope = await this.readJsonBody<WorkerEventEnvelope>(req);
+    } catch {
+      this.sendJson(res, 400, {
+        error_code: "ERR_BAD_REQUEST",
+        reason: "Invalid JSON body in worker event submission",
+      });
+      return;
+    }
+
+    const { claims } = auth;
+    if (
+      envelope.project_id !== claims.projectId ||
+      envelope.task_id !== claims.taskId ||
+      envelope.lease_id !== claims.leaseId ||
+      envelope.lease_epoch !== claims.leaseEpoch ||
+      envelope.worker_id !== claims.workerId
+    ) {
+      this.sendJson(res, 403, {
+        error_code: "ERR_LEASE_TOKEN_CLAIM_MISMATCH",
+        reason: "Worker event envelope identity does not match Bearer lease token claims",
+      });
+      return;
+    }
+
+    if (this.transientFaultHook?.failBeforeCommitSeq?.has(envelope.sequence_no)) {
+      this.transientFaultHook.failBeforeCommitSeq.delete(envelope.sequence_no);
+      this.sendJson(res, 503, {
+        error_code: "ERR_TRANSIENT_GATEWAY_UNAVAILABLE",
+        reason: `Simulated transient gateway outage before committing seq=${envelope.sequence_no}`,
+      });
+      return;
+    }
+
+    const dropAckAfterCommit = Boolean(
+      this.transientFaultHook?.dropAfterCommitSeq?.has(envelope.sequence_no)
+    );
+    if (dropAckAfterCommit) {
+      this.transientFaultHook?.dropAfterCommitSeq?.delete(envelope.sequence_no);
+    }
+
+    try {
+      const ack = await this.store.withRlsTransaction(
+        {
+          currentProjectId: claims.projectId,
+          currentPrincipalId: claims.workerId,
+          currentRole: "gateway_service",
+        },
+        () => this.store.submitWorkerEvent(envelope)
+      );
+
+      if (dropAckAfterCommit) {
+        this.sendJson(res, 503, {
+          error_code: "ERR_SIMULATED_LOST_ACK",
+          reason: `Simulated connection drop after durable DB commit for seq=${envelope.sequence_no}`,
+        });
+        return;
+      }
+
+      const status =
+        ack.ack_status === "ACCEPTED" || ack.ack_status === "DUPLICATE_RETRY_NOP" ? 200 : 409;
+      this.sendJson(res, status, ack);
+    } catch (err: unknown) {
+      this.sendJson(res, 500, {
+        error_code: "ERR_INTERNAL",
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async handleLeaseSync(
+    req: IncomingMessage,
+    res: ServerResponse,
+    leaseId: string
+  ): Promise<void> {
+    const token = this.extractBearerToken(req);
+    if (!token) {
+      this.sendJson(res, 401, { error_code: "ERR_UNAUTHORIZED", reason: "Missing Bearer worker token" });
+      return;
+    }
+    const auth = this.tokenService.verifyWorkerBearerToken(token);
+    if (!auth.valid) {
+      this.sendJson(res, 403, { error_code: "ERR_INVALID_WORKER_TOKEN", reason: auth.reason });
+      return;
+    }
+    const { claims } = auth;
+    if (claims.leaseId !== leaseId) {
+      this.sendJson(res, 403, {
+        error_code: "ERR_LEASE_TOKEN_CLAIM_MISMATCH",
+        reason: `Token lease ${claims.leaseId} cannot sync lease ${leaseId}`,
+      });
+      return;
+    }
+
+    try {
+      const sync = await this.store.withRlsTransaction(
+        {
+          currentProjectId: claims.projectId,
+          currentPrincipalId: claims.workerId,
+          currentRole: "gateway_service",
+        },
+        () => this.store.getLeaseSyncStatus(leaseId)
+      );
+      if (!sync) {
+        this.sendJson(res, 404, { error_code: "ERR_LEASE_NOT_FOUND", reason: `Lease ${leaseId} not found` });
+        return;
+      }
+      this.sendJson(res, 200, sync);
+    } catch (err: unknown) {
+      this.sendJson(res, 500, {
+        error_code: "ERR_INTERNAL",
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async handleReportMetric(
+    req: IncomingMessage,
+    res: ServerResponse,
+    leaseId: string
+  ): Promise<void> {
+    const token = this.extractBearerToken(req);
+    if (!token) {
+      this.sendJson(res, 401, { error_code: "ERR_UNAUTHORIZED", reason: "Missing Bearer worker token" });
+      return;
+    }
+    const auth = this.tokenService.verifyWorkerBearerToken(token);
+    if (!auth.valid) {
+      this.sendJson(res, 403, { error_code: "ERR_INVALID_WORKER_TOKEN", reason: auth.reason });
+      return;
+    }
+    const { claims } = auth;
+    if (claims.leaseId !== leaseId) {
+      this.sendJson(res, 403, {
+        error_code: "ERR_LEASE_TOKEN_CLAIM_MISMATCH",
+        reason: `Token lease ${claims.leaseId} cannot report metric for lease ${leaseId}`,
+      });
+      return;
+    }
+
+    let body: RecordResourceUsageMetricInput;
+    try {
+      body = await this.readJsonBody<RecordResourceUsageMetricInput>(req);
+    } catch {
+      this.sendJson(res, 400, { error_code: "ERR_BAD_REQUEST", reason: "Invalid JSON metric payload" });
+      return;
+    }
+
+    if (
+      body.project_id !== claims.projectId ||
+      body.task_id !== claims.taskId ||
+      (body.lease_id !== undefined && body.lease_id !== null && body.lease_id !== claims.leaseId) ||
+      body.lease_epoch !== claims.leaseEpoch
+    ) {
+      this.sendJson(res, 403, {
+        error_code: "ERR_LEASE_TOKEN_CLAIM_MISMATCH",
+        reason: "Metric payload does not match Bearer lease claims",
+      });
+      return;
+    }
+
+    try {
+      const metric = await this.store.withRlsTransaction(
+        {
+          currentProjectId: claims.projectId,
+          currentPrincipalId: claims.workerId,
+          currentRole: "gateway_service",
+        },
+        () =>
+          this.store.recordResourceUsageMetric({
+            ...body,
+            lease_id: leaseId,
+          })
+      );
+      this.sendJson(res, 201, metric);
+    } catch (err: unknown) {
+      this.sendJson(res, 500, {
+        error_code: "ERR_INTERNAL",
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/**
+ * Live HTTP Client implementation of `AgentGatewayTransportClient` (`M5`),
+ * used by `WnaWorkerDaemon` and `LocalOutboxBuffer` to talk to `AgentGatewayHttpServer` over HTTP.
+ */
+export class HttpAgentGatewayClient implements AgentGatewayTransportClient {
+  private readonly baseUrl: string;
+  private readonly bearerToken: string;
+  private readonly requestTimeoutMs: number;
+
+  constructor(options: {
+    baseUrl: string;
+    bearerToken: string;
+    requestTimeoutMs?: number;
+  }) {
+    this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.bearerToken = options.bearerToken;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? 5_000;
+  }
+
+  public async submitEvent(envelope: WorkerEventEnvelope): Promise<ServerEventAckContract> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    try {
+      const res = await fetch(`${this.baseUrl}/api/v1/gateway/events`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.bearerToken}`,
+        },
+        body: JSON.stringify(envelope),
+        signal: controller.signal,
+      });
+
+      if (res.status === 200 || res.status === 409) {
+        return (await res.json()) as ServerEventAckContract;
+      }
+      const errText = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status} from gateway events endpoint: ${errText}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  public async getLeaseSyncStatus(leaseId: string): Promise<LeaseSyncStatusResponse> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    try {
+      const res = await fetch(
+        `${this.baseUrl}/api/v1/gateway/leases/${encodeURIComponent(leaseId)}/sync`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${this.bearerToken}`,
+          },
+          signal: controller.signal,
+        }
+      );
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} from gateway sync endpoint: ${errText}`);
+      }
+      return (await res.json()) as LeaseSyncStatusResponse;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  public async reportResourceUsageMetric(
+    input: RecordResourceUsageMetricInput
+  ): Promise<ResourceUsageMetricRecord> {
+    if (!input.lease_id) {
+      throw new Error("HttpAgentGatewayClient.reportResourceUsageMetric requires lease_id");
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    try {
+      const res = await fetch(
+        `${this.baseUrl}/api/v1/gateway/leases/${encodeURIComponent(input.lease_id)}/metrics`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.bearerToken}`,
+          },
+          body: JSON.stringify(input),
+          signal: controller.signal,
+        }
+      );
+      if (res.status !== 200 && res.status !== 201) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} from gateway metrics endpoint: ${errText}`);
+      }
+      return (await res.json()) as ResourceUsageMetricRecord;
+    } finally {
+      clearTimeout(timer);
     }
   }
 }
