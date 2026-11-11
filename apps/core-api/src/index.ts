@@ -1330,7 +1330,11 @@ export class CoreApiService {
         sandboxBackend: reviewerSandbox,
       });
 
-    const reviewSessionId = issuedCredential.claims.reviewerSessionId;
+    const reviewSessionId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      issuedCredential.claims.reviewerSessionId
+    )
+      ? issuedCredential.claims.reviewerSessionId
+      : undefined;
     const startedSession = await this.store.withRlsTransaction(
       {
         currentProjectId: projectId,

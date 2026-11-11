@@ -225,7 +225,7 @@ export class EphemeralReviewerCredentialService {
     if (ttlMs <= 0) {
       throw new Error("Reviewer credential ttlMs must be positive");
     }
-    const reviewerSessionId = input.reviewerSessionId?.trim() || `rev-sess-${randomUUID()}`;
+    const reviewerSessionId = input.reviewerSessionId?.trim() || randomUUID();
     const reviewerCredentialId = input.reviewerCredentialId?.trim() || `rev-cred-${randomUUID()}`;
 
     const claims: ReviewerSessionTokenClaims = {
@@ -390,7 +390,7 @@ export class AgentGatewayService implements AgentGatewayTransportClient {
     }
 
     const devSession = input.developer_session_id.trim();
-    const revSession = input.reviewer_session_id?.trim() || `rev-sess-${randomUUID()}`;
+    const revSession = input.reviewer_session_id?.trim() || randomUUID();
     if (!devSession || devSession.toLowerCase() === revSession.toLowerCase()) {
       throw new ReviewerIdentityIndependenceError(
         "session",

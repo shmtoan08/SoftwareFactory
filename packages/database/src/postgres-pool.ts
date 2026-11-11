@@ -278,6 +278,7 @@ class PooledPgConnection {
   private readonly config: PostgresPoolConfig;
   private recvBuffer: Buffer = Buffer.alloc(0);
   private waiters: Array<(frame: WireFrame) => void> = [];
+  private wireQueue: Promise<void> = Promise.resolve();
   private closed = false;
   private closeError: Error | null = null;
   public lastTxStatus: "I" | "T" | "E" = "I";
@@ -303,6 +304,15 @@ class PooledPgConnection {
 
   public isAlive(): boolean {
     return !this.closed && !this.socket.destroyed;
+  }
+
+  private enqueueWireOp<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.wireQueue.then(fn, fn);
+    this.wireQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   }
 
   private rejectAllWaiters(err: Error): void {
@@ -521,15 +531,17 @@ class PooledPgConnection {
     }
   }
 
-  public async simpleQuery<TRow extends Record<string, unknown> = Record<string, unknown>>(
+  public simpleQuery<TRow extends Record<string, unknown> = Record<string, unknown>>(
     sql: string
   ): Promise<PostgresQueryResult<TRow>> {
-    const body = Buffer.concat([Buffer.from(sql, "utf8"), Buffer.from([0])]);
-    this.socket.write(buildTypedMessage("Q", body));
-    return this.collectQueryResult<TRow>();
+    return this.enqueueWireOp(() => {
+      const body = Buffer.concat([Buffer.from(sql, "utf8"), Buffer.from([0])]);
+      this.socket.write(buildTypedMessage("Q", body));
+      return this.collectQueryResult<TRow>();
+    });
   }
 
-  public async query<TRow extends Record<string, unknown> = Record<string, unknown>>(
+  public query<TRow extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
     params: readonly unknown[] = []
   ): Promise<PostgresQueryResult<TRow>> {
@@ -537,55 +549,55 @@ class PooledPgConnection {
       return this.simpleQuery<TRow>(sql);
     }
 
-    // Parse ('P'): unnamed statement "", SQL, 0 pre-specified param OIDs
-    const sqlBuf = Buffer.from(sql, "utf8");
-    const parseBody = Buffer.allocUnsafe(1 + sqlBuf.length + 1 + 2);
-    parseBody.writeUInt8(0, 0);
-    sqlBuf.copy(parseBody, 1);
-    parseBody.writeUInt8(0, 1 + sqlBuf.length);
-    parseBody.writeInt16BE(0, 1 + sqlBuf.length + 1);
+    return this.enqueueWireOp(() => {
+      // Parse ('P'): unnamed statement "", SQL, 0 pre-specified param OIDs
+      const sqlBuf = Buffer.from(sql, "utf8");
+      const parseBody = Buffer.allocUnsafe(1 + sqlBuf.length + 1 + 2);
+      parseBody.writeUInt8(0, 0);
+      sqlBuf.copy(parseBody, 1);
+      parseBody.writeUInt8(0, 1 + sqlBuf.length);
+      parseBody.writeInt16BE(0, 1 + sqlBuf.length + 1);
 
-    // Bind ('B'): portal "", statement "", 0 param format codes (all text), paramCount, values, 0 result format codes
-    const encodedParams = params.map(encodeParamValue);
-    const bindChunks: Buffer[] = [
-      Buffer.from([0, 0]), // portal="", statement=""
-      Buffer.from([0, 0, (encodedParams.length >> 8) & 0xff, encodedParams.length & 0xff]),
-    ];
-    // wait — param format codes count (Int16=0) + param count (Int16=N)
-    bindChunks[1] = Buffer.allocUnsafe(4);
-    bindChunks[1].writeInt16BE(0, 0);
-    bindChunks[1].writeInt16BE(encodedParams.length, 2);
+      // Bind ('B'): portal "", statement "", 0 param format codes (all text), paramCount, values, 0 result format codes
+      const encodedParams = params.map(encodeParamValue);
+      const bindHeader = Buffer.allocUnsafe(6);
+      bindHeader.writeUInt8(0, 0); // portal=""
+      bindHeader.writeUInt8(0, 1); // statement=""
+      bindHeader.writeInt16BE(0, 2); // 0 param format codes
+      bindHeader.writeInt16BE(encodedParams.length, 4);
+      const bindChunks: Buffer[] = [bindHeader];
 
-    for (const p of encodedParams) {
-      const lenBuf = Buffer.allocUnsafe(4);
-      if (p === null) {
-        lenBuf.writeInt32BE(-1, 0);
-        bindChunks.push(lenBuf);
-      } else {
-        lenBuf.writeInt32BE(p.length, 0);
-        bindChunks.push(lenBuf, p);
+      for (const p of encodedParams) {
+        const lenBuf = Buffer.allocUnsafe(4);
+        if (p === null) {
+          lenBuf.writeInt32BE(-1, 0);
+          bindChunks.push(lenBuf);
+        } else {
+          lenBuf.writeInt32BE(p.length, 0);
+          bindChunks.push(lenBuf, p);
+        }
       }
-    }
-    const resultFmtBuf = Buffer.allocUnsafe(2);
-    resultFmtBuf.writeInt16BE(0, 0);
-    bindChunks.push(resultFmtBuf);
+      const resultFmtBuf = Buffer.allocUnsafe(2);
+      resultFmtBuf.writeInt16BE(0, 0);
+      bindChunks.push(resultFmtBuf);
 
-    // Describe ('D') portal ""
-    const describeBody = Buffer.from([0x50, 0x00]); // 'P', ""
-    // Execute ('E') portal "", maxRows=0
-    const executeBody = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00]);
-    // Sync ('S')
-    const syncMsg = buildTypedMessage("S", Buffer.alloc(0));
+      // Describe ('D') portal ""
+      const describeBody = Buffer.from([0x50, 0x00]); // 'P', ""
+      // Execute ('E') portal "", maxRows=0
+      const executeBody = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x00]);
+      // Sync ('S')
+      const syncMsg = buildTypedMessage("S", Buffer.alloc(0));
 
-    const wirePacket = Buffer.concat([
-      buildTypedMessage("P", parseBody),
-      buildTypedMessage("B", Buffer.concat(bindChunks)),
-      buildTypedMessage("D", describeBody),
-      buildTypedMessage("E", executeBody),
-      syncMsg,
-    ]);
-    this.socket.write(wirePacket);
-    return this.collectQueryResult<TRow>();
+      const wirePacket = Buffer.concat([
+        buildTypedMessage("P", parseBody),
+        buildTypedMessage("B", Buffer.concat(bindChunks)),
+        buildTypedMessage("D", describeBody),
+        buildTypedMessage("E", executeBody),
+        syncMsg,
+      ]);
+      this.socket.write(wirePacket);
+      return this.collectQueryResult<TRow>();
+    });
   }
 
   private async collectQueryResult<TRow extends Record<string, unknown>>(): Promise<
