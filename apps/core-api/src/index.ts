@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
+import { types } from "node:util";
 import {
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
@@ -342,8 +343,17 @@ export class CoreApiService {
         clockFn:
           options?.clockFn ??
           (() => {
+            if (types.isAsyncFunction(this.store.clockTimestampIso)) {
+              return new Date();
+            }
             const iso = this.store.clockTimestampIso();
-            return typeof iso === "string" ? new Date(iso) : new Date();
+            if (typeof iso === "string") {
+              return new Date(iso);
+            }
+            if (iso && typeof (iso as Promise<unknown>).catch === "function") {
+              void (iso as Promise<unknown>).catch(() => {});
+            }
+            return new Date();
           }),
       });
   }

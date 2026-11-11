@@ -362,17 +362,22 @@ export class WnaWorkerDaemon {
       securityMetadata = spawnRes.securityMetadata;
 
       let timedOut = false;
+      let agentTimeoutId: ReturnType<typeof setTimeout> | undefined;
       const exitRes = await Promise.race([
         spawnRes.exitPromise,
         new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdoutTail?: string; stderrTail?: string }>(
           (resolveTimeout) => {
-            setTimeout(() => {
+            agentTimeoutId = setTimeout(() => {
               timedOut = true;
               resolveTimeout({ code: 124, signal: "SIGKILL", stdoutTail: "", stderrTail: "Agent execution timeout" });
             }, plan.timeoutMs);
           }
         ),
-      ]);
+      ]).finally(() => {
+        if (agentTimeoutId !== undefined) {
+          clearTimeout(agentTimeoutId);
+        }
+      });
 
       if (timedOut) {
         cleanupEvidence = await this.sandboxBackend.killAndVerifyClean(task.task_id, lease.lease_epoch);

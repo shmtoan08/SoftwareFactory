@@ -2008,8 +2008,8 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
       });
       const lease2 = await coreClient.dispatchTaskLease(projectAId, authOp, task2.task_id, {
         worker_id: `pg-worker-orphan-${suffix}`,
-        heartbeat_interval_ms: 500,
-        lease_ttl_ms: 2000,
+        heartbeat_interval_ms: 1000,
+        lease_ttl_ms: 5000,
       });
       const wt2 = tokenService.issueLeasePushToken({
         projectId: projectAId,
@@ -2033,13 +2033,35 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
         worktreeBaseDir,
         outboxDir,
       });
+      const adapter2 = new WorkspaceCodingAgentAdapter({
+        writerProvider: "anthropic",
+        writerModel: "claude-sonnet-4",
+        editsResolver: () => [
+          {
+            path: "src/calculator.mjs",
+            content:
+              VALID_CALCULATOR_SUBTRACT_SOURCE +
+              "\nexport function divide(a, b) {\n  return a / b;\n}\n",
+          },
+          {
+            path: "test/calc-orphan.agent.test.mjs",
+            content: [
+              'import assert from "node:assert/strict";',
+              'import { divide } from "../src/calculator.mjs";',
+              "assert.equal(divide(12, 3), 4);",
+              'console.log("tier3-orphan-agent-test-pass");',
+              "",
+            ].join("\n"),
+          },
+        ],
+      });
       const crashRes2 = await daemon2.executeLease({
         task: task2,
         lease: lease2,
         repoBarePath: gitA.bareRepoDir,
         gitPushToken: gp2,
         preReceiveUrl: gwInfo.url,
-        adapter,
+        adapter: adapter2,
         stagingRefKind: "staging",
         isolateNamespaces: false,
         dropPrivileges: false,
@@ -2047,8 +2069,8 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
       });
       assert.equal(crashRes2.outcome, "SIMULATED_CRASH_BEFORE_COMPLETED");
 
-      // Wait for real PostgreSQL clock_timestamp() to pass 2000ms TTL
-      await new Promise((r) => setTimeout(r, 2150));
+      // Wait for real PostgreSQL clock_timestamp() to pass 5000ms TTL
+      await new Promise((r) => setTimeout(r, 5150));
       const recoveredPg = await coreClient.runOrphanedPushReconciler(projectAId, authOp);
       const matchedRec = recoveredPg.find((r) => r.task_id === task2.task_id);
       assert.ok(matchedRec);

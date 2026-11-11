@@ -1279,6 +1279,25 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     const trackedPids = new Set<number>(this.activeSandboxes.get(k) ?? []);
     const managed = this.managedProcesses.get(k) ?? [];
 
+    const waitForExitWithTimeout = async (
+      exitPromise: Promise<unknown>,
+      ms: number
+    ): Promise<boolean> => {
+      let timerId: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          exitPromise.then(() => true),
+          new Promise<boolean>((r) => {
+            timerId = setTimeout(() => r(false), ms);
+          }),
+        ]);
+      } finally {
+        if (timerId !== undefined) {
+          clearTimeout(timerId);
+        }
+      }
+    };
+
     if (mode === "real-cgroup-v2") {
       try {
         for (const p of readFileSync(join(cgroupPath, "cgroup.procs"), "utf8")
@@ -1322,10 +1341,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
             // already exited
           }
         }
-        const settled = await Promise.race([
-          proc.exitPromise.then(() => true),
-          new Promise<boolean>((r) => setTimeout(() => r(false), 3000)),
-        ]);
+        const settled = await waitForExitWithTimeout(proc.exitPromise, 3000);
         if (!settled && proc.supervisorPid !== undefined) {
           try {
             process.kill(-proc.pid, "SIGKILL");
@@ -1337,7 +1353,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
           } catch {
             // ignore
           }
-          await Promise.race([proc.exitPromise, new Promise((r) => setTimeout(r, 1000))]);
+          await waitForExitWithTimeout(proc.exitPromise, 1000);
         }
       }
 
@@ -1391,6 +1407,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     }
 
     if (mode === "real-process") {
+
       for (const proc of managed) {
         if (proc.supervisorPid !== undefined) {
           for (const d of findLinuxDescendantPids(proc.supervisorPid)) {
@@ -1403,10 +1420,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
               // already exited
             }
           }
-          const settled = await Promise.race([
-            proc.exitPromise.then(() => true),
-            new Promise<boolean>((r) => setTimeout(() => r(false), 3000)),
-          ]);
+          const settled = await waitForExitWithTimeout(proc.exitPromise, 3000);
           if (!settled) {
             for (const d of findLinuxDescendantPids(proc.supervisorPid)) {
               trackedPids.add(d);
@@ -1426,7 +1440,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
             } catch {
               // ignore
             }
-            await Promise.race([proc.exitPromise, new Promise((r) => setTimeout(r, 1000))]);
+            await waitForExitWithTimeout(proc.exitPromise, 1000);
           }
         } else {
           try {
@@ -1438,7 +1452,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
               // already exited
             }
           }
-          await Promise.race([proc.exitPromise, new Promise((r) => setTimeout(r, 3000))]);
+          await waitForExitWithTimeout(proc.exitPromise, 3000);
         }
       }
 
