@@ -661,6 +661,9 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
         { debugHeader: "git_push_token=abc123" },
         { envDump: ["GITHUB", "_TOKEN=demo_value_123"].join("") },
         { pemPayload: ["-----BEGIN ", "PRIVATE ", "KEY-----"].join("") },
+        { snapshotStore: { developerScratchpad: "spoofed snapshotStore payload" } },
+        { sandboxBackend: { customNote: "Authorization: Bearer secret-bearer-token-1234567890" } },
+        { helperFn: Object.assign(() => {}, { developerScratchpad: "hidden on fn" }) },
       ];
       for (const forbiddenPayload of forbiddenPayloads) {
         await assert.rejects(
@@ -689,6 +692,40 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
             err instanceof ReviewerContextLeakError && err.code === "ERR_REVIEWER_CONTEXT_LEAK"
         );
       }
+
+      const taintedRealBackend = Object.assign(new LinuxCgroupV2SandboxBackend(), {
+        leakedNote: "Authorization: Bearer secret-bearer-token-1234567890",
+      });
+      await assert.rejects(
+        () =>
+          fx.reviewerService.executeIndependentReview({
+            reviewSessionId: "99999999-9999-4999-8999-999999999900",
+            projectId: fx.projectId,
+            taskId: prep.task.task_id,
+            mergeCandidateId: prep.mergeCandidate.merge_candidate_id,
+            mergeCandidateHash: prep.mergeCandidate.merge_candidate_hash,
+            verifiedTreeHash: prep.mergeCandidate.verified_tree_hash,
+            baseMainCommitHash: prep.mergeCandidate.base_main_commit_hash,
+            snapshotPath: prep.mergeCandidate.snapshot_path!,
+            snapshotSha256: prep.mergeCandidate.snapshot_sha256!,
+            taskContract: fx.contract,
+            verificationRun: prep.finalRun,
+            reviewerIdentity: {
+              principalId: "rev-tainted-backend",
+              credentialId: "rev-cred-tainted-1",
+              sessionId: "rev-sess-tainted-1",
+              agentProfileId: "profile-reviewer-sec",
+              provider: "google",
+              model: "gemini-2.5-pro",
+              role: "ROLE_REVIEWER_READONLY",
+            },
+            repoPath: fx.bareRepoDir,
+            tier3TestFiles: ["test/calc.agent.test.mjs"],
+            sandboxBackend: taintedRealBackend,
+          }),
+        (err: unknown) =>
+          err instanceof ReviewerContextLeakError && err.code === "ERR_REVIEWER_CONTEXT_LEAK"
+      );
 
       // Clean execution verifies whitelist input, read-only extracted snapshot, and sandbox reap
       let capturedCleanInputKeys: string[] = [];
@@ -1401,6 +1438,22 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(postSwapState.reqB?.status, "PENDING");
 
       // Part D (M4-FIX-06): Fail closed (409 ERR_APPROVAL_EXPIRED_OR_STALE) when APPROVED has no PENDING ApprovalRequest
+      assert.throws(
+        () => fx.store.deleteApprovalRequestForTest(revBindB.approvalRequest!.approval_request_id),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "42501"
+      );
+      await assert.rejects(
+        () =>
+          fx.store.withRlsTransaction(
+            {
+              currentProjectId: "00000000-0000-4000-8000-000000000999",
+              currentPrincipalId: "approver-bob",
+              currentRole: "core_api_service",
+            },
+            () => fx.store.deleteApprovalRequestForTest(revBindB.approvalRequest!.approval_request_id)
+          ),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "42501"
+      );
       const deletedReq = await fx.store.withRlsTransaction(
         {
           currentProjectId: fx.projectId,
@@ -1513,6 +1566,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(midCrashDb.ops[0]?.status, "IN_PROGRESS");
 
       // Execute 5 consecutive retries -> 1st reconciles lost response, retries 2..5 remain idempotent
+      const retryMergeOpIds: Array<string | undefined> = [];
       for (let attempt = 1; attempt <= 5; attempt++) {
         const res = await fx.coreApi.executeCasMerge(fx.projectId, fx.authOp, {
           task_id: prep.task.task_id,
@@ -1524,6 +1578,8 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
         assert.equal(res.task_status, "MergedAndCompleted");
         assert.equal(res.merged_commit_hash, prep.mergeCandidate.merge_candidate_hash);
         assert.equal(res.reconciled_after_lost_response, true);
+        assert.ok(res.merge_op_id);
+        retryMergeOpIds.push(res.merge_op_id);
       }
 
       // Git history count and merge_operations count never duplicated!
@@ -1549,6 +1605,8 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       assert.equal(afterRetries.ops[0]?.status, "MERGED");
       assert.equal(afterRetries.ops[0]?.reconciled_after_lost_response, true);
       assert.equal(afterRetries.ops[0]?.retry_count, 1);
+      assert.equal(new Set(retryMergeOpIds).size, 1);
+      assert.equal(retryMergeOpIds[0], afterRetries.ops[0]?.merge_op_id);
       assert.equal(
         afterRetries.events.filter((e) => e.event_type === "task.merged_reconciled").length,
         1

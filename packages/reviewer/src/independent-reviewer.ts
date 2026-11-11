@@ -288,7 +288,7 @@ function assertNoForbiddenContextKeys(
     assertStringHasNoForbiddenContext(value, path, seen);
     return;
   }
-  if (value === null || typeof value !== "object") {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) {
     return;
   }
   if (seen.has(value)) {
@@ -331,7 +331,7 @@ function assertNoForbiddenContextKeys(
         `ERR_REVIEWER_CONTEXT_LEAK: Forbidden developer context field '${key}' detected at ${path}`
       );
     }
-    if (key === "snapshotStore" || key === "sandboxBackend" || typeof nested === "function") {
+    if (key === "managedProcesses" && value instanceof LinuxCgroupV2SandboxBackend) {
       continue;
     }
     assertNoForbiddenContextKeys(nested, `${path}.${key}`, seen);

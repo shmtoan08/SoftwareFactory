@@ -2575,7 +2575,16 @@ export class SoftwareFactoryControlPlaneStore {
     refs?.delete(refName);
   }
 
+  /**
+   * @internal Test-only fault-injection helper for verifying fail-closed `409 ERR_APPROVAL_EXPIRED_OR_STALE`
+   * when an `ApprovalRequest` record is absent. Requires an active RLS write transaction for the record's project.
+   */
   public deleteApprovalRequestForTest(approvalRequestId: string): boolean {
+    const existing = this.approvalRequests.get(approvalRequestId);
+    if (!existing) {
+      return false;
+    }
+    this.assertWritePermissionForProject(existing.project_id);
     return this.approvalRequests.delete(approvalRequestId);
   }
 
@@ -2715,7 +2724,7 @@ export class SoftwareFactoryControlPlaneStore {
           task_status: "MergedAndCompleted",
           merged_commit_hash: task.merged_commit_hash,
           main_ref_commit_hash: currentMainSha,
-          merge_op_id: existingOp?.merge_op_id ?? randomUUID(),
+          ...(existingOp ? { merge_op_id: existingOp.merge_op_id } : {}),
           reconciled_after_lost_response: existingOp?.reconciled_after_lost_response ?? false,
         };
       }

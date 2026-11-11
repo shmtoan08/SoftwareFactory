@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js 22.x
         uses: actions/setup-node@v4
@@ -58,6 +60,7 @@ jobs:
         run: |
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0001_mvp_core_schema_and_rls.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
           psql -v ON_ERROR_STOP=1 <<'SQL'
@@ -541,6 +544,185 @@ jobs:
           END
           $$;
           SQL
+
+      - name: Verify Upgrade Path from Pre-Fix M4 Schema (86076639 -> HEAD)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGDATABASE: software_factory_upgrade_test
+          PGUSER: factory_admin
+          PGPASSWORD: factory_secret_password
+        run: |
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_upgrade_test;"
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE software_factory_upgrade_test;"
+
+          # 1. Install pre-fix M4 schema baseline (commit 86076639)
+          git show 86076639:packages/database/migrations/0001_mvp_core_schema_and_rls.sql | psql -v ON_ERROR_STOP=1
+          git show 86076639:packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql | psql -v ON_ERROR_STOP=1
+          git show 86076639:packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql | psql -v ON_ERROR_STOP=1
+
+          # 2. Seed existing M4 rows BEFORE running the upgraded migration
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            v_proj UUID := '33333333-3333-3333-3333-333333333333';
+            v_task UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_lease UUID := 'c3333333-3333-3333-3333-333333333333';
+            v_imp UUID := 'd3333333-3333-3333-3333-333333333333';
+            v_cand1 UUID := 'e3333333-3333-3333-3333-333333333333';
+            v_cand2 UUID := 'e3333333-3333-3333-3333-333333333334';
+            v_vr1 UUID := 'f3333333-3333-3333-3333-333333333333';
+            v_vr2 UUID := 'f3333333-3333-3333-3333-333333333334';
+            v_rs1 UUID := '13333333-3333-3333-3333-333333333333';
+            v_rs2 UUID := '13333333-3333-3333-3333-333333333334';
+            v_ra1 UUID := '23333333-3333-3333-3333-333333333333';
+            v_ra2 UUID := '23333333-3333-3333-3333-333333333334';
+            v_ar1 UUID := '53333333-3333-3333-3333-333333333333';
+            v_ar2 UUID := '53333333-3333-3333-3333-333333333334';
+            v_ad1 UUID := '63333333-3333-3333-3333-333333333333';
+          BEGIN
+            INSERT INTO projects (project_id, slug, name, repo_bare_path, default_branch, approval_ttl_seconds)
+            VALUES (v_proj, 'm4-upg-proj', 'M4 Upgrade Test', '/var/git/m4-upg.git', 'main', 3600);
+            INSERT INTO tasks (task_id, project_id, title, task_contract_json, status, base_main_commit_hash, current_attempt_no)
+            VALUES (v_task, v_proj, 'Upgrade Task', '{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('1', 40), 1);
+            INSERT INTO task_leases (lease_id, project_id, task_id, attempt_no, lease_epoch, worker_id, status, task_execution_idempotency_key, last_processed_seq, heartbeat_interval_ms, lease_ttl_ms, expires_at)
+            VALUES (v_lease, v_proj, v_task, 1, 1, 'worker-upg', 'COMPLETED', repeat('a', 64), 1, 10000, 35000, clock_timestamp() + interval '1 hour');
+            INSERT INTO verified_code_imports (import_id, project_id, task_id, lease_id, lease_epoch, agent_commit_hash, verified_tree_hash, staging_ref, changed_files_count, deleted_lines_count)
+            VALUES (v_imp, v_proj, v_task, v_lease, 1, repeat('3', 40), repeat('4', 40), 'refs/factory/Verify/' || v_task || '/1', 1, 0);
+            INSERT INTO merge_candidates (merge_candidate_id, project_id, task_id, import_id, agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash)
+            VALUES
+              (v_cand1, v_proj, v_task, v_imp, repeat('3', 40), repeat('1', 40), repeat('5', 40), repeat('4', 40)),
+              (v_cand2, v_proj, v_task, v_imp, repeat('3', 40), repeat('6', 40), repeat('7', 40), repeat('8', 40));
+            INSERT INTO verification_runs (verification_run_id, project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash, verifier_image_digest, verdict, overall_status, tier1_trusted_acceptance_passed, tier2_protected_baseline_passed, tier3_agent_tests_passed, exit_code, duration_ms, report_sha256)
+            VALUES
+              (v_vr1, v_proj, v_task, v_cand1, repeat('5', 40), repeat('4', 40), 'sha256:test', 'PASS', 'PASSED', true, true, true, 0, 10, repeat('a', 64)),
+              (v_vr2, v_proj, v_task, v_cand2, repeat('7', 40), repeat('8', 40), 'sha256:test', 'PASS', 'PASSED', true, true, true, 0, 10, repeat('b', 64));
+            INSERT INTO review_sessions (review_session_id, project_id, task_id, merge_candidate_id, verification_run_id, reviewer_principal_id, reviewer_credential_id, reviewer_agent_profile_id, reviewer_provider, reviewer_model, role, sandbox_backend_mode, status)
+            VALUES
+              (v_rs1, v_proj, v_task, v_cand1, v_vr1, 'rev-u1', 'rev-cred-u1', 'prof-rev-u', 'google', 'gemini-2.5-pro', 'ROLE_REVIEWER_READONLY', 'linux-supervisor', 'COMPLETED'),
+              (v_rs2, v_proj, v_task, v_cand2, v_vr2, 'rev-u2', 'rev-cred-u2', 'prof-rev-u', 'google', 'gemini-2.5-pro', 'ROLE_REVIEWER_READONLY', 'linux-supervisor', 'COMPLETED');
+            INSERT INTO review_artifacts (review_artifact_id, project_id, task_id, merge_candidate_id, verification_run_id, merge_candidate_hash, verified_tree_hash, writer_provider, writer_model, reviewer_provider, reviewer_model, developer_principal_id, reviewer_principal_id, developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id, developer_agent_profile_id, reviewer_agent_profile_id, review_session_id, verdict, status)
+            VALUES
+              (v_ra1, v_proj, v_task, v_cand1, v_vr1, repeat('5', 40), repeat('4', 40), 'anthropic', 'claude-sonnet-4', 'google', 'gemini-2.5-pro', 'dev-u', 'rev-u1', 'dev-sess-u1', 'rev-sess-u1', 'dev-cred-u1', 'rev-cred-u1', 'prof-dev-u', 'prof-rev-u', v_rs1, 'PASS', 'VALID'),
+              (v_ra2, v_proj, v_task, v_cand2, v_vr2, repeat('7', 40), repeat('8', 40), 'anthropic', 'claude-sonnet-4', 'google', 'gemini-2.5-pro', 'dev-u', 'rev-u2', 'dev-sess-u2', 'rev-sess-u2', 'dev-cred-u2', 'rev-cred-u2', 'prof-dev-u', 'prof-rev-u', v_rs2, 'PASS', 'VALID');
+            INSERT INTO approval_requests (approval_request_id, project_id, task_id, merge_candidate_id, agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash, verification_run_id, review_artifact_id, status, expires_at, created_at)
+            VALUES
+              (v_ar1, v_proj, v_task, v_cand1, repeat('3', 40), repeat('1', 40), repeat('5', 40), repeat('4', 40), v_vr1, v_ra1, 'APPROVED', clock_timestamp() + interval '1 hour', clock_timestamp()),
+              (v_ar2, v_proj, v_task, v_cand2, repeat('3', 40), repeat('6', 40), repeat('7', 40), repeat('8', 40), v_vr2, v_ra2, 'PENDING',  clock_timestamp() + interval '1 hour', clock_timestamp());
+            INSERT INTO approval_decisions (approval_id, project_id, task_id, merge_candidate_id, agent_commit_hash, base_main_commit_hash, verified_tree_hash, merge_candidate_hash, verification_run_id, review_artifact_id, approval_request_id, approver_principal_id, decision, status, approved_at, expires_at)
+            VALUES
+              (v_ad1, v_proj, v_task, v_cand1, repeat('3', 40), repeat('1', 40), repeat('4', 40), repeat('5', 40), v_vr1, v_ra1, v_ar1, 'alice-approver', 'APPROVED', 'ACTIVE', clock_timestamp(), clock_timestamp() + interval '1 hour');
+          END
+          $$;
+          SQL
+
+          # 3. Apply upgraded HEAD 0004 twice (upgrade + idempotent re-run) on pre-populated DB
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
+
+          # 4. Assert upgraded constraints actually replaced the old definitions
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            v_proj UUID := '33333333-3333-3333-3333-333333333333';
+            v_task UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_cand2 UUID := 'e3333333-3333-3333-3333-333333333334';
+            v_vr2 UUID := 'f3333333-3333-3333-3333-333333333334';
+            v_ra2 UUID := '23333333-3333-3333-3333-333333333334';
+            v_ar1 UUID := '53333333-3333-3333-3333-333333333333';
+            v_caught BOOLEAN := false;
+            v_uq_cols INTEGER;
+            v_fk_cols INTEGER;
+            v_fk_ref_cols INTEGER;
+          BEGIN
+            SELECT array_length(conkey, 1) INTO v_uq_cols
+            FROM pg_constraint
+            WHERE conname = 'uq_ar_composite_binding'
+              AND conrelid = 'approval_requests'::regclass;
+            IF COALESCE(v_uq_cols, 0) <> 10 THEN
+              RAISE EXCEPTION 'Expected 10-column uq_ar_composite_binding after upgrade, got %', v_uq_cols;
+            END IF;
+
+            SELECT array_length(conkey, 1), array_length(confkey, 1) INTO v_fk_cols, v_fk_ref_cols
+            FROM pg_constraint
+            WHERE conname = 'fk_ad_approval_request'
+              AND conrelid = 'approval_decisions'::regclass
+              AND confrelid = 'approval_requests'::regclass;
+            IF COALESCE(v_fk_cols, 0) <> 10 OR COALESCE(v_fk_ref_cols, 0) <> 10 THEN
+              RAISE EXCEPTION 'Expected 10-column fk_ad_approval_request after upgrade, got % -> %', v_fk_cols, v_fk_ref_cols;
+            END IF;
+
+            -- Case-insensitive chk_ra_independent_credential probe on upgraded DB
+            v_caught := false;
+            BEGIN
+              INSERT INTO review_artifacts (
+                review_artifact_id, project_id, task_id, merge_candidate_id, verification_run_id,
+                merge_candidate_hash, verified_tree_hash, writer_provider, writer_model,
+                reviewer_provider, reviewer_model, developer_principal_id, reviewer_principal_id,
+                developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
+                developer_agent_profile_id, reviewer_agent_profile_id, verdict
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_task, v_cand2, v_vr2,
+                repeat('7', 40), repeat('8', 40), 'anthropic', 'claude-sonnet-4',
+                'google', 'gemini-2.5-pro', 'dev-u', 'rev-u2',
+                'dev-sess-u3', 'rev-sess-u3', 'Shared-Cred', ' shared-cred ',
+                'prof-dev-u', 'prof-rev-u', 'PASS'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Upgraded chk_ra_independent_credential failed to reject case-insensitive duplicate';
+            END IF;
+
+            -- Case-insensitive chk_independent_reviewer_session probe on upgraded DB
+            v_caught := false;
+            BEGIN
+              INSERT INTO review_artifacts (
+                review_artifact_id, project_id, task_id, merge_candidate_id, verification_run_id,
+                merge_candidate_hash, verified_tree_hash, writer_provider, writer_model,
+                reviewer_provider, reviewer_model, developer_principal_id, reviewer_principal_id,
+                developer_session_id, reviewer_session_id, developer_credential_id, reviewer_credential_id,
+                developer_agent_profile_id, reviewer_agent_profile_id, verdict
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_task, v_cand2, v_vr2,
+                repeat('7', 40), repeat('8', 40), 'anthropic', 'claude-sonnet-4',
+                'google', 'gemini-2.5-pro', 'dev-u', 'rev-u2',
+                'Shared-Sess', ' shared-sess ', 'dev-cred-u3', 'rev-cred-u3',
+                'prof-dev-u', 'prof-rev-u', 'PASS'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Upgraded chk_independent_reviewer_session failed to reject case-insensitive duplicate';
+            END IF;
+
+            -- 10-column composite FK fk_ad_approval_request negative probe on upgraded DB
+            v_caught := false;
+            BEGIN
+              INSERT INTO approval_decisions (
+                approval_id, project_id, task_id, merge_candidate_id,
+                agent_commit_hash, base_main_commit_hash, verified_tree_hash, merge_candidate_hash,
+                verification_run_id, review_artifact_id, approval_request_id, approver_principal_id,
+                decision, status, approved_at, expires_at
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_task, v_cand2,
+                repeat('3', 40), repeat('6', 40), repeat('8', 40), repeat('7', 40),
+                v_vr2, v_ra2, v_ar1, 'alice-approver',
+                'APPROVED', 'ACTIVE', clock_timestamp(), clock_timestamp() + interval '1 hour'
+              );
+            EXCEPTION WHEN foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Upgraded 10-column fk_ad_approval_request failed to reject mismatched approval_request_id';
+            END IF;
+
+            RAISE NOTICE 'M4 Upgrade Path Verification (86076639 -> HEAD) PASSED.';
+          END
+          $$;
+          SQL
+
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_upgrade_test;"
 
       - name: Prepare Optional Docker Verifier Base Image
         run: docker pull node:22-alpine || true

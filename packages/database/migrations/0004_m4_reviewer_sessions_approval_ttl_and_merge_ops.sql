@@ -50,20 +50,17 @@ BEGIN
       CHECK (status IN ('VALID', 'INVALIDATED_STALE_CANDIDATE', 'INVALIDATED_STALE_BASE'));
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'chk_ra_independent_credential'
-  ) THEN
-    ALTER TABLE review_artifacts
-      ADD CONSTRAINT chk_ra_independent_credential
-      CHECK (
-        (developer_credential_id IS NULL AND reviewer_credential_id IS NULL)
-        OR (
-          NULLIF(btrim(developer_credential_id), '') IS NOT NULL
-          AND NULLIF(btrim(reviewer_credential_id), '') IS NOT NULL
-          AND lower(btrim(developer_credential_id)) IS DISTINCT FROM lower(btrim(reviewer_credential_id))
-        )
-      );
-  END IF;
+  ALTER TABLE review_artifacts DROP CONSTRAINT IF EXISTS chk_ra_independent_credential;
+  ALTER TABLE review_artifacts
+    ADD CONSTRAINT chk_ra_independent_credential
+    CHECK (
+      (developer_credential_id IS NULL AND reviewer_credential_id IS NULL)
+      OR (
+        NULLIF(btrim(developer_credential_id), '') IS NOT NULL
+        AND NULLIF(btrim(reviewer_credential_id), '') IS NOT NULL
+        AND lower(btrim(developer_credential_id)) IS DISTINCT FROM lower(btrim(reviewer_credential_id))
+      )
+    );
 
   -- Align chk_independent_reviewer_session with case-insensitive checks across pre-existing 0001 schemas
   ALTER TABLE review_artifacts DROP CONSTRAINT IF EXISTS chk_independent_reviewer_session;
@@ -75,20 +72,17 @@ BEGIN
       AND lower(btrim(developer_session_id)) IS DISTINCT FROM lower(btrim(reviewer_session_id))
     );
 
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'chk_ra_independent_agent_profile'
-  ) THEN
-    ALTER TABLE review_artifacts
-      ADD CONSTRAINT chk_ra_independent_agent_profile
-      CHECK (
-        (developer_agent_profile_id IS NULL AND reviewer_agent_profile_id IS NULL)
-        OR (
-          NULLIF(btrim(developer_agent_profile_id), '') IS NOT NULL
-          AND NULLIF(btrim(reviewer_agent_profile_id), '') IS NOT NULL
-          AND lower(btrim(developer_agent_profile_id)) IS DISTINCT FROM lower(btrim(reviewer_agent_profile_id))
-        )
-      );
-  END IF;
+  ALTER TABLE review_artifacts DROP CONSTRAINT IF EXISTS chk_ra_independent_agent_profile;
+  ALTER TABLE review_artifacts
+    ADD CONSTRAINT chk_ra_independent_agent_profile
+    CHECK (
+      (developer_agent_profile_id IS NULL AND reviewer_agent_profile_id IS NULL)
+      OR (
+        NULLIF(btrim(developer_agent_profile_id), '') IS NOT NULL
+        AND NULLIF(btrim(reviewer_agent_profile_id), '') IS NOT NULL
+        AND lower(btrim(developer_agent_profile_id)) IS DISTINCT FROM lower(btrim(reviewer_agent_profile_id))
+      )
+    );
 
   IF NOT EXISTS (
     SELECT 1 FROM pg_constraint WHERE conname = 'chk_ra_report_sha256_hex'
@@ -168,27 +162,56 @@ ALTER TABLE approval_decisions
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'uq_ad_id_project'
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'uq_ad_id_project'
+      AND conrelid = 'approval_decisions'::regclass
   ) THEN
     ALTER TABLE approval_decisions
       ADD CONSTRAINT uq_ad_id_project UNIQUE (approval_id, project_id);
   END IF;
 
+  -- Drop legacy or existing fk_ad_approval_request BEFORE adding/updating uq_ar_composite_binding
+  -- so upgrades from pre-fix M4 schemas cleanly replace the 2-column FK with the 10-column composite FK.
+  ALTER TABLE approval_decisions DROP CONSTRAINT IF EXISTS fk_ad_approval_request;
+
   IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'fk_ad_approval_request'
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'uq_ar_composite_binding'
+      AND conrelid = 'approval_requests'::regclass
   ) THEN
-    ALTER TABLE approval_decisions
-      ADD CONSTRAINT fk_ad_approval_request
-      FOREIGN KEY (
+    ALTER TABLE approval_requests
+      ADD CONSTRAINT uq_ar_composite_binding UNIQUE (
         approval_request_id, project_id, task_id, merge_candidate_id,
         agent_commit_hash, base_main_commit_hash, merge_candidate_hash,
         verified_tree_hash, verification_run_id, review_artifact_id
-      ) REFERENCES approval_requests(
-        approval_request_id, project_id, task_id, merge_candidate_id,
-        agent_commit_hash, base_main_commit_hash, merge_candidate_hash,
-        verified_tree_hash, verification_run_id, review_artifact_id
-      ) ON DELETE RESTRICT;
+      );
+  ELSE
+    PERFORM 1 FROM pg_constraint
+    WHERE conname = 'uq_ar_composite_binding'
+      AND conrelid = 'approval_requests'::regclass
+      AND array_length(conkey, 1) = 10;
+    IF NOT FOUND THEN
+      ALTER TABLE approval_requests DROP CONSTRAINT uq_ar_composite_binding;
+      ALTER TABLE approval_requests
+        ADD CONSTRAINT uq_ar_composite_binding UNIQUE (
+          approval_request_id, project_id, task_id, merge_candidate_id,
+          agent_commit_hash, base_main_commit_hash, merge_candidate_hash,
+          verified_tree_hash, verification_run_id, review_artifact_id
+        );
+    END IF;
   END IF;
+
+  ALTER TABLE approval_decisions
+    ADD CONSTRAINT fk_ad_approval_request
+    FOREIGN KEY (
+      approval_request_id, project_id, task_id, merge_candidate_id,
+      agent_commit_hash, base_main_commit_hash, merge_candidate_hash,
+      verified_tree_hash, verification_run_id, review_artifact_id
+    ) REFERENCES approval_requests(
+      approval_request_id, project_id, task_id, merge_candidate_id,
+      agent_commit_hash, base_main_commit_hash, merge_candidate_hash,
+      verified_tree_hash, verification_run_id, review_artifact_id
+    ) ON DELETE RESTRICT;
 END
 $$;
 
