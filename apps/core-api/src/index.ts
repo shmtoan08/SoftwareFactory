@@ -1838,7 +1838,7 @@ export class CoreApiService {
         const hasRealRepo = this.isRealGitRepoOnDisk(effectiveRepo, input.git_dir);
         const liveMainCommitHash = hasRealRepo
           ? this.createRealGitCasBridge(effectiveRepo, input.git_dir).getCurrentMainHead()
-          : await this.store.getMainRefCommitHash();
+          : await this.store.getMainRefCommitHash(projectId);
 
         const fullLineage =
           (await this.store.getCandidateBoundLineage(task.task_id, liveMainCommitHash)) ?? undefined;
@@ -2105,7 +2105,7 @@ export class CoreApiService {
         const hasRealRepo = this.isRealGitRepoOnDisk(effectiveRepo, input.git_dir);
         const liveMainHead = hasRealRepo
           ? this.createRealGitCasBridge(effectiveRepo, input.git_dir).getCurrentMainHead()
-          : await this.store.getMainRefCommitHash();
+          : await this.store.getMainRefCommitHash(projectId);
 
         const lineage = await this.store.getCandidateBoundLineage(input.task_id, liveMainHead);
         if (!lineage) {

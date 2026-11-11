@@ -66,6 +66,45 @@ export function computePromptSha256(spec: PromptTemplateSpec): string {
 
 const PLACEHOLDER_REGEX = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 
+function deepCloneAndFreeze<T>(value: T): T {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    const clonedArr = value.map((item) => deepCloneAndFreeze(item));
+    return Object.freeze(clonedArr) as unknown as T;
+  }
+  const clonedObj: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    clonedObj[k] = deepCloneAndFreeze(v);
+  }
+  return Object.freeze(clonedObj) as unknown as T;
+}
+
+function compareSemverVersions(a: string, b: string): number {
+  const semverPattern = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/;
+  const ma = a.trim().match(semverPattern);
+  const mb = b.trim().match(semverPattern);
+  if (!ma || !mb) {
+    return 0;
+  }
+  for (let i = 1; i <= 3; i += 1) {
+    const na = Number.parseInt(ma[i]!, 10);
+    const nb = Number.parseInt(mb[i]!, 10);
+    if (na !== nb) {
+      return na - nb;
+    }
+  }
+  const preA = ma[4];
+  const preB = mb[4];
+  if (preA === undefined && preB !== undefined) return 1;
+  if (preA !== undefined && preB === undefined) return -1;
+  if (preA !== undefined && preB !== undefined && preA !== preB) {
+    return preA < preB ? -1 : 1;
+  }
+  return 0;
+}
+
 /**
  * Deterministic Immutable Prompt Version Registry (`M6A`).
  * Guarantees `(promptId, version)` cannot be silently mutated and tags every call
@@ -86,11 +125,11 @@ export class PromptRegistry {
       );
     }
 
-    const normalizedSpec: PromptTemplateSpec = {
+    const normalizedSpec: PromptTemplateSpec = deepCloneAndFreeze({
       ...spec,
       promptId,
       version,
-    };
+    });
     const promptSha256 = computePromptSha256(normalizedSpec);
 
     let versionMap = this.versionsByPromptId.get(promptId);
@@ -111,10 +150,10 @@ export class PromptRegistry {
       return existing;
     }
 
-    const registered: RegisteredPromptTemplate = {
+    const registered: RegisteredPromptTemplate = deepCloneAndFreeze({
       spec: normalizedSpec,
       promptSha256,
-    };
+    });
     versionMap.set(version, registered);
     return registered;
   }
@@ -136,7 +175,9 @@ export class PromptRegistry {
       return found;
     }
     const entries = [...versionMap.values()];
-    return entries[entries.length - 1]!;
+    return entries.reduce((best, candidate) =>
+      compareSemverVersions(candidate.spec.version, best.spec.version) >= 0 ? candidate : best
+    );
   }
 
   public listVersions(promptId: string): RegisteredPromptTemplate[] {

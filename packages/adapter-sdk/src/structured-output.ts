@@ -18,8 +18,8 @@ export class StructuredOutputValidationError extends Error {
  * Extracts strictly bounded JSON from model output text (`Fail-Closed`).
  * Accepts ONLY:
  * 1. Pure valid JSON covering the entire trimmed text, OR
- * 2. A single markdown code fence (` ```json ... ``` ` or ` ``` ... ``` `) covering the entire trimmed text.
- * Rejects responses with leading/trailing prose or multiple fenced blocks.
+ * 2. A single markdown code fence (` ```json ... ``` `) covering the entire trimmed text.
+ * Rejects responses with leading/trailing prose, bare fences, or multiple fenced blocks.
  */
 export function extractJsonFromModelText(rawText: string): unknown {
   if (typeof rawText !== "string") {
@@ -40,11 +40,11 @@ export function extractJsonFromModelText(rawText: string): unknown {
 
   let candidateJson = trimmed;
   if (trimmed.startsWith("```")) {
-    const fenceMatch = trimmed.match(/^```(?:json)?\s*\r?\n?([\s\S]*?)\r?\n?```$/i);
+    const fenceMatch = trimmed.match(/^```json[ \t]*\r?\n([\s\S]*?)(?:\r?\n)?```$/i);
     if (!fenceMatch) {
       throw new StructuredOutputValidationError(
-        "Model response contained an unclosed or trailing-prose code fence",
-        ["Code fence did not cleanly span entire output"],
+        "Model response contained an unclosed, untagged, or trailing-prose code fence",
+        ["Code fence must start with ```json and cleanly span entire output"],
         rawText
       );
     }
@@ -79,6 +79,39 @@ function describeRuntimeType(value: unknown): string {
   return typeof value;
 }
 
+function deepJsonEqual(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) {
+    return true;
+  }
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+    return false;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+      return false;
+    }
+    for (let i = 0; i < a.length; i += 1) {
+      if (!deepJsonEqual(a[i], b[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  const objA = a as Record<string, unknown>;
+  const objB = b as Record<string, unknown>;
+  const keysA = Object.keys(objA);
+  const keysB = Object.keys(objB);
+  if (keysA.length !== keysB.length) {
+    return false;
+  }
+  for (const key of keysA) {
+    if (!Object.hasOwn(objB, key) || !deepJsonEqual(objA[key], objB[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Validates parsed JSON value against a `StructuredJsonSchema`.
  * Returns an array of validation error strings (`[]` if valid).
@@ -90,8 +123,13 @@ export function validateAgainstJsonSchema(
 ): string[] {
   const errors: string[] = [];
 
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    errors.push(`${path}: invalid schema definition (expected object)`);
+    return errors;
+  }
+
   if (schema.enum !== undefined) {
-    const matchesEnum = schema.enum.some((allowed) => Object.is(allowed, value));
+    const matchesEnum = schema.enum.some((allowed) => deepJsonEqual(allowed, value));
     if (!matchesEnum) {
       errors.push(
         `${path}: expected one of [${schema.enum.map((v) => JSON.stringify(v)).join(", ")}], got ${JSON.stringify(value)}`
@@ -125,9 +163,15 @@ export function validateAgainstJsonSchema(
         errors.push(`${path}: string length ${value.length} > maxLength ${schema.maxLength}`);
       }
       if (schema.pattern !== undefined) {
-        const regex = new RegExp(schema.pattern);
-        if (!regex.test(value)) {
-          errors.push(`${path}: string does not match pattern /${schema.pattern}/`);
+        try {
+          const regex = new RegExp(schema.pattern);
+          if (!regex.test(value)) {
+            errors.push(`${path}: string does not match pattern /${schema.pattern}/`);
+          }
+        } catch (err: unknown) {
+          errors.push(
+            `${path}: invalid schema pattern /${schema.pattern}/: ${err instanceof Error ? err.message : String(err)}`
+          );
         }
       }
       return errors;
@@ -175,14 +219,17 @@ export function validateAgainstJsonSchema(
       const record = value as Record<string, unknown>;
       if (schema.required) {
         for (const reqKey of schema.required) {
-          if (record[reqKey] === undefined) {
+          const propSchema = schema.properties?.[reqKey];
+          if (!Object.hasOwn(record, reqKey) || record[reqKey] === undefined) {
             errors.push(`${path}.${reqKey}: missing required property`);
+          } else if (record[reqKey] === null && !propSchema) {
+            errors.push(`${path}.${reqKey}: required property cannot be null`);
           }
         }
       }
       if (schema.properties) {
         for (const [propKey, propSchema] of Object.entries(schema.properties)) {
-          if (record[propKey] !== undefined) {
+          if (Object.hasOwn(record, propKey) && record[propKey] !== undefined) {
             errors.push(
               ...validateAgainstJsonSchema(record[propKey], propSchema, `${path}.${propKey}`)
             );
@@ -197,6 +244,12 @@ export function validateAgainstJsonSchema(
           }
         }
       }
+      return errors;
+    }
+    default: {
+      errors.push(
+        `${path}: unsupported or missing schema type '${String((schema as { type?: unknown }).type)}'`
+      );
       return errors;
     }
   }

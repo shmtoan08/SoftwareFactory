@@ -1,8 +1,7 @@
-import { PromptRegistry } from "@software-factory/adapter-sdk";
+import { PromptRegistry, computePromptSha256 } from "@software-factory/adapter-sdk";
 import {
   type PromptTemplateSpec,
   type StructuredJsonSchema,
-  sha256Hex,
 } from "@software-factory/shared-types";
 
 export const STAGE1_DISCOVERY_PROMPT_ID = "stage1.discovery.extract";
@@ -16,9 +15,6 @@ export const STAGE3_ARCHITECTURE_PROMPT_VERSION = "1.0.0";
 
 export const STAGE4_CONSISTENCY_CHECK_PROMPT_ID = "stage4.consistency.check";
 export const STAGE4_CONSISTENCY_CHECK_PROMPT_VERSION = "1.0.0";
-export const STAGE4_CONSISTENCY_CHECK_PROMPT_SHA256 = sha256Hex(
-  `${STAGE4_CONSISTENCY_CHECK_PROMPT_ID}:${STAGE4_CONSISTENCY_CHECK_PROMPT_VERSION}`
-);
 
 export const STAGE1_DISCOVERY_OUTPUT_SCHEMA: StructuredJsonSchema = {
   type: "object",
@@ -93,6 +89,7 @@ const STAGE2_REQUIREMENT_ITEM_SCHEMA: StructuredJsonSchema = {
     },
     acceptance_criteria: {
       type: "array",
+      minItems: 1,
       items: {
         type: "object",
         additionalProperties: false,
@@ -167,6 +164,7 @@ export const STAGE3_ARCHITECTURE_OUTPUT_SCHEMA: StructuredJsonSchema = {
         overview: { type: "string", minLength: 1 },
         components: {
           type: "array",
+          minItems: 1,
           items: {
             type: "object",
             additionalProperties: false,
@@ -192,6 +190,7 @@ export const STAGE3_ARCHITECTURE_OUTPUT_SCHEMA: StructuredJsonSchema = {
       properties: {
         entities: {
           type: "array",
+          minItems: 1,
           items: {
             type: "object",
             additionalProperties: false,
@@ -229,6 +228,7 @@ export const STAGE3_ARCHITECTURE_OUTPUT_SCHEMA: StructuredJsonSchema = {
       properties: {
         endpoints: {
           type: "array",
+          minItems: 1,
           items: {
             type: "object",
             additionalProperties: false,
@@ -258,6 +258,7 @@ export const STAGE3_ARCHITECTURE_OUTPUT_SCHEMA: StructuredJsonSchema = {
       properties: {
         threat_controls: {
           type: "array",
+          minItems: 1,
           items: {
             type: "object",
             additionalProperties: false,
@@ -276,6 +277,7 @@ export const STAGE3_ARCHITECTURE_OUTPUT_SCHEMA: StructuredJsonSchema = {
         },
       },
     },
+    // Keep adrs minItems unbounded here so Stage 4 CHK-04 catches empty ADR proposals cleanly (M6A-AC6).
     adrs: {
       type: "array",
       items: {
@@ -307,6 +309,76 @@ export const STAGE3_ARCHITECTURE_OUTPUT_SCHEMA: StructuredJsonSchema = {
     },
   },
 };
+
+export const STAGE4_CONSISTENCY_CHECK_OUTPUT_SCHEMA: StructuredJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "pipeline_session_id",
+    "passed",
+    "checks",
+    "blocking_errors",
+    "referenced_stage1_artifact_id",
+    "referenced_stage2_artifact_id",
+    "referenced_stage3_artifact_id",
+    "checked_at",
+  ],
+  properties: {
+    pipeline_session_id: { type: "string", minLength: 1 },
+    passed: { type: "boolean" },
+    checks: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["check_id", "name", "passed", "severity", "details", "affected_ids"],
+        properties: {
+          check_id: { type: "string", minLength: 1 },
+          name: { type: "string", minLength: 1 },
+          passed: { type: "boolean" },
+          severity: { type: "string", enum: ["ERROR", "WARNING"] },
+          details: { type: "string", minLength: 1 },
+          affected_ids: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+    blocking_errors: { type: "array", items: { type: "string" } },
+    referenced_stage1_artifact_id: { type: "string" },
+    referenced_stage2_artifact_id: { type: "string" },
+    referenced_stage3_artifact_id: { type: "string" },
+    checked_at: { type: "string", minLength: 1 },
+  },
+};
+
+export const STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC: PromptTemplateSpec = {
+  promptId: STAGE4_CONSISTENCY_CHECK_PROMPT_ID,
+  version: STAGE4_CONSISTENCY_CHECK_PROMPT_VERSION,
+  description:
+    "Deterministic Stage 4 CrossArtifactConsistencyChecker verification report contract (CHK-01..CHK-05).",
+  requiredVariables: [
+    "pipeline_session_id",
+    "stage1_artifact_id",
+    "stage2_artifact_id",
+    "stage3_artifact_id",
+  ],
+  systemTemplate: [
+    "Deterministic Stage 4 CrossArtifactConsistencyChecker Contract.",
+    "Evaluate CHK-01..CHK-05 across verified Stage 1 items and Stages 1..3 canonical artifacts.",
+    "Emit a Stage4ConsistencyReport JSON object matching the registered schema.",
+  ].join("\n"),
+  userTemplate: [
+    "Pipeline Session ID: {{pipeline_session_id}}",
+    "Stage 1 Artifact ID: {{stage1_artifact_id}}",
+    "Stage 2 Artifact ID: {{stage2_artifact_id}}",
+    "Stage 3 Artifact ID: {{stage3_artifact_id}}",
+  ].join("\n"),
+  outputSchema: STAGE4_CONSISTENCY_CHECK_OUTPUT_SCHEMA,
+};
+
+export const STAGE4_CONSISTENCY_CHECK_PROMPT_SHA256 = computePromptSha256(
+  STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC
+);
 
 export const DEFAULT_PIPELINE_PROMPT_TEMPLATES: readonly PromptTemplateSpec[] = [
   {
@@ -385,6 +457,7 @@ export const DEFAULT_PIPELINE_PROMPT_TEMPLATES: readonly PromptTemplateSpec[] = 
     ].join("\n"),
     outputSchema: STAGE3_ARCHITECTURE_OUTPUT_SCHEMA,
   },
+  STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC,
 ];
 
 export function createDefaultPipelinePromptRegistry(): PromptRegistry {

@@ -8,12 +8,16 @@ on:
 
 jobs:
   test:
-    name: Build, Typecheck, RLS Verification & Test Suite
+    name: Build, Typecheck, RLS Verification & Test Suite (PG ${{ matrix.postgres_version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres_version: ["16-alpine", "17-alpine"]
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.postgres_version }}
         env:
           POSTGRES_DB: software_factory_test
           POSTGRES_USER: factory_admin
@@ -66,6 +70,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
           psql -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
@@ -109,12 +115,14 @@ jobs:
             v_sa1_a UUID := 'a5333333-3333-3333-3333-333333333331';
             v_sa2_a UUID := 'a5333333-3333-3333-3333-333333333332';
             v_sa3_a UUID := 'a5333333-3333-3333-3333-333333333333';
-            v_sa4_a UUID := 'a5333333-3333-3333-3333-333333333334';
+            v_sa4_old_pass_a UUID := 'a5333333-3333-3333-3333-333333333336';
             v_sa4_fail_a UUID := 'a5333333-3333-3333-3333-333333333335';
+            v_sa4_a UUID := 'a5333333-3333-3333-3333-333333333334';
             v_sa1_b UUID := 'a5444444-4444-4444-4444-444444444441';
             v_sag1_a UUID := 'b5333333-3333-3333-3333-333333333331';
-            v_sag4_a UUID := 'b5333333-3333-3333-3333-333333333334';
+            v_sag4_old_pass_a UUID := 'b5333333-3333-3333-3333-333333333336';
             v_sag4_fail_a UUID := 'b5333333-3333-3333-3333-333333333335';
+            v_sag4_a UUID := 'b5333333-3333-3333-3333-333333333334';
             v_sag1_b UUID := 'b5444444-4444-4444-4444-444444444441';
             v_bsf_a UUID := 'c5333333-3333-3333-3333-333333333331';
             v_caught BOOLEAN := false;
@@ -316,6 +324,51 @@ jobs:
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'trg_stage_artifact_invariants failed to reject UNCONFIRMED Stage 2 reference'; END IF;
 
+            -- M6A-FIX-01: missing source_discovery_item_ids key raises 23514 check_violation
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage_artifacts (
+                artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 2,
+                'openai', 'gpt-4.1', 'pipeline.stage2', '1.0.0', repeat('5', 64),
+                jsonb_build_object('srs', jsonb_build_object('functional_requirements', jsonb_build_array(jsonb_build_object('req_id', 'FR-NO-SRC')))),
+                repeat('6', 64), 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'M6A-FIX-01: trg_stage_artifact_invariants failed to reject missing source_discovery_item_ids key'; END IF;
+
+            -- Minor Note 7: non-array functional_requirements raises 23514 check_violation (not 22023)
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage_artifacts (
+                artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 3,
+                'openai', 'gpt-4.1', 'pipeline.stage2', '1.0.0', repeat('5', 64),
+                '{"srs":{"functional_requirements":"not-an-array","non_functional_requirements":[]}}'::jsonb,
+                repeat('6', 64), 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Minor Note 7: trg_stage_artifact_invariants failed to raise check_violation on non-array functional_requirements'; END IF;
+
+            -- Minor Note 1: blank clarification_question on ASSUMPTION rejected
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage1_discovery_items (
+                item_id, project_id, pipeline_session_id, kind, title, statement, rationale,
+                clarification_question, confirmation_status
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, 'ASSUMPTION', 'No Q', 'Missing question', 'R', '   ', 'UNCONFIRMED'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'chk_s1_assumption_clarification failed to reject blank clarification_question'; END IF;
+
             INSERT INTO stage_artifacts (
               artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
               provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
@@ -323,20 +376,30 @@ jobs:
               (v_sa1_a, v_proj_a, v_pps_a, 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE', 1, 'anthropic', 'claude-sonnet-4', 'pipeline.stage1', '1.0.0', repeat('a', 64), '{"items":[]}'::jsonb, repeat('1', 64), 'alice-dev'),
               (v_sa2_a, v_proj_a, v_pps_a, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 1, 'openai', 'gpt-4.1', 'pipeline.stage2', '1.0.0', repeat('b', 64), jsonb_build_object('srs', jsonb_build_object('functional_requirements', jsonb_build_array(jsonb_build_object('req_id', 'FR-1', 'source_discovery_item_ids', jsonb_build_array(v_s1_fact_a::text, v_s1_assump_a::text))))), repeat('2', 64), 'alice-dev'),
               (v_sa3_a, v_proj_a, v_pps_a, 'STAGE_3_ARCHITECTURE', 'STAGE_3_ARCHITECTURE_DESIGN', 1, 'google', 'gemini-2.5-pro', 'pipeline.stage3', '1.0.0', repeat('c', 64), '{"sections":5}'::jsonb, repeat('3', 64), 'alice-dev'),
-              (v_sa4_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 1, 'system', 'consistency-checker', 'pipeline.stage4', '1.0.0', repeat('d', 64), '{"passed":true}'::jsonb, repeat('4', 64), 'alice-approver'),
-              (v_sa4_fail_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 2, 'system', 'consistency-checker', 'pipeline.stage4', '1.0.0', repeat('d', 64), '{"passed":false}'::jsonb, repeat('e', 64), 'alice-approver'),
+              (v_sa4_old_pass_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 1, 'system', 'consistency-checker', 'pipeline.stage4', '1.0.0', repeat('d', 64), '{"passed":true}'::jsonb, repeat('4', 64), 'alice-approver'),
+              (v_sa4_fail_a,     v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 2, 'system', 'consistency-checker', 'pipeline.stage4', '1.0.0', repeat('d', 64), '{"passed":false}'::jsonb, repeat('e', 64), 'alice-approver'),
+              (v_sa4_a,          v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 3, 'system', 'consistency-checker', 'pipeline.stage4', '1.0.0', repeat('d', 64), '{"passed":true}'::jsonb, repeat('d', 64), 'alice-approver'),
               (v_sa1_b, v_proj_b, v_pps_b, 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE', 1, 'anthropic', 'claude-sonnet-4', 'pipeline.stage1', '1.0.0', repeat('f', 64), '{"items":[]}'::jsonb, repeat('9', 64), 'bob-dev');
 
             INSERT INTO stage_approval_gates (
               gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id, target_artifact_sha256,
               approver_principal_id, decision, rationale
             ) VALUES
-              (v_sag1_a,      v_proj_a, v_pps_a, 'STAGE_1_DISCOVERY',  v_sa1_a,      repeat('1', 64), 'alice-approver', 'APPROVED', 'Stage 1 ok'),
-              (v_sag4_a,      v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_a,      repeat('4', 64), 'alice-approver', 'APPROVED', 'Ready to freeze'),
-              (v_sag4_fail_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_fail_a, repeat('e', 64), 'alice-approver', 'APPROVED', 'Negative probe gate'),
-              (v_sag1_b,      v_proj_b, v_pps_b, 'STAGE_1_DISCOVERY',  v_sa1_b,      repeat('9', 64), 'bob-approver',   'APPROVED', 'Project B gate');
+              (v_sag1_a,          v_proj_a, v_pps_a, 'STAGE_1_DISCOVERY',  v_sa1_a,          repeat('1', 64), 'alice-approver', 'APPROVED', 'Stage 1 ok'),
+              (v_sag4_old_pass_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_old_pass_a, repeat('4', 64), 'alice-approver', 'APPROVED', 'Stale v1 gate'),
+              (v_sag4_fail_a,     v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_fail_a,     repeat('e', 64), 'alice-approver', 'APPROVED', 'Negative probe gate'),
+              (v_sag4_a,          v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_a,          repeat('d', 64), 'alice-approver', 'APPROVED', 'Ready to freeze latest v3'),
+              (v_sag1_b,          v_proj_b, v_pps_b, 'STAGE_1_DISCOVERY',  v_sa1_b,          repeat('9', 64), 'bob-approver',   'APPROVED', 'Project B gate');
 
-            -- M6A pre-freeze negative checks: trg_pipeline_session_freeze_lock, fk_bsf_gate, trg_baseline_freeze_invariants
+            -- M6A-FIX-02: Stage 1 transition is one-way (cannot overwrite CONFIRMED -> REJECTED)
+            v_caught := false;
+            BEGIN
+              UPDATE stage1_discovery_items SET confirmation_status = 'REJECTED' WHERE item_id = v_s1_assump_a;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'M6A-FIX-02: trg_s1_mutable_until_frozen failed to block CONFIRMED -> REJECTED'; END IF;
+
+            -- M6A pre-freeze negative checks: trg_pipeline_session_freeze_lock, fk_bsf_gate, trg_baseline_freeze_invariants (stale v1 & failed v2)
             v_caught := false;
             BEGIN
               UPDATE product_pipeline_sessions SET status = 'FROZEN', frozen_baseline_id = gen_random_uuid() WHERE pipeline_session_id = v_pps_a;
@@ -356,11 +419,29 @@ jobs:
               ) VALUES (
                 gen_random_uuid(), v_proj_a, v_pps_a,
                 v_sa1_a, repeat('1', 64), v_sa2_a, repeat('2', 64), v_sa3_a, repeat('3', 64),
-                v_sa4_a, repeat('4', 64), v_sag1_a, 'alice-approver', repeat('7', 64)
+                v_sa4_a, repeat('d', 64), v_sag1_a, 'alice-approver', repeat('7', 64)
               );
             EXCEPTION WHEN foreign_key_violation THEN v_caught := true;
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'fk_bsf_gate failed to reject wrong-stage gate binding'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO baseline_spec_freezes (
+                baseline_id, project_id, pipeline_session_id,
+                stage1_artifact_id, stage1_artifact_sha256,
+                stage2_artifact_id, stage2_artifact_sha256,
+                stage3_artifact_id, stage3_artifact_sha256,
+                validation_report_artifact_id, validation_report_sha256,
+                approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a,
+                v_sa1_a, repeat('1', 64), v_sa2_a, repeat('2', 64), v_sa3_a, repeat('3', 64),
+                v_sa4_old_pass_a, repeat('4', 64), v_sag4_old_pass_a, 'alice-approver', repeat('7', 64)
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'M6A-FIX-03: trg_baseline_freeze_invariants failed to reject stale Stage 4 v1 report when v3 exists'; END IF;
 
             v_caught := false;
             BEGIN
@@ -380,7 +461,7 @@ jobs:
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'trg_baseline_freeze_invariants failed to reject passed=false report'; END IF;
 
-            -- Commit valid BaselineSpecFreeze & lock v_pps_a to FROZEN
+            -- Commit valid BaselineSpecFreeze (latest Stage 4 v3) & lock v_pps_a to FROZEN
             INSERT INTO baseline_spec_freezes (
               baseline_id, project_id, pipeline_session_id,
               stage1_artifact_id, stage1_artifact_sha256,
@@ -391,13 +472,13 @@ jobs:
             ) VALUES (
               v_bsf_a, v_proj_a, v_pps_a,
               v_sa1_a, repeat('1', 64), v_sa2_a, repeat('2', 64), v_sa3_a, repeat('3', 64),
-              v_sa4_a, repeat('4', 64), v_sag4_a, 'alice-approver', repeat('8', 64)
+              v_sa4_a, repeat('d', 64), v_sag4_a, 'alice-approver', repeat('8', 64)
             );
             UPDATE product_pipeline_sessions
               SET status = 'FROZEN', frozen_baseline_id = v_bsf_a, current_stage = 'STAGE_4_SPEC_FREEZE'
               WHERE pipeline_session_id = v_pps_a;
 
-            -- Post-freeze immutability trigger probes
+            -- Post-freeze immutability trigger probes (S1 items, artifacts, gates, frozen session columns)
             v_caught := false;
             BEGIN
               UPDATE stage1_discovery_items SET resolution_note = 'Post-freeze mutation' WHERE item_id = v_s1_assump_a;
@@ -420,10 +501,43 @@ jobs:
 
             v_caught := false;
             BEGIN
+              INSERT INTO stage_approval_gates (
+                gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id,
+                target_artifact_sha256, approver_principal_id, decision
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_a,
+                repeat('d', 64), 'alice-approver', 'APPROVED'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Minor Note 17: trg_sag_mutable_until_frozen failed to block post-freeze gate'; END IF;
+
+            v_caught := false;
+            BEGIN
               UPDATE product_pipeline_sessions SET status = 'ACTIVE' WHERE pipeline_session_id = v_pps_a;
             EXCEPTION WHEN check_violation THEN v_caught := true;
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'trg_pipeline_session_freeze_lock failed to block unfreezing'; END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE product_pipeline_sessions SET title = 'Hijacked post-freeze title' WHERE pipeline_session_id = v_pps_a;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Minor Note 8: trg_pipeline_session_freeze_lock failed to block frozen title mutation'; END IF;
+
+            IF NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_name = 'model_call_ledgers' AND column_name = 'usage_estimated'
+            ) THEN
+              RAISE EXCEPTION 'M6A-FIX-07: Missing model_call_ledgers.usage_estimated column';
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'fk_mcs_pipeline_session' AND conrelid = 'model_cost_sessions'::regclass
+            ) THEN
+              RAISE EXCEPTION 'Minor Note 6: Missing fk_mcs_pipeline_session constraint';
+            END IF;
 
             -- M5 checks: chk_projects_main_ref_sha1, recovered_by_reconciler, resource_usage_metrics CHECK constraints
             v_caught := false;
@@ -716,9 +830,9 @@ jobs:
             SELECT count(*) INTO v_cnt FROM stage1_discovery_items;
             IF v_cnt <> 3 THEN RAISE EXCEPTION 'stage1_discovery_items tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM stage_artifacts;
-            IF v_cnt <> 5 THEN RAISE EXCEPTION 'stage_artifacts tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            IF v_cnt <> 6 THEN RAISE EXCEPTION 'stage_artifacts tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM stage_approval_gates;
-            IF v_cnt <> 3 THEN RAISE EXCEPTION 'stage_approval_gates tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            IF v_cnt <> 4 THEN RAISE EXCEPTION 'stage_approval_gates tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM baseline_spec_freezes;
             IF v_cnt <> 1 THEN RAISE EXCEPTION 'baseline_spec_freezes tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
 
@@ -864,7 +978,7 @@ jobs:
                 gen_random_uuid(), v_proj_b, v_pps_b, 'STAGE_1_DISCOVERY', v_sa1_b,
                 repeat('9', 64), 'intruder', 'APPROVED'
               );
-            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            EXCEPTION WHEN insufficient_privilege OR foreign_key_violation THEN v_caught := true;
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into stage_approval_gates was not blocked'; END IF;
 
@@ -1182,13 +1296,15 @@ jobs:
           $$;
           SQL
 
-          # 3. Apply upgraded HEAD 0004, 0005 & 0006 twice (upgrade + idempotent re-run) on pre-populated DB
+          # 3. Apply upgraded HEAD 0004, 0005, 0006 & 0007 twice (upgrade + idempotent re-run) on pre-populated DB
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
           # 4. Assert upgraded constraints actually replaced the old definitions
@@ -1290,7 +1406,7 @@ jobs:
               RAISE EXCEPTION 'Upgraded 10-column fk_ad_approval_request failed to reject mismatched approval_request_id';
             END IF;
 
-            -- M6A tables & FORCE RLS + AC-10 check on upgraded DB
+            -- M6A tables & FORCE RLS + AC-10 + 0007 hardening check on upgraded DB
             FOREACH m6a_tbl IN ARRAY ARRAY[
               'model_cost_sessions',
               'model_call_ledgers',
@@ -1334,6 +1450,21 @@ jobs:
             IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_baseline_freeze_invariants') THEN
               RAISE EXCEPTION 'Upgraded DB missing trg_baseline_freeze_invariants trigger';
             END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_sag_mutable_until_frozen') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_sag_mutable_until_frozen trigger';
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_name = 'model_call_ledgers' AND column_name = 'usage_estimated'
+            ) THEN
+              RAISE EXCEPTION 'Upgraded DB missing model_call_ledgers.usage_estimated column';
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'fk_mcs_pipeline_session' AND conrelid = 'model_cost_sessions'::regclass
+            ) THEN
+              RAISE EXCEPTION 'Upgraded DB missing fk_mcs_pipeline_session constraint';
+            END IF;
 
             RAISE NOTICE 'M4, M5 & M6A Upgrade Path Verification (86076639 -> HEAD) PASSED.';
           END
@@ -1367,6 +1498,214 @@ jobs:
           SQL
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_upgrade_test;"
+
+      - name: Verify Upgrade Path from Initial M6A Schema (8044774 -> HEAD)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGDATABASE: software_factory_m6a_upgrade_test
+          PGUSER: factory_admin
+          PGPASSWORD: factory_secret_password
+        run: |
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6a_upgrade_test;"
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE software_factory_m6a_upgrade_test;"
+
+          # 1. Install initial M6A schema baseline (commit 8044774)
+          git show 8044774:packages/database/migrations/0001_mvp_core_schema_and_rls.sql | psql -v ON_ERROR_STOP=1
+          git show 8044774:packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql | psql -v ON_ERROR_STOP=1
+          git show 8044774:packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql | psql -v ON_ERROR_STOP=1
+          git show 8044774:packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql | psql -v ON_ERROR_STOP=1
+          git show 8044774:packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql | psql -v ON_ERROR_STOP=1
+
+          # 2. Seed existing M6A rows BEFORE applying 0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            v_proj   UUID := '33333333-3333-3333-3333-333333333333';
+            v_mcs    UUID := '83333333-3333-3333-3333-333333333331';
+            v_pps    UUID := '83333333-3333-3333-3333-333333333332';
+            v_fact   UUID := '93333333-3333-3333-3333-333333333331';
+            v_assump UUID := '93333333-3333-3333-3333-333333333332';
+            v_sa1    UUID := 'a5333333-3333-3333-3333-333333333331';
+            v_sa2    UUID := 'a5333333-3333-3333-3333-333333333332';
+            v_sa3    UUID := 'a5333333-3333-3333-3333-333333333333';
+            v_sa4_v1 UUID := 'a5333333-3333-3333-3333-333333333334';
+            v_sa4_v2 UUID := 'a5333333-3333-3333-3333-333333333335';
+            v_sag_v1 UUID := 'b5333333-3333-3333-3333-333333333331';
+            v_sag_v2 UUID := 'b5333333-3333-3333-3333-333333333332';
+          BEGIN
+            INSERT INTO projects (project_id, slug, name, repo_bare_path, default_branch, approval_ttl_seconds)
+            VALUES (v_proj, 'm6a-upg-proj', 'M6A Upgrade Test', '/var/git/m6a-upg.git', 'main', 3600);
+
+            INSERT INTO model_cost_sessions (
+              cost_session_id, project_id, pipeline_session_id,
+              max_tokens_per_request, max_cost_micro_usd_per_request,
+              session_token_budget, session_cost_budget_micro_usd
+            ) VALUES (v_mcs, v_proj, v_pps, 4000, 100000, 20000, 500000);
+
+            INSERT INTO product_pipeline_sessions (
+              pipeline_session_id, project_id, cost_session_id, title, raw_idea_text,
+              current_stage, status, created_by_principal_id
+            ) VALUES (v_pps, v_proj, v_mcs, 'Pre-0007 Session', 'Upgrade check', 'STAGE_4_SPEC_FREEZE', 'ACTIVE', 'alice-dev');
+
+            INSERT INTO stage1_discovery_items (
+              item_id, project_id, pipeline_session_id, kind, title, statement, rationale,
+              clarification_question, confirmation_status, confirmed_by_principal_id, confirmed_at
+            ) VALUES
+              (v_fact,   v_proj, v_pps, 'FACT',       'Fact 1',   'Given fact', 'G', NULL,           'AUTO_VERIFIED', NULL,             NULL),
+              (v_assump, v_proj, v_pps, 'ASSUMPTION', 'Assump 1', 'Needs SLA',  'R', 'Confirm SLA?', 'CONFIRMED',     'alice-approver', clock_timestamp());
+
+            INSERT INTO stage_artifacts (
+              artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+              provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+            ) VALUES
+              (v_sa1,    v_proj, v_pps, 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE',    1, 'anthropic', 'claude-sonnet-4', 'p1', '1.0.0', repeat('1', 64), '{"items":[]}'::jsonb, repeat('a', 64), 'alice-dev'),
+              (v_sa2,    v_proj, v_pps, 'STAGE_2_REQUIREMENTS',   'STAGE_2_PRD_SRS',             1, 'openai',    'gpt-4.1',         'p2', '1.0.0', repeat('2', 64), jsonb_build_object('srs', jsonb_build_object('functional_requirements', jsonb_build_array(jsonb_build_object('req_id', 'FR-1', 'source_discovery_item_ids', jsonb_build_array(v_fact::text, v_assump::text))))), repeat('b', 64), 'alice-dev'),
+              (v_sa3,    v_proj, v_pps, 'STAGE_3_ARCHITECTURE',   'STAGE_3_ARCHITECTURE_DESIGN', 1, 'google',    'gemini-2.5-pro',  'p3', '1.0.0', repeat('3', 64), '{}'::jsonb, repeat('c', 64), 'alice-dev'),
+              (v_sa4_v1, v_proj, v_pps, 'STAGE_4_SPEC_FREEZE',    'STAGE_4_VALIDATION_REPORT',   1, 'system',    'consistency-checker', 'p4', '1.0.0', repeat('4', 64), '{"passed":true}'::jsonb, repeat('d', 64), 'alice-approver'),
+              (v_sa4_v2, v_proj, v_pps, 'STAGE_4_SPEC_FREEZE',    'STAGE_4_VALIDATION_REPORT',   2, 'system',    'consistency-checker', 'p4', '1.0.0', repeat('4', 64), '{"passed":true}'::jsonb, repeat('e', 64), 'alice-approver');
+
+            INSERT INTO stage_approval_gates (
+              gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id,
+              target_artifact_sha256, approver_principal_id, decision
+            ) VALUES
+              (v_sag_v1, v_proj, v_pps, 'STAGE_4_SPEC_FREEZE', v_sa4_v1, repeat('d', 64), 'bob-approver', 'APPROVED'),
+              (v_sag_v2, v_proj, v_pps, 'STAGE_4_SPEC_FREEZE', v_sa4_v2, repeat('e', 64), 'bob-approver', 'APPROVED');
+          END
+          $$;
+          SQL
+
+          # 3. Apply HEAD 0007_m6a_review_fixes.sql twice (upgrade + idempotency) + 0002 RLS matrix
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
+
+          # 4. Assert M6A-FIX-01..03, 07 and Minor Notes 1, 5, 6, 7, 8, 17, 18 on upgraded DB
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            v_proj   UUID := '33333333-3333-3333-3333-333333333333';
+            v_pps    UUID := '83333333-3333-3333-3333-333333333332';
+            v_assump UUID := '93333333-3333-3333-3333-333333333332';
+            v_sa1    UUID := 'a5333333-3333-3333-3333-333333333331';
+            v_sa2    UUID := 'a5333333-3333-3333-3333-333333333332';
+            v_sa3    UUID := 'a5333333-3333-3333-3333-333333333333';
+            v_sa4_v1 UUID := 'a5333333-3333-3333-3333-333333333334';
+            v_sa4_v2 UUID := 'a5333333-3333-3333-3333-333333333335';
+            v_sag_v1 UUID := 'b5333333-3333-3333-3333-333333333331';
+            v_sag_v2 UUID := 'b5333333-3333-3333-3333-333333333332';
+            v_bsf    UUID := 'c5333333-3333-3333-3333-333333333331';
+            v_caught BOOLEAN := false;
+          BEGIN
+            -- M6A-FIX-01
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage_artifacts (
+                artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_pps, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 2,
+                'openai', 'gpt-4.1', 'p2', '1.0.0', repeat('2', 64),
+                '{"srs":{"functional_requirements":[{"req_id":"NO-SRC"}]}}'::jsonb,
+                repeat('1', 64), 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: M6A-FIX-01 failed'; END IF;
+
+            -- M6A-FIX-02
+            v_caught := false;
+            BEGIN
+              UPDATE stage1_discovery_items SET confirmation_status = 'REJECTED' WHERE item_id = v_assump;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: M6A-FIX-02 one-way transition check failed'; END IF;
+
+            -- M6A-FIX-03: stale Stage 4 v1 rejected when v2 exists
+            v_caught := false;
+            BEGIN
+              INSERT INTO baseline_spec_freezes (
+                baseline_id, project_id, pipeline_session_id,
+                stage1_artifact_id, stage1_artifact_sha256,
+                stage2_artifact_id, stage2_artifact_sha256,
+                stage3_artifact_id, stage3_artifact_sha256,
+                validation_report_artifact_id, validation_report_sha256,
+                approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_pps,
+                v_sa1, repeat('a', 64), v_sa2, repeat('b', 64), v_sa3, repeat('c', 64),
+                v_sa4_v1, repeat('d', 64), v_sag_v1, 'bob-approver', repeat('f', 64)
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: M6A-FIX-03 stale v1 check failed'; END IF;
+
+            -- Minor Note 6: dangling fk_mcs_pipeline_session checked immediately
+            v_caught := false;
+            BEGIN
+              SET CONSTRAINTS fk_mcs_pipeline_session IMMEDIATE;
+              INSERT INTO model_cost_sessions (
+                cost_session_id, project_id, pipeline_session_id,
+                max_tokens_per_request, max_cost_micro_usd_per_request,
+                session_token_budget, session_cost_budget_micro_usd
+              ) VALUES (gen_random_uuid(), v_proj, gen_random_uuid(), 1000, 100000, 5000, 500000);
+            EXCEPTION WHEN foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: fk_mcs_pipeline_session failed'; END IF;
+
+            -- Commit valid freeze on latest Stage 4 v2 & lock FROZEN
+            INSERT INTO baseline_spec_freezes (
+              baseline_id, project_id, pipeline_session_id,
+              stage1_artifact_id, stage1_artifact_sha256,
+              stage2_artifact_id, stage2_artifact_sha256,
+              stage3_artifact_id, stage3_artifact_sha256,
+              validation_report_artifact_id, validation_report_sha256,
+              approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+            ) VALUES (
+              v_bsf, v_proj, v_pps,
+              v_sa1, repeat('a', 64), v_sa2, repeat('b', 64), v_sa3, repeat('c', 64),
+              v_sa4_v2, repeat('e', 64), v_sag_v2, 'bob-approver', repeat('9', 64)
+            );
+            UPDATE product_pipeline_sessions
+              SET status = 'FROZEN', frozen_baseline_id = v_bsf
+              WHERE pipeline_session_id = v_pps;
+
+            -- Minor Note 17: post-freeze gate insert blocked
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage_approval_gates (
+                gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id,
+                target_artifact_sha256, approver_principal_id, decision
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_pps, 'STAGE_4_SPEC_FREEZE', v_sa4_v2,
+                repeat('e', 64), 'bob-approver', 'APPROVED'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: trg_sag_mutable_until_frozen failed'; END IF;
+          END
+          $$;
+          BEGIN;
+          SET LOCAL ROLE app_runtime;
+          SELECT
+            set_config('app.current_project_id', '33333333-3333-3333-3333-333333333333', true),
+            set_config('app.current_principal_id', 'core-api', true),
+            set_config('app.current_role', 'core_api_service', true);
+          DO $$
+          DECLARE
+            v_caught BOOLEAN := false;
+          BEGIN
+            BEGIN
+              UPDATE stage_artifacts SET model = 'tampered' WHERE project_id = '33333333-3333-3333-3333-333333333333'::uuid;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: REVOKE UPDATE on stage_artifacts failed'; END IF;
+          END
+          $$;
+          COMMIT;
+          SQL
+
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6a_upgrade_test;"
 
       - name: Prepare Optional Docker Verifier Base Image
         run: docker pull node:22-alpine || true

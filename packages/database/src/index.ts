@@ -3437,6 +3437,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           estimated_cost_micro_usd: input.estimated_cost_micro_usd,
           actual_cost_micro_usd: 0,
           status: "BLOCKED_PREFLIGHT",
+          usage_estimated: false,
           block_reason: `${violation.limitScope}: ${violation.reason}`,
           error_message: violation.reason,
           latency_ms: 0,
@@ -3469,6 +3470,27 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   public async finalizeModelCallLedger(
     input: FinalizeModelCallInput
   ): Promise<FinalizeModelCallResult> {
+    if (
+      !Number.isSafeInteger(input.estimated_input_tokens) ||
+      input.estimated_input_tokens < 0 ||
+      !Number.isSafeInteger(input.reserved_output_tokens) ||
+      input.reserved_output_tokens < 0 ||
+      !Number.isSafeInteger(input.actual_input_tokens) ||
+      input.actual_input_tokens < 0 ||
+      !Number.isSafeInteger(input.actual_output_tokens) ||
+      input.actual_output_tokens < 0 ||
+      !Number.isSafeInteger(input.estimated_cost_micro_usd) ||
+      input.estimated_cost_micro_usd < 0 ||
+      !Number.isSafeInteger(input.actual_cost_micro_usd) ||
+      input.actual_cost_micro_usd < 0
+    ) {
+      throw new PostgresRlsError("23514", "Model call token and cost quantities must be non-negative safe integers");
+    }
+    const actualTotalTokens = input.actual_input_tokens + input.actual_output_tokens;
+    if (!Number.isSafeInteger(actualTotalTokens)) {
+      throw new RangeError("actual_total_tokens exceeds JavaScript safe integer range");
+    }
+
     const run = (): Promise<FinalizeModelCallResult> => {
       this.assertWritePermissionForProject(input.project_id);
       return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () => {
@@ -3501,23 +3523,30 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         }
 
         const nowIso = this.clockTimestampIso();
-        const actualTotalTokens = input.actual_input_tokens + input.actual_output_tokens;
         const evalRes = evaluatePostcallLimits(
           session,
           actualTotalTokens,
           input.actual_cost_micro_usd
         );
 
-        const updatedSession: CostSessionRecord = {
-          ...session,
-          tokens_used_total: evalRes.nextTokensUsedTotal,
-          cost_used_micro_usd: evalRes.nextCostUsedMicroUsd,
-          status: evalRes.nextStatus,
-          updated_at: nowIso,
-        };
-        this.costSessions.set(session.cost_session_id, updatedSession);
+        let updatedSession: CostSessionRecord = session;
+        if (session.status === "ACTIVE") {
+          updatedSession = {
+            ...session,
+            tokens_used_total: evalRes.nextTokensUsedTotal,
+            cost_used_micro_usd: evalRes.nextCostUsedMicroUsd,
+            status: evalRes.nextStatus,
+            updated_at: nowIso,
+          };
+          this.costSessions.set(session.cost_session_id, updatedSession);
+        }
 
         const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
+        const errorMessage = evalRes.exceeded
+          ? input.error_message && input.outcome !== "ALLOWED"
+            ? `${evalRes.exceeded.reason}; upstream error: ${input.error_message}`
+            : evalRes.exceeded.reason
+          : input.error_message ?? null;
         const ledger: ModelCallLedgerRecord = {
           call_id: randomUUID(),
           project_id: input.project_id,
@@ -3539,10 +3568,11 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           estimated_cost_micro_usd: input.estimated_cost_micro_usd,
           actual_cost_micro_usd: input.actual_cost_micro_usd,
           status,
+          usage_estimated: Boolean(input.usage_estimated),
           block_reason: evalRes.exceeded
             ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
             : null,
-          error_message: evalRes.exceeded?.reason ?? input.error_message ?? null,
+          error_message: errorMessage,
           latency_ms: Math.max(0, Math.trunc(input.latency_ms)),
           created_at: nowIso,
         };
@@ -3720,7 +3750,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           title: normalized.title,
           statement: normalized.statement,
           rationale: rawItem.rationale,
-          clarification_question: rawItem.clarification_question ?? null,
+          clarification_question: normalized.clarification_question,
           confirmation_status: normalized.confirmation_status,
           confirmed_by_principal_id: null,
           confirmed_at: null,
@@ -3767,6 +3797,12 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         throw new PostgresRlsError(
           "23503",
           `Stage 1 discovery item ${input.item_id} not found in pipeline session ${input.pipeline_session_id}`
+        );
+      }
+      if (existing.confirmation_status !== "UNCONFIRMED") {
+        throw new PostgresRlsError(
+          "23514",
+          `Stage 1 discovery item ${input.item_id} is already ${existing.confirmation_status} and cannot be re-resolved`
         );
       }
       const nowIso = this.clockTimestampIso();
@@ -3920,6 +3956,12 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
         );
       }
+      if (session.status !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${session.status}; new stage approval gates are forbidden after baseline freeze`
+        );
+      }
       const artifact = this.stageArtifacts.get(input.target_artifact_id);
       if (
         !artifact ||
@@ -3977,6 +4019,26 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     return this.withSerializedLock(`pipeline-session:${input.pipeline_session_id}`, () => {
       const session = this.pipelineSessions.get(input.pipeline_session_id) ?? null;
       const existingFreeze = this.getBaselineSpecFreeze(input.pipeline_session_id);
+      let latestStage4Artifact: StageArtifactRecord | null = null;
+      for (const art of this.stageArtifacts.values()) {
+        if (
+          art.project_id === input.project_id &&
+          art.pipeline_session_id === input.pipeline_session_id &&
+          art.stage === "STAGE_4_SPEC_FREEZE" &&
+          (!latestStage4Artifact || art.version > latestStage4Artifact.version)
+        ) {
+          latestStage4Artifact = art;
+        }
+      }
+      const stage1Items: Stage1DiscoveryItemRecord[] = [];
+      for (const item of this.stage1DiscoveryItems.values()) {
+        if (
+          item.project_id === input.project_id &&
+          item.pipeline_session_id === input.pipeline_session_id
+        ) {
+          stage1Items.push({ ...item });
+        }
+      }
       validateFreezeBaselineSpecInvariants({
         request: input,
         session,
@@ -3985,6 +4047,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         stage3Artifact: this.stageArtifacts.get(input.stage3_artifact_id) ?? null,
         validationReportArtifact:
           this.stageArtifacts.get(input.validation_report_artifact_id) ?? null,
+        latestStage4Artifact,
+        stage1Items,
         approvalGate: this.stageApprovalGates.get(input.approval_gate_id) ?? null,
         existingFreeze,
       });

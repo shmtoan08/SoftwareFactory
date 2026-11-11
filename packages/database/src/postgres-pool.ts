@@ -1743,18 +1743,49 @@ function mapOutboxRow(row: Record<string, unknown>): OutboxEventRecord {
   };
 }
 
+function toSafeInt(value: unknown, fieldName: string): number {
+  if (typeof value === "bigint") {
+    if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new RangeError(`${fieldName} (${value.toString()}) exceeds JavaScript safe integer range`);
+    }
+    return Number(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!/^-?\d+$/.test(trimmed)) {
+      throw new RangeError(`${fieldName} (${value}) is not a safe integer`);
+    }
+    const parsed = BigInt(trimmed);
+    if (parsed < BigInt(Number.MIN_SAFE_INTEGER) || parsed > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new RangeError(`${fieldName} (${value}) exceeds JavaScript safe integer range`);
+    }
+    return Number(parsed);
+  }
+  const num = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(num)) {
+    throw new RangeError(`${fieldName} (${String(value)}) is not a safe integer`);
+  }
+  return num;
+}
+
 function mapCostSessionRow(row: Record<string, unknown>): CostSessionRecord {
   return {
     cost_session_id: String(row.cost_session_id),
     project_id: String(row.project_id),
     pipeline_session_id: row.pipeline_session_id ? String(row.pipeline_session_id) : null,
     task_id: row.task_id ? String(row.task_id) : null,
-    max_tokens_per_request: Number(row.max_tokens_per_request),
-    max_cost_micro_usd_per_request: Number(row.max_cost_micro_usd_per_request),
-    session_token_budget: Number(row.session_token_budget),
-    session_cost_budget_micro_usd: Number(row.session_cost_budget_micro_usd),
-    tokens_used_total: Number(row.tokens_used_total),
-    cost_used_micro_usd: Number(row.cost_used_micro_usd),
+    max_tokens_per_request: toSafeInt(row.max_tokens_per_request, "max_tokens_per_request"),
+    max_cost_micro_usd_per_request: toSafeInt(
+      row.max_cost_micro_usd_per_request,
+      "max_cost_micro_usd_per_request"
+    ),
+    session_token_budget: toSafeInt(row.session_token_budget, "session_token_budget"),
+    session_cost_budget_micro_usd: toSafeInt(
+      row.session_cost_budget_micro_usd,
+      "session_cost_budget_micro_usd"
+    ),
+    tokens_used_total: toSafeInt(row.tokens_used_total, "tokens_used_total"),
+    cost_used_micro_usd: toSafeInt(row.cost_used_micro_usd, "cost_used_micro_usd"),
     status: String(row.status) as CostSessionRecord["status"],
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
@@ -1775,17 +1806,21 @@ function mapModelCallLedgerRow(row: Record<string, unknown>): ModelCallLedgerRec
     prompt_version: String(row.prompt_version),
     prompt_sha256: String(row.prompt_sha256).trimEnd(),
     request_sha256: String(row.request_sha256).trimEnd(),
-    estimated_input_tokens: Number(row.estimated_input_tokens),
-    reserved_output_tokens: Number(row.reserved_output_tokens),
-    actual_input_tokens: Number(row.actual_input_tokens),
-    actual_output_tokens: Number(row.actual_output_tokens),
-    actual_total_tokens: Number(row.actual_total_tokens),
-    estimated_cost_micro_usd: Number(row.estimated_cost_micro_usd),
-    actual_cost_micro_usd: Number(row.actual_cost_micro_usd),
+    estimated_input_tokens: toSafeInt(row.estimated_input_tokens, "estimated_input_tokens"),
+    reserved_output_tokens: toSafeInt(row.reserved_output_tokens, "reserved_output_tokens"),
+    actual_input_tokens: toSafeInt(row.actual_input_tokens, "actual_input_tokens"),
+    actual_output_tokens: toSafeInt(row.actual_output_tokens, "actual_output_tokens"),
+    actual_total_tokens: toSafeInt(row.actual_total_tokens, "actual_total_tokens"),
+    estimated_cost_micro_usd: toSafeInt(
+      row.estimated_cost_micro_usd,
+      "estimated_cost_micro_usd"
+    ),
+    actual_cost_micro_usd: toSafeInt(row.actual_cost_micro_usd, "actual_cost_micro_usd"),
     status: String(row.status) as ModelCallStatus,
+    usage_estimated: Boolean(row.usage_estimated),
     block_reason: row.block_reason ? String(row.block_reason) : null,
     error_message: row.error_message ? String(row.error_message) : null,
-    latency_ms: Number(row.latency_ms),
+    latency_ms: toSafeInt(row.latency_ms, "latency_ms"),
     created_at: String(row.created_at),
   };
 }
@@ -4827,14 +4862,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             estimated_input_tokens, reserved_output_tokens,
             actual_input_tokens, actual_output_tokens, actual_total_tokens,
             estimated_cost_micro_usd, actual_cost_micro_usd,
-            status, block_reason, error_message, latency_ms
+            status, usage_estimated, block_reason, error_message, latency_ms
           ) VALUES (
             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
             $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
             $13::integer, $14::integer,
             0, 0, 0,
             $15::bigint, 0,
-            'BLOCKED_PREFLIGHT', $16::text, $17::text, 0
+            'BLOCKED_PREFLIGHT', FALSE, $16::text, $17::text, 0
           ) RETURNING *;`,
           [
             callId,
@@ -4884,6 +4919,30 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async finalizeModelCallLedger(
     input: FinalizeModelCallInput
   ): Promise<FinalizeModelCallResult> {
+    if (
+      !Number.isSafeInteger(input.estimated_input_tokens) ||
+      input.estimated_input_tokens < 0 ||
+      !Number.isSafeInteger(input.reserved_output_tokens) ||
+      input.reserved_output_tokens < 0 ||
+      !Number.isSafeInteger(input.actual_input_tokens) ||
+      input.actual_input_tokens < 0 ||
+      !Number.isSafeInteger(input.actual_output_tokens) ||
+      input.actual_output_tokens < 0 ||
+      !Number.isSafeInteger(input.estimated_cost_micro_usd) ||
+      input.estimated_cost_micro_usd < 0 ||
+      !Number.isSafeInteger(input.actual_cost_micro_usd) ||
+      input.actual_cost_micro_usd < 0
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "Model call token and cost quantities must be non-negative safe integers"
+      );
+    }
+    const actualTotalTokens = input.actual_input_tokens + input.actual_output_tokens;
+    if (!Number.isSafeInteger(actualTotalTokens)) {
+      throw new RangeError("actual_total_tokens exceeds JavaScript safe integer range");
+    }
+
     const run = async (): Promise<FinalizeModelCallResult> => {
       try {
         const sessRes = await this.pool.queryInActiveTx(
@@ -4900,36 +4959,42 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
           );
         }
         const session = mapCostSessionRow(sessRow);
-        const actualTotalTokens = input.actual_input_tokens + input.actual_output_tokens;
         const evalRes = evaluatePostcallLimits(
           session,
           actualTotalTokens,
           input.actual_cost_micro_usd
         );
 
-        const updRes = await this.pool.queryInActiveTx(
-          `UPDATE model_cost_sessions
-           SET tokens_used_total = $1::bigint,
-               cost_used_micro_usd = $2::bigint,
-               status = $3::text,
-               updated_at = clock_timestamp()
-           WHERE cost_session_id = $4::uuid AND project_id = $5::uuid
-           RETURNING *;`,
-          [
-            evalRes.nextTokensUsedTotal,
-            evalRes.nextCostUsedMicroUsd,
-            evalRes.nextStatus,
-            input.cost_session_id,
-            input.project_id,
-          ]
-        );
-        const updatedSession = mapCostSessionRow(updRes.rows[0]!);
+        let updatedSession = session;
+        if (session.status === "ACTIVE") {
+          const updRes = await this.pool.queryInActiveTx(
+            `UPDATE model_cost_sessions
+             SET tokens_used_total = $1::bigint,
+                 cost_used_micro_usd = $2::bigint,
+                 status = $3::text,
+                 updated_at = clock_timestamp()
+             WHERE cost_session_id = $4::uuid AND project_id = $5::uuid
+             RETURNING *;`,
+            [
+              evalRes.nextTokensUsedTotal,
+              evalRes.nextCostUsedMicroUsd,
+              evalRes.nextStatus,
+              input.cost_session_id,
+              input.project_id,
+            ]
+          );
+          updatedSession = mapCostSessionRow(updRes.rows[0]!);
+        }
 
         const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
         const blockReason = evalRes.exceeded
           ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
           : null;
-        const errorMessage = evalRes.exceeded?.reason ?? input.error_message ?? null;
+        const errorMessage = evalRes.exceeded
+          ? input.error_message && input.outcome !== "ALLOWED"
+            ? `${evalRes.exceeded.reason}; upstream error: ${input.error_message}`
+            : evalRes.exceeded.reason
+          : input.error_message ?? null;
         const callId = randomUUID();
 
         const ledgerRes = await this.pool.queryInActiveTx(
@@ -4939,14 +5004,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             estimated_input_tokens, reserved_output_tokens,
             actual_input_tokens, actual_output_tokens, actual_total_tokens,
             estimated_cost_micro_usd, actual_cost_micro_usd,
-            status, block_reason, error_message, latency_ms
+            status, usage_estimated, block_reason, error_message, latency_ms
           ) VALUES (
             $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
             $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
             $13::integer, $14::integer,
             $15::integer, $16::integer, $17::integer,
             $18::bigint, $19::bigint,
-            $20::text, $21::text, $22::text, $23::integer
+            $20::text, $21::boolean, $22::text, $23::text, $24::integer
           ) RETURNING *;`,
           [
             callId,
@@ -4969,6 +5034,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             input.estimated_cost_micro_usd,
             input.actual_cost_micro_usd,
             status,
+            Boolean(input.usage_estimated),
             blockReason,
             errorMessage,
             Math.max(0, Math.trunc(input.latency_ms)),
@@ -5120,7 +5186,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             normalized.title,
             normalized.statement,
             raw.rationale,
-            raw.clarification_question ?? null,
+            normalized.clarification_question,
             normalized.confirmation_status,
           ]
         );
@@ -5139,6 +5205,40 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       throw new PostgresRlsError("23514", "actor_principal_id is required to resolve Stage 1 item");
     }
     try {
+      const existingRes = await this.pool.queryInActiveTx(
+        `SELECT s.confirmation_status, p.status AS session_status
+         FROM stage1_discovery_items s
+         JOIN product_pipeline_sessions p
+           ON p.pipeline_session_id = s.pipeline_session_id
+          AND p.project_id = s.project_id
+         WHERE s.item_id = $1::uuid
+           AND s.pipeline_session_id = $2::uuid
+           AND s.project_id = $3::uuid
+         FOR UPDATE OF s;`,
+        [input.item_id, input.pipeline_session_id, input.project_id]
+      );
+      const existingRow = existingRes.rows[0];
+      if (!existingRow) {
+        throw new PostgresRlsError(
+          "23503",
+          `Stage 1 discovery item ${input.item_id} not found in pipeline session ${input.pipeline_session_id}`
+        );
+      }
+      const sessionStatus = String(existingRow.session_status);
+      if (sessionStatus !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${sessionStatus}; stage1_discovery_items cannot be modified after baseline freeze`
+        );
+      }
+      const existingStatus = String(existingRow.confirmation_status);
+      if (existingStatus !== "UNCONFIRMED") {
+        throw new PostgresRlsError(
+          "23514",
+          `Stage 1 discovery item ${input.item_id} is already ${existingStatus} and cannot be re-resolved`
+        );
+      }
+
       const nextStatus = input.decision === "CONFIRM" ? "CONFIRMED" : "REJECTED";
       const res = await this.pool.queryInActiveTx(
         `UPDATE stage1_discovery_items
@@ -5150,6 +5250,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
          WHERE item_id = $4::uuid
            AND pipeline_session_id = $5::uuid
            AND project_id = $6::uuid
+           AND confirmation_status = 'UNCONFIRMED'
          RETURNING *;`,
         [
           nextStatus,
@@ -5162,8 +5263,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       );
       if (!res.rows[0]) {
         throw new PostgresRlsError(
-          "23503",
-          `Stage 1 discovery item ${input.item_id} not found in pipeline session ${input.pipeline_session_id}`
+          "23514",
+          `Stage 1 discovery item ${input.item_id} is no longer UNCONFIRMED and cannot be re-resolved`
         );
       }
       return mapStage1DiscoveryItemRow(res.rows[0]);
@@ -5289,7 +5390,29 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async recordStageApprovalGate(
     input: RecordStageApprovalGateInput
   ): Promise<StageApprovalGateRecord> {
+    if (!input.approver_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "approver_principal_id must be non-empty");
+    }
     try {
+      const sessRes = await this.pool.queryInActiveTx(
+        `SELECT status FROM product_pipeline_sessions
+         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+         FOR UPDATE;`,
+        [input.pipeline_session_id, input.project_id]
+      );
+      const sessRow = sessRes.rows[0];
+      if (!sessRow) {
+        throw new PostgresRlsError(
+          "23503",
+          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      if (String(sessRow.status) !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; new stage approval gates are forbidden after baseline freeze`
+        );
+      }
       const gateId = input.gate_id ?? randomUUID();
       const res = await this.pool.queryInActiveTx(
         `INSERT INTO stage_approval_gates (
@@ -5332,6 +5455,9 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async freezeBaselineSpec(
     input: FreezeBaselineSpecInput
   ): Promise<BaselineSpecFreezeRecord> {
+    if (!input.frozen_by_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "frozen_by_principal_id must be non-empty");
+    }
     try {
       const sessRes = await this.pool.queryInActiveTx(
         `SELECT * FROM product_pipeline_sessions
@@ -5357,6 +5483,16 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
         [input.validation_report_artifact_id]
       );
+      const latestS4Res = await this.pool.queryInActiveTx(
+        `SELECT * FROM stage_artifacts
+         WHERE project_id = $1::uuid
+           AND pipeline_session_id = $2::uuid
+           AND stage = 'STAGE_4_SPEC_FREEZE'
+         ORDER BY version DESC
+         LIMIT 1;`,
+        [input.project_id, input.pipeline_session_id]
+      );
+      const stage1Items = await this.listStage1DiscoveryItems(input.pipeline_session_id);
       const gateRes = await this.pool.queryInActiveTx(
         "SELECT * FROM stage_approval_gates WHERE gate_id = $1::uuid LIMIT 1;",
         [input.approval_gate_id]
@@ -5373,6 +5509,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         stage2Artifact: s2Res.rows[0] ? mapStageArtifactRow(s2Res.rows[0]) : null,
         stage3Artifact: s3Res.rows[0] ? mapStageArtifactRow(s3Res.rows[0]) : null,
         validationReportArtifact: s4Res.rows[0] ? mapStageArtifactRow(s4Res.rows[0]) : null,
+        latestStage4Artifact: latestS4Res.rows[0]
+          ? mapStageArtifactRow(latestS4Res.rows[0])
+          : null,
+        stage1Items,
         approvalGate: gateRes.rows[0] ? mapStageApprovalGateRow(gateRes.rows[0]) : null,
         existingFreeze: existingRes.rows[0] ? mapBaselineSpecFreezeRow(existingRes.rows[0]) : null,
       });
@@ -5644,10 +5784,10 @@ export function buildCandidateBoundLineage(input: {
       reviewArtifact &&
       approvalForCandidate &&
       verificationRun.verdict === "PASS" &&
-      (verificationRun.overall_status ?? "PASSED") === "PASSED" &&
+      verificationRun.overall_status === "PASSED" &&
       reviewArtifact.verdict === "PASS" &&
       !reviewArtifact.is_invalidated &&
-      (reviewArtifact.status ?? "VALID") === "VALID" &&
+      reviewArtifact.status === "VALID" &&
       approvalForCandidate.decision === "APPROVED" &&
       (approvalForCandidate.status === "ACTIVE" || approvalForCandidate.status === "CONSUMED") &&
       (!approvalForCandidate.approval_request_id ||

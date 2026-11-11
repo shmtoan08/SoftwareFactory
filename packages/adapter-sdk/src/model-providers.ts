@@ -19,7 +19,11 @@ import {
   resolveModelPricingRate,
 } from "./cost-guard.ts";
 import type { PromptRegistry } from "./prompt-registry.ts";
-import { parseAndValidateStructuredOutput } from "./structured-output.ts";
+import {
+  StructuredOutputValidationError,
+  extractJsonFromModelText,
+  parseAndValidateStructuredOutput,
+} from "./structured-output.ts";
 
 export type { ModelProviderName };
 
@@ -53,9 +57,9 @@ export interface ModelProviderConfig {
   readonly apiKeyEnvVar?: string;
   readonly baseUrl?: string;
   readonly timeoutMs?: number;
-  /** Explicitly opt in to plain http:// on non-loopback hosts (unsafe outside tests). Default: false. */
+  /** Explicitly opt in to plain http:// or private network hosts (unsafe outside controlled tests). Default: false. */
   readonly allowInsecureHttpBaseUrl?: boolean;
-  /** Optional hostname allowlist for custom baseUrl endpoints. */
+  /** Optional hostname allowlist for provider endpoints (applies even when baseUrl uses default endpoint). */
   readonly allowedHosts?: readonly string[];
 }
 
@@ -75,6 +79,9 @@ export interface ModelCompletionResponse {
   readonly rawUsage?: Readonly<Record<string, unknown>>;
   readonly usage: ModelUsageMetrics;
 }
+
+const MAX_TOKENS_PER_CALL_HARD_CAP = 200_000;
+const MAX_HTTP_ERROR_BODY_CHARS = 500;
 
 function defaultEnvVarForProvider(provider: ModelProviderName): string {
   switch (provider) {
@@ -98,54 +105,202 @@ function defaultModelForProvider(provider: ModelProviderName): string {
   }
 }
 
-function isLoopbackHostname(hostname: string): boolean {
-  const normalized = hostname.trim().toLowerCase();
-  return (
-    normalized === "localhost" ||
-    normalized === "127.0.0.1" ||
-    normalized === "::1" ||
-    normalized === "[::1]"
-  );
+function defaultBaseUrlForProvider(provider: ModelProviderName): string {
+  switch (provider) {
+    case "anthropic":
+      return "https://api.anthropic.com";
+    case "openai":
+      return "https://api.openai.com";
+    case "google":
+      return "https://generativelanguage.googleapis.com";
+  }
+}
+
+function normalizeHostname(rawHostname: string): string {
+  return rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+}
+
+function parseIpv4Octets(host: string): readonly [number, number, number, number] | null {
+  const parts = host.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+  const nums: number[] = [];
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) {
+      return null;
+    }
+    const n = Number(part);
+    if (n < 0 || n > 255) {
+      return null;
+    }
+    nums.push(n);
+  }
+  return [nums[0]!, nums[1]!, nums[2]!, nums[3]!];
+}
+
+function extractEmbeddedIpv4FromIpv6(host: string): readonly [number, number, number, number] | null {
+  if (!host.includes(":")) {
+    return null;
+  }
+  const dottedMatch = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (dottedMatch?.[1]) {
+    return parseIpv4Octets(dottedMatch[1]);
+  }
+  const hexMatch = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hexMatch?.[1] && hexMatch?.[2]) {
+    const hi = Number.parseInt(hexMatch[1], 16);
+    const lo = Number.parseInt(hexMatch[2], 16);
+    return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+  }
+  return null;
+}
+
+function classifyHost(rawHostname: string): "loopback" | "metadata_or_unspecified" | "private" | "public" {
+  const host = normalizeHostname(rawHostname);
+  if (host === "localhost" || host === "::1") {
+    return "loopback";
+  }
+  if (host === "::" || host === "metadata.google.internal" || host === "metadata") {
+    return "metadata_or_unspecified";
+  }
+  const directIpv4 = parseIpv4Octets(host);
+  const embeddedIpv4 = directIpv4 ? null : extractEmbeddedIpv4FromIpv6(host);
+  const ipv4 = directIpv4 ?? embeddedIpv4;
+  if (ipv4) {
+    const [a, b, c, d] = ipv4;
+    if (a === 127) {
+      if (directIpv4 && b === 0 && c === 0 && d === 1) {
+        return "loopback";
+      }
+      return "private";
+    }
+    if (a === 0 || (a === 169 && b === 254)) {
+      return "metadata_or_unspecified";
+    }
+    if (
+      a === 10 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127)
+    ) {
+      return "private";
+    }
+  }
+  if (/^fe[89ab][0-9a-f]:/.test(host)) {
+    return "metadata_or_unspecified";
+  }
+  if (/^f[cd][0-9a-f]{2}:/.test(host)) {
+    return "private";
+  }
+  return "public";
 }
 
 function validateModelBaseUrl(config: ModelProviderConfig): void {
-  if (config.baseUrl === undefined) {
-    return;
-  }
+  const effectiveUrl = config.baseUrl ?? defaultBaseUrlForProvider(config.provider);
   let parsed: URL;
   try {
-    parsed = new URL(config.baseUrl);
+    parsed = new URL(effectiveUrl);
   } catch {
     throw new ModelProviderConfigurationError(
       config.provider,
-      `Invalid model provider baseUrl '${config.baseUrl}' for '${config.provider}'`
+      `Invalid model provider baseUrl '${effectiveUrl}' for '${config.provider}'`
     );
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new ModelProviderConfigurationError(
       config.provider,
-      `Unsupported URL scheme '${parsed.protocol}' in baseUrl '${config.baseUrl}'; expected https://`
+      `Unsupported URL scheme '${parsed.protocol}' in baseUrl '${effectiveUrl}'; expected https://`
+    );
+  }
+  if (parsed.username || parsed.password) {
+    throw new ModelProviderConfigurationError(
+      config.provider,
+      `Embedded URL credentials are forbidden in model provider baseUrl`
+    );
+  }
+
+  const hostClass = classifyHost(parsed.hostname);
+  if (hostClass === "metadata_or_unspecified") {
+    throw new ModelProviderConfigurationError(
+      config.provider,
+      `Forbidden metadata/unspecified host '${parsed.hostname}' in model provider baseUrl`
+    );
+  }
+  if (hostClass === "private" && config.allowInsecureHttpBaseUrl !== true) {
+    throw new ModelProviderConfigurationError(
+      config.provider,
+      `Private/internal network host '${parsed.hostname}' is blocked in model provider baseUrl`
     );
   }
   if (
     parsed.protocol === "http:" &&
-    !isLoopbackHostname(parsed.hostname) &&
+    hostClass !== "loopback" &&
     config.allowInsecureHttpBaseUrl !== true
   ) {
     throw new ModelProviderConfigurationError(
       config.provider,
-      `Insecure http:// baseUrl '${config.baseUrl}' is forbidden for non-loopback host '${parsed.hostname}'; use https:// or set allowInsecureHttpBaseUrl: true`
+      `Insecure http:// baseUrl '${effectiveUrl}' is forbidden for non-loopback host '${parsed.hostname}'; use https:// or set allowInsecureHttpBaseUrl: true`
     );
   }
   if (config.allowedHosts && config.allowedHosts.length > 0) {
-    const normalizedHost = parsed.hostname.toLowerCase();
-    const allowed = config.allowedHosts.some((h) => h.trim().toLowerCase() === normalizedHost);
+    const normalizedHost = normalizeHostname(parsed.hostname);
+    const allowed = config.allowedHosts.some((h) => normalizeHostname(h) === normalizedHost);
     if (!allowed) {
       throw new ModelProviderConfigurationError(
         config.provider,
-        `Model provider baseUrl host '${parsed.hostname}' is not in allowedHosts [${config.allowedHosts.join(", ")}]`
+        `Model provider host '${parsed.hostname}' is not in allowedHosts [${config.allowedHosts.join(", ")}]`
       );
     }
+  }
+}
+
+function validateGenerationParams(
+  provider: ModelProviderName,
+  maxTokens: number,
+  temperature: number
+): void {
+  if (!Number.isInteger(maxTokens) || maxTokens <= 0 || maxTokens > MAX_TOKENS_PER_CALL_HARD_CAP) {
+    throw new ModelProviderConfigurationError(
+      provider,
+      `Invalid maxTokens (${String(maxTokens)}): must be an integer between 1 and ${MAX_TOKENS_PER_CALL_HARD_CAP}`
+    );
+  }
+  if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+    throw new ModelProviderConfigurationError(
+      provider,
+      `Invalid temperature (${String(temperature)}): must be a finite number between 0 and 2`
+    );
+  }
+}
+
+function isOpenAiReasoningModel(model: string): boolean {
+  return /^(?:o1|o3|o4)(?:$|[-_])/i.test(model.trim());
+}
+
+async function readTruncatedResponseText(resp: Response): Promise<string> {
+  try {
+    const text = await resp.text();
+    return text.length > MAX_HTTP_ERROR_BODY_CHARS
+      ? `${text.slice(0, MAX_HTTP_ERROR_BODY_CHARS)}...[truncated]`
+      : text;
+  } catch {
+    return "<unreadable response body>";
+  }
+}
+
+async function parseProviderJsonResponse<T>(
+  provider: ModelProviderName,
+  resp: Response
+): Promise<T> {
+  try {
+    return (await resp.json()) as T;
+  } catch (err: unknown) {
+    throw new ModelProviderHttpError(
+      provider,
+      resp.status,
+      `${provider} API returned invalid JSON response: ${err instanceof Error ? err.message : String(err)}`
+    );
   }
 }
 
@@ -172,8 +327,9 @@ function extractTextContent(rawContent: unknown): string {
 
 /**
  * Live Model Provider HTTP Adapter (`anthropic`, `openai`, `google`).
- * Fail-closed: throws `ModelProviderConfigurationError` if no API key is configured
- * or if a non-loopback `http://` baseUrl is configured without explicit opt-in.
+ * Fail-closed: throws `ModelProviderConfigurationError` if no API key is configured,
+ * if a forbidden private/metadata host is used, or if a non-loopback `http://` baseUrl
+ * is configured without explicit opt-in.
  */
 export class LiveModelProviderClient {
   public readonly config: ModelProviderConfig;
@@ -197,6 +353,7 @@ export class LiveModelProviderClient {
     const timeoutMs = this.config.timeoutMs ?? 30_000;
     const maxTokens = req.maxTokens ?? 1024;
     const temperature = req.temperature ?? 0;
+    validateGenerationParams(this.config.provider, maxTokens, temperature);
     const requestSha256 = sha256Hex(
       canonicalizeJson({
         provider: this.config.provider,
@@ -232,13 +389,13 @@ export class LiveModelProviderClient {
           throw new ModelProviderHttpError(
             "anthropic",
             resp.status,
-            `Anthropic API error HTTP ${resp.status}: ${await resp.text()}`
+            `Anthropic API error HTTP ${resp.status}: ${await readTruncatedResponseText(resp)}`
           );
         }
-        const json = (await resp.json()) as {
+        const json = await parseProviderJsonResponse<{
           content?: Array<{ type?: string; text?: string }>;
           usage?: Record<string, unknown>;
-        };
+        }>("anthropic", resp);
         const text =
           Array.isArray(json.content)
             ? json.content
@@ -265,6 +422,26 @@ export class LiveModelProviderClient {
       if (this.config.provider === "openai") {
         const base = (this.config.baseUrl ?? "https://api.openai.com").replace(/\/+$/, "");
         const endpoint = `${base}/v1/chat/completions`;
+        const reasoning = isOpenAiReasoningModel(this.config.model);
+        const bodyPayload: Record<string, unknown> = reasoning
+          ? {
+              model: this.config.model,
+              max_completion_tokens: maxTokens,
+              ...(req.temperature === 1 ? { temperature: 1 } : {}),
+              messages: [
+                { role: "system", content: req.systemPrompt },
+                { role: "user", content: req.userPrompt },
+              ],
+            }
+          : {
+              model: this.config.model,
+              max_tokens: maxTokens,
+              temperature,
+              messages: [
+                { role: "system", content: req.systemPrompt },
+                { role: "user", content: req.userPrompt },
+              ],
+            };
         const resp = await fetch(endpoint, {
           method: "POST",
           signal: controller.signal,
@@ -272,27 +449,19 @@ export class LiveModelProviderClient {
             "content-type": "application/json",
             authorization: `Bearer ${this.resolvedApiKey}`,
           },
-          body: JSON.stringify({
-            model: this.config.model,
-            max_tokens: maxTokens,
-            temperature,
-            messages: [
-              { role: "system", content: req.systemPrompt },
-              { role: "user", content: req.userPrompt },
-            ],
-          }),
+          body: JSON.stringify(bodyPayload),
         });
         if (!resp.ok) {
           throw new ModelProviderHttpError(
             "openai",
             resp.status,
-            `OpenAI API error HTTP ${resp.status}: ${await resp.text()}`
+            `OpenAI API error HTTP ${resp.status}: ${await readTruncatedResponseText(resp)}`
           );
         }
-        const json = (await resp.json()) as {
+        const json = await parseProviderJsonResponse<{
           choices?: Array<{ message?: { content?: unknown } }>;
           usage?: Record<string, unknown>;
-        };
+        }>("openai", resp);
         const text = extractTextContent(json.choices?.[0]?.message?.content);
         return {
           provider: "openai",
@@ -335,13 +504,13 @@ export class LiveModelProviderClient {
         throw new ModelProviderHttpError(
           "google",
           resp.status,
-          `Google Gemini API error HTTP ${resp.status}: ${await resp.text()}`
+          `Google Gemini API error HTTP ${resp.status}: ${await readTruncatedResponseText(resp)}`
         );
       }
-      const json = (await resp.json()) as {
+      const json = await parseProviderJsonResponse<{
         candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
         usageMetadata?: Record<string, unknown>;
-      };
+      }>("google", resp);
       const parts = json.candidates?.[0]?.content?.parts;
       const text = Array.isArray(parts)
         ? parts
@@ -424,24 +593,12 @@ export async function evaluateIndependentReviewWithLiveModel(
   });
 
   const rawText = typeof completion?.contentText === "string" ? completion.contentText.trim() : "";
-  const jsonStart = rawText.indexOf("{");
-  const jsonEnd = rawText.lastIndexOf("}");
-  if (jsonStart === -1 || jsonEnd <= jsonStart) {
-    return {
-      verdict: "FAIL",
-      findings: [
-        {
-          code: "CUSTOM_REVIEW_REJECTION",
-          severity: "HIGH",
-          detail: `Live model ${client.config.provider}/${client.config.model} returned non-JSON review response`,
-        },
-      ],
-      summaryMarkdown: `### Live Review Result (${client.config.provider}/${client.config.model})\n\nVerdict: FAIL (malformed JSON response)`,
-    };
-  }
-
   try {
-    const parsed = JSON.parse(rawText.slice(jsonStart, jsonEnd + 1)) as {
+    const parsedRaw = extractJsonFromModelText(rawText);
+    if (!parsedRaw || typeof parsedRaw !== "object" || Array.isArray(parsedRaw)) {
+      throw new Error("Expected JSON object");
+    }
+    const parsed = parsedRaw as {
       verdict?: unknown;
       summaryMarkdown?: unknown;
       findings?: Array<{ severity?: unknown; filePath?: unknown; detail?: unknown }>;
@@ -469,17 +626,17 @@ export async function evaluateIndependentReviewWithLiveModel(
         ? parsed.summaryMarkdown
         : `### Live Review Result (${client.config.provider}/${client.config.model})\n\nVerdict: ${verdict}`;
     return { verdict, findings, summaryMarkdown };
-  } catch {
+  } catch (err: unknown) {
     return {
       verdict: "FAIL",
       findings: [
         {
           code: "CUSTOM_REVIEW_REJECTION",
           severity: "HIGH",
-          detail: `Failed to parse live model review JSON from ${client.config.provider}/${client.config.model}`,
+          detail: `Live model ${client.config.provider}/${client.config.model} returned non-JSON review response: ${err instanceof Error ? err.message : String(err)}`,
         },
       ],
-      summaryMarkdown: `### Live Review Result\n\nVerdict: FAIL (JSON parse error)`,
+      summaryMarkdown: `### Live Review Result (${client.config.provider}/${client.config.model})\n\nVerdict: FAIL (malformed JSON response)`,
     };
   }
 }
@@ -636,16 +793,18 @@ export class ManagedModelProviderExecutor {
   public async executeStructuredPrompt<T>(
     input: ManagedPromptExecutionInput
   ): Promise<ManagedStructuredExecutionResult<T>> {
+    const provider = this.client.config.provider;
+    const model = this.client.config.model;
+    const maxTokens = input.maxTokens ?? this.defaultMaxTokens;
+    const temperature = input.temperature ?? this.defaultTemperature;
+    validateGenerationParams(provider, maxTokens, temperature);
+
     const renderedPrompt = this.promptRegistry.render(
       input.promptId,
       input.promptVersion,
       input.variables ?? {}
     );
 
-    const provider = this.client.config.provider;
-    const model = this.client.config.model;
-    const maxTokens = input.maxTokens ?? this.defaultMaxTokens;
-    const temperature = input.temperature ?? this.defaultTemperature;
     const estimatedInputTokens = estimateTokenCount(
       `${renderedPrompt.systemPrompt}\n${renderedPrompt.userPrompt}`
     );
@@ -728,6 +887,7 @@ export class ManagedModelProviderExecutor {
         actual_output_tokens: 0,
         estimated_cost_micro_usd: estimatedCostMicroUsd,
         actual_cost_micro_usd: 0,
+        usage_estimated: false,
         outcome: "FAILED_PROVIDER",
         error_message:
           providerErr instanceof Error ? providerErr.message : String(providerErr),
@@ -746,6 +906,8 @@ export class ManagedModelProviderExecutor {
       try {
         parsed = parseAndValidateStructuredOutput<T>(completion.contentText, schema);
       } catch (validationErr: unknown) {
+        const validationMsg =
+          validationErr instanceof Error ? validationErr.message : String(validationErr);
         const finalizeFailed = await this.costGuard.finalizeModelCallLedger({
           project_id: input.projectId,
           cost_session_id: input.costSessionId,
@@ -764,9 +926,9 @@ export class ManagedModelProviderExecutor {
           actual_output_tokens: usage.outputTokens,
           estimated_cost_micro_usd: estimatedCostMicroUsd,
           actual_cost_micro_usd: actualCostMicroUsd,
+          usage_estimated: Boolean(usage.usageEstimated),
           outcome: "FAILED_VALIDATION",
-          error_message:
-            validationErr instanceof Error ? validationErr.message : String(validationErr),
+          error_message: validationMsg,
           latency_ms: latencyMs,
         });
         if (!finalizeFailed.allowed) {
@@ -774,7 +936,22 @@ export class ManagedModelProviderExecutor {
             limitScope: finalizeFailed.limitScope ?? "SESSION_COST_BUDGET",
             costSessionId: input.costSessionId,
             ledgerId: finalizeFailed.ledger.call_id,
-            message: finalizeFailed.reason ?? "Post-call cost budget exceeded on invalid response",
+            message: `${finalizeFailed.reason ?? "Post-call cost budget exceeded"} (after structured output validation failure: ${validationMsg})`,
+            cause: validationErr,
+            details: {
+              stage: input.stage,
+              provider,
+              model,
+              actualInputTokens: usage.inputTokens,
+              actualOutputTokens: usage.outputTokens,
+              actualCostMicroUsd,
+              ledgerStatus: finalizeFailed.ledger.status,
+              validationFailed: true,
+              validationErrors:
+                validationErr instanceof StructuredOutputValidationError
+                  ? validationErr.validationErrors
+                  : [validationMsg],
+            },
           });
         }
         throw validationErr;
@@ -801,6 +978,7 @@ export class ManagedModelProviderExecutor {
       actual_output_tokens: usage.outputTokens,
       estimated_cost_micro_usd: estimatedCostMicroUsd,
       actual_cost_micro_usd: actualCostMicroUsd,
+      usage_estimated: Boolean(usage.usageEstimated),
       outcome: "ALLOWED",
       latency_ms: latencyMs,
     });

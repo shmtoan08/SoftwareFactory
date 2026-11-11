@@ -63,6 +63,7 @@ export function normalizeCreateStage1DiscoveryItem(
   readonly title: string;
   readonly statement: string;
   readonly confirmation_status: Stage1ConfirmationStatus;
+  readonly clarification_question: string | null;
 } {
   const title = item.title.trim();
   const statement = item.statement.trim();
@@ -86,10 +87,21 @@ export function normalizeCreateStage1DiscoveryItem(
     );
   }
 
+  const trimmedQuestion =
+    typeof item.clarification_question === "string" ? item.clarification_question.trim() : "";
+  const clarification_question = trimmedQuestion.length > 0 ? trimmedQuestion : null;
+  if ((item.kind === "ASSUMPTION" || item.kind === "RECOMMENDATION") && !clarification_question) {
+    throw new PostgresRlsError(
+      "23514",
+      `Stage 1 ${item.kind} "${title}" requires a non-empty clarification_question`
+    );
+  }
+
   return {
     title,
     statement,
     confirmation_status: status,
+    clarification_question,
   };
 }
 
@@ -129,12 +141,23 @@ export function validateStage2Ac10References(
     throw new PostgresRlsError("23514", "Stage 2 artifact must contain object content_json.srs");
   }
   const srs = rawSrs as Record<string, unknown>;
-  const functionalReqs = Array.isArray(srs.functional_requirements)
-    ? srs.functional_requirements
-    : [];
-  const nonFunctionalReqs = Array.isArray(srs.non_functional_requirements)
-    ? srs.non_functional_requirements
-    : [];
+  if (srs.functional_requirements !== undefined && !Array.isArray(srs.functional_requirements)) {
+    throw new PostgresRlsError(
+      "23514",
+      "AC-10 violation: content_json.srs.functional_requirements must be a JSON array"
+    );
+  }
+  if (
+    srs.non_functional_requirements !== undefined &&
+    !Array.isArray(srs.non_functional_requirements)
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      "AC-10 violation: content_json.srs.non_functional_requirements must be a JSON array"
+    );
+  }
+  const functionalReqs = srs.functional_requirements ?? [];
+  const nonFunctionalReqs = srs.non_functional_requirements ?? [];
   const allReqs = [...functionalReqs, ...nonFunctionalReqs];
 
   const itemMap = new Map<string, Stage1DiscoveryItemRecord>();
@@ -218,6 +241,8 @@ export function validateFreezeBaselineSpecInvariants(input: {
   readonly stage2Artifact: StageArtifactRecord | null;
   readonly stage3Artifact: StageArtifactRecord | null;
   readonly validationReportArtifact: StageArtifactRecord | null;
+  readonly latestStage4Artifact?: StageArtifactRecord | null;
+  readonly stage1Items?: readonly Stage1DiscoveryItemRecord[];
   readonly approvalGate: StageApprovalGateRecord | null;
   readonly existingFreeze: BaselineSpecFreezeRecord | null;
 }): void {
@@ -294,10 +319,54 @@ export function validateFreezeBaselineSpecInvariants(input: {
     "validation_report"
   );
 
-  if (input.validationReportArtifact!.content_json.passed !== true) {
+  const report = input.validationReportArtifact!;
+  if (
+    input.latestStage4Artifact &&
+    (report.artifact_id !== input.latestStage4Artifact.artifact_id ||
+      report.version !== input.latestStage4Artifact.version)
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      `Cannot freeze baseline: Stage 4 validation report ${report.artifact_id} (v${report.version}) is not the latest report (v${input.latestStage4Artifact.version}: ${input.latestStage4Artifact.artifact_id})`
+    );
+  }
+
+  if (report.content_json.passed !== true) {
     throw new PostgresRlsError(
       "23514",
       "Cannot freeze baseline: Stage 4 CrossArtifactConsistencyChecker report passed is not TRUE"
+    );
+  }
+
+  const reportJson = report.content_json as Record<string, unknown>;
+  const refS1 =
+    typeof reportJson.referenced_stage1_artifact_id === "string"
+      ? reportJson.referenced_stage1_artifact_id.trim()
+      : "";
+  const refS2 =
+    typeof reportJson.referenced_stage2_artifact_id === "string"
+      ? reportJson.referenced_stage2_artifact_id.trim()
+      : "";
+  const refS3 =
+    typeof reportJson.referenced_stage3_artifact_id === "string"
+      ? reportJson.referenced_stage3_artifact_id.trim()
+      : "";
+  if (
+    (refS1 && refS1 !== request.stage1_artifact_id) ||
+    (refS2 && refS2 !== request.stage2_artifact_id) ||
+    (refS3 && refS3 !== request.stage3_artifact_id)
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      `Cannot freeze baseline: Stage 1..3 artifact IDs do not match Stage 4 validation report ${report.artifact_id} references`
+    );
+  }
+
+  if (input.stage1Items !== undefined) {
+    validateStage2Ac10References(
+      input.stage2Artifact!.content_json,
+      input.stage1Items,
+      request.pipeline_session_id
     );
   }
 

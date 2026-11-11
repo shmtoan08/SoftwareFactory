@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
+import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import {
   CostBudgetExceededError,
@@ -15,6 +18,7 @@ import {
   PromptVersionConflictError,
   StructuredOutputValidationError,
   computeCostMicroUsd,
+  evaluateIndependentReviewWithLiveModel,
   loadModelProviderConfigFromEnv,
   parseAndValidateStructuredOutput,
 } from "@software-factory/adapter-sdk";
@@ -29,6 +33,7 @@ import {
 import {
   Ac10ViolationError,
   PostgresRlsError,
+  PostgresRuntimePool,
   SoftwareFactoryControlPlaneStore,
   buildPostgresPoolConfigFromEnv,
 } from "@software-factory/database";
@@ -36,6 +41,8 @@ import {
   STAGE1_DISCOVERY_PROMPT_ID,
   STAGE2_REQUIREMENTS_PROMPT_ID,
   STAGE3_ARCHITECTURE_PROMPT_ID,
+  STAGE4_CONSISTENCY_CHECK_PROMPT_ID,
+  STAGE4_CONSISTENCY_CHECK_PROMPT_SHA256,
   createDefaultPipelinePromptRegistry,
   runCrossArtifactConsistencyCheck,
 } from "@software-factory/product-pipeline";
@@ -47,6 +54,7 @@ import {
   type Stage1DiscoveryBundle,
   type Stage2RequirementsSpec,
   type Stage3ArchitectureSpec,
+  type StructuredJsonSchema,
   computeCanonicalPayloadSha256,
 } from "@software-factory/shared-types";
 import { createControlPlaneStackRuntime } from "@software-factory/web";
@@ -66,6 +74,9 @@ interface ProviderResponseOverride {
   readonly text?: string;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
+  readonly cacheCreationInputTokens?: number;
+  readonly cacheReadInputTokens?: number;
+  readonly omitUsage?: boolean;
 }
 
 interface MockModelProviderHarness {
@@ -366,6 +377,7 @@ async function startMockModelProviderServers(): Promise<MockModelProviderHarness
 
         const inputTokens = resolvedOverride?.inputTokens ?? 120;
         const outputTokens = resolvedOverride?.outputTokens ?? 80;
+        const omitUsage = resolvedOverride?.omitUsage === true;
 
         if (provider === "anthropic") {
           writeJsonResponse(res, 200, {
@@ -373,7 +385,20 @@ async function startMockModelProviderServers(): Promise<MockModelProviderHarness
             type: "message",
             role: "assistant",
             content: [{ type: "text", text: responseText }],
-            usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+            ...(omitUsage
+              ? {}
+              : {
+                  usage: {
+                    input_tokens: inputTokens,
+                    output_tokens: outputTokens,
+                    ...(resolvedOverride?.cacheCreationInputTokens !== undefined
+                      ? { cache_creation_input_tokens: resolvedOverride.cacheCreationInputTokens }
+                      : {}),
+                    ...(resolvedOverride?.cacheReadInputTokens !== undefined
+                      ? { cache_read_input_tokens: resolvedOverride.cacheReadInputTokens }
+                      : {}),
+                  },
+                }),
           });
           return;
         }
@@ -381,21 +406,29 @@ async function startMockModelProviderServers(): Promise<MockModelProviderHarness
           writeJsonResponse(res, 200, {
             id: `chatcmpl_${hits.openai}`,
             choices: [{ index: 0, message: { role: "assistant", content: responseText } }],
-            usage: {
-              prompt_tokens: inputTokens,
-              completion_tokens: outputTokens,
-              total_tokens: inputTokens + outputTokens,
-            },
+            ...(omitUsage
+              ? {}
+              : {
+                  usage: {
+                    prompt_tokens: inputTokens,
+                    completion_tokens: outputTokens,
+                    total_tokens: inputTokens + outputTokens,
+                  },
+                }),
           });
           return;
         }
         writeJsonResponse(res, 200, {
           candidates: [{ content: { role: "model", parts: [{ text: responseText }] } }],
-          usageMetadata: {
-            promptTokenCount: inputTokens,
-            candidatesTokenCount: outputTokens,
-            totalTokenCount: inputTokens + outputTokens,
-          },
+          ...(omitUsage
+            ? {}
+            : {
+                usageMetadata: {
+                  promptTokenCount: inputTokens,
+                  candidatesTokenCount: outputTokens,
+                  totalTokenCount: inputTokens + outputTokens,
+                },
+              }),
         });
       } catch (err: unknown) {
         writeJsonResponse(res, 500, { error: err instanceof Error ? err.message : String(err) });
@@ -2279,13 +2312,148 @@ describe("M6A Acceptance Gates (Model Provider v2, AC-12b Cost Guard & Stages 1â
         (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
       );
 
-      // Confirm assumption, reject recommendation, finish Stages 2..4 + Freeze
+      // (b2) M6A-FIX-01: Missing source_discovery_item_ids key on requirement rejected at DB trigger (23514)
+      const directMissingKeyS2Content = {
+        prd: { product_vision: "v", target_personas: ["Op"], goals: ["g"], non_goals: [] },
+        srs: {
+          functional_requirements: [
+            {
+              req_id: "REQ-PG-MISSING-KEY",
+              title: "Missing Key Probe",
+              description: "d",
+              priority: "MUST",
+            },
+          ],
+          non_functional_requirements: [],
+        },
+      };
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            () =>
+              pool.queryInActiveTx(
+                `INSERT INTO stage_artifacts (
+                  artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                  provider, model, prompt_id, prompt_version, prompt_sha256,
+                  content_json, artifact_sha256, created_by_principal_id
+                ) VALUES (
+                  $1::uuid, $2::uuid, $3::uuid, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 99,
+                  'anthropic', 'claude-sonnet-4-20250514', 'p', '1.0.0', $4::char(64),
+                  $5::jsonb, $6::char(64), 'pg-alice-dev'
+                );`,
+                [
+                  randomUUID(),
+                  projectAId,
+                  sessId,
+                  "a".repeat(64),
+                  directMissingKeyS2Content,
+                  computeCanonicalPayloadSha256(directMissingKeyS2Content),
+                ]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // (b3) Minor Note 7: Non-array functional_requirements raises 23514 (not 22023)
+      const directNonArrayS2Content = {
+        prd: { product_vision: "v", target_personas: ["Op"], goals: ["g"], non_goals: [] },
+        srs: {
+          functional_requirements: "not-an-array",
+          non_functional_requirements: [],
+        },
+      };
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            () =>
+              pool.queryInActiveTx(
+                `INSERT INTO stage_artifacts (
+                  artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                  provider, model, prompt_id, prompt_version, prompt_sha256,
+                  content_json, artifact_sha256, created_by_principal_id
+                ) VALUES (
+                  $1::uuid, $2::uuid, $3::uuid, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 99,
+                  'anthropic', 'claude-sonnet-4-20250514', 'p', '1.0.0', $4::char(64),
+                  $5::jsonb, $6::char(64), 'pg-alice-dev'
+                );`,
+                [
+                  randomUUID(),
+                  projectAId,
+                  sessId,
+                  "a".repeat(64),
+                  directNonArrayS2Content,
+                  computeCanonicalPayloadSha256(directNonArrayS2Content),
+                ]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // (b4) Minor Note 1: ASSUMPTION with blank clarification_question blocked by CHECK (23514)
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `INSERT INTO stage1_discovery_items (
+                  item_id, project_id, pipeline_session_id, kind, title, statement, rationale,
+                  clarification_question, confirmation_status
+                ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'ASSUMPTION', 'NoQ', 'S', 'R', '   ', 'UNCONFIRMED');`,
+                [randomUUID(), projectAId, sessId]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // Confirm assumption, reject recommendation, verify M6A-FIX-02 one-way transition guard in PG, finish Stages 2..4
       await coreClient.resolvePipelineStage1Item(projectAId, authDevA, sessId, assumpItem.item_id, {
         decision: "CONFIRM",
       });
       await coreClient.resolvePipelineStage1Item(projectAId, authDevA, sessId, recItem.item_id, {
         decision: "REJECT",
       });
+
+      // M6A-FIX-02: Cannot flip CONFIRMED -> REJECTED or REJECTED -> CONFIRMED or FACT -> REJECTED
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `UPDATE stage1_discovery_items
+                 SET confirmation_status = 'REJECTED'
+                 WHERE item_id = $1::uuid;`,
+                [assumpItem.item_id]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+      await assert.rejects(
+        () =>
+          coreClient.resolvePipelineStage1Item(projectAId, authDevA, sessId, assumpItem.item_id, {
+            decision: "REJECT",
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
 
       const s2 = await coreClient.runPipelineStage2Requirements(projectAId, authDevA, sessId, {
         model_config: {
@@ -2295,7 +2463,7 @@ describe("M6A Acceptance Gates (Model Provider v2, AC-12b Cost Guard & Stages 1â
           baseUrl: mock.openaiBaseUrl,
         },
       });
-      await coreClient.runPipelineStage3Architecture(projectAId, authDevA, sessId, {
+      const s3 = await coreClient.runPipelineStage3Architecture(projectAId, authDevA, sessId, {
         model_config: {
           provider: "google",
           model: "gemini-2.5-pro",
@@ -2317,6 +2485,80 @@ describe("M6A Acceptance Gates (Model Provider v2, AC-12b Cost Guard & Stages 1â
         );
       }
 
+      // M6A-FIX-03 in PostgreSQL: generate newer Stage 4 v2 and verify older v1 report cannot be frozen via HTTP or direct SQL
+      const staleGateV1 = await coreClient.submitPipelineApprovalGate(projectAId, authApproverA, sessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: s4.artifact.artifact_id,
+        target_artifact_sha256: s4.artifact.artifact_sha256,
+        decision: "APPROVED",
+        rationale: "Gate bound to older Stage 4 v1",
+      });
+      const s4Latest = await coreClient.runPipelineStage4ConsistencyCheck(projectAId, authDevA, sessId);
+      assert.equal(s4Latest.artifact.version, s4.artifact.version + 1);
+
+      const staleFreezeRes = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(projectAId)}/pipeline-sessions/${encodeURIComponent(sessId)}/freeze`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApproverA),
+          },
+          body: JSON.stringify({
+            validation_report_artifact_id: s4.artifact.artifact_id,
+            validation_report_sha256: s4.artifact.artifact_sha256,
+            approval_gate_id: staleGateV1.gate_id,
+          }),
+        }
+      );
+      assert.equal(staleFreezeRes.status, 422);
+
+      const s1ArtFromPg = bundleFromPg.artifacts.find((a) => a.stage === "STAGE_1_IDEA_DISCOVERY")!;
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-bob-approver",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `INSERT INTO baseline_spec_freezes (
+                  baseline_id, project_id, pipeline_session_id,
+                  stage1_artifact_id, stage1_artifact_sha256,
+                  stage2_artifact_id, stage2_artifact_sha256,
+                  stage3_artifact_id, stage3_artifact_sha256,
+                  validation_report_artifact_id, validation_report_sha256,
+                  approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+                ) VALUES (
+                  $1::uuid, $2::uuid, $3::uuid,
+                  $4::uuid, $5::char(64),
+                  $6::uuid, $7::char(64),
+                  $8::uuid, $9::char(64),
+                  $10::uuid, $11::char(64),
+                  $12::uuid, 'pg-bob-approver', $13::char(64)
+                );`,
+                [
+                  randomUUID(),
+                  projectAId,
+                  sessId,
+                  s1ArtFromPg.artifact_id,
+                  s1ArtFromPg.artifact_sha256,
+                  s2.artifact.artifact_id,
+                  s2.artifact.artifact_sha256,
+                  s3.artifact.artifact_id,
+                  s3.artifact.artifact_sha256,
+                  s4.artifact.artifact_id,
+                  s4.artifact.artifact_sha256,
+                  staleGateV1.gate_id,
+                  "f".repeat(64),
+                ]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
       // Direct PG SQL trigger: marking session FROZEN without committed baseline_spec_freezes row fails (23514)
       await assert.rejects(
         () =>
@@ -2337,7 +2579,7 @@ describe("M6A Acceptance Gates (Model Provider v2, AC-12b Cost Guard & Stages 1â
         (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
       );
 
-      // Web Console Approve & Freeze against live PostgreSQL
+      // Web Console Approve (latest Stage 4) & Freeze against live PostgreSQL
       const webGateRes = await fetch(
         `${webBaseUrl}/projects/${encodeURIComponent(projectAId)}/pipeline-sessions/${encodeURIComponent(sessId)}/approval-gates`,
         {
@@ -2394,6 +2636,70 @@ describe("M6A Acceptance Gates (Model Provider v2, AC-12b Cost Guard & Stages 1â
               conn.query(
                 `UPDATE product_pipeline_sessions SET status = 'ACTIVE' WHERE pipeline_session_id = $1::uuid;`,
                 [sessId]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // Minor Note 8: Title column UPDATE denied (42501) by column GRANT & granted frozen columns blocked (23514) by trigger
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `UPDATE product_pipeline_sessions SET title = 'Hijacked Frozen Title' WHERE pipeline_session_id = $1::uuid;`,
+                [sessId]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "42501"
+      );
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `UPDATE product_pipeline_sessions SET current_stage = 'STAGE_1_IDEA_DISCOVERY' WHERE pipeline_session_id = $1::uuid;`,
+                [sessId]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // Minor Note 17: Stage approval gates cannot be inserted after baseline freeze
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-bob-approver",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `INSERT INTO stage_approval_gates (
+                  gate_id, project_id, pipeline_session_id, gate_stage,
+                  target_artifact_id, target_artifact_sha256, approver_principal_id, decision
+                ) VALUES (
+                  $1::uuid, $2::uuid, $3::uuid, 'STAGE_4_SPEC_FREEZE',
+                  $4::uuid, $5::char(64), 'pg-bob-approver', 'APPROVED'
+                );`,
+                [
+                  randomUUID(),
+                  projectAId,
+                  sessId,
+                  s4Latest.artifact.artifact_id,
+                  s4Latest.artifact.artifact_sha256,
+                ]
               )
           ),
         (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
@@ -2598,11 +2904,1382 @@ describe("M6A Acceptance Gates (Model Provider v2, AC-12b Cost Guard & Stages 1â
       );
       assert.equal(mock.hits.anthropic, hitsBeforePgExhausted);
 
+      // 6. M6A-FIX-04 in PG: direct finalizeModelCallLedger on EXHAUSTED session blocks & preserves EXHAUSTED
+      const directExhFin = await store.finalizeModelCallLedger({
+        project_id: projectAId,
+        cost_session_id: tightPipe.costSession!.cost_session_id,
+        pipeline_session_id: tightPipe.session.pipeline_session_id,
+        stage: "STAGE_1_IDEA_DISCOVERY",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        prompt_id: STAGE1_DISCOVERY_PROMPT_ID,
+        prompt_version: "1.0.0",
+        prompt_sha256: "a".repeat(64),
+        request_sha256: "b".repeat(64),
+        estimated_input_tokens: 10,
+        reserved_output_tokens: 10,
+        actual_input_tokens: 5,
+        actual_output_tokens: 5,
+        estimated_cost_micro_usd: 100,
+        actual_cost_micro_usd: 50,
+        outcome: "ALLOWED",
+        latency_ms: 10,
+      });
+      assert.equal(directExhFin.allowed, false);
+      assert.equal(directExhFin.limitScope, "SESSION_EXHAUSTED");
+      assert.equal(directExhFin.session.status, "EXHAUSTED");
+      assert.equal(directExhFin.ledger.status, "BLOCKED_POSTCALL");
+
+      // 7. M6A-FIX-07 in PG: omitted provider usage persists usage_estimated=true in model_call_ledgers
+      const estPipe = await coreClient.createPipelineSession(projectAId, authDevA, {
+        title: `PG Estimated Usage ${suffix}`,
+        raw_idea_text: "Verify usage_estimated=true round-trips through PostgreSQL.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 2_000_000,
+          session_token_budget: 40_000,
+          session_cost_budget_micro_usd: 10_000_000,
+        },
+      });
+      mock.setResponseOverride("anthropic", { omitUsage: true });
+      const estOutcome = await coreClient.runPipelineStage1Extract(
+        projectAId,
+        authDevA,
+        estPipe.session.pipeline_session_id
+      );
+      mock.setResponseOverride("anthropic", null);
+      assert.equal(estOutcome.ledger.usage_estimated, true);
+
+      // 8. Minor Note 6 in PG: model_cost_sessions.pipeline_session_id composite FK rejects dangling reference on COMMIT (23503)
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `INSERT INTO model_cost_sessions (
+                   cost_session_id, project_id, pipeline_session_id,
+                   max_tokens_per_request, max_cost_micro_usd_per_request,
+                   session_token_budget, session_cost_budget_micro_usd
+                 ) VALUES (gen_random_uuid(), $1::uuid, $2::uuid, 1000, 100000, 5000, 500000);`,
+                [projectAId, randomUUID()]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23503"
+      );
+
       assert.ok(pool.getStats().discardAllExecuted > 0);
     } finally {
       await Promise.allSettled([stack.close(), mock.close()]);
       if (stack.pool) {
         assert.equal(stack.pool.getStats().totalConnections, 0);
+      }
+    }
+  });
+});
+
+describe("M6A Review Hardening & Regression Suite (M6A-FIX-01..10 + Minor Notes)", () => {
+  it("M6A-FIX-05/06 & Minor Notes 9, 17: PromptRegistry deep-freeze/semver, Stage 4 SHA-256 & strict StructuredJsonSchema validation", () => {
+    const registry = createDefaultPipelinePromptRegistry();
+
+    // Minor Note 9: Stage 4 Consistency Check template registered with deterministic promptSha256
+    const regStage4 = registry.get(STAGE4_CONSISTENCY_CHECK_PROMPT_ID, "1.0.0");
+    assert.equal(regStage4.promptSha256, STAGE4_CONSISTENCY_CHECK_PROMPT_SHA256);
+
+    // M6A-FIX-05: Deep clone & deep freeze prevents caller post-register mutation
+    const schemaRef: StructuredJsonSchema = {
+      type: "object",
+      additionalProperties: false,
+      required: ["nested"],
+      properties: {
+        nested: {
+          type: "object",
+          required: ["flag"],
+          properties: {
+            flag: { type: "string", enum: ["ON", "OFF"] },
+          },
+        },
+      },
+    };
+    const regMutable = registry.register({
+      promptId: "m6a.fix05.freeze",
+      version: "1.0.0",
+      description: "Deep freeze test",
+      requiredVariables: ["topic"],
+      systemTemplate: "Topic {{topic}}",
+      userTemplate: "Run {{topic}}",
+      outputSchema: schemaRef,
+    });
+    assert.ok(Object.isFrozen(regMutable.spec.outputSchema));
+    assert.ok(Object.isFrozen(regMutable.spec.outputSchema!.properties!.nested));
+    (schemaRef.properties!.nested!.required as string[]).push("tampered");
+    assert.deepEqual(regMutable.spec.outputSchema!.properties!.nested!.required, ["flag"]);
+    assert.throws(() => {
+      (regMutable.spec.outputSchema!.properties!.nested!.required as string[]).push("tampered");
+    }, TypeError);
+    assert.throws(() => {
+      const rendered = registry.render("m6a.fix05.freeze", "1.0.0", { topic: "x" });
+      (rendered.outputSchema!.properties as Record<string, unknown>).tamper = { type: "string" };
+    }, TypeError);
+
+    // Minor Note 17: Unversioned get(promptId) selects highest semver regardless of insertion order
+    registry.register({
+      promptId: "m6a.semver.test",
+      version: "1.10.0",
+      description: "Higher minor semver",
+      requiredVariables: [],
+      systemTemplate: "v1.10.0",
+      userTemplate: "go",
+    });
+    registry.register({
+      promptId: "m6a.semver.test",
+      version: "1.2.0",
+      description: "Lower minor semver inserted second",
+      requiredVariables: [],
+      systemTemplate: "v1.2.0",
+      userTemplate: "go",
+    });
+    assert.equal(registry.get("m6a.semver.test").spec.version, "1.10.0");
+
+    // M6A-FIX-06: Missing or unknown schema.type must fail closed (never silently pass)
+    assert.throws(
+      () =>
+        parseAndValidateStructuredOutput(
+          '{"a":123}',
+          { required: ["missing"], properties: { missing: { type: "string" } } } as unknown as StructuredJsonSchema
+        ),
+      (err: unknown) =>
+        err instanceof StructuredOutputValidationError && err.code === "ERR_STRUCTURED_OUTPUT_INVALID"
+    );
+    assert.throws(
+      () =>
+        parseAndValidateStructuredOutput(
+          '"hello"',
+          { type: "bogus_type" } as unknown as StructuredJsonSchema
+        ),
+      (err: unknown) =>
+        err instanceof StructuredOutputValidationError && err.code === "ERR_STRUCTURED_OUTPUT_INVALID"
+    );
+
+    // Minor Note 17: Bare fence rejected, malformed regex caught cleanly, null required property rejected, object/array enum supported
+    assert.throws(
+      () =>
+        parseAndValidateStructuredOutput('```\n{"ok":"yes"}\n```', {
+          type: "object",
+          required: ["ok"],
+          properties: { ok: { type: "string" } },
+        }),
+      (err: unknown) => err instanceof StructuredOutputValidationError
+    );
+    assert.throws(
+      () =>
+        parseAndValidateStructuredOutput('{"code":"abc"}', {
+          type: "object",
+          required: ["code"],
+          properties: { code: { type: "string", pattern: "[unclosed" } },
+        }),
+      (err: unknown) => err instanceof StructuredOutputValidationError
+    );
+    assert.throws(
+      () =>
+        parseAndValidateStructuredOutput('{"name":null}', {
+          type: "object",
+          required: ["name"],
+          properties: { name: { type: "string" } },
+        }),
+      (err: unknown) => err instanceof StructuredOutputValidationError
+    );
+    const enumObj = parseAndValidateStructuredOutput<{ mode: string; tags: string[] }>(
+      '{"tags":["a","b"],"mode":"strict"}',
+      {
+        type: "object",
+        enum: [{ mode: "strict", tags: ["a", "b"] }],
+        properties: {
+          mode: { type: "string" },
+          tags: { type: "array", items: { type: "string" } },
+        },
+      }
+    );
+    assert.equal(enumObj.mode, "strict");
+  });
+
+  it("M6A-FIX-07 & Minor Notes 3, 4, 13, 14, 15, 16: Cache billing, estimated usage, SSRF, OpenAI reasoning & review JSON", async () => {
+    const mock = await startMockModelProviderServers();
+    const ledgerStore = new InMemoryCostGuardLedger();
+    try {
+      const projId = randomUUID();
+      const costSess = ledgerStore.createSession({
+        project_id: projId,
+        max_tokens_per_request: 100_000,
+        max_cost_micro_usd_per_request: 10_000_000,
+        session_token_budget: 200_000,
+        session_cost_budget_micro_usd: 20_000_000,
+      });
+
+      // Minor Notes 3 & 4: SSRF blocks metadata, 127.0.0.2, RFC1918 private IPs, and checks allowedHosts when baseUrl omitted
+      for (const badUrl of [
+        "https://169.254.169.254/latest/meta-data",
+        "http://127.0.0.2:8080/v1",
+        "https://10.0.0.1/v1",
+        "https://[::ffff:169.254.169.254]/v1",
+      ]) {
+        assert.throws(
+          () =>
+            new LiveModelProviderClient({
+              provider: "openai",
+              model: "gpt-4.1",
+              apiKey: "test-key",
+              baseUrl: badUrl,
+              allowInsecureHttpBaseUrl: false,
+            }),
+          ModelProviderConfigurationError
+        );
+      }
+      assert.throws(
+        () =>
+          new LiveModelProviderClient({
+            provider: "openai",
+            model: "gpt-4.1",
+            apiKey: "test-key",
+            allowedHosts: ["internal-proxy.example.com"],
+          }),
+        ModelProviderConfigurationError
+      );
+
+      // Minor Note 16: Unsafe integer overflow in computeCostMicroUsd fails closed
+      assert.throws(
+        () =>
+          computeCostMicroUsd(10_000_000_000, 0, {
+            inputMicroUsdPerMillionTokens: 2_000_000_000_000,
+            outputMicroUsdPerMillionTokens: 1,
+          }),
+        /MAX_SAFE_INTEGER|exceeds/i
+      );
+
+      // Minor Note 17: Invalid generation params (maxTokens <= 0 / negative temperature) fail closed
+      const client = new LiveModelProviderClient({
+        provider: "openai",
+        model: "gpt-4.1",
+        apiKey: "test-openai-key",
+        baseUrl: mock.openaiBaseUrl,
+      });
+      await assert.rejects(
+        () =>
+          client.complete({
+            systemPrompt: "sys",
+            userPrompt: "usr",
+            maxTokens: 0,
+            temperature: 0,
+          }),
+        ModelProviderConfigurationError
+      );
+
+      // Minor Note 15: OpenAI reasoning model (o3-mini) uses max_completion_tokens and omits temperature
+      const o3Client = new LiveModelProviderClient({
+        provider: "openai",
+        model: "o3-mini",
+        apiKey: "test-openai-key",
+        baseUrl: mock.openaiBaseUrl,
+      });
+      mock.resetCounts();
+      await o3Client.complete({
+        systemPrompt: "sys",
+        userPrompt: "usr",
+        maxTokens: 256,
+        temperature: 0,
+      });
+      const o3Body = mock.requests[0]!.rawBody;
+      assert.equal(o3Body.max_completion_tokens, 256);
+      assert.equal(o3Body.max_tokens, undefined);
+      assert.equal(o3Body.temperature, undefined);
+
+      // M6A-FIX-07 (part 1): Anthropic cache_creation_input_tokens + cache_read_input_tokens included in billing
+      const anthExec = new ManagedModelProviderExecutor({
+        client: new LiveModelProviderClient({
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anth-key",
+          baseUrl: mock.anthropicBaseUrl,
+        }),
+        promptRegistry: createDefaultPipelinePromptRegistry(),
+        costGuard: ledgerStore,
+      });
+      mock.setResponseOverride("anthropic", {
+        text: JSON.stringify(buildDefaultStage1Bundle()),
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheCreationInputTokens: 40,
+        cacheReadInputTokens: 60,
+      });
+      const cacheRes = await anthExec.executeStructuredPrompt({
+        projectId: projId,
+        costSessionId: costSess.cost_session_id,
+        stage: "STAGE_1_IDEA_DISCOVERY",
+        promptId: STAGE1_DISCOVERY_PROMPT_ID,
+        variables: {
+          project_id: projId,
+          pipeline_session_id: randomUUID(),
+          title: "Cache billing",
+          raw_idea_text: "Idea",
+        },
+      });
+      assert.equal(cacheRes.usage.inputTokens, 200);
+      assert.equal(cacheRes.usage.usageEstimated, false);
+      assert.equal(cacheRes.ledger.actual_input_tokens, 200);
+      assert.equal(cacheRes.ledger.usage_estimated, false);
+
+      // M6A-FIX-07 (part 2): Omitted usage triggers fallback byte estimation and marks ledger.usage_estimated = true
+      mock.setResponseOverride("anthropic", {
+        text: JSON.stringify(buildDefaultStage1Bundle()),
+        omitUsage: true,
+      });
+      const estRes = await anthExec.executeStructuredPrompt({
+        projectId: projId,
+        costSessionId: costSess.cost_session_id,
+        stage: "STAGE_1_IDEA_DISCOVERY",
+        promptId: STAGE1_DISCOVERY_PROMPT_ID,
+        variables: {
+          project_id: projId,
+          pipeline_session_id: randomUUID(),
+          title: "Estimated telemetry",
+          raw_idea_text: "Idea",
+        },
+      });
+      mock.setResponseOverride("anthropic", null);
+      assert.equal(estRes.usage.usageEstimated, true);
+      assert.equal(estRes.ledger.usage_estimated, true);
+
+      // Minor Note 13: Invalid structured output + post-call budget overrun preserves cause & validation metadata
+      const tinySess = ledgerStore.createSession({
+        project_id: projId,
+        max_tokens_per_request: 50_000,
+        max_cost_micro_usd_per_request: 10_000_000,
+        session_token_budget: 500,
+        session_cost_budget_micro_usd: 10_000_000,
+      });
+      mock.setResponseOverride("anthropic", {
+        text: '{"unexpected":"invalid-schema"}',
+        inputTokens: 400,
+        outputTokens: 200, // 600 > 500 session_token_budget
+      });
+      await assert.rejects(
+        () =>
+          anthExec.executeStructuredPrompt({
+            projectId: projId,
+            costSessionId: tinySess.cost_session_id,
+            stage: "STAGE_1_IDEA_DISCOVERY",
+            promptId: STAGE1_DISCOVERY_PROMPT_ID,
+            maxTokens: 16,
+            variables: {
+              project_id: projId,
+              pipeline_session_id: randomUUID(),
+              title: "Both invalid & over budget",
+              raw_idea_text: "Idea",
+            },
+          }),
+        (err: unknown) =>
+          err instanceof CostBudgetExceededError &&
+          err.details.validationFailed === true &&
+          Array.isArray(err.details.validationErrors) &&
+          err.details.validationErrors.length > 0 &&
+          err.cause instanceof StructuredOutputValidationError
+      );
+      mock.setResponseOverride("anthropic", null);
+
+      // Minor Note 14: Review client uses strict extractJsonFromModelText (rejects prose wrapping JSON)
+      mock.setResponseOverride("google", {
+        text: 'Prose before JSON: {"verdict":"PASS","findings":[]}',
+      });
+      const revClient = new LiveModelProviderClient({
+        provider: "google",
+        model: "gemini-2.5-pro",
+        apiKey: "test-google-key",
+        baseUrl: mock.googleBaseUrl,
+      });
+      const revResult = await evaluateIndependentReviewWithLiveModel(revClient, {
+        taskContract: {
+          allowed_files: ["src/a.ts"],
+          protected_paths: [],
+        },
+        diffText: "+const x = 1;",
+        changedFiles: ["src/a.ts"],
+        verificationRunSummary: {
+          verification_run_id: randomUUID(),
+          verdict: "PASS",
+          overall_status: "PASSED",
+          tier1_trusted_acceptance_passed: true,
+          tier2_protected_baseline_passed: true,
+          tier3_agent_tests_passed: true,
+        },
+      });
+      mock.setResponseOverride("google", null);
+      assert.equal(revResult.verdict, "FAIL");
+      assert.ok(revResult.findings.some((f) => /non-JSON/i.test(f.detail)));
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("M6A-FIX-02/03/04 & Minor Notes 1, 17: Store/Domain one-way Stage 1 resolve, latest Stage 4 freeze, CLOSED/EXHAUSTED finalize & post-freeze gate lock", async () => {
+    const mock = await startMockModelProviderServers();
+    const store = new SoftwareFactoryControlPlaneStore();
+    let httpServer: CoreApiHttpServer | null = null;
+    try {
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: `m6a-domain-fixes-${randomUUID().slice(0, 8)}`,
+            name: "Domain Fixes",
+            repo_bare_path: "/tmp/m6a-domain-fixes.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          return p;
+        }
+      );
+
+      // M6A-FIX-04: Direct finalize on CLOSED or EXHAUSTED cost sessions rejects in both Store and InMemoryCostGuardLedger
+      const memGuard = new InMemoryCostGuardLedger();
+      const csClosedMem = memGuard.createSession({
+        project_id: proj.project_id,
+        max_tokens_per_request: 1000,
+        max_cost_micro_usd_per_request: 100000,
+        session_token_budget: 5000,
+        session_cost_budget_micro_usd: 500000,
+      });
+      memGuard.closeSession(proj.project_id, csClosedMem.cost_session_id);
+      const closedMemFin = memGuard.finalizeModelCallLedger({
+        project_id: proj.project_id,
+        cost_session_id: csClosedMem.cost_session_id,
+        stage: "STAGE_1_IDEA_DISCOVERY",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        prompt_id: "p",
+        prompt_version: "1.0.0",
+        prompt_sha256: "a".repeat(64),
+        request_sha256: "b".repeat(64),
+        estimated_input_tokens: 10,
+        reserved_output_tokens: 10,
+        actual_input_tokens: 5,
+        actual_output_tokens: 5,
+        estimated_cost_micro_usd: 100,
+        actual_cost_micro_usd: 50,
+        outcome: "ALLOWED",
+        latency_ms: 5,
+      });
+      assert.equal(closedMemFin.allowed, false);
+      assert.equal(closedMemFin.limitScope, "SESSION_EXHAUSTED");
+      assert.equal(closedMemFin.session.status, "CLOSED");
+      assert.equal(closedMemFin.ledger.status, "BLOCKED_POSTCALL");
+
+      const coreApi = new CoreApiService(store, {
+        defaultModelConfig: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anthropic-key-local",
+          baseUrl: mock.anthropicBaseUrl,
+        },
+      });
+      httpServer = new CoreApiHttpServer({ coreApi });
+      const { baseUrl } = await httpServer.start();
+      const client = new HttpCoreApiClient(baseUrl);
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      const created = await client.createPipelineSession(proj.project_id, authDev, {
+        title: "Domain Guard Matrix",
+        raw_idea_text: "Test ASSUMPTION clarification, one-way resolve, and stale freeze.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 50_000,
+          session_cost_budget_micro_usd: 5_000_000,
+        },
+      });
+      const sessId = created.session.pipeline_session_id;
+
+      // Minor Note 1: ASSUMPTION lacking clarification_question rejected at domain store layer (23514)
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            { currentProjectId: proj.project_id, currentPrincipalId: "alice-dev", currentRole: "core_api_service" },
+            () =>
+              store.createStage1DiscoveryItems({
+                project_id: proj.project_id,
+                pipeline_session_id: sessId,
+                items: [
+                  {
+                    kind: "ASSUMPTION",
+                    title: "Missing Q",
+                    statement: "No question provided",
+                    rationale: "Test",
+                    clarification_question: "   ",
+                  },
+                ],
+              })
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      const s1 = await client.runPipelineStage1Extract(proj.project_id, authDev, sessId);
+      const fact = s1.discoveryItems.find((i) => i.kind === "FACT")!;
+      const assump = s1.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      const rec = s1.discoveryItems.find((i) => i.kind === "RECOMMENDATION")!;
+
+      // M6A-FIX-02: Resolving FACT or flipping CONFIRMED -> REJECTED rejected with 422
+      await assert.rejects(
+        () => client.resolvePipelineStage1Item(proj.project_id, authDev, sessId, fact.item_id, { decision: "REJECT" }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      await client.resolvePipelineStage1Item(proj.project_id, authDev, sessId, assump.item_id, { decision: "CONFIRM" });
+      await client.resolvePipelineStage1Item(proj.project_id, authDev, sessId, rec.item_id, { decision: "REJECT" });
+      await assert.rejects(
+        () => client.resolvePipelineStage1Item(proj.project_id, authDev, sessId, assump.item_id, { decision: "REJECT" }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      await client.runPipelineStage2Requirements(proj.project_id, authDev, sessId);
+      await client.runPipelineStage3Architecture(proj.project_id, authDev, sessId);
+
+      // M6A-FIX-03: Report v1 passes, then newer Report v2 supersedes it -> freezing with v1 fails 422
+      const s4V1 = await client.runPipelineStage4ConsistencyCheck(proj.project_id, authDev, sessId);
+      const gateV1 = await client.submitPipelineApprovalGate(proj.project_id, authApprover, sessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: s4V1.artifact.artifact_id,
+        target_artifact_sha256: s4V1.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+      const s4V2 = await client.runPipelineStage4ConsistencyCheck(proj.project_id, authDev, sessId);
+      await assert.rejects(
+        () =>
+          client.freezePipelineBaseline(proj.project_id, authApprover, sessId, {
+            validation_report_artifact_id: s4V1.artifact.artifact_id,
+            validation_report_sha256: s4V1.artifact.artifact_sha256,
+            approval_gate_id: gateV1.gate_id,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // Valid freeze with latest v2 succeeds, and post-freeze approval gate insert fails (422)
+      const gateV2 = await client.submitPipelineApprovalGate(proj.project_id, authApprover, sessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: s4V2.artifact.artifact_id,
+        target_artifact_sha256: s4V2.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+      const frozen = await client.freezePipelineBaseline(proj.project_id, authApprover, sessId, {
+        approval_gate_id: gateV2.gate_id,
+      });
+      assert.equal(frozen.status, "FROZEN");
+
+      await assert.rejects(
+        () =>
+          client.submitPipelineApprovalGate(proj.project_id, authApprover, sessId, {
+            gate_stage: "STAGE_4_SPEC_FREEZE",
+            decision: "REJECTED",
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+    } finally {
+      await Promise.allSettled([httpServer?.stop(), mock.close()]);
+    }
+  });
+
+  it("M6A-FIX-08 & Minor Note 17: Full Stages 1 -> Resolve -> 2 -> 3 -> 4 -> Gate -> Freeze driven exclusively via Web UI HTTP & HTML form routes", async () => {
+    const mock = await startMockModelProviderServers();
+    const stack = await createControlPlaneStackRuntime({
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+      withGatewayHttp: false,
+    });
+    try {
+      const store = stack.coreApiRuntime!.store;
+      const coreApi = stack.coreApiRuntime!.coreApi;
+      const webBaseUrl = stack.webEndpoint!.baseUrl;
+
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: `m6a-webui-e2e-${randomUUID().slice(0, 8)}`,
+            name: "Web UI Full Flow",
+            repo_bare_path: "/tmp/m6a-webui.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          return p;
+        }
+      );
+
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+      const pEnc = encodeURIComponent(proj.project_id);
+
+      // 1. Project Pipeline index HTML renders interactive create session form
+      const listHtmlRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions?format=html`, {
+        headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev) },
+      });
+      assert.equal(listHtmlRes.status, 200);
+      const listHtml = await listHtmlRes.text();
+      assert.ok(listHtml.includes('<form method="POST"'));
+      assert.ok(listHtml.includes(`<form method="POST" action="/projects/${pEnc}/pipeline-sessions">`));
+
+      // 2. Submit HTML form to create pipeline session -> 303 redirect to session page
+      const createFormRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+        },
+        body: new URLSearchParams({
+          title: "Web UI End-to-End Pipeline",
+          raw_idea_text: "Build customer billing console through Web UI forms only.",
+          max_tokens_per_request: "8000",
+          max_cost_micro_usd_per_request: "1000000",
+          session_token_budget: "60000",
+          session_cost_budget_micro_usd: "10000000",
+        }).toString(),
+      });
+      assert.equal(createFormRes.status, 303);
+      const location = createFormRes.headers.get("location") ?? "";
+      assert.ok(location.startsWith(`/projects/${pEnc}/pipeline-sessions/`));
+      const sessId = decodeURIComponent(location.split("/").pop()!);
+      const sEnc = encodeURIComponent(sessId);
+
+      // SSRF defense on Web UI model_config overrides
+      const ssrfWebRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage1/extract`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+        },
+        body: JSON.stringify({
+          model_config: {
+            provider: "openai",
+            model: "gpt-4.1",
+            apiKey: "test-key",
+            baseUrl: "http://127.0.0.2:9999",
+            allowInsecureHttpBaseUrl: true,
+          },
+        }),
+      });
+      assert.equal(ssrfWebRes.status, 503);
+
+      // 3. Stage 1 Extract via Web form route -> 303
+      const s1FormRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage1/extract`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+        },
+        body: "",
+      });
+      assert.equal(s1FormRes.status, 303);
+
+      // Inspect HTML page after Stage 1: verify interactive Confirm/Reject & Stage 1..4 forms rendered
+      const midHtmlRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}`, {
+        headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev) },
+      });
+      assert.equal(midHtmlRes.status, 200);
+      const midHtml = await midHtmlRes.text();
+      assert.ok(midHtml.includes("/stage2/requirements"));
+      assert.ok(midHtml.includes("/stage3/architecture"));
+      assert.ok(midHtml.includes("/stage4/consistency-check"));
+      assert.ok(midHtml.includes("/approval-gates"));
+      assert.ok(midHtml.includes("/freeze"));
+      assert.ok(midHtml.includes('<button type="submit">Confirm</button>'));
+
+      // 4. HTML form POST errors render HTTP 422 HTML error banner (both premature Stage 3 and hypotheses-only Stage 2 ERR_AC10_UNCONFIRMED_ASSUMPTION)
+      const prematureS3HtmlRes = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage3/architecture`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: "",
+        }
+      );
+      assert.equal(prematureS3HtmlRes.status, 422);
+      const prematureS3Html = await prematureS3HtmlRes.text();
+      assert.ok(prematureS3Html.includes('data-error-banner="true"'));
+
+      const unconfFormRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+        },
+        body: new URLSearchParams({
+          title: "Hypotheses-Only Web UI Pipeline",
+          raw_idea_text: "Only unconfirmed assumptions.",
+          max_tokens_per_request: "8000",
+          max_cost_micro_usd_per_request: "1000000",
+          session_token_budget: "20000",
+          session_cost_budget_micro_usd: "5000000",
+        }).toString(),
+      });
+      assert.equal(unconfFormRes.status, 303);
+      const unconfSessEnc = encodeURIComponent(decodeURIComponent((unconfFormRes.headers.get("location") ?? "").split("/").pop()!));
+      mock.setStage1Factory(() => ({
+        summary: "Hypotheses only",
+        facts: [],
+        assumptions: [
+          {
+            title: "Unconfirmed Hypothesis",
+            statement: "Needs human signoff",
+            rationale: "No verified facts yet",
+            clarification_question: "Approve hypothesis?",
+          },
+        ],
+        recommendations: [],
+      }));
+      const unconfS1Res = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${unconfSessEnc}/stage1/extract`,
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: "",
+        }
+      );
+      assert.equal(unconfS1Res.status, 303);
+      mock.setStage1Factory(() => buildDefaultStage1Bundle());
+
+      const prematureS2HtmlRes = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${unconfSessEnc}/stage2/requirements`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: "",
+        }
+      );
+      assert.equal(prematureS2HtmlRes.status, 422);
+      const prematureS2Html = await prematureS2HtmlRes.text();
+      assert.ok(prematureS2Html.includes('data-error-banner="true"'));
+      assert.ok(prematureS2Html.includes("ERR_AC10_UNCONFIRMED_ASSUMPTION"));
+
+      // Fetch bundle JSON from Web Console to pick item IDs, then resolve via Web Console routes
+      const midBundle = (await (
+        await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}?format=json`, {
+          headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev) },
+        })
+      ).json()) as ProductPipelineBundle;
+      const assump = midBundle.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      const rec = midBundle.discoveryItems.find((i) => i.kind === "RECOMMENDATION")!;
+
+      const confirmRes = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage1/items/${encodeURIComponent(assump.item_id)}/resolve`,
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: new URLSearchParams({ decision: "CONFIRM" }).toString(),
+        }
+      );
+      assert.equal(confirmRes.status, 303);
+
+      const rejectRes = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage1/items/${encodeURIComponent(rec.item_id)}/resolve`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: JSON.stringify({ decision: "REJECT", resolution_note: "Excluded from v1" }),
+        }
+      );
+      assert.equal(rejectRes.status, 200);
+
+      // 5. Stage 2, Stage 3, Stage 4 exclusively through Web Console routes (with omitted usage on Stage 2 to verify "(est)" banner!)
+      mock.setResponseOverride("anthropic", { omitUsage: true });
+      const s2Res = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage2/requirements`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: "{}",
+        }
+      );
+      assert.equal(s2Res.status, 200);
+      mock.setResponseOverride("anthropic", null);
+
+      const s3Res = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage3/architecture`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: JSON.stringify({
+            model_config: {
+              provider: "google",
+              model: "gemini-2.5-pro",
+              apiKey: "test-google-key-local",
+              baseUrl: mock.googleBaseUrl,
+            },
+          }),
+        }
+      );
+      assert.equal(s3Res.status, 200);
+
+      const s4FormRes = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/stage4/consistency-check`,
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: "",
+        }
+      );
+      assert.equal(s4FormRes.status, 303);
+
+      // 6. Approver approves & freezes exclusively through Web Console HTML form POSTs
+      const gateFormRes = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/approval-gates`,
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover),
+          },
+          body: new URLSearchParams({
+            gate_stage: "STAGE_4_SPEC_FREEZE",
+            decision: "APPROVED",
+            rationale: "Approved in Web UI workbench",
+          }).toString(),
+        }
+      );
+      assert.equal(gateFormRes.status, 303);
+
+      // DEVELOPER freeze via Web UI HTML form returns 403 HTML error banner!
+      const devFreezeFormRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/freeze`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+        },
+        body: "",
+      });
+      assert.equal(devFreezeFormRes.status, 403);
+      assert.ok((await devFreezeFormRes.text()).includes('data-error-banner="true"'));
+
+      const freezeFormRes = await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/freeze`, {
+        method: "POST",
+        redirect: "manual",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover),
+        },
+        body: "",
+      });
+      assert.equal(freezeFormRes.status, 303);
+
+      const finalHtml = await (
+        await fetch(`${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}`, {
+          headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover) },
+        })
+      ).text();
+      assert.ok(finalHtml.includes("FROZEN"));
+      assert.ok(finalHtml.includes("(est)"));
+    } finally {
+      await Promise.allSettled([stack.close(), mock.close()]);
+    }
+  });
+
+  it("M6A-FIX-09: Live HTTP AC-6 freeze blocks (dangling REQ-NONEXISTENT, omitted Stage 1 traceability, tampered SHA-256) & DEVELOPER Web freeze 403", async () => {
+    const mock = await startMockModelProviderServers();
+    const stack = await createControlPlaneStackRuntime({
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+      withGatewayHttp: false,
+    });
+    try {
+      const store = stack.coreApiRuntime!.store;
+      const coreApi = stack.coreApiRuntime!.coreApi;
+      const coreClient = new HttpCoreApiClient(stack.coreApiRuntime!.coreApiEndpoint!.baseUrl);
+      const webBaseUrl = stack.webEndpoint!.baseUrl;
+
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: `m6a-fix09-live-${randomUUID().slice(0, 8)}`,
+            name: "Live AC6 Matrix",
+            repo_bare_path: "/tmp/m6a-fix09.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          return p;
+        }
+      );
+
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      const created = await coreClient.createPipelineSession(proj.project_id, authDev, {
+        title: "Live AC6 Branches",
+        raw_idea_text: "Test dangling REQ ID, missing traceability, and tampered SHA-256 over HTTP.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 80_000,
+          session_cost_budget_micro_usd: 10_000_000,
+        },
+      });
+      const sessId = created.session.pipeline_session_id;
+      const s1 = await coreClient.runPipelineStage1Extract(proj.project_id, authDev, sessId);
+      const firstFact = s1.discoveryItems.find((i) => i.kind === "FACT")!;
+      const assump = s1.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      const rec = s1.discoveryItems.find((i) => i.kind === "RECOMMENDATION")!;
+      await coreClient.resolvePipelineStage1Item(proj.project_id, authDev, sessId, assump.item_id, {
+        decision: "REJECT",
+      });
+      await coreClient.resolvePipelineStage1Item(proj.project_id, authDev, sessId, rec.item_id, {
+        decision: "REJECT",
+      });
+
+      // (a) Stage 2 omits second AUTO_VERIFIED FACT -> valid Stage 2 schema, CHK-02 coverage fails -> freeze blocked 422
+      mock.setResponseOverride("anthropic", () => ({
+        text: JSON.stringify({
+          prd: {
+            product_vision: "v",
+            target_personas: ["Operator"],
+            goals: ["g"],
+            non_goals: [],
+          },
+          srs: {
+            functional_requirements: [
+              {
+                req_id: "REQ-FUNC-ONLY-1",
+                title: "Only cites first fact",
+                description: "Omits second fact",
+                priority: "MUST",
+                source_discovery_item_ids: [firstFact.item_id],
+                acceptance_criteria: [{ ac_id: "AC-1", given: "g", when: "w", then: "t" }],
+              },
+            ],
+            non_functional_requirements: [],
+          },
+        }),
+      }));
+      await coreClient.runPipelineStage2Requirements(proj.project_id, authDev, sessId);
+      mock.setResponseOverride("anthropic", null);
+      await coreClient.runPipelineStage3Architecture(proj.project_id, authDev, sessId);
+      const s4MissingTrace = await coreClient.runPipelineStage4ConsistencyCheck(proj.project_id, authDev, sessId);
+      assert.equal(s4MissingTrace.report.passed, false);
+      assert.equal(s4MissingTrace.report.checks.find((c) => c.check_id === "CHK-01")?.passed, true);
+      assert.equal(s4MissingTrace.report.checks.find((c) => c.check_id === "CHK-02")?.passed, false);
+      const gateMissingTrace = await coreClient.submitPipelineApprovalGate(proj.project_id, authApprover, sessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: s4MissingTrace.artifact.artifact_id,
+        target_artifact_sha256: s4MissingTrace.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(proj.project_id, authApprover, sessId, {
+            approval_gate_id: gateMissingTrace.gate_id,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // (b) Stage 2 now covers all Facts, while Stage 3 cites dangling "REQ-NONEXISTENT" -> CHK-03 fails -> freeze blocked 422
+      await coreClient.runPipelineStage2Requirements(proj.project_id, authDev, sessId);
+      mock.setResponseOverride("anthropic", (req) => {
+        const s3 = buildDynamicStage3Payload(req.userPrompt);
+        return {
+          text: JSON.stringify({
+            ...s3,
+            adrs: s3.adrs.map((adr) => ({
+              ...adr,
+              requirement_ids: [...adr.requirement_ids, "REQ-NONEXISTENT"],
+            })),
+          }),
+        };
+      });
+      await coreClient.runPipelineStage3Architecture(proj.project_id, authDev, sessId);
+      mock.setResponseOverride("anthropic", null);
+      const s4Dangling = await coreClient.runPipelineStage4ConsistencyCheck(proj.project_id, authDev, sessId);
+      assert.equal(s4Dangling.report.passed, false);
+      assert.equal(s4Dangling.report.checks.find((c) => c.check_id === "CHK-03")?.passed, false);
+      const gateDangling = await coreClient.submitPipelineApprovalGate(proj.project_id, authApprover, sessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: s4Dangling.artifact.artifact_id,
+        target_artifact_sha256: s4Dangling.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(proj.project_id, authApprover, sessId, {
+            approval_gate_id: gateDangling.gate_id,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // (c) Valid Stage 3 & Stage 4 PASS, but DEVELOPER Web Console freeze -> 403 and tampered stage3_artifact_sha256 -> 404/422
+      const goodS3 = await coreClient.runPipelineStage3Architecture(proj.project_id, authDev, sessId);
+      const goodS4 = await coreClient.runPipelineStage4ConsistencyCheck(proj.project_id, authDev, sessId, {
+        stage3_artifact_id: goodS3.artifact.artifact_id,
+      });
+      assert.equal(goodS4.report.passed, true);
+      const goodGate = await coreClient.submitPipelineApprovalGate(proj.project_id, authApprover, sessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: goodS4.artifact.artifact_id,
+        target_artifact_sha256: goodS4.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+
+      const devWebFreeze = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(proj.project_id)}/pipeline-sessions/${encodeURIComponent(sessId)}/freeze`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDev),
+          },
+          body: JSON.stringify({ approval_gate_id: goodGate.gate_id }),
+        }
+      );
+      assert.equal(devWebFreeze.status, 403);
+
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(proj.project_id, authApprover, sessId, {
+            stage3_artifact_id: goodS3.artifact.artifact_id,
+            stage3_artifact_sha256: "0".repeat(64),
+            approval_gate_id: goodGate.gate_id,
+          }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError && (err.statusCode === 422 || err.statusCode === 404)
+      );
+    } finally {
+      await Promise.allSettled([stack.close(), mock.close()]);
+    }
+  });
+
+  it("M6A-AC7b / M6A-FIX-10: Live PostgreSQL Upgrade Paths (86076639 -> HEAD & 8044774 -> HEAD)", async (t) => {
+    const pgConfig = buildPostgresPoolConfigFromEnv();
+    if (!pgConfig) {
+      t.skip("PostgreSQL connection env (PGHOST/DATABASE_URL) not configured on local workstation");
+      return;
+    }
+
+    const repoRoot = resolve(import.meta.dirname ?? process.cwd(), "../../..");
+    const hasHistory = (() => {
+      try {
+        execFileSync("git", ["cat-file", "-e", "86076639^{commit}"], { cwd: repoRoot });
+        execFileSync("git", ["cat-file", "-e", "8044774^{commit}"], { cwd: repoRoot });
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    if (!hasHistory) {
+      t.skip("Full git commit history (86076639, 8044774) not present in shallow checkout");
+      return;
+    }
+
+    const psqlBin = (() => {
+      for (const candidate of [
+        "psql",
+        "/opt/homebrew/opt/postgresql@17/bin/psql",
+        "/usr/local/opt/postgresql@17/bin/psql",
+        "/opt/homebrew/bin/psql",
+        "/usr/local/bin/psql",
+      ]) {
+        try {
+          execFileSync(candidate, ["--version"], { stdio: "ignore" });
+          return candidate;
+        } catch {
+          // try next candidate
+        }
+      }
+      return null;
+    })();
+    if (!psqlBin) {
+      if (process.env.CI) {
+        assert.fail("psql CLI binary is required in CI for M6A-AC7b migration upgrade tests");
+      }
+      t.skip("psql CLI binary not found on local PATH");
+      return;
+    }
+
+    const gitSql = (rev: string, relPath: string): string =>
+      execFileSync("git", ["show", `${rev}:${relPath}`], { cwd: repoRoot, encoding: "utf8" });
+    const headSql = (relPath: string): string => readFileSync(resolve(repoRoot, relPath), "utf8");
+
+    const runPsql = (database: string, sql: string): void => {
+      execFileSync(psqlBin, ["-v", "ON_ERROR_STOP=1"], {
+        cwd: repoRoot,
+        input: sql,
+        env: {
+          ...process.env,
+          PGHOST: pgConfig.host,
+          PGPORT: String(pgConfig.port),
+          PGUSER: pgConfig.user,
+          PGDATABASE: database,
+          ...(pgConfig.password !== undefined ? { PGPASSWORD: pgConfig.password } : {}),
+          ...(pgConfig.sslMode ? { PGSSLMODE: pgConfig.sslMode } : {}),
+          ...(pgConfig.sslRootCertPath ? { PGSSLROOTCERT: pgConfig.sslRootCertPath } : {}),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    };
+
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 12);
+    const dbM4Upg = `sf_m6a_upg_m4_${suffix}`;
+    const dbM6aUpg = `sf_m6a_upg_6a_${suffix}`;
+
+    try {
+      runPsql("postgres", `DROP DATABASE IF EXISTS ${dbM4Upg};`);
+      runPsql("postgres", `CREATE DATABASE ${dbM4Upg};`);
+      runPsql("postgres", `DROP DATABASE IF EXISTS ${dbM6aUpg};`);
+      runPsql("postgres", `CREATE DATABASE ${dbM6aUpg};`);
+
+      // Path A: 86076639 (pre-fix M4) -> HEAD (0004..0007 x2 + 0002)
+      runPsql(dbM4Upg, gitSql("86076639", "packages/database/migrations/0001_mvp_core_schema_and_rls.sql"));
+      runPsql(dbM4Upg, gitSql("86076639", "packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql"));
+      runPsql(
+        dbM4Upg,
+        gitSql("86076639", "packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql")
+      );
+
+      // Seed existing pre-fix M4 rows before running HEAD migrations
+      runPsql(
+        dbM4Upg,
+        `INSERT INTO projects (project_id, slug, name, repo_bare_path, default_branch, approval_ttl_seconds)
+         VALUES ('33333333-3333-3333-3333-333333333333', 'm4-upg-proj', 'M4 Upg', '/tmp/m4-upg.git', 'main', 3600);
+         INSERT INTO tasks (task_id, project_id, title, task_contract_json, status, base_main_commit_hash, current_attempt_no)
+         VALUES ('a3333333-3333-3333-3333-333333333333', '33333333-3333-3333-3333-333333333333', 'Upg Task', '{}'::jsonb, 'Ready', repeat('1', 40), 1);`
+      );
+
+      for (const mig of [
+        "packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql",
+        "packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql",
+        "packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql",
+        "packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql",
+        "packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql",
+        "packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql",
+        "packages/database/migrations/0007_m6a_review_fixes.sql",
+        "packages/database/migrations/0007_m6a_review_fixes.sql",
+        "packages/database/migrations/0002_rls_verification_matrix.sql",
+      ]) {
+        runPsql(dbM4Upg, headSql(mig));
+      }
+
+      const m4Pool = new PostgresRuntimePool({ ...pgConfig, database: dbM4Upg, maxConnections: 2 });
+      try {
+        await m4Pool.withRlsTransaction({ currentRole: "core_api_service" }, async (conn) => {
+          const uqRes = await conn.query<{ cols: number }>(
+            `SELECT array_length(conkey, 1) AS cols
+             FROM pg_constraint
+             WHERE conname = 'uq_ar_composite_binding' AND conrelid = 'approval_requests'::regclass;`
+          );
+          assert.equal(uqRes.rows[0]?.cols, 10);
+          const colRes = await conn.query<{ exists_col: boolean }>(
+            `SELECT EXISTS (
+               SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'model_call_ledgers' AND column_name = 'usage_estimated'
+             ) AS exists_col;`
+          );
+          assert.equal(colRes.rows[0]?.exists_col, true);
+        });
+      } finally {
+        await m4Pool.close();
+      }
+
+      // Path B: 8044774 (initial M6A) -> HEAD (0007 x2 + 0002)
+      for (const mig of [
+        "packages/database/migrations/0001_mvp_core_schema_and_rls.sql",
+        "packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql",
+        "packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql",
+        "packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql",
+        "packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql",
+      ]) {
+        runPsql(dbM6aUpg, gitSql("8044774", mig));
+      }
+
+      const pId = randomUUID();
+      const csId = randomUUID();
+      const ppsId = randomUUID();
+      const factId = randomUUID();
+      const assumpId = randomUUID();
+      const sa1 = randomUUID();
+      const sa2 = randomUUID();
+      const sa3 = randomUUID();
+      const sa4Old = randomUUID();
+      const sa4New = randomUUID();
+      const sagOld = randomUUID();
+
+      runPsql(
+        dbM6aUpg,
+        `INSERT INTO projects (project_id, slug, name, repo_bare_path, default_branch, approval_ttl_seconds)
+         VALUES ('${pId}', 'm6a-upg-proj', 'M6A Upg', '/tmp/m6a-upg.git', 'main', 3600);
+         INSERT INTO model_cost_sessions (cost_session_id, project_id, pipeline_session_id, max_tokens_per_request, max_cost_micro_usd_per_request, session_token_budget, session_cost_budget_micro_usd)
+         VALUES ('${csId}', '${pId}', '${ppsId}', 4000, 100000, 20000, 500000);
+         INSERT INTO product_pipeline_sessions (pipeline_session_id, project_id, cost_session_id, title, raw_idea_text, current_stage, status, created_by_principal_id)
+         VALUES ('${ppsId}', '${pId}', '${csId}', 'Pre-0007 Pipeline', 'Upgrade check', 'STAGE_4_SPEC_FREEZE', 'ACTIVE', 'alice-dev');
+         INSERT INTO stage1_discovery_items (item_id, project_id, pipeline_session_id, kind, title, statement, rationale, clarification_question, confirmation_status, confirmed_by_principal_id, confirmed_at)
+         VALUES
+           ('${factId}', '${pId}', '${ppsId}', 'FACT', 'F1', 'S1', 'R1', NULL, 'AUTO_VERIFIED', NULL, NULL),
+           ('${assumpId}', '${pId}', '${ppsId}', 'ASSUMPTION', 'A1', 'S2', 'R2', 'Confirm SLA?', 'CONFIRMED', 'alice-approver', clock_timestamp());
+         INSERT INTO stage_artifacts (artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version, provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id)
+         VALUES
+           ('${sa1}', '${pId}', '${ppsId}', 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE', 1, 'anthropic', 'claude-sonnet-4', 'p1', '1.0.0', repeat('1', 64), '{}'::jsonb, repeat('a', 64), 'alice-dev'),
+           ('${sa2}', '${pId}', '${ppsId}', 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 1, 'openai', 'gpt-4.1', 'p2', '1.0.0', repeat('2', 64), '{"srs":{"functional_requirements":[{"req_id":"R1","source_discovery_item_ids":["${factId}"]}]}}'::jsonb, repeat('b', 64), 'alice-dev'),
+           ('${sa3}', '${pId}', '${ppsId}', 'STAGE_3_ARCHITECTURE', 'STAGE_3_ARCHITECTURE_DESIGN', 1, 'google', 'gemini-2.5-pro', 'p3', '1.0.0', repeat('3', 64), '{}'::jsonb, repeat('c', 64), 'alice-dev'),
+           ('${sa4Old}', '${pId}', '${ppsId}', 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 1, 'system', 'consistency-checker', 'p4', '1.0.0', repeat('4', 64), '{"passed":true}'::jsonb, repeat('d', 64), 'alice-dev'),
+           ('${sa4New}', '${pId}', '${ppsId}', 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 2, 'system', 'consistency-checker', 'p4', '1.0.0', repeat('4', 64), '{"passed":true}'::jsonb, repeat('e', 64), 'alice-dev');
+         INSERT INTO stage_approval_gates (gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id, target_artifact_sha256, approver_principal_id, decision)
+         VALUES ('${sagOld}', '${pId}', '${ppsId}', 'STAGE_4_SPEC_FREEZE', '${sa4Old}', repeat('d', 64), 'bob-approver', 'APPROVED');`
+      );
+
+      runPsql(dbM6aUpg, headSql("packages/database/migrations/0007_m6a_review_fixes.sql"));
+      runPsql(dbM6aUpg, headSql("packages/database/migrations/0007_m6a_review_fixes.sql"));
+      runPsql(dbM6aUpg, headSql("packages/database/migrations/0002_rls_verification_matrix.sql"));
+
+      const m6aPool = new PostgresRuntimePool({ ...pgConfig, database: dbM6aUpg, maxConnections: 2 });
+      try {
+        // Verify post-0007 invariants on upgraded DB (M6A-FIX-01, 02, 03, Minor Note 6)
+        await assert.rejects(
+          () =>
+            m6aPool.withRlsTransaction(
+              { currentProjectId: pId, currentPrincipalId: "alice-dev", currentRole: "core_api_service" },
+              (conn) =>
+                conn.query(
+                  `UPDATE stage1_discovery_items SET confirmation_status = 'REJECTED' WHERE item_id = $1::uuid;`,
+                  [assumpId]
+                )
+            ),
+          (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+        );
+        await assert.rejects(
+          () =>
+            m6aPool.withRlsTransaction(
+              { currentProjectId: pId, currentPrincipalId: "bob-approver", currentRole: "core_api_service" },
+              (conn) =>
+                conn.query(
+                  `INSERT INTO baseline_spec_freezes (
+                     baseline_id, project_id, pipeline_session_id,
+                     stage1_artifact_id, stage1_artifact_sha256,
+                     stage2_artifact_id, stage2_artifact_sha256,
+                     stage3_artifact_id, stage3_artifact_sha256,
+                     validation_report_artifact_id, validation_report_sha256,
+                     approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+                   ) VALUES (
+                     gen_random_uuid(), $1::uuid, $2::uuid,
+                     $3::uuid, repeat('a', 64), $4::uuid, repeat('b', 64),
+                     $5::uuid, repeat('c', 64), $6::uuid, repeat('d', 64),
+                     $7::uuid, 'bob-approver', repeat('f', 64)
+                   );`,
+                  [pId, ppsId, sa1, sa2, sa3, sa4Old, sagOld]
+                )
+            ),
+          (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+        );
+      } finally {
+        await m6aPool.close();
+      }
+    } finally {
+      try {
+        runPsql("postgres", `DROP DATABASE IF EXISTS ${dbM4Upg};`);
+      } catch {
+        // best-effort cleanup
+      }
+      try {
+        runPsql("postgres", `DROP DATABASE IF EXISTS ${dbM6aUpg};`);
+      } catch {
+        // best-effort cleanup
       }
     }
   });

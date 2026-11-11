@@ -933,6 +933,12 @@ export class ProductPipelineService {
             `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
           );
         }
+        if (session.status !== "ACTIVE") {
+          throw new PostgresRlsError(
+            "23514",
+            `Session ${input.pipeline_session_id} is ${session.status}; stage approval gates cannot be recorded`
+          );
+        }
 
         const expectedArtifactStage = GATE_STAGE_TO_ARTIFACT_STAGE[input.gate_stage];
         const artifacts = await this.store.listStageArtifacts(input.pipeline_session_id);
@@ -1021,11 +1027,18 @@ export class ProductPipelineService {
           "STAGE_3_ARCHITECTURE",
           "Stage 3 Architecture"
         );
+        const latestStage4 = findLatestArtifactForStage(artifacts, "STAGE_4_SPEC_FREEZE");
         const validationReport = pickArtifact(
           input.validation_report_artifact_id,
           "STAGE_4_SPEC_FREEZE",
           "Stage 4 Validation Report"
         );
+        if (latestStage4 && validationReport.artifact_id !== latestStage4.artifact_id) {
+          throw new PostgresRlsError(
+            "23514",
+            `Cannot freeze baseline: Stage 4 validation report ${validationReport.artifact_id} (v${validationReport.version}) is not the latest report (v${latestStage4.version}: ${latestStage4.artifact_id})`
+          );
+        }
 
         const resolvedValidationSha = input.validation_report_sha256 ?? validationReport.artifact_sha256;
         let gate: StageApprovalGateRecord | undefined;

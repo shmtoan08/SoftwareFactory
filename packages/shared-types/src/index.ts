@@ -672,7 +672,7 @@ export interface StructuredJsonSchema {
   readonly minLength?: number;
   readonly maxLength?: number;
   readonly pattern?: string;
-  readonly enum?: readonly (string | number | boolean | null)[];
+  readonly enum?: readonly unknown[];
   readonly minimum?: number;
   readonly maximum?: number;
   readonly description?: string;
@@ -701,6 +701,7 @@ export interface ModelUsageMetrics {
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly totalTokens: number;
+  readonly usageEstimated?: boolean;
   readonly rawProviderUsage?: Readonly<Record<string, unknown>>;
 }
 
@@ -755,6 +756,7 @@ export interface ModelCallLedgerRecord {
   readonly estimated_cost_micro_usd: number;
   readonly actual_cost_micro_usd: number;
   readonly status: ModelCallStatus;
+  readonly usage_estimated: boolean;
   readonly block_reason: string | null;
   readonly error_message: string | null;
   readonly latency_ms: number;
@@ -816,6 +818,7 @@ export interface FinalizeModelCallInput {
   readonly actual_output_tokens: number;
   readonly estimated_cost_micro_usd: number;
   readonly actual_cost_micro_usd: number;
+  readonly usage_estimated?: boolean;
   readonly outcome: "ALLOWED" | "FAILED_VALIDATION" | "FAILED_PROVIDER";
   readonly error_message?: string | null;
   readonly latency_ms: number;
@@ -883,6 +886,18 @@ export function evaluatePostcallLimits(
   readonly nextStatus: CostSessionStatus;
   readonly exceeded: { readonly limitScope: CostLimitScope; readonly reason: string } | null;
 } {
+  if (session.status !== "ACTIVE") {
+    return {
+      nextTokensUsedTotal: session.tokens_used_total,
+      nextCostUsedMicroUsd: session.cost_used_micro_usd,
+      nextStatus: session.status,
+      exceeded: {
+        limitScope: "SESSION_EXHAUSTED",
+        reason: `Cost session ${session.cost_session_id} is ${session.status} and cannot finalize additional model calls`,
+      },
+    };
+  }
+
   const nextTokensUsedTotal = session.tokens_used_total + actualTotalTokens;
   const nextCostUsedMicroUsd = session.cost_used_micro_usd + actualCostMicroUsd;
 
