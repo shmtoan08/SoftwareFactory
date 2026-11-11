@@ -638,3 +638,542 @@ export function computeEventIdempotencyKey(
 ): string {
   return sha256Hex(`${leaseId}:${leaseEpoch}:${sequenceNo}:${eventType}`);
 }
+
+export function isUuidString(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
+  );
+}
+
+/**
+ * Milestone M6A: Model Provider Adapter v2, Prompt Versioning, Cost Guard (`AC-12b`)
+ * & Stages 1–4 Product Pipeline Domain Types (`M6A-SPEC-01`)
+ */
+export type ModelProviderName = "anthropic" | "openai" | "google";
+
+export type StructuredJsonSchemaType =
+  | "object"
+  | "array"
+  | "string"
+  | "number"
+  | "integer"
+  | "boolean"
+  | "null";
+
+export interface StructuredJsonSchema {
+  readonly type: StructuredJsonSchemaType;
+  readonly properties?: Readonly<Record<string, StructuredJsonSchema>>;
+  readonly required?: readonly string[];
+  readonly additionalProperties?: boolean;
+  readonly items?: StructuredJsonSchema;
+  readonly minItems?: number;
+  readonly maxItems?: number;
+  readonly minLength?: number;
+  readonly maxLength?: number;
+  readonly pattern?: string;
+  readonly enum?: readonly (string | number | boolean | null)[];
+  readonly minimum?: number;
+  readonly maximum?: number;
+  readonly description?: string;
+}
+
+export interface PromptTemplateSpec {
+  readonly promptId: string;
+  readonly version: string;
+  readonly description: string;
+  readonly systemTemplate: string;
+  readonly userTemplate: string;
+  readonly outputSchema?: StructuredJsonSchema;
+  readonly requiredVariables?: readonly string[];
+}
+
+export interface RenderedPrompt {
+  readonly promptId: string;
+  readonly version: string;
+  readonly promptSha256: string;
+  readonly systemPrompt: string;
+  readonly userPrompt: string;
+  readonly outputSchema?: StructuredJsonSchema;
+}
+
+export interface ModelUsageMetrics {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly rawProviderUsage?: Readonly<Record<string, unknown>>;
+}
+
+export interface ModelPricingRate {
+  readonly inputMicroUsdPerMillionTokens: number;
+  readonly outputMicroUsdPerMillionTokens: number;
+}
+
+export type CostSessionStatus = "ACTIVE" | "EXHAUSTED" | "CLOSED";
+
+export interface CostSessionRecord {
+  readonly cost_session_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string | null;
+  readonly task_id: string | null;
+  readonly max_tokens_per_request: number;
+  readonly max_cost_micro_usd_per_request: number;
+  readonly session_token_budget: number;
+  readonly session_cost_budget_micro_usd: number;
+  readonly tokens_used_total: number;
+  readonly cost_used_micro_usd: number;
+  readonly status: CostSessionStatus;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export type ModelCallStatus =
+  | "ALLOWED"
+  | "BLOCKED_PREFLIGHT"
+  | "BLOCKED_POSTCALL"
+  | "FAILED_VALIDATION"
+  | "FAILED_PROVIDER";
+
+export interface ModelCallLedgerRecord {
+  readonly call_id: string;
+  readonly project_id: string;
+  readonly cost_session_id: string;
+  readonly pipeline_session_id: string | null;
+  readonly task_id: string | null;
+  readonly stage: string;
+  readonly provider: ModelProviderName;
+  readonly model: string;
+  readonly prompt_id: string;
+  readonly prompt_version: string;
+  readonly prompt_sha256: string;
+  readonly request_sha256: string;
+  readonly estimated_input_tokens: number;
+  readonly reserved_output_tokens: number;
+  readonly actual_input_tokens: number;
+  readonly actual_output_tokens: number;
+  readonly actual_total_tokens: number;
+  readonly estimated_cost_micro_usd: number;
+  readonly actual_cost_micro_usd: number;
+  readonly status: ModelCallStatus;
+  readonly block_reason: string | null;
+  readonly error_message: string | null;
+  readonly latency_ms: number;
+  readonly created_at: string;
+}
+
+export type CostLimitScope =
+  | "PER_REQUEST_TOKENS"
+  | "PER_REQUEST_COST"
+  | "SESSION_TOKEN_BUDGET"
+  | "SESSION_COST_BUDGET"
+  | "SESSION_EXHAUSTED";
+
+export interface CostPreflightCheckInput {
+  readonly project_id: string;
+  readonly cost_session_id: string;
+  readonly pipeline_session_id?: string | null;
+  readonly task_id?: string | null;
+  readonly stage: string;
+  readonly provider: ModelProviderName;
+  readonly model: string;
+  readonly prompt_id: string;
+  readonly prompt_version: string;
+  readonly prompt_sha256: string;
+  readonly request_sha256: string;
+  readonly estimated_input_tokens: number;
+  readonly reserved_output_tokens: number;
+  readonly estimated_cost_micro_usd: number;
+}
+
+export type CostPreflightCheckResult =
+  | {
+      readonly allowed: true;
+      readonly session: CostSessionRecord;
+    }
+  | {
+      readonly allowed: false;
+      readonly limitScope: CostLimitScope;
+      readonly reason: string;
+      readonly session: CostSessionRecord;
+      readonly blockedLedger: ModelCallLedgerRecord;
+    };
+
+export interface FinalizeModelCallInput {
+  readonly project_id: string;
+  readonly cost_session_id: string;
+  readonly pipeline_session_id?: string | null;
+  readonly task_id?: string | null;
+  readonly stage: string;
+  readonly provider: ModelProviderName;
+  readonly model: string;
+  readonly prompt_id: string;
+  readonly prompt_version: string;
+  readonly prompt_sha256: string;
+  readonly request_sha256: string;
+  readonly estimated_input_tokens: number;
+  readonly reserved_output_tokens: number;
+  readonly actual_input_tokens: number;
+  readonly actual_output_tokens: number;
+  readonly estimated_cost_micro_usd: number;
+  readonly actual_cost_micro_usd: number;
+  readonly outcome: "ALLOWED" | "FAILED_VALIDATION" | "FAILED_PROVIDER";
+  readonly error_message?: string | null;
+  readonly latency_ms: number;
+}
+
+export interface FinalizeModelCallResult {
+  readonly allowed: boolean;
+  readonly limitScope?: CostLimitScope;
+  readonly reason?: string;
+  readonly session: CostSessionRecord;
+  readonly ledger: ModelCallLedgerRecord;
+}
+
+export function evaluatePreflightLimits(
+  session: CostSessionRecord,
+  input: Pick<
+    CostPreflightCheckInput,
+    "estimated_input_tokens" | "reserved_output_tokens" | "estimated_cost_micro_usd"
+  >
+): { readonly limitScope: CostLimitScope; readonly reason: string } | null {
+  if (session.status !== "ACTIVE") {
+    return {
+      limitScope: "SESSION_EXHAUSTED",
+      reason: `Cost session ${session.cost_session_id} is ${session.status}`,
+    };
+  }
+  const projectedTokens = input.estimated_input_tokens + input.reserved_output_tokens;
+  if (projectedTokens > session.max_tokens_per_request) {
+    return {
+      limitScope: "PER_REQUEST_TOKENS",
+      reason: `Projected request tokens (${projectedTokens}) exceeds max_tokens_per_request (${session.max_tokens_per_request})`,
+    };
+  }
+  if (input.estimated_cost_micro_usd > session.max_cost_micro_usd_per_request) {
+    return {
+      limitScope: "PER_REQUEST_COST",
+      reason: `Projected request cost (${input.estimated_cost_micro_usd} micro-USD) exceeds max_cost_micro_usd_per_request (${session.max_cost_micro_usd_per_request} micro-USD)`,
+    };
+  }
+  if (session.tokens_used_total + projectedTokens > session.session_token_budget) {
+    return {
+      limitScope: "SESSION_TOKEN_BUDGET",
+      reason: `Session tokens used (${session.tokens_used_total}) + projected (${projectedTokens}) exceeds session_token_budget (${session.session_token_budget})`,
+    };
+  }
+  if (
+    session.cost_used_micro_usd + input.estimated_cost_micro_usd >
+    session.session_cost_budget_micro_usd
+  ) {
+    return {
+      limitScope: "SESSION_COST_BUDGET",
+      reason: `Session cost used (${session.cost_used_micro_usd} micro-USD) + projected (${input.estimated_cost_micro_usd} micro-USD) exceeds session_cost_budget_micro_usd (${session.session_cost_budget_micro_usd} micro-USD)`,
+    };
+  }
+  return null;
+}
+
+export function evaluatePostcallLimits(
+  session: CostSessionRecord,
+  actualTotalTokens: number,
+  actualCostMicroUsd: number
+): {
+  readonly nextTokensUsedTotal: number;
+  readonly nextCostUsedMicroUsd: number;
+  readonly nextStatus: CostSessionStatus;
+  readonly exceeded: { readonly limitScope: CostLimitScope; readonly reason: string } | null;
+} {
+  const nextTokensUsedTotal = session.tokens_used_total + actualTotalTokens;
+  const nextCostUsedMicroUsd = session.cost_used_micro_usd + actualCostMicroUsd;
+
+  if (actualTotalTokens > session.max_tokens_per_request) {
+    return {
+      nextTokensUsedTotal,
+      nextCostUsedMicroUsd,
+      nextStatus: "EXHAUSTED",
+      exceeded: {
+        limitScope: "PER_REQUEST_TOKENS",
+        reason: `Actual request tokens (${actualTotalTokens}) exceeded max_tokens_per_request (${session.max_tokens_per_request})`,
+      },
+    };
+  }
+  if (actualCostMicroUsd > session.max_cost_micro_usd_per_request) {
+    return {
+      nextTokensUsedTotal,
+      nextCostUsedMicroUsd,
+      nextStatus: "EXHAUSTED",
+      exceeded: {
+        limitScope: "PER_REQUEST_COST",
+        reason: `Actual request cost (${actualCostMicroUsd} micro-USD) exceeded max_cost_micro_usd_per_request (${session.max_cost_micro_usd_per_request} micro-USD)`,
+      },
+    };
+  }
+  if (nextTokensUsedTotal > session.session_token_budget) {
+    return {
+      nextTokensUsedTotal,
+      nextCostUsedMicroUsd,
+      nextStatus: "EXHAUSTED",
+      exceeded: {
+        limitScope: "SESSION_TOKEN_BUDGET",
+        reason: `Cumulative session tokens (${nextTokensUsedTotal}) exceeded session_token_budget (${session.session_token_budget})`,
+      },
+    };
+  }
+  if (nextCostUsedMicroUsd > session.session_cost_budget_micro_usd) {
+    return {
+      nextTokensUsedTotal,
+      nextCostUsedMicroUsd,
+      nextStatus: "EXHAUSTED",
+      exceeded: {
+        limitScope: "SESSION_COST_BUDGET",
+        reason: `Cumulative session cost (${nextCostUsedMicroUsd} micro-USD) exceeded session_cost_budget_micro_usd (${session.session_cost_budget_micro_usd} micro-USD)`,
+      },
+    };
+  }
+
+  return {
+    nextTokensUsedTotal,
+    nextCostUsedMicroUsd,
+    nextStatus: session.status,
+    exceeded: null,
+  };
+}
+
+
+export type PipelineStageName =
+  | "STAGE_1_IDEA_DISCOVERY"
+  | "STAGE_2_REQUIREMENTS"
+  | "STAGE_3_ARCHITECTURE"
+  | "STAGE_4_SPEC_FREEZE";
+
+export type PipelineSessionStatus = "ACTIVE" | "FROZEN" | "CANCELLED";
+
+export interface ProductPipelineSessionRecord {
+  readonly pipeline_session_id: string;
+  readonly project_id: string;
+  readonly cost_session_id: string | null;
+  readonly title: string;
+  readonly raw_idea_text: string;
+  readonly current_stage: PipelineStageName;
+  readonly status: PipelineSessionStatus;
+  readonly frozen_baseline_id: string | null;
+  readonly created_by_principal_id: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export type Stage1ItemKind = "FACT" | "ASSUMPTION" | "RECOMMENDATION";
+
+export type Stage1ConfirmationStatus =
+  | "AUTO_VERIFIED"
+  | "UNCONFIRMED"
+  | "CONFIRMED"
+  | "REJECTED";
+
+export interface Stage1DiscoveryItemRecord {
+  readonly item_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly kind: Stage1ItemKind;
+  readonly title: string;
+  readonly statement: string;
+  readonly rationale: string;
+  readonly clarification_question: string | null;
+  readonly confirmation_status: Stage1ConfirmationStatus;
+  readonly confirmed_by_principal_id: string | null;
+  readonly confirmed_at: string | null;
+  readonly resolution_note: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface Stage1DiscoveryBundle {
+  readonly summary: string;
+  readonly facts: ReadonlyArray<{
+    readonly title: string;
+    readonly statement: string;
+    readonly rationale: string;
+  }>;
+  readonly assumptions: ReadonlyArray<{
+    readonly title: string;
+    readonly statement: string;
+    readonly rationale: string;
+    readonly clarification_question: string;
+  }>;
+  readonly recommendations: ReadonlyArray<{
+    readonly title: string;
+    readonly statement: string;
+    readonly rationale: string;
+    readonly clarification_question: string;
+  }>;
+}
+
+export interface Stage2AcceptanceCriterion {
+  readonly ac_id: string;
+  readonly given: string;
+  readonly when: string;
+  readonly then: string;
+}
+
+export interface Stage2RequirementItem {
+  readonly req_id: string;
+  readonly title: string;
+  readonly description: string;
+  readonly priority: "MUST" | "SHOULD" | "COULD";
+  readonly source_discovery_item_ids: readonly string[];
+  readonly acceptance_criteria: readonly Stage2AcceptanceCriterion[];
+}
+
+export interface Stage2RequirementsSpec {
+  readonly prd: {
+    readonly product_vision: string;
+    readonly target_personas: readonly string[];
+    readonly goals: readonly string[];
+    readonly non_goals: readonly string[];
+  };
+  readonly srs: {
+    readonly functional_requirements: readonly Stage2RequirementItem[];
+    readonly non_functional_requirements: readonly Stage2RequirementItem[];
+  };
+}
+
+export interface Stage3ArchitectureSpec {
+  readonly architecture: {
+    readonly overview: string;
+    readonly components: ReadonlyArray<{
+      readonly component_id: string;
+      readonly name: string;
+      readonly responsibility: string;
+      readonly requirement_ids: readonly string[];
+    }>;
+  };
+  readonly database_erd: {
+    readonly entities: ReadonlyArray<{
+      readonly entity_name: string;
+      readonly primary_key: string;
+      readonly columns: readonly string[];
+      readonly foreign_keys: readonly string[];
+      readonly rls_tier: "TIER_1" | "TIER_2" | "TIER_3" | "TIER_4";
+      readonly requirement_ids: readonly string[];
+    }>;
+  };
+  readonly api_spec: {
+    readonly endpoints: ReadonlyArray<{
+      readonly method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+      readonly path: string;
+      readonly summary: string;
+      readonly auth_role: string;
+      readonly requirement_ids: readonly string[];
+    }>;
+  };
+  readonly security_design: {
+    readonly threat_controls: ReadonlyArray<{
+      readonly threat_id: string;
+      readonly threat: string;
+      readonly mitigation: string;
+      readonly requirement_ids: readonly string[];
+    }>;
+  };
+  readonly adrs: ReadonlyArray<{
+    readonly adr_id: string;
+    readonly title: string;
+    readonly status: "PROPOSED" | "ACCEPTED";
+    readonly context: string;
+    readonly decision: string;
+    readonly consequences: string;
+    readonly requirement_ids: readonly string[];
+  }>;
+}
+
+export interface Stage4ConsistencyCheckResult {
+  readonly check_id: string;
+  readonly name: string;
+  readonly passed: boolean;
+  readonly severity: "ERROR" | "WARNING";
+  readonly details: string;
+  readonly affected_ids: readonly string[];
+}
+
+export interface Stage4ConsistencyReport {
+  readonly pipeline_session_id: string;
+  readonly passed: boolean;
+  readonly checks: readonly Stage4ConsistencyCheckResult[];
+  readonly blocking_errors: readonly string[];
+  readonly referenced_stage1_artifact_id: string;
+  readonly referenced_stage2_artifact_id: string;
+  readonly referenced_stage3_artifact_id: string;
+  readonly checked_at: string;
+}
+
+export type StageArtifactKind =
+  | "STAGE_1_DISCOVERY_BUNDLE"
+  | "STAGE_2_PRD_SRS"
+  | "STAGE_3_ARCHITECTURE_DESIGN"
+  | "STAGE_4_VALIDATION_REPORT";
+
+export interface StageArtifactRecord {
+  readonly artifact_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly stage: PipelineStageName;
+  readonly artifact_kind: StageArtifactKind;
+  readonly version: number;
+  readonly provider: ModelProviderName | "system";
+  readonly model: string;
+  readonly prompt_id: string;
+  readonly prompt_version: string;
+  readonly prompt_sha256: string;
+  readonly content_json: Readonly<Record<string, unknown>>;
+  readonly artifact_sha256: string;
+  readonly created_by_principal_id: string;
+  readonly created_at: string;
+}
+
+export type StageApprovalGateStage =
+  | "STAGE_1_DISCOVERY"
+  | "STAGE_2_REQUIREMENTS"
+  | "STAGE_3_ARCHITECTURE"
+  | "STAGE_4_SPEC_FREEZE";
+
+export interface StageApprovalGateRecord {
+  readonly gate_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly gate_stage: StageApprovalGateStage;
+  readonly target_artifact_id: string;
+  readonly target_artifact_sha256: string;
+  readonly approver_principal_id: string;
+  readonly decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+  readonly rationale: string | null;
+  readonly decided_at: string;
+}
+
+export interface BaselineSpecFreezeRecord {
+  readonly baseline_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly stage1_artifact_id: string;
+  readonly stage1_artifact_sha256: string;
+  readonly stage2_artifact_id: string;
+  readonly stage2_artifact_sha256: string;
+  readonly stage3_artifact_id: string;
+  readonly stage3_artifact_sha256: string;
+  readonly validation_report_artifact_id: string;
+  readonly validation_report_sha256: string;
+  readonly approval_gate_id: string;
+  readonly frozen_by_principal_id: string;
+  readonly freeze_bundle_sha256: string;
+  readonly status: "FROZEN";
+  readonly frozen_at: string;
+}
+
+export interface ProductPipelineBundle {
+  readonly session: ProductPipelineSessionRecord;
+  readonly costSession: CostSessionRecord | null;
+  readonly modelCallLedgers: readonly ModelCallLedgerRecord[];
+  readonly discoveryItems: readonly Stage1DiscoveryItemRecord[];
+  readonly artifacts: readonly StageArtifactRecord[];
+  readonly approvalGates: readonly StageApprovalGateRecord[];
+  readonly baselineFreeze: BaselineSpecFreezeRecord | null;
+}
+

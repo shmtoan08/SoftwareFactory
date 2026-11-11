@@ -2,6 +2,11 @@ import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } fro
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  type ModelProviderConfig,
+  type PromptRegistry,
+  loadModelProviderConfigFromEnv,
+} from "@software-factory/adapter-sdk";
+import {
   AgentGatewayHttpServer,
   AgentGatewayService,
   EphemeralGitPushTokenService,
@@ -15,6 +20,7 @@ import {
   PostgresRuntimePool,
   createControlPlaneStoreFromEnv,
 } from "@software-factory/database";
+import type { ModelPricingRate } from "@software-factory/shared-types";
 import {
   Docker3TierVerifier,
   ImmutableSourceSnapshotStore,
@@ -41,6 +47,9 @@ export interface CreateCoreApiRuntimeOptions {
   readonly transientFaultHook?: GatewayTransientFaultHook;
   readonly verifyPolicy?: CoreApiVerifyHttpPolicy;
   readonly enableTestFaultInjection?: boolean;
+  readonly defaultModelConfig?: ModelProviderConfig;
+  readonly promptRegistry?: PromptRegistry;
+  readonly modelPricingOverrides?: Readonly<Record<string, ModelPricingRate>>;
   readonly clockFn?: () => Date;
   readonly startServer?: boolean;
 }
@@ -148,10 +157,18 @@ export async function createCoreApiRuntime(
     reviewerCredentialService,
   });
 
+  const resolvedModelConfig =
+    options?.defaultModelConfig ??
+    (env.SF_MODEL_PROVIDER?.trim() ? loadModelProviderConfigFromEnv(env) : undefined);
+
   const coreApi = new CoreApiService(store, {
     authenticator,
     clockFn: options?.clockFn,
     snapshotStore,
+    defaultModelConfig: resolvedModelConfig,
+    promptRegistry: options?.promptRegistry,
+    modelPricingOverrides: options?.modelPricingOverrides,
+    env,
   });
 
   const host = options?.host ?? env.CORE_API_HOST ?? env.HOST ?? "127.0.0.1";

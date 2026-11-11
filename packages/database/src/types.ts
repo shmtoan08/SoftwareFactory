@@ -1,12 +1,23 @@
 import type {
   ApprovalDecisionRecord,
   ApprovalRequestRecord,
+  BaselineSpecFreezeRecord,
   CandidateBoundLineage,
+  CostPreflightCheckInput,
+  CostPreflightCheckResult,
+  CostSessionRecord,
+  FinalizeModelCallInput,
+  FinalizeModelCallResult,
   LeaseSyncStatusResponse,
   MergeCandidateRecord,
   MergeOperationRecord,
+  ModelCallLedgerRecord,
+  ModelProviderName,
   OutboxEventRecord,
+  PipelineStageName,
   ProcessedWorkerEventRecord,
+  ProductPipelineBundle,
+  ProductPipelineSessionRecord,
   ResourceUsageMetricRecord,
   ResourceUsageMetricsSource,
   ResourceUsagePhase,
@@ -15,6 +26,13 @@ import type {
   ReviewSessionStatus,
   ServerEventAckContract,
   SnapshotRetentionClass,
+  Stage1ConfirmationStatus,
+  Stage1DiscoveryItemRecord,
+  Stage1ItemKind,
+  StageApprovalGateRecord,
+  StageApprovalGateStage,
+  StageArtifactKind,
+  StageArtifactRecord,
   TaskLeaseRecord,
   TaskRecord,
   TaskStatus,
@@ -64,6 +82,17 @@ export class PostgresRlsError extends Error {
     super(message);
     this.name = "PostgresRlsError";
     this.sqlState = sqlState;
+  }
+}
+
+export class Ac10ViolationError extends PostgresRlsError {
+  public readonly code = "ERR_AC10_UNCONFIRMED_ASSUMPTION" as const;
+  public readonly offendingItemIds: readonly string[];
+
+  constructor(message: string, offendingItemIds: readonly string[] = []) {
+    super("23514", message);
+    this.name = "Ac10ViolationError";
+    this.offendingItemIds = offendingItemIds;
   }
 }
 
@@ -130,6 +159,96 @@ export interface RecordResourceUsageMetricInput {
   peak_memory_bytes: number;
   sandbox_backend_mode: string;
   metrics_source: ResourceUsageMetricsSource;
+}
+
+export interface CreateCostSessionInput {
+  readonly cost_session_id?: string;
+  readonly project_id: string;
+  readonly pipeline_session_id?: string | null;
+  readonly task_id?: string | null;
+  readonly max_tokens_per_request: number;
+  readonly max_cost_micro_usd_per_request: number;
+  readonly session_token_budget: number;
+  readonly session_cost_budget_micro_usd: number;
+}
+
+export interface CreateProductPipelineSessionInput {
+  readonly pipeline_session_id?: string;
+  readonly project_id: string;
+  readonly cost_session_id?: string | null;
+  readonly title: string;
+  readonly raw_idea_text: string;
+  readonly created_by_principal_id: string;
+}
+
+export interface CreateStage1DiscoveryItemInput {
+  readonly item_id?: string;
+  readonly kind: Stage1ItemKind;
+  readonly title: string;
+  readonly statement: string;
+  readonly rationale: string;
+  readonly clarification_question?: string | null;
+  readonly confirmation_status?: Stage1ConfirmationStatus;
+}
+
+export interface CreateStage1DiscoveryItemsInput {
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly items: readonly CreateStage1DiscoveryItemInput[];
+}
+
+export interface ResolveStage1DiscoveryItemInput {
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly item_id: string;
+  readonly decision: "CONFIRM" | "REJECT";
+  readonly actor_principal_id: string;
+  readonly resolution_note?: string | null;
+}
+
+export interface RecordStageArtifactInput {
+  readonly artifact_id?: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly stage: PipelineStageName;
+  readonly artifact_kind: StageArtifactKind;
+  readonly provider: ModelProviderName | "system";
+  readonly model: string;
+  readonly prompt_id: string;
+  readonly prompt_version: string;
+  readonly prompt_sha256: string;
+  readonly content_json: Readonly<Record<string, unknown>>;
+  readonly artifact_sha256?: string;
+  readonly created_by_principal_id: string;
+  readonly advance_session_stage?: PipelineStageName;
+}
+
+export interface RecordStageApprovalGateInput {
+  readonly gate_id?: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly gate_stage: StageApprovalGateStage;
+  readonly target_artifact_id: string;
+  readonly target_artifact_sha256: string;
+  readonly approver_principal_id: string;
+  readonly decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+  readonly rationale?: string | null;
+}
+
+export interface FreezeBaselineSpecInput {
+  readonly baseline_id?: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly stage1_artifact_id: string;
+  readonly stage1_artifact_sha256: string;
+  readonly stage2_artifact_id: string;
+  readonly stage2_artifact_sha256: string;
+  readonly stage3_artifact_id: string;
+  readonly stage3_artifact_sha256: string;
+  readonly validation_report_artifact_id: string;
+  readonly validation_report_sha256: string;
+  readonly approval_gate_id: string;
+  readonly frozen_by_principal_id: string;
 }
 
 /**
@@ -427,4 +546,72 @@ export interface ControlPlaneStore {
     liveMainHeadHash?: string | null
   ): CandidateBoundLineage | null | Promise<CandidateBoundLineage | null>;
   listOutboxEventsForProject(): OutboxEventRecord[] | Promise<OutboxEventRecord[]>;
+
+  // Milestone M6A: Model Cost Guard (AC-12b) & Stages 1–4 Product Pipeline
+  createCostSession(input: CreateCostSessionInput): CostSessionRecord | Promise<CostSessionRecord>;
+  getCostSession(
+    costSessionId: string
+  ): CostSessionRecord | null | Promise<CostSessionRecord | null>;
+  listModelCallLedgers(filter?: {
+    readonly cost_session_id?: string;
+    readonly pipeline_session_id?: string;
+  }): ModelCallLedgerRecord[] | Promise<ModelCallLedgerRecord[]>;
+  preflightCheckCostSession(
+    input: CostPreflightCheckInput
+  ): CostPreflightCheckResult | Promise<CostPreflightCheckResult>;
+  finalizeModelCallLedger(
+    input: FinalizeModelCallInput
+  ): FinalizeModelCallResult | Promise<FinalizeModelCallResult>;
+
+  createProductPipelineSession(
+    input: CreateProductPipelineSessionInput
+  ): ProductPipelineSessionRecord | Promise<ProductPipelineSessionRecord>;
+  getProductPipelineSession(
+    pipelineSessionId: string
+  ): ProductPipelineSessionRecord | null | Promise<ProductPipelineSessionRecord | null>;
+  listProductPipelineSessions():
+    | ProductPipelineSessionRecord[]
+    | Promise<ProductPipelineSessionRecord[]>;
+  updateProductPipelineSessionCostSession(input: {
+    readonly project_id: string;
+    readonly pipeline_session_id: string;
+    readonly cost_session_id: string;
+  }): ProductPipelineSessionRecord | Promise<ProductPipelineSessionRecord>;
+
+  createStage1DiscoveryItems(
+    input: CreateStage1DiscoveryItemsInput
+  ): Stage1DiscoveryItemRecord[] | Promise<Stage1DiscoveryItemRecord[]>;
+  resolveStage1DiscoveryItem(
+    input: ResolveStage1DiscoveryItemInput
+  ): Stage1DiscoveryItemRecord | Promise<Stage1DiscoveryItemRecord>;
+  listStage1DiscoveryItems(
+    pipelineSessionId: string
+  ): Stage1DiscoveryItemRecord[] | Promise<Stage1DiscoveryItemRecord[]>;
+
+  recordStageArtifact(
+    input: RecordStageArtifactInput
+  ): StageArtifactRecord | Promise<StageArtifactRecord>;
+  listStageArtifacts(
+    pipelineSessionId: string
+  ): StageArtifactRecord[] | Promise<StageArtifactRecord[]>;
+  getStageArtifactById(
+    artifactId: string
+  ): StageArtifactRecord | null | Promise<StageArtifactRecord | null>;
+
+  recordStageApprovalGate(
+    input: RecordStageApprovalGateInput
+  ): StageApprovalGateRecord | Promise<StageApprovalGateRecord>;
+  listStageApprovalGates(
+    pipelineSessionId: string
+  ): StageApprovalGateRecord[] | Promise<StageApprovalGateRecord[]>;
+
+  freezeBaselineSpec(
+    input: FreezeBaselineSpecInput
+  ): BaselineSpecFreezeRecord | Promise<BaselineSpecFreezeRecord>;
+  getBaselineSpecFreeze(
+    pipelineSessionId: string
+  ): BaselineSpecFreezeRecord | null | Promise<BaselineSpecFreezeRecord | null>;
+  getProductPipelineBundle(
+    pipelineSessionId: string
+  ): ProductPipelineBundle | null | Promise<ProductPipelineBundle | null>;
 }

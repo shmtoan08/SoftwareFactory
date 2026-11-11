@@ -1,11 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type {
-  ApprovalDecisionRecord,
-  CandidateBoundLineage,
-  MergeCandidateRecord,
-  ReviewArtifactRecord,
-  VerificationRunRecord,
-} from "@software-factory/shared-types";
+import {
+  CostBudgetExceededError,
+  ModelProviderConfigurationError,
+  ModelProviderHttpError,
+  PromptNotFoundError,
+  PromptRenderError,
+  PromptVersionConflictError,
+  StructuredOutputValidationError,
+} from "@software-factory/adapter-sdk";
 import {
   type ApprovalCenterBundle,
   CORE_API_AUTH_HEADER,
@@ -13,6 +15,44 @@ import {
   type CoreApiService,
   decodeCoreApiAuthHeader,
 } from "@software-factory/core-api";
+import { Ac10ViolationError, PostgresRlsError } from "@software-factory/database";
+import type {
+  ApprovalDecisionRecord,
+  BaselineSpecFreezeRecord,
+  CandidateBoundLineage,
+  MergeCandidateRecord,
+  PipelineStageName,
+  ProductPipelineBundle,
+  ReviewArtifactRecord,
+  Stage4ConsistencyReport,
+  StageApprovalGateRecord,
+  StageApprovalGateStage,
+  StageArtifactRecord,
+  VerificationRunRecord,
+} from "@software-factory/shared-types";
+
+const PIPELINE_GATE_STAGE_TO_ARTIFACT_STAGE: Readonly<
+  Record<StageApprovalGateStage, PipelineStageName>
+> = {
+  STAGE_1_DISCOVERY: "STAGE_1_IDEA_DISCOVERY",
+  STAGE_2_REQUIREMENTS: "STAGE_2_REQUIREMENTS",
+  STAGE_3_ARCHITECTURE: "STAGE_3_ARCHITECTURE",
+  STAGE_4_SPEC_FREEZE: "STAGE_4_SPEC_FREEZE",
+};
+
+function findLatestStageArtifact(
+  artifacts: readonly StageArtifactRecord[],
+  stage: PipelineStageName
+): StageArtifactRecord | null {
+  let latest: StageArtifactRecord | null = null;
+  for (const artifact of artifacts) {
+    if (artifact.stage !== stage) continue;
+    if (!latest || artifact.version >= latest.version) {
+      latest = artifact;
+    }
+  }
+  return latest;
+}
 
 function escapeHtml(raw: string): string {
   return raw
@@ -354,6 +394,292 @@ export class WebApprovalConsoleController {
       feedback: input.reason,
     });
   }
+
+  // ===========================================================================
+  // Milestone M6A: Stages 1–4 Product Pipeline Console & Baseline Freeze Gate
+  // ===========================================================================
+
+  public async loadPipelineBundle(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+  }): Promise<ProductPipelineBundle | null> {
+    return this.coreApi.getPipelineBundle(input.projectId, input.auth, input.pipelineSessionId);
+  }
+
+  public renderPipelineBundleMarkdown(bundle: ProductPipelineBundle): string {
+    const cost = bundle.costSession;
+    const ledgersRows = bundle.modelCallLedgers
+      .map(
+        (l) =>
+          `| ${l.stage} | ${l.provider}/${l.model} | ${l.prompt_id}@${l.prompt_version} | ${l.status} | ${l.actual_total_tokens} | ${l.actual_cost_micro_usd} |`
+      )
+      .join("\n");
+    const discoveryRows = bundle.discoveryItems
+      .map(
+        (d) =>
+          `| ${d.kind} | ${d.title} | ${d.confirmation_status} | ${d.confirmed_by_principal_id ?? "-"} |`
+      )
+      .join("\n");
+    const artifactRows = bundle.artifacts
+      .map(
+        (a) =>
+          `| ${a.stage} | v${a.version} | ${a.artifact_kind} | ${a.provider}/${a.model} | \`${a.artifact_sha256}\` |`
+      )
+      .join("\n");
+    const stage4Artifact = findLatestStageArtifact(bundle.artifacts, "STAGE_4_SPEC_FREEZE");
+    const report = stage4Artifact
+      ? (stage4Artifact.content_json as unknown as Stage4ConsistencyReport)
+      : null;
+    const gateRows = bundle.approvalGates
+      .map(
+        (g) =>
+          `| ${g.gate_stage} | ${g.decision} | ${g.approver_principal_id} | \`${g.target_artifact_sha256}\` |`
+      )
+      .join("\n");
+
+    return [
+      `# Product Pipeline — ${bundle.session.title} (\`${bundle.session.pipeline_session_id}\`)`,
+      `- **Project:** \`${bundle.session.project_id}\` | **Stage:** \`${bundle.session.current_stage}\` | **Status:** \`${bundle.session.status}\``,
+      `- **Cost Session (AC-12b):** \`${cost?.cost_session_id ?? "none"}\` status=\`${
+        cost?.status ?? "none"
+      }\` tokens=\`${cost?.tokens_used_total ?? 0}/${
+        cost?.session_token_budget ?? 0
+      }\` cost_micro_usd=\`${cost?.cost_used_micro_usd ?? 0}/${
+        cost?.session_cost_budget_micro_usd ?? 0
+      }\``,
+      "",
+      "## Stage 1 Discovery Items (AC-10)",
+      "| Kind | Title | Confirmation | Confirmed By |",
+      "|---|---|---|---|",
+      discoveryRows,
+      "",
+      "## Stage Artifacts",
+      "| Stage | Version | Kind | Provider/Model | Artifact SHA-256 |",
+      "|---|---:|---|---|---|",
+      artifactRows,
+      "",
+      "## Model Call Ledgers",
+      "| Stage | Provider/Model | Prompt | Status | Actual Tokens | Cost (micro-USD) |",
+      "|---|---|---|---|---:|---:|",
+      ledgersRows,
+      "",
+      report
+        ? [
+            `## Stage 4 Consistency Check (\`passed=${String(report.passed)}\`)`,
+            ...report.checks.map(
+              (c) => `- **${c.check_id} (${c.name}):** \`${c.passed ? "PASS" : c.severity}\` — ${c.details}`
+            ),
+          ].join("\n")
+        : "## Stage 4 Consistency Check\n- Not executed yet",
+      "",
+      "## Approval Gates",
+      "| Gate Stage | Decision | Approver | Target SHA-256 |",
+      "|---|---|---|---|",
+      gateRows,
+      "",
+      bundle.baselineFreeze
+        ? `## Baseline Spec Freeze\n- **Baseline ID:** \`${bundle.baselineFreeze.baseline_id}\` | **Status:** \`${bundle.baselineFreeze.status}\` | **Bundle SHA-256:** \`${bundle.baselineFreeze.freeze_bundle_sha256}\``
+        : "## Baseline Spec Freeze\n- Not frozen",
+    ].join("\n");
+  }
+
+  public renderPipelineBundleHtml(bundle: ProductPipelineBundle): string {
+    const cost = bundle.costSession;
+    const discoveryRows = bundle.discoveryItems
+      .map(
+        (d) =>
+          `<tr><td><code>${escapeHtml(d.kind)}</code></td><td>${escapeHtml(
+            d.title
+          )}</td><td><code>${escapeHtml(d.confirmation_status)}</code></td><td><code>${escapeHtml(
+            d.confirmed_by_principal_id ?? "-"
+          )}</code></td></tr>`
+      )
+      .join("");
+    const artifactRows = bundle.artifacts
+      .map(
+        (a) =>
+          `<tr><td><code>${escapeHtml(a.stage)}</code></td><td>v${a.version}</td><td><code>${escapeHtml(
+            a.artifact_kind
+          )}</code></td><td>${escapeHtml(a.provider)}/${escapeHtml(
+            a.model
+          )}</td><td><code>${escapeHtml(a.artifact_sha256)}</code></td></tr>`
+      )
+      .join("");
+    const ledgerRows = bundle.modelCallLedgers
+      .map(
+        (l) =>
+          `<tr><td><code>${escapeHtml(l.stage)}</code></td><td>${escapeHtml(
+            l.provider
+          )}/${escapeHtml(l.model)}</td><td><code>${escapeHtml(l.status)}</code></td><td>${
+            l.actual_total_tokens
+          }</td><td>${l.actual_cost_micro_usd}</td></tr>`
+      )
+      .join("");
+    const gateRows = bundle.approvalGates
+      .map(
+        (g) =>
+          `<tr><td><code>${escapeHtml(g.gate_stage)}</code></td><td><code>${escapeHtml(
+            g.decision
+          )}</code></td><td><code>${escapeHtml(g.approver_principal_id)}</code></td><td><code>${escapeHtml(
+            g.target_artifact_sha256
+          )}</code></td></tr>`
+      )
+      .join("");
+    const stage4Artifact = findLatestStageArtifact(bundle.artifacts, "STAGE_4_SPEC_FREEZE");
+    const report = stage4Artifact
+      ? (stage4Artifact.content_json as unknown as Stage4ConsistencyReport)
+      : null;
+
+    return [
+      "<!DOCTYPE html>",
+      '<html lang="en">',
+      "<head>",
+      '<meta charset="utf-8">',
+      `<title>Product Pipeline - ${escapeHtml(bundle.session.title)}</title>`,
+      "</head>",
+      "<body>",
+      `<main data-pipeline-session-id="${escapeHtml(bundle.session.pipeline_session_id)}">`,
+      `<h1>Product Pipeline: ${escapeHtml(bundle.session.title)}</h1>`,
+      `<p>Stage: <code>${escapeHtml(bundle.session.current_stage)}</code> | Status: <code>${escapeHtml(
+        bundle.session.status
+      )}</code> | Frozen Baseline: <code>${escapeHtml(
+        bundle.session.frozen_baseline_id ?? "none"
+      )}</code></p>`,
+      "<section>",
+      "<h2>Cost Session (AC-12b)</h2>",
+      cost
+        ? `<p>Cost Session: <code>${escapeHtml(cost.cost_session_id)}</code> | Status: <code>${escapeHtml(
+            cost.status
+          )}</code> | Tokens: <strong>${cost.tokens_used_total}</strong>/${
+            cost.session_token_budget
+          } | Cost (micro-USD): <strong>${cost.cost_used_micro_usd}</strong>/${
+            cost.session_cost_budget_micro_usd
+          }</p>`
+        : "<p>No cost session linked</p>",
+      "<table><thead><tr><th>Stage</th><th>Provider/Model</th><th>Status</th><th>Tokens</th><th>Micro-USD</th></tr></thead>",
+      `<tbody>${ledgerRows}</tbody></table>`,
+      "</section>",
+      "<section>",
+      `<h2>Stage 1 Discovery Items (${bundle.discoveryItems.length})</h2>`,
+      "<table><thead><tr><th>Kind</th><th>Title</th><th>Status</th><th>Confirmed By</th></tr></thead>",
+      `<tbody>${discoveryRows}</tbody></table>`,
+      "</section>",
+      "<section>",
+      `<h2>Stage Artifacts (${bundle.artifacts.length})</h2>`,
+      "<table><thead><tr><th>Stage</th><th>Version</th><th>Kind</th><th>Provider/Model</th><th>SHA-256</th></tr></thead>",
+      `<tbody>${artifactRows}</tbody></table>`,
+      "</section>",
+      "<section>",
+      `<h2>Stage 4 Consistency Check (${report ? (report.passed ? "PASS" : "FAIL") : "PENDING"})</h2>`,
+      report
+        ? `<ul>${report.checks
+            .map(
+              (c) =>
+                `<li><strong>${escapeHtml(c.check_id)}</strong> (${escapeHtml(
+                  c.name
+                )}): <code>${c.passed ? "PASS" : escapeHtml(c.severity)}</code> — ${escapeHtml(
+                  c.details
+                )}</li>`
+            )
+            .join("")}</ul>`
+        : "<p>Stage 4 report not generated</p>",
+      "</section>",
+      "<section>",
+      `<h2>Approval Gates (${bundle.approvalGates.length})</h2>`,
+      "<table><thead><tr><th>Gate</th><th>Decision</th><th>Approver</th><th>Target SHA-256</th></tr></thead>",
+      `<tbody>${gateRows}</tbody></table>`,
+      "</section>",
+      "<section>",
+      "<h2>Baseline Spec Freeze</h2>",
+      bundle.baselineFreeze
+        ? `<p>Baseline ID: <code>${escapeHtml(
+            bundle.baselineFreeze.baseline_id
+          )}</code> | Status: <code>${escapeHtml(
+            bundle.baselineFreeze.status
+          )}</code> | Bundle SHA-256: <code>${escapeHtml(
+            bundle.baselineFreeze.freeze_bundle_sha256
+          )}</code></p>`
+        : "<p>Not frozen</p>",
+      "</section>",
+      "</main>",
+      "</body>",
+      "</html>",
+    ].join("\n");
+  }
+
+  public async submitPipelineApprovalGate(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    gateStage: StageApprovalGateStage;
+    targetArtifactId?: string;
+    targetArtifactSha256?: string;
+    decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+    rationale?: string | null;
+  }): Promise<StageApprovalGateRecord> {
+    return this.coreApi.submitPipelineApprovalGate(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      gate_stage: input.gateStage,
+      target_artifact_id: input.targetArtifactId,
+      target_artifact_sha256: input.targetArtifactSha256,
+      decision: input.decision,
+      rationale: input.rationale,
+    });
+  }
+
+  public async submitPipelineApprovalGateFromBundle(input: {
+    auth: CoreApiAuthContext;
+    bundle: ProductPipelineBundle;
+    gateStage: StageApprovalGateStage;
+    decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+    rationale?: string | null;
+  }): Promise<StageApprovalGateRecord> {
+    const expectedStage = PIPELINE_GATE_STAGE_TO_ARTIFACT_STAGE[input.gateStage];
+    const targetArtifact = findLatestStageArtifact(input.bundle.artifacts, expectedStage);
+    if (!targetArtifact) {
+      throw new PostgresRlsError(
+        "23503",
+        `Target artifact for gate ${input.gateStage} not found in pipeline session ${input.bundle.session.pipeline_session_id}`
+      );
+    }
+    return this.coreApi.submitPipelineApprovalGate(input.bundle.session.project_id, input.auth, {
+      pipeline_session_id: input.bundle.session.pipeline_session_id,
+      gate_stage: input.gateStage,
+      target_artifact_id: targetArtifact.artifact_id,
+      target_artifact_sha256: targetArtifact.artifact_sha256,
+      decision: input.decision,
+      rationale: input.rationale,
+    });
+  }
+
+  public async freezePipelineBaseline(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    stage1ArtifactId?: string;
+    stage1ArtifactSha256?: string;
+    stage2ArtifactId?: string;
+    stage2ArtifactSha256?: string;
+    stage3ArtifactId?: string;
+    stage3ArtifactSha256?: string;
+    validationReportArtifactId?: string;
+    validationReportSha256?: string;
+    approvalGateId?: string;
+  }): Promise<BaselineSpecFreezeRecord> {
+    return this.coreApi.freezePipelineBaseline(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      stage1_artifact_id: input.stage1ArtifactId,
+      stage1_artifact_sha256: input.stage1ArtifactSha256,
+      stage2_artifact_id: input.stage2ArtifactId,
+      stage2_artifact_sha256: input.stage2ArtifactSha256,
+      stage3_artifact_id: input.stage3ArtifactId,
+      stage3_artifact_sha256: input.stage3ArtifactSha256,
+      validation_report_artifact_id: input.validationReportArtifactId,
+      validation_report_sha256: input.validationReportSha256,
+      approval_gate_id: input.approvalGateId,
+    });
+  }
 }
 
 export interface WebApprovalConsoleHttpServerOptions {
@@ -447,11 +773,110 @@ export class WebApprovalConsoleHttpServer {
       chunks.push(buf);
     }
     const raw = Buffer.concat(chunks).toString("utf8").trim();
-    return (raw ? JSON.parse(raw) : {}) as T;
+    if (!raw) {
+      return {} as T;
+    }
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      throw new SyntaxError("Malformed JSON request body");
+    }
   }
 
   private sendMappedError(res: ServerResponse, err: unknown): void {
-    const shaped = err as { code?: string; sqlState?: string; message?: string };
+    if (err instanceof SyntaxError) {
+      this.sendJson(res, 400, {
+        error_code: "ERR_BAD_REQUEST",
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof CostBudgetExceededError) {
+      this.sendJson(res, 402, {
+        error_code: err.code,
+        limit_scope: err.limitScope,
+        cost_session_id: err.costSessionId,
+        ledger_id: err.ledgerId,
+        details: err.details,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof StructuredOutputValidationError) {
+      this.sendJson(res, 422, {
+        error_code: err.code,
+        validation_errors: err.validationErrors,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof PromptVersionConflictError) {
+      this.sendJson(res, 409, {
+        error_code: err.code,
+        prompt_id: err.promptId,
+        version: err.version,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof PromptNotFoundError) {
+      this.sendJson(res, 404, {
+        error_code: err.code,
+        prompt_id: err.promptId,
+        version: err.version,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof PromptRenderError) {
+      this.sendJson(res, 400, {
+        error_code: err.code,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof ModelProviderConfigurationError) {
+      this.sendJson(res, 503, {
+        error_code: err.code,
+        provider: err.provider,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof ModelProviderHttpError) {
+      this.sendJson(res, 502, {
+        error_code: "ERR_MODEL_PROVIDER_UPSTREAM",
+        provider: err.provider,
+        upstream_status: err.statusCode,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof Ac10ViolationError) {
+      this.sendJson(res, 422, {
+        error_code: err.code,
+        sqlState: err.sqlState,
+        offending_item_ids: err.offendingItemIds,
+        reason: err.message,
+      });
+      return;
+    }
+
+    const shaped = err as {
+      code?: string;
+      sqlState?: string;
+      message?: string;
+      offendingItemIds?: readonly string[];
+    };
+    if (shaped.code === "ERR_AC10_UNCONFIRMED_ASSUMPTION") {
+      this.sendJson(res, 422, {
+        error_code: "ERR_AC10_UNCONFIRMED_ASSUMPTION",
+        sqlState: shaped.sqlState ?? "23514",
+        offending_item_ids: shaped.offendingItemIds ?? [],
+        reason: shaped.message ?? "AC-10 unconfirmed assumption violation",
+      });
+      return;
+    }
     if (shaped.code === "ERR_APPROVAL_EXPIRED_OR_STALE") {
       this.sendJson(res, 409, {
         error_code: "ERR_APPROVAL_EXPIRED_OR_STALE",
@@ -667,6 +1092,160 @@ export class WebApprovalConsoleHttpServer {
         }
 
         this.sendJson(res, 201, record);
+        return;
+      }
+
+      const pipelineSessionMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)$/
+      );
+      if (method === "GET" && pipelineSessionMatch?.[1] && pipelineSessionMatch?.[2]) {
+        const projectId = decodeURIComponent(pipelineSessionMatch[1]);
+        const pipelineSessionId = decodeURIComponent(pipelineSessionMatch[2]);
+        const bundle = await this.controller.loadPipelineBundle({
+          auth,
+          projectId,
+          pipelineSessionId,
+        });
+        if (!bundle) {
+          this.sendJson(res, 404, {
+            error_code: "ERR_PIPELINE_SESSION_NOT_FOUND",
+            reason: `Product pipeline session ${pipelineSessionId} not found in project ${projectId}`,
+          });
+          return;
+        }
+        const format = url.searchParams.get("format") ?? "html";
+        if (format === "json") {
+          this.sendJson(res, 200, bundle);
+          return;
+        }
+        if (format === "md") {
+          this.sendBody(
+            res,
+            200,
+            "text/markdown; charset=utf-8",
+            this.controller.renderPipelineBundleMarkdown(bundle)
+          );
+          return;
+        }
+        this.sendBody(
+          res,
+          200,
+          "text/html; charset=utf-8",
+          this.controller.renderPipelineBundleHtml(bundle)
+        );
+        return;
+      }
+
+      const pipelineGateMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/approval-gates$/
+      );
+      if (method === "POST" && pipelineGateMatch?.[1] && pipelineGateMatch?.[2]) {
+        const projectId = decodeURIComponent(pipelineGateMatch[1]);
+        const pipelineSessionId = decodeURIComponent(pipelineGateMatch[2]);
+        const body = await this.readJsonBody<{
+          gate_stage?: StageApprovalGateStage;
+          target_artifact_id?: string;
+          target_artifact_sha256?: string;
+          decision?: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+          rationale?: string | null;
+        }>(req);
+
+        if (
+          body.gate_stage !== "STAGE_1_DISCOVERY" &&
+          body.gate_stage !== "STAGE_2_REQUIREMENTS" &&
+          body.gate_stage !== "STAGE_3_ARCHITECTURE" &&
+          body.gate_stage !== "STAGE_4_SPEC_FREEZE"
+        ) {
+          this.sendJson(res, 400, {
+            error_code: "ERR_BAD_REQUEST",
+            reason:
+              "gate_stage must be STAGE_1_DISCOVERY, STAGE_2_REQUIREMENTS, STAGE_3_ARCHITECTURE, or STAGE_4_SPEC_FREEZE",
+          });
+          return;
+        }
+        if (
+          body.decision !== "APPROVED" &&
+          body.decision !== "REJECTED" &&
+          body.decision !== "REQUEST_CHANGES"
+        ) {
+          this.sendJson(res, 400, {
+            error_code: "ERR_BAD_REQUEST",
+            reason: "decision must be APPROVED, REJECTED, or REQUEST_CHANGES",
+          });
+          return;
+        }
+
+        let gate: StageApprovalGateRecord;
+        if (body.target_artifact_id && body.target_artifact_sha256) {
+          gate = await this.controller.submitPipelineApprovalGate({
+            auth,
+            projectId,
+            pipelineSessionId,
+            gateStage: body.gate_stage,
+            targetArtifactId: body.target_artifact_id,
+            targetArtifactSha256: body.target_artifact_sha256,
+            decision: body.decision,
+            rationale: body.rationale,
+          });
+        } else {
+          const bundle = await this.controller.loadPipelineBundle({
+            auth,
+            projectId,
+            pipelineSessionId,
+          });
+          if (!bundle) {
+            this.sendJson(res, 404, {
+              error_code: "ERR_PIPELINE_SESSION_NOT_FOUND",
+              reason: `Product pipeline session ${pipelineSessionId} not found in project ${projectId}`,
+            });
+            return;
+          }
+          gate = await this.controller.submitPipelineApprovalGateFromBundle({
+            auth,
+            bundle,
+            gateStage: body.gate_stage,
+            decision: body.decision,
+            rationale: body.rationale,
+          });
+        }
+
+        this.sendJson(res, 201, gate);
+        return;
+      }
+
+      const pipelineFreezeMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/freeze$/
+      );
+      if (method === "POST" && pipelineFreezeMatch?.[1] && pipelineFreezeMatch?.[2]) {
+        const projectId = decodeURIComponent(pipelineFreezeMatch[1]);
+        const pipelineSessionId = decodeURIComponent(pipelineFreezeMatch[2]);
+        const body = await this.readJsonBody<{
+          stage1_artifact_id?: string;
+          stage1_artifact_sha256?: string;
+          stage2_artifact_id?: string;
+          stage2_artifact_sha256?: string;
+          stage3_artifact_id?: string;
+          stage3_artifact_sha256?: string;
+          validation_report_artifact_id?: string;
+          validation_report_sha256?: string;
+          approval_gate_id?: string;
+        }>(req);
+
+        const freeze = await this.controller.freezePipelineBaseline({
+          auth,
+          projectId,
+          pipelineSessionId,
+          stage1ArtifactId: body.stage1_artifact_id,
+          stage1ArtifactSha256: body.stage1_artifact_sha256,
+          stage2ArtifactId: body.stage2_artifact_id,
+          stage2ArtifactSha256: body.stage2_artifact_sha256,
+          stage3ArtifactId: body.stage3_artifact_id,
+          stage3ArtifactSha256: body.stage3_artifact_sha256,
+          validationReportArtifactId: body.validation_report_artifact_id,
+          validationReportSha256: body.validation_report_sha256,
+          approvalGateId: body.approval_gate_id,
+        });
+        this.sendJson(res, 201, freeze);
         return;
       }
 

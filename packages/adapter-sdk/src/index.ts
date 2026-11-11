@@ -13,6 +13,9 @@ import {
 import { LiveModelProviderClient, type ModelProviderConfig } from "./model-providers.ts";
 
 export * from "./model-providers.ts";
+export * from "./prompt-registry.ts";
+export * from "./structured-output.ts";
+export * from "./cost-guard.ts";
 
 /**
  * AgentRuntimeAdapter Interface (MVP-SPEC-03 Section 4.4 & Roadmap M2/M5)

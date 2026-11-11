@@ -5,16 +5,27 @@ import { types } from "node:util";
 import {
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
+  type BaselineSpecFreezeRecord,
   type CandidateBoundLineage,
+  type CostSessionRecord,
   type M5AcceptanceCriterionReport,
   type M5EnvironmentCapabilities,
   type M5EvidenceBundle,
   type M5FaultRecoveryScenarioReport,
   type MergeCandidateRecord,
   type MergeOperationRecord,
+  type ModelCallLedgerRecord,
+  type ModelPricingRate,
+  type ProductPipelineBundle,
+  type ProductPipelineSessionRecord,
   type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
   type ReviewSessionRecord,
+  type Stage1DiscoveryItemRecord,
+  type Stage4ConsistencyReport,
+  type StageApprovalGateRecord,
+  type StageApprovalGateStage,
+  type StageArtifactRecord,
   type TaskLeaseRecord,
   type TaskRecord,
   type TaskStatus,
@@ -23,6 +34,11 @@ import {
   canonicalizeJson,
   sha256Hex,
 } from "@software-factory/shared-types";
+import {
+  type ManagedModelProviderExecutor,
+  type ModelProviderConfig,
+  type PromptRegistry,
+} from "@software-factory/adapter-sdk";
 import {
   type GitTreeImportCandidateInput,
   type TaskContractSpec,
@@ -36,6 +52,11 @@ import {
   type ProjectMembershipRecord,
   type RecordResourceUsageMetricInput,
 } from "@software-factory/database";
+import {
+  ProductPipelineService,
+  type Stage1ExtractOutcome,
+  type StageExecutionOutcome,
+} from "@software-factory/product-pipeline";
 import {
   type BuildMergeCandidateResult,
   Docker3TierVerifier,
@@ -320,6 +341,7 @@ export class CoreApiService {
   private readonly store: ControlPlaneStore;
   public readonly authenticator: CoreApiTokenAuthenticator;
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
+  public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
   private readonly onWarning?: (warning: CoreApiWarning) => void;
 
@@ -331,6 +353,12 @@ export class CoreApiService {
       clockFn?: () => Date;
       snapshotStore?: ImmutableSourceSnapshotStore;
       onWarning?: (warning: CoreApiWarning) => void;
+      promptRegistry?: PromptRegistry;
+      defaultModelConfig?: ModelProviderConfig;
+      defaultModelExecutor?: ManagedModelProviderExecutor;
+      modelPricingOverrides?: Readonly<Record<string, ModelPricingRate>>;
+      pipelineService?: ProductPipelineService;
+      env?: NodeJS.ProcessEnv;
     }
   ) {
     this.store = store;
@@ -355,6 +383,16 @@ export class CoreApiService {
             }
             return new Date();
           }),
+      });
+    this.pipelineService =
+      options?.pipelineService ??
+      new ProductPipelineService({
+        store: this.store,
+        promptRegistry: options?.promptRegistry,
+        defaultModelConfig: options?.defaultModelConfig,
+        defaultModelExecutor: options?.defaultModelExecutor,
+        pricingOverrides: options?.modelPricingOverrides,
+        env: options?.env,
       });
   }
 
@@ -2108,6 +2146,248 @@ export class CoreApiService {
     generatedAt?: string;
   }): M5EvidenceBundle {
     return buildM5EvidenceBundle(input);
+  }
+
+  // ===========================================================================
+  // Milestone M6A: Model Cost Guard (AC-12b) & Stages 1–4 Product Pipeline
+  // ===========================================================================
+
+  public async createCostSession(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly cost_session_id?: string;
+      readonly pipeline_session_id?: string | null;
+      readonly task_id?: string | null;
+      readonly max_tokens_per_request: number;
+      readonly max_cost_micro_usd_per_request: number;
+      readonly session_token_budget: number;
+      readonly session_cost_budget_micro_usd: number;
+    }
+  ): Promise<CostSessionRecord> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.createCostSession({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async getCostSessionWithLedgers(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    costSessionId: string
+  ): Promise<{
+    readonly session: CostSessionRecord;
+    readonly ledgers: readonly ModelCallLedgerRecord[];
+  } | null> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.getCostSessionWithLedgers({
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+      cost_session_id: costSessionId,
+    });
+  }
+
+  public async createPipelineSession(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id?: string;
+      readonly cost_session_id?: string | null;
+      readonly cost_budget?: {
+        readonly cost_session_id?: string;
+        readonly max_tokens_per_request: number;
+        readonly max_cost_micro_usd_per_request: number;
+        readonly session_token_budget: number;
+        readonly session_cost_budget_micro_usd: number;
+      };
+      readonly title: string;
+      readonly raw_idea_text: string;
+    }
+  ): Promise<{
+    readonly session: ProductPipelineSessionRecord;
+    readonly costSession: CostSessionRecord | null;
+  }> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.createSession({
+      ...input,
+      project_id: projectId,
+      created_by_principal_id: verified.principalId,
+    });
+  }
+
+  public async listPipelineSessions(
+    projectId: string,
+    auth: CoreApiAuthContext
+  ): Promise<ProductPipelineSessionRecord[]> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.listSessions({
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async getPipelineBundle(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string
+  ): Promise<ProductPipelineBundle | null> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.getBundle({
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+      pipeline_session_id: pipelineSessionId,
+    });
+  }
+
+  public async runPipelineStage1Extract(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly cost_session_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly model_config?: ModelProviderConfig;
+      readonly model_executor?: ManagedModelProviderExecutor;
+    }
+  ): Promise<Stage1ExtractOutcome> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.intakeAndExtractStage1({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async resolvePipelineStage1Item(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly item_id: string;
+      readonly decision: "CONFIRM" | "REJECT";
+      readonly resolution_note?: string | null;
+    }
+  ): Promise<Stage1DiscoveryItemRecord> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.resolveStage1Item({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async runPipelineStage2Requirements(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly cost_session_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly model_config?: ModelProviderConfig;
+      readonly model_executor?: ManagedModelProviderExecutor;
+    }
+  ): Promise<StageExecutionOutcome<Record<string, unknown>>> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.generateStage2Requirements({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async runPipelineStage3Architecture(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly cost_session_id?: string;
+      readonly stage2_artifact_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly model_config?: ModelProviderConfig;
+      readonly model_executor?: ManagedModelProviderExecutor;
+    }
+  ): Promise<StageExecutionOutcome<Record<string, unknown>>> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.generateStage3Architecture({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async runPipelineStage4ConsistencyCheck(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly stage1_artifact_id?: string;
+      readonly stage2_artifact_id?: string;
+      readonly stage3_artifact_id?: string;
+      readonly checked_at?: string;
+    }
+  ): Promise<{
+    readonly session: ProductPipelineSessionRecord;
+    readonly report: Stage4ConsistencyReport;
+    readonly artifact: StageArtifactRecord;
+  }> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.runStage4ConsistencyCheck({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async submitPipelineApprovalGate(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly gate_stage: StageApprovalGateStage;
+      readonly target_artifact_id?: string;
+      readonly target_artifact_sha256?: string;
+      readonly decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+      readonly rationale?: string | null;
+    }
+  ): Promise<StageApprovalGateRecord> {
+    const verified = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.pipelineService.submitStageApprovalGate({
+      ...input,
+      project_id: projectId,
+      approver_principal_id: verified.principalId,
+    });
+  }
+
+  public async freezePipelineBaseline(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly stage1_artifact_id?: string;
+      readonly stage1_artifact_sha256?: string;
+      readonly stage2_artifact_id?: string;
+      readonly stage2_artifact_sha256?: string;
+      readonly stage3_artifact_id?: string;
+      readonly stage3_artifact_sha256?: string;
+      readonly validation_report_artifact_id?: string;
+      readonly validation_report_sha256?: string;
+      readonly approval_gate_id?: string;
+    }
+  ): Promise<BaselineSpecFreezeRecord> {
+    const verified = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.pipelineService.freezeBaselineSpec({
+      ...input,
+      project_id: projectId,
+      frozen_by_principal_id: verified.principalId,
+    });
   }
 }
 

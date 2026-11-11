@@ -75,6 +75,9 @@ export async function createControlPlaneStackRuntime(
         transientFaultHook: options?.transientFaultHook,
         verifyPolicy: options?.verifyPolicy,
         enableTestFaultInjection: options?.enableTestFaultInjection,
+        defaultModelConfig: options?.defaultModelConfig,
+        promptRegistry: options?.promptRegistry,
+        modelPricingOverrides: options?.modelPricingOverrides,
         clockFn: options?.clockFn,
         startServer: options?.startCoreApiHttp ?? shouldStart,
       });

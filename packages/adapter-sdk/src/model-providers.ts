@@ -1,7 +1,27 @@
-import { canonicalizeJson, sha256Hex } from "@software-factory/shared-types";
+import {
+  type CostSessionRecord,
+  type ModelCallLedgerRecord,
+  type ModelPricingRate,
+  type ModelProviderName,
+  type ModelUsageMetrics,
+  type RenderedPrompt,
+  type StructuredJsonSchema,
+  canonicalizeJson,
+  sha256Hex,
+} from "@software-factory/shared-types";
 import type { TaskContractSpec } from "@software-factory/task-contract";
+import {
+  CostBudgetExceededError,
+  type CostGuardRecorder,
+  computeCostMicroUsd,
+  estimateTokenCount,
+  extractNormalizedTokenUsage,
+  resolveModelPricingRate,
+} from "./cost-guard.ts";
+import type { PromptRegistry } from "./prompt-registry.ts";
+import { parseAndValidateStructuredOutput } from "./structured-output.ts";
 
-export type ModelProviderName = "anthropic" | "openai" | "google";
+export type { ModelProviderName };
 
 export class ModelProviderConfigurationError extends Error {
   public readonly code = "ERR_MODEL_PROVIDER_NOT_CONFIGURED" as const;
@@ -53,6 +73,7 @@ export interface ModelCompletionResponse {
   readonly contentText: string;
   readonly requestSha256: string;
   readonly rawUsage?: Readonly<Record<string, unknown>>;
+  readonly usage: ModelUsageMetrics;
 }
 
 function defaultEnvVarForProvider(provider: ModelProviderName): string {
@@ -63,6 +84,17 @@ function defaultEnvVarForProvider(provider: ModelProviderName): string {
       return "OPENAI_API_KEY";
     case "google":
       return "GOOGLE_API_KEY";
+  }
+}
+
+function defaultModelForProvider(provider: ModelProviderName): string {
+  switch (provider) {
+    case "anthropic":
+      return "claude-sonnet-4-20250514";
+    case "openai":
+      return "gpt-4.1";
+    case "google":
+      return "gemini-2.5-pro";
   }
 }
 
@@ -221,6 +253,12 @@ export class LiveModelProviderClient {
           contentText: text,
           requestSha256,
           rawUsage: json.usage,
+          usage: extractNormalizedTokenUsage(
+            "anthropic",
+            json.usage,
+            `${req.systemPrompt}\n${req.userPrompt}`,
+            text
+          ),
         };
       }
 
@@ -263,6 +301,12 @@ export class LiveModelProviderClient {
           contentText: text,
           requestSha256,
           rawUsage: json.usage,
+          usage: extractNormalizedTokenUsage(
+            "openai",
+            json.usage,
+            `${req.systemPrompt}\n${req.userPrompt}`,
+            text
+          ),
         };
       }
 
@@ -313,6 +357,12 @@ export class LiveModelProviderClient {
         contentText: text,
         requestSha256,
         rawUsage: json.usageMetadata,
+        usage: extractNormalizedTokenUsage(
+          "google",
+          json.usageMetadata,
+          `${req.systemPrompt}\n${req.userPrompt}`,
+          text
+        ),
       };
     } finally {
       clearTimeout(timer);
@@ -433,3 +483,355 @@ export async function evaluateIndependentReviewWithLiveModel(
     };
   }
 }
+
+export interface ModelProviderProfileConfig extends ModelProviderConfig {
+  readonly defaultMaxTokens?: number;
+  readonly defaultTemperature?: number;
+}
+
+/**
+ * Loads `ModelProviderProfileConfig` purely from environment variables (`AC-01` config-driven swapping).
+ * Supports `SF_MODEL_PROVIDER` (`anthropic` | `openai` | `google`), `SF_MODEL_NAME`,
+ * `SF_MODEL_BASE_URL`, `SF_MODEL_API_KEY`, `SF_MODEL_TIMEOUT_MS`, `SF_MODEL_ALLOWED_HOSTS`,
+ * and `SF_MODEL_ALLOW_INSECURE_HTTP`.
+ */
+export function loadModelProviderConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  overrides?: Partial<ModelProviderProfileConfig>
+): ModelProviderProfileConfig {
+  const rawProvider = (overrides?.provider ?? env.SF_MODEL_PROVIDER ?? "anthropic").trim().toLowerCase();
+  if (rawProvider !== "anthropic" && rawProvider !== "openai" && rawProvider !== "google") {
+    throw new ModelProviderConfigurationError(
+      "anthropic",
+      `Unsupported SF_MODEL_PROVIDER '${rawProvider}'; expected anthropic, openai, or google`
+    );
+  }
+  const provider: ModelProviderName = rawProvider;
+  const model =
+    (overrides?.model ?? env.SF_MODEL_NAME ?? "").trim() || defaultModelForProvider(provider);
+  const baseUrl = (overrides?.baseUrl ?? env.SF_MODEL_BASE_URL)?.trim() || undefined;
+  const apiKey = (overrides?.apiKey ?? env.SF_MODEL_API_KEY)?.trim() || undefined;
+
+  let timeoutMs = overrides?.timeoutMs;
+  if (timeoutMs === undefined && env.SF_MODEL_TIMEOUT_MS?.trim()) {
+    const parsed = Number.parseInt(env.SF_MODEL_TIMEOUT_MS.trim(), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new ModelProviderConfigurationError(
+        provider,
+        `Invalid SF_MODEL_TIMEOUT_MS '${env.SF_MODEL_TIMEOUT_MS}'`
+      );
+    }
+    timeoutMs = parsed;
+  }
+
+  let allowedHosts = overrides?.allowedHosts;
+  if (!allowedHosts && env.SF_MODEL_ALLOWED_HOSTS?.trim()) {
+    allowedHosts = env.SF_MODEL_ALLOWED_HOSTS.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  const allowInsecureHttpBaseUrl =
+    overrides?.allowInsecureHttpBaseUrl ?? env.SF_MODEL_ALLOW_INSECURE_HTTP === "1";
+
+  return {
+    provider,
+    model,
+    ...(apiKey ? { apiKey } : {}),
+    ...(overrides?.apiKeyEnvVar ? { apiKeyEnvVar: overrides.apiKeyEnvVar } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(allowedHosts ? { allowedHosts } : {}),
+    ...(allowInsecureHttpBaseUrl ? { allowInsecureHttpBaseUrl } : {}),
+    ...(overrides?.defaultMaxTokens !== undefined
+      ? { defaultMaxTokens: overrides.defaultMaxTokens }
+      : {}),
+    ...(overrides?.defaultTemperature !== undefined
+      ? { defaultTemperature: overrides.defaultTemperature }
+      : {}),
+  };
+}
+
+export function createModelProviderClient(
+  config: ModelProviderConfig,
+  env: NodeJS.ProcessEnv = process.env
+): LiveModelProviderClient {
+  return new LiveModelProviderClient(config, env);
+}
+
+export interface ManagedModelProviderExecutorOptions {
+  readonly client: LiveModelProviderClient;
+  readonly promptRegistry: PromptRegistry;
+  readonly costGuard: CostGuardRecorder;
+  readonly pricingOverrides?: Readonly<Record<string, ModelPricingRate>>;
+  readonly defaultMaxTokens?: number;
+  readonly defaultTemperature?: number;
+}
+
+export interface ManagedPromptExecutionInput {
+  readonly projectId: string;
+  readonly costSessionId: string;
+  readonly pipelineSessionId?: string | null;
+  readonly taskId?: string | null;
+  readonly stage: string;
+  readonly promptId: string;
+  readonly promptVersion?: string;
+  readonly variables?: Readonly<Record<string, string | number | boolean | null | undefined>>;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+  readonly outputSchemaOverride?: StructuredJsonSchema;
+}
+
+export interface ManagedStructuredExecutionResult<T> {
+  readonly parsed: T;
+  readonly rawCompletion: ModelCompletionResponse;
+  readonly renderedPrompt: RenderedPrompt;
+  readonly usage: ModelUsageMetrics;
+  readonly actualCostMicroUsd: number;
+  readonly ledger: ModelCallLedgerRecord;
+  readonly costSession: CostSessionRecord;
+}
+
+/**
+ * Config-driven Model Executor (`M6A`):
+ * Orchestrates immutable `PromptRegistry` versioning, `AC-12b` Pre-Flight Cost Guard,
+ * `LiveModelProviderClient` completion, Fail-Closed `StructuredOutputValidation`,
+ * and atomic `CostGuardRecorder` Post-Call Ledger accounting.
+ */
+export class ManagedModelProviderExecutor {
+  public readonly client: LiveModelProviderClient;
+  public readonly promptRegistry: PromptRegistry;
+  public readonly costGuard: CostGuardRecorder;
+  public readonly pricingOverrides?: Readonly<Record<string, ModelPricingRate>>;
+  public readonly defaultMaxTokens: number;
+  public readonly defaultTemperature: number;
+
+  constructor(options: ManagedModelProviderExecutorOptions) {
+    this.client = options.client;
+    this.promptRegistry = options.promptRegistry;
+    this.costGuard = options.costGuard;
+    this.pricingOverrides = options.pricingOverrides;
+    this.defaultMaxTokens = options.defaultMaxTokens ?? 1024;
+    this.defaultTemperature = options.defaultTemperature ?? 0;
+  }
+
+  /**
+   * Returns a cloned executor bound to a different provider configuration without altering
+   * prompts, schemas, or budget tracking state (`AC-01`).
+   */
+  public withProviderConfig(
+    config: ModelProviderConfig,
+    env: NodeJS.ProcessEnv = process.env
+  ): ManagedModelProviderExecutor {
+    return new ManagedModelProviderExecutor({
+      client: createModelProviderClient(config, env),
+      promptRegistry: this.promptRegistry,
+      costGuard: this.costGuard,
+      pricingOverrides: this.pricingOverrides,
+      defaultMaxTokens: this.defaultMaxTokens,
+      defaultTemperature: this.defaultTemperature,
+    });
+  }
+
+  public async executeStructuredPrompt<T>(
+    input: ManagedPromptExecutionInput
+  ): Promise<ManagedStructuredExecutionResult<T>> {
+    const renderedPrompt = this.promptRegistry.render(
+      input.promptId,
+      input.promptVersion,
+      input.variables ?? {}
+    );
+
+    const provider = this.client.config.provider;
+    const model = this.client.config.model;
+    const maxTokens = input.maxTokens ?? this.defaultMaxTokens;
+    const temperature = input.temperature ?? this.defaultTemperature;
+    const estimatedInputTokens = estimateTokenCount(
+      `${renderedPrompt.systemPrompt}\n${renderedPrompt.userPrompt}`
+    );
+    const rate = resolveModelPricingRate(provider, model, this.pricingOverrides);
+    const estimatedCostMicroUsd = computeCostMicroUsd(estimatedInputTokens, maxTokens, rate);
+    const requestSha256 = sha256Hex(
+      canonicalizeJson({
+        provider,
+        model,
+        promptId: renderedPrompt.promptId,
+        promptVersion: renderedPrompt.version,
+        promptSha256: renderedPrompt.promptSha256,
+        systemPrompt: renderedPrompt.systemPrompt,
+        userPrompt: renderedPrompt.userPrompt,
+        maxTokens,
+      })
+    );
+
+    const preflight = await this.costGuard.preflightCheckCostSession({
+      project_id: input.projectId,
+      cost_session_id: input.costSessionId,
+      pipeline_session_id: input.pipelineSessionId ?? null,
+      task_id: input.taskId ?? null,
+      stage: input.stage,
+      provider,
+      model,
+      prompt_id: renderedPrompt.promptId,
+      prompt_version: renderedPrompt.version,
+      prompt_sha256: renderedPrompt.promptSha256,
+      request_sha256: requestSha256,
+      estimated_input_tokens: estimatedInputTokens,
+      reserved_output_tokens: maxTokens,
+      estimated_cost_micro_usd: estimatedCostMicroUsd,
+    });
+
+    if (!preflight.allowed) {
+      throw new CostBudgetExceededError({
+        limitScope: preflight.limitScope,
+        costSessionId: input.costSessionId,
+        ledgerId: preflight.blockedLedger.call_id,
+        message: preflight.reason,
+        details: {
+          stage: input.stage,
+          provider,
+          model,
+          estimatedInputTokens,
+          reservedOutputTokens: maxTokens,
+          estimatedCostMicroUsd,
+          ledgerStatus: preflight.blockedLedger.status,
+        },
+      });
+    }
+
+    const startMs = Date.now();
+    let completion: ModelCompletionResponse;
+    try {
+      completion = await this.client.complete({
+        systemPrompt: renderedPrompt.systemPrompt,
+        userPrompt: renderedPrompt.userPrompt,
+        maxTokens,
+        temperature,
+      });
+    } catch (providerErr: unknown) {
+      const latencyMs = Math.max(0, Date.now() - startMs);
+      await this.costGuard.finalizeModelCallLedger({
+        project_id: input.projectId,
+        cost_session_id: input.costSessionId,
+        pipeline_session_id: input.pipelineSessionId ?? null,
+        task_id: input.taskId ?? null,
+        stage: input.stage,
+        provider,
+        model,
+        prompt_id: renderedPrompt.promptId,
+        prompt_version: renderedPrompt.version,
+        prompt_sha256: renderedPrompt.promptSha256,
+        request_sha256: requestSha256,
+        estimated_input_tokens: estimatedInputTokens,
+        reserved_output_tokens: maxTokens,
+        actual_input_tokens: 0,
+        actual_output_tokens: 0,
+        estimated_cost_micro_usd: estimatedCostMicroUsd,
+        actual_cost_micro_usd: 0,
+        outcome: "FAILED_PROVIDER",
+        error_message:
+          providerErr instanceof Error ? providerErr.message : String(providerErr),
+        latency_ms: latencyMs,
+      });
+      throw providerErr;
+    }
+
+    const latencyMs = Math.max(0, Date.now() - startMs);
+    const usage = completion.usage;
+    const actualCostMicroUsd = computeCostMicroUsd(usage.inputTokens, usage.outputTokens, rate);
+    const schema = input.outputSchemaOverride ?? renderedPrompt.outputSchema;
+
+    let parsed: T;
+    if (schema) {
+      try {
+        parsed = parseAndValidateStructuredOutput<T>(completion.contentText, schema);
+      } catch (validationErr: unknown) {
+        const finalizeFailed = await this.costGuard.finalizeModelCallLedger({
+          project_id: input.projectId,
+          cost_session_id: input.costSessionId,
+          pipeline_session_id: input.pipelineSessionId ?? null,
+          task_id: input.taskId ?? null,
+          stage: input.stage,
+          provider,
+          model,
+          prompt_id: renderedPrompt.promptId,
+          prompt_version: renderedPrompt.version,
+          prompt_sha256: renderedPrompt.promptSha256,
+          request_sha256: requestSha256,
+          estimated_input_tokens: estimatedInputTokens,
+          reserved_output_tokens: maxTokens,
+          actual_input_tokens: usage.inputTokens,
+          actual_output_tokens: usage.outputTokens,
+          estimated_cost_micro_usd: estimatedCostMicroUsd,
+          actual_cost_micro_usd: actualCostMicroUsd,
+          outcome: "FAILED_VALIDATION",
+          error_message:
+            validationErr instanceof Error ? validationErr.message : String(validationErr),
+          latency_ms: latencyMs,
+        });
+        if (!finalizeFailed.allowed) {
+          throw new CostBudgetExceededError({
+            limitScope: finalizeFailed.limitScope ?? "SESSION_COST_BUDGET",
+            costSessionId: input.costSessionId,
+            ledgerId: finalizeFailed.ledger.call_id,
+            message: finalizeFailed.reason ?? "Post-call cost budget exceeded on invalid response",
+          });
+        }
+        throw validationErr;
+      }
+    } else {
+      parsed = completion.contentText as unknown as T;
+    }
+
+    const finalized = await this.costGuard.finalizeModelCallLedger({
+      project_id: input.projectId,
+      cost_session_id: input.costSessionId,
+      pipeline_session_id: input.pipelineSessionId ?? null,
+      task_id: input.taskId ?? null,
+      stage: input.stage,
+      provider,
+      model,
+      prompt_id: renderedPrompt.promptId,
+      prompt_version: renderedPrompt.version,
+      prompt_sha256: renderedPrompt.promptSha256,
+      request_sha256: requestSha256,
+      estimated_input_tokens: estimatedInputTokens,
+      reserved_output_tokens: maxTokens,
+      actual_input_tokens: usage.inputTokens,
+      actual_output_tokens: usage.outputTokens,
+      estimated_cost_micro_usd: estimatedCostMicroUsd,
+      actual_cost_micro_usd: actualCostMicroUsd,
+      outcome: "ALLOWED",
+      latency_ms: latencyMs,
+    });
+
+    if (!finalized.allowed) {
+      throw new CostBudgetExceededError({
+        limitScope: finalized.limitScope ?? "SESSION_COST_BUDGET",
+        costSessionId: input.costSessionId,
+        ledgerId: finalized.ledger.call_id,
+        message: finalized.reason ?? "Post-call cost budget exceeded",
+        details: {
+          stage: input.stage,
+          provider,
+          model,
+          actualInputTokens: usage.inputTokens,
+          actualOutputTokens: usage.outputTokens,
+          actualCostMicroUsd,
+          ledgerStatus: finalized.ledger.status,
+        },
+      });
+    }
+
+    return {
+      parsed,
+      rawCompletion: completion,
+      renderedPrompt,
+      usage,
+      actualCostMicroUsd,
+      ledger: finalized.ledger,
+      costSession: finalized.session,
+    };
+  }
+}
+

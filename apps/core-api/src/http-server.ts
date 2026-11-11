@@ -1,9 +1,20 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  CostBudgetExceededError,
+  type ModelProviderConfig,
+  ModelProviderConfigurationError,
+  ModelProviderHttpError,
+  PromptNotFoundError,
+  PromptRenderError,
+  PromptVersionConflictError,
+  StructuredOutputValidationError,
+} from "@software-factory/adapter-sdk";
 import type {
   AgentGatewayService,
   IssuedReviewerSessionCredential,
 } from "@software-factory/agent-gateway";
 import {
+  Ac10ViolationError,
   ApprovalExpiredOrStaleError,
   type CasMergeResult,
   type ControlPlaneStore,
@@ -11,15 +22,29 @@ import {
   type RecordResourceUsageMetricInput,
   SimulatedPostMergeCrashError,
 } from "@software-factory/database";
+import type {
+  Stage1ExtractOutcome,
+  StageExecutionOutcome,
+} from "@software-factory/product-pipeline";
 import type { IndependentReviewExecutionResult } from "@software-factory/reviewer";
 import type {
   ApprovalDecisionRecord,
   ApprovalRequestRecord,
+  BaselineSpecFreezeRecord,
   CandidateBoundLineage,
+  CostSessionRecord,
   MergeCandidateRecord,
+  ModelCallLedgerRecord,
+  ProductPipelineBundle,
+  ProductPipelineSessionRecord,
   ResourceUsageMetricRecord,
   ReviewArtifactRecord,
   ReviewSessionRecord,
+  Stage1DiscoveryItemRecord,
+  Stage4ConsistencyReport,
+  StageApprovalGateRecord,
+  StageApprovalGateStage,
+  StageArtifactRecord,
   TaskLeaseRecord,
   TaskRecord,
   TaskStatus,
@@ -34,6 +59,35 @@ import type {
   TierCommandSpec,
 } from "@software-factory/verifier";
 import type { ApprovalCenterBundle, CoreApiAuthContext, CoreApiService } from "./index.ts";
+
+function sanitizeHttpModelConfig(raw: unknown): ModelProviderConfig | undefined {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new BadRequestHttpError("model_config must be an object");
+  }
+  const candidate = raw as Record<string, unknown>;
+  const provider = candidate.provider;
+  const model = candidate.model;
+  if (provider !== "anthropic" && provider !== "openai" && provider !== "google") {
+    throw new BadRequestHttpError(
+      "model_config.provider must be one of anthropic, openai, google"
+    );
+  }
+  if (typeof model !== "string" || !model.trim()) {
+    throw new BadRequestHttpError("model_config.model must be a non-empty string");
+  }
+  return {
+    provider,
+    model: model.trim(),
+    ...(typeof candidate.apiKey === "string" ? { apiKey: candidate.apiKey } : {}),
+    ...(typeof candidate.apiKeyEnvVar === "string" ? { apiKeyEnvVar: candidate.apiKeyEnvVar } : {}),
+    ...(typeof candidate.baseUrl === "string" ? { baseUrl: candidate.baseUrl } : {}),
+    ...(typeof candidate.timeoutMs === "number" ? { timeoutMs: candidate.timeoutMs } : {}),
+    allowInsecureHttpBaseUrl: false,
+  };
+}
 
 export const CORE_API_AUTH_HEADER = "x-sf-auth-token";
 
@@ -218,6 +272,76 @@ export class CoreApiHttpServer {
       });
       return;
     }
+    if (err instanceof CostBudgetExceededError) {
+      this.sendJson(res, 402, {
+        error_code: err.code,
+        limit_scope: err.limitScope,
+        cost_session_id: err.costSessionId,
+        ledger_id: err.ledgerId,
+        details: err.details,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof StructuredOutputValidationError) {
+      this.sendJson(res, 422, {
+        error_code: err.code,
+        validation_errors: err.validationErrors,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof PromptVersionConflictError) {
+      this.sendJson(res, 409, {
+        error_code: err.code,
+        prompt_id: err.promptId,
+        version: err.version,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof PromptNotFoundError) {
+      this.sendJson(res, 404, {
+        error_code: err.code,
+        prompt_id: err.promptId,
+        version: err.version,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof PromptRenderError) {
+      this.sendJson(res, 400, {
+        error_code: err.code,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof ModelProviderConfigurationError) {
+      this.sendJson(res, 503, {
+        error_code: err.code,
+        provider: err.provider,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof ModelProviderHttpError) {
+      this.sendJson(res, 502, {
+        error_code: "ERR_MODEL_PROVIDER_UPSTREAM",
+        provider: err.provider,
+        upstream_status: err.statusCode,
+        reason: err.message,
+      });
+      return;
+    }
+    if (err instanceof Ac10ViolationError) {
+      this.sendJson(res, 422, {
+        error_code: err.code,
+        sqlState: err.sqlState,
+        offending_item_ids: err.offendingItemIds,
+        reason: err.message,
+      });
+      return;
+    }
     if (err instanceof ApprovalExpiredOrStaleError) {
       this.sendJson(res, 409, {
         error_code: err.code,
@@ -338,6 +462,324 @@ export class CoreApiHttpServer {
           return;
         }
         this.sendJson(res, 200, task);
+        return;
+      }
+
+      const costSessionsMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/cost-sessions$/
+      );
+      if (method === "POST" && costSessionsMatch?.[1]) {
+        const projectId = decodeURIComponent(costSessionsMatch[1]);
+        const body = await this.readJsonBody<{
+          cost_session_id?: string;
+          pipeline_session_id?: string | null;
+          task_id?: string | null;
+          max_tokens_per_request: number;
+          max_cost_micro_usd_per_request: number;
+          session_token_budget: number;
+          session_cost_budget_micro_usd: number;
+        }>(req);
+        if (
+          typeof body.max_tokens_per_request !== "number" ||
+          typeof body.max_cost_micro_usd_per_request !== "number" ||
+          typeof body.session_token_budget !== "number" ||
+          typeof body.session_cost_budget_micro_usd !== "number"
+        ) {
+          throw new BadRequestHttpError(
+            "max_tokens_per_request, max_cost_micro_usd_per_request, session_token_budget, and session_cost_budget_micro_usd are required numeric budgets"
+          );
+        }
+        const created = await this.coreApi.createCostSession(projectId, auth, body);
+        this.sendJson(res, 201, created);
+        return;
+      }
+
+      const singleCostSessionMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/cost-sessions\/([^/]+)$/
+      );
+      if (method === "GET" && singleCostSessionMatch?.[1] && singleCostSessionMatch?.[2]) {
+        const projectId = decodeURIComponent(singleCostSessionMatch[1]);
+        const costSessionId = decodeURIComponent(singleCostSessionMatch[2]);
+        const costView = await this.coreApi.getCostSessionWithLedgers(
+          projectId,
+          auth,
+          costSessionId
+        );
+        if (!costView) {
+          this.sendJson(res, 404, {
+            error_code: "ERR_COST_SESSION_NOT_FOUND",
+            reason: `Cost session ${costSessionId} not found in project ${projectId}`,
+          });
+          return;
+        }
+        this.sendJson(res, 200, costView);
+        return;
+      }
+
+      const pipelineSessionsMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions$/
+      );
+      if (pipelineSessionsMatch?.[1]) {
+        const projectId = decodeURIComponent(pipelineSessionsMatch[1]);
+        if (method === "POST") {
+          const body = await this.readJsonBody<{
+            pipeline_session_id?: string;
+            cost_session_id?: string | null;
+            cost_budget?: {
+              cost_session_id?: string;
+              max_tokens_per_request: number;
+              max_cost_micro_usd_per_request: number;
+              session_token_budget: number;
+              session_cost_budget_micro_usd: number;
+            };
+            title: string;
+            raw_idea_text: string;
+          }>(req);
+          if (
+            typeof body.title !== "string" ||
+            !body.title.trim() ||
+            typeof body.raw_idea_text !== "string" ||
+            !body.raw_idea_text.trim()
+          ) {
+            throw new BadRequestHttpError("title and raw_idea_text are required non-empty strings");
+          }
+          if (
+            body.cost_budget !== undefined &&
+            (typeof body.cost_budget !== "object" ||
+              body.cost_budget === null ||
+              typeof body.cost_budget.max_tokens_per_request !== "number" ||
+              typeof body.cost_budget.max_cost_micro_usd_per_request !== "number" ||
+              typeof body.cost_budget.session_token_budget !== "number" ||
+              typeof body.cost_budget.session_cost_budget_micro_usd !== "number")
+          ) {
+            throw new BadRequestHttpError(
+              "cost_budget must include numeric per-request and session token/cost budgets"
+            );
+          }
+          const created = await this.coreApi.createPipelineSession(projectId, auth, body);
+          this.sendJson(res, 201, created);
+          return;
+        }
+        if (method === "GET") {
+          const sessions = await this.coreApi.listPipelineSessions(projectId, auth);
+          this.sendJson(res, 200, { sessions });
+          return;
+        }
+      }
+
+      const singlePipelineMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)$/
+      );
+      if (method === "GET" && singlePipelineMatch?.[1] && singlePipelineMatch?.[2]) {
+        const projectId = decodeURIComponent(singlePipelineMatch[1]);
+        const pipelineSessionId = decodeURIComponent(singlePipelineMatch[2]);
+        const bundle = await this.coreApi.getPipelineBundle(projectId, auth, pipelineSessionId);
+        if (!bundle) {
+          this.sendJson(res, 404, {
+            error_code: "ERR_PIPELINE_SESSION_NOT_FOUND",
+            reason: `Product pipeline session ${pipelineSessionId} not found in project ${projectId}`,
+          });
+          return;
+        }
+        this.sendJson(res, 200, bundle);
+        return;
+      }
+
+      const stage1ExtractMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/stage1\/extract$/
+      );
+      if (method === "POST" && stage1ExtractMatch?.[1] && stage1ExtractMatch?.[2]) {
+        const projectId = decodeURIComponent(stage1ExtractMatch[1]);
+        const pipelineSessionId = decodeURIComponent(stage1ExtractMatch[2]);
+        const body = await this.readJsonBody<{
+          cost_session_id?: string;
+          prompt_version?: string;
+          max_tokens?: number;
+          temperature?: number;
+          model_config?: unknown;
+        }>(req);
+        const outcome = await this.coreApi.runPipelineStage1Extract(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          cost_session_id: body.cost_session_id,
+          prompt_version: body.prompt_version,
+          max_tokens: body.max_tokens,
+          temperature: body.temperature,
+          model_config: sanitizeHttpModelConfig(body.model_config),
+        });
+        this.sendJson(res, 200, outcome);
+        return;
+      }
+
+      const stage1ResolveMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/stage1\/items\/([^/]+)\/resolve$/
+      );
+      if (
+        method === "POST" &&
+        stage1ResolveMatch?.[1] &&
+        stage1ResolveMatch?.[2] &&
+        stage1ResolveMatch?.[3]
+      ) {
+        const projectId = decodeURIComponent(stage1ResolveMatch[1]);
+        const pipelineSessionId = decodeURIComponent(stage1ResolveMatch[2]);
+        const itemId = decodeURIComponent(stage1ResolveMatch[3]);
+        const body = await this.readJsonBody<{
+          decision?: "CONFIRM" | "REJECT";
+          resolution_note?: string | null;
+        }>(req);
+        if (body.decision !== "CONFIRM" && body.decision !== "REJECT") {
+          throw new BadRequestHttpError("decision must be CONFIRM or REJECT");
+        }
+        const resolved = await this.coreApi.resolvePipelineStage1Item(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          item_id: itemId,
+          decision: body.decision,
+          resolution_note: body.resolution_note,
+        });
+        this.sendJson(res, 200, resolved);
+        return;
+      }
+
+      const stage2RequirementsMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/stage2\/requirements$/
+      );
+      if (method === "POST" && stage2RequirementsMatch?.[1] && stage2RequirementsMatch?.[2]) {
+        const projectId = decodeURIComponent(stage2RequirementsMatch[1]);
+        const pipelineSessionId = decodeURIComponent(stage2RequirementsMatch[2]);
+        const body = await this.readJsonBody<{
+          cost_session_id?: string;
+          prompt_version?: string;
+          max_tokens?: number;
+          temperature?: number;
+          model_config?: unknown;
+        }>(req);
+        const outcome = await this.coreApi.runPipelineStage2Requirements(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          cost_session_id: body.cost_session_id,
+          prompt_version: body.prompt_version,
+          max_tokens: body.max_tokens,
+          temperature: body.temperature,
+          model_config: sanitizeHttpModelConfig(body.model_config),
+        });
+        this.sendJson(res, 200, outcome);
+        return;
+      }
+
+      const stage3ArchitectureMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/stage3\/architecture$/
+      );
+      if (method === "POST" && stage3ArchitectureMatch?.[1] && stage3ArchitectureMatch?.[2]) {
+        const projectId = decodeURIComponent(stage3ArchitectureMatch[1]);
+        const pipelineSessionId = decodeURIComponent(stage3ArchitectureMatch[2]);
+        const body = await this.readJsonBody<{
+          cost_session_id?: string;
+          stage2_artifact_id?: string;
+          prompt_version?: string;
+          max_tokens?: number;
+          temperature?: number;
+          model_config?: unknown;
+        }>(req);
+        const outcome = await this.coreApi.runPipelineStage3Architecture(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          cost_session_id: body.cost_session_id,
+          stage2_artifact_id: body.stage2_artifact_id,
+          prompt_version: body.prompt_version,
+          max_tokens: body.max_tokens,
+          temperature: body.temperature,
+          model_config: sanitizeHttpModelConfig(body.model_config),
+        });
+        this.sendJson(res, 200, outcome);
+        return;
+      }
+
+      const stage4CheckMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/stage4\/consistency-check$/
+      );
+      if (method === "POST" && stage4CheckMatch?.[1] && stage4CheckMatch?.[2]) {
+        const projectId = decodeURIComponent(stage4CheckMatch[1]);
+        const pipelineSessionId = decodeURIComponent(stage4CheckMatch[2]);
+        const body = await this.readJsonBody<{
+          stage1_artifact_id?: string;
+          stage2_artifact_id?: string;
+          stage3_artifact_id?: string;
+          checked_at?: string;
+        }>(req);
+        const outcome = await this.coreApi.runPipelineStage4ConsistencyCheck(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          stage1_artifact_id: body.stage1_artifact_id,
+          stage2_artifact_id: body.stage2_artifact_id,
+          stage3_artifact_id: body.stage3_artifact_id,
+          checked_at: body.checked_at,
+        });
+        this.sendJson(res, 200, outcome);
+        return;
+      }
+
+      const pipelineGateMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/approval-gates$/
+      );
+      if (method === "POST" && pipelineGateMatch?.[1] && pipelineGateMatch?.[2]) {
+        const projectId = decodeURIComponent(pipelineGateMatch[1]);
+        const pipelineSessionId = decodeURIComponent(pipelineGateMatch[2]);
+        const body = await this.readJsonBody<{
+          gate_stage?: StageApprovalGateStage;
+          target_artifact_id?: string;
+          target_artifact_sha256?: string;
+          decision?: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+          rationale?: string | null;
+        }>(req);
+        if (
+          body.gate_stage !== "STAGE_1_DISCOVERY" &&
+          body.gate_stage !== "STAGE_2_REQUIREMENTS" &&
+          body.gate_stage !== "STAGE_3_ARCHITECTURE" &&
+          body.gate_stage !== "STAGE_4_SPEC_FREEZE"
+        ) {
+          throw new BadRequestHttpError(
+            "gate_stage must be STAGE_1_DISCOVERY, STAGE_2_REQUIREMENTS, STAGE_3_ARCHITECTURE, or STAGE_4_SPEC_FREEZE"
+          );
+        }
+        if (
+          body.decision !== "APPROVED" &&
+          body.decision !== "REJECTED" &&
+          body.decision !== "REQUEST_CHANGES"
+        ) {
+          throw new BadRequestHttpError(
+            "decision must be APPROVED, REJECTED, or REQUEST_CHANGES"
+          );
+        }
+        const gate = await this.coreApi.submitPipelineApprovalGate(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          gate_stage: body.gate_stage,
+          target_artifact_id: body.target_artifact_id,
+          target_artifact_sha256: body.target_artifact_sha256,
+          decision: body.decision,
+          rationale: body.rationale,
+        });
+        this.sendJson(res, 201, gate);
+        return;
+      }
+
+      const pipelineFreezeMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/freeze$/
+      );
+      if (method === "POST" && pipelineFreezeMatch?.[1] && pipelineFreezeMatch?.[2]) {
+        const projectId = decodeURIComponent(pipelineFreezeMatch[1]);
+        const pipelineSessionId = decodeURIComponent(pipelineFreezeMatch[2]);
+        const body = await this.readJsonBody<{
+          stage1_artifact_id?: string;
+          stage1_artifact_sha256?: string;
+          stage2_artifact_id?: string;
+          stage2_artifact_sha256?: string;
+          stage3_artifact_id?: string;
+          stage3_artifact_sha256?: string;
+          validation_report_artifact_id?: string;
+          validation_report_sha256?: string;
+          approval_gate_id?: string;
+        }>(req);
+        const freeze = await this.coreApi.freezePipelineBaseline(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          ...body,
+        });
+        this.sendJson(res, 201, freeze);
         return;
       }
 
@@ -1122,5 +1564,294 @@ export class HttpCoreApiClient {
       [200]
     );
     return res.data.recovered;
+  }
+
+  // Milestone M6A: Cost Sessions & Product Pipeline Stages 1–4
+  public async createCostSession(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly cost_session_id?: string;
+      readonly pipeline_session_id?: string | null;
+      readonly task_id?: string | null;
+      readonly max_tokens_per_request: number;
+      readonly max_cost_micro_usd_per_request: number;
+      readonly session_token_budget: number;
+      readonly session_cost_budget_micro_usd: number;
+    }
+  ): Promise<CostSessionRecord> {
+    const res = await this.requestJson<CostSessionRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/cost-sessions`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
+  }
+
+  public async getCostSession(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    costSessionId: string
+  ): Promise<{
+    readonly session: CostSessionRecord;
+    readonly ledgers: readonly ModelCallLedgerRecord[];
+  }> {
+    const res = await this.requestJson<{
+      readonly session: CostSessionRecord;
+      readonly ledgers: readonly ModelCallLedgerRecord[];
+    }>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/cost-sessions/${encodeURIComponent(
+        costSessionId
+      )}`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async createPipelineSession(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id?: string;
+      readonly cost_session_id?: string | null;
+      readonly cost_budget?: {
+        readonly cost_session_id?: string;
+        readonly max_tokens_per_request: number;
+        readonly max_cost_micro_usd_per_request: number;
+        readonly session_token_budget: number;
+        readonly session_cost_budget_micro_usd: number;
+      };
+      readonly title: string;
+      readonly raw_idea_text: string;
+    }
+  ): Promise<{
+    readonly session: ProductPipelineSessionRecord;
+    readonly costSession: CostSessionRecord | null;
+  }> {
+    const res = await this.requestJson<{
+      readonly session: ProductPipelineSessionRecord;
+      readonly costSession: CostSessionRecord | null;
+    }>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
+  }
+
+  public async listPipelineSessions(
+    projectId: string,
+    auth: CoreApiAuthContext
+  ): Promise<ProductPipelineSessionRecord[]> {
+    const res = await this.requestJson<{ sessions: ProductPipelineSessionRecord[] }>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data.sessions;
+  }
+
+  public async getPipelineBundle(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string
+  ): Promise<ProductPipelineBundle> {
+    const res = await this.requestJson<ProductPipelineBundle>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async runPipelineStage1Extract(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly cost_session_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly model_config?: ModelProviderConfig;
+    } = {}
+  ): Promise<Stage1ExtractOutcome> {
+    const res = await this.requestJson<Stage1ExtractOutcome>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/stage1/extract`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async resolvePipelineStage1Item(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    itemId: string,
+    input: {
+      readonly decision: "CONFIRM" | "REJECT";
+      readonly resolution_note?: string | null;
+    }
+  ): Promise<Stage1DiscoveryItemRecord> {
+    const res = await this.requestJson<Stage1DiscoveryItemRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/stage1/items/${encodeURIComponent(itemId)}/resolve`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async runPipelineStage2Requirements(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly cost_session_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly model_config?: ModelProviderConfig;
+    } = {}
+  ): Promise<StageExecutionOutcome<Record<string, unknown>>> {
+    const res = await this.requestJson<StageExecutionOutcome<Record<string, unknown>>>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/stage2/requirements`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async runPipelineStage3Architecture(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly cost_session_id?: string;
+      readonly stage2_artifact_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly model_config?: ModelProviderConfig;
+    } = {}
+  ): Promise<StageExecutionOutcome<Record<string, unknown>>> {
+    const res = await this.requestJson<StageExecutionOutcome<Record<string, unknown>>>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/stage3/architecture`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async runPipelineStage4ConsistencyCheck(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly stage1_artifact_id?: string;
+      readonly stage2_artifact_id?: string;
+      readonly stage3_artifact_id?: string;
+      readonly checked_at?: string;
+    } = {}
+  ): Promise<{
+    readonly session: ProductPipelineSessionRecord;
+    readonly report: Stage4ConsistencyReport;
+    readonly artifact: StageArtifactRecord;
+  }> {
+    const res = await this.requestJson<{
+      readonly session: ProductPipelineSessionRecord;
+      readonly report: Stage4ConsistencyReport;
+      readonly artifact: StageArtifactRecord;
+    }>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/stage4/consistency-check`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async submitPipelineApprovalGate(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly gate_stage: StageApprovalGateStage;
+      readonly target_artifact_id?: string;
+      readonly target_artifact_sha256?: string;
+      readonly decision: "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+      readonly rationale?: string | null;
+    }
+  ): Promise<StageApprovalGateRecord> {
+    const res = await this.requestJson<StageApprovalGateRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/approval-gates`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
+  }
+
+  public async freezePipelineBaseline(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly stage1_artifact_id?: string;
+      readonly stage1_artifact_sha256?: string;
+      readonly stage2_artifact_id?: string;
+      readonly stage2_artifact_sha256?: string;
+      readonly stage3_artifact_id?: string;
+      readonly stage3_artifact_sha256?: string;
+      readonly validation_report_artifact_id?: string;
+      readonly validation_report_sha256?: string;
+      readonly approval_gate_id?: string;
+    } = {}
+  ): Promise<BaselineSpecFreezeRecord> {
+    const res = await this.requestJson<BaselineSpecFreezeRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/freeze`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
   }
 }

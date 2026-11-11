@@ -1,0 +1,2609 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
+import { describe, it } from "node:test";
+import {
+  CostBudgetExceededError,
+  type CostGuardRecorder,
+  InMemoryCostGuardLedger,
+  LiveModelProviderClient,
+  ManagedModelProviderExecutor,
+  ModelProviderConfigurationError,
+  PromptNotFoundError,
+  PromptRegistry,
+  PromptRenderError,
+  PromptVersionConflictError,
+  StructuredOutputValidationError,
+  computeCostMicroUsd,
+  loadModelProviderConfigFromEnv,
+  parseAndValidateStructuredOutput,
+} from "@software-factory/adapter-sdk";
+import {
+  CORE_API_AUTH_HEADER,
+  CoreApiHttpServer,
+  CoreApiService,
+  HttpCoreApiClient,
+  HttpCoreApiError,
+  encodeCoreApiAuthHeader,
+} from "@software-factory/core-api";
+import {
+  Ac10ViolationError,
+  PostgresRlsError,
+  SoftwareFactoryControlPlaneStore,
+  buildPostgresPoolConfigFromEnv,
+} from "@software-factory/database";
+import {
+  STAGE1_DISCOVERY_PROMPT_ID,
+  STAGE2_REQUIREMENTS_PROMPT_ID,
+  STAGE3_ARCHITECTURE_PROMPT_ID,
+  createDefaultPipelinePromptRegistry,
+  runCrossArtifactConsistencyCheck,
+} from "@software-factory/product-pipeline";
+import {
+  type ModelProviderName,
+  type PipelineStageName,
+  type ProductPipelineBundle,
+  type PromptTemplateSpec,
+  type Stage1DiscoveryBundle,
+  type Stage2RequirementsSpec,
+  type Stage3ArchitectureSpec,
+  computeCanonicalPayloadSha256,
+} from "@software-factory/shared-types";
+import { createControlPlaneStackRuntime } from "@software-factory/web";
+
+interface RecordedProviderRequest {
+  readonly provider: ModelProviderName;
+  readonly method: string;
+  readonly url: string;
+  readonly headers: IncomingMessage["headers"];
+  readonly systemPrompt: string;
+  readonly userPrompt: string;
+  readonly rawBody: Record<string, unknown>;
+}
+
+interface ProviderResponseOverride {
+  readonly statusCode?: number;
+  readonly text?: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+}
+
+interface MockModelProviderHarness {
+  readonly anthropicBaseUrl: string;
+  readonly openaiBaseUrl: string;
+  readonly googleBaseUrl: string;
+  readonly hits: Record<ModelProviderName, number>;
+  readonly requests: RecordedProviderRequest[];
+  setStage1Factory(factory: (req: RecordedProviderRequest) => Stage1DiscoveryBundle): void;
+  setResponseOverride(
+    provider: ModelProviderName | "any",
+    override: ProviderResponseOverride | ((req: RecordedProviderRequest) => ProviderResponseOverride) | null
+  ): void;
+  resetCounts(): void;
+  close(): Promise<void>;
+}
+
+function readHttpBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function writeJsonResponse(res: ServerResponse, statusCode: number, body: unknown): void {
+  const json = JSON.stringify(body);
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(json),
+    Connection: "close",
+  });
+  res.end(json);
+}
+
+function buildDefaultStage1Bundle(): Stage1DiscoveryBundle {
+  return {
+    summary: "Deterministic intake extraction separating verified facts from unconfirmed items.",
+    facts: [
+      {
+        title: "Multi-tenant Tenant Isolation",
+        statement: "All project data must be strictly isolated per project_id.",
+        rationale: "Explicitly required by the customer security mandate.",
+      },
+      {
+        title: "Audit Log Retention",
+        statement: "All state transitions must emit an immutable audit trail.",
+        rationale: "Explicit compliance requirement stated in raw idea text.",
+      },
+    ],
+    assumptions: [
+      {
+        title: "OAuth2 SSO Requirement",
+        statement: "Enterprise operators authenticate exclusively via OIDC SSO.",
+        rationale: "Common enterprise deployment pattern not explicitly confirmed.",
+        clarification_question: "Is OIDC SSO mandatory for initial release?",
+      },
+    ],
+    recommendations: [
+      {
+        title: "Export CSV Billing Summary",
+        statement: "Provide monthly CSV download alongside ledger JSON export.",
+        rationale: "Helpful convenience for finance reviewers.",
+        clarification_question: "Should CSV export be included in v1 scope?",
+      },
+    ],
+  };
+}
+
+function buildDynamicStage2Payload(userPrompt: string): Stage2RequirementsSpec {
+  const marker = "Verified Stage 1 Items (AUTO_VERIFIED / CONFIRMED only):\n";
+  const idx = userPrompt.indexOf(marker);
+  if (idx === -1) {
+    throw new Error("Mock Stage 2 handler expected confirmed_discovery_items_json marker");
+  }
+  const jsonText = userPrompt.slice(idx + marker.length).trim();
+  const items = JSON.parse(jsonText) as Array<{
+    item_id: string;
+    kind: string;
+    title: string;
+    statement: string;
+  }>;
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error("Mock Stage 2 received zero verified Stage 1 items");
+  }
+
+  const funcReqs = items.slice(0, Math.max(1, items.length - 1)).map((item, pos) => ({
+    req_id: `REQ-FUNC-${String(pos + 1).padStart(3, "0")}`,
+    title: `Implement ${item.title}`,
+    description: item.statement,
+    priority: "MUST" as const,
+    source_discovery_item_ids: [item.item_id],
+    acceptance_criteria: [
+      {
+        ac_id: `AC-FUNC-${pos + 1}`,
+        given: `Verified Stage 1 item ${item.item_id} is active`,
+        when: "Operator triggers core workflow",
+        then: `${item.title} invariant is enforced deterministically`,
+      },
+    ],
+  }));
+
+  const tailItem = items[items.length - 1]!;
+  const nonFuncReqs = [
+    {
+      req_id: "REQ-NFR-001",
+      title: `Audit & Reliability for ${tailItem.title}`,
+      description: tailItem.statement,
+      priority: "MUST" as const,
+      source_discovery_item_ids: [tailItem.item_id],
+      acceptance_criteria: [
+        {
+          ac_id: "AC-NFR-1",
+          given: "Production PostgreSQL storage is enabled",
+          when: "Operation commits",
+          then: "Immutable ledger and SHA-256 digest are verified",
+        },
+      ],
+    },
+  ];
+
+  return {
+    prd: {
+      product_vision: "Deterministic multi-tenant software factory pipeline",
+      target_personas: ["Platform Architect", "Project Approver", "Developer"],
+      goals: ["Zero hallucinated requirements (AC-10)", "Deterministic baseline freeze"],
+      non_goals: ["Unverified auto-execution without human approval"],
+    },
+    srs: {
+      functional_requirements: funcReqs,
+      non_functional_requirements: nonFuncReqs,
+    },
+  };
+}
+
+function buildDynamicStage3Payload(userPrompt: string): Stage3ArchitectureSpec {
+  const marker = "Stage 2 PRD & SRS:\n";
+  const idx = userPrompt.indexOf(marker);
+  if (idx === -1) {
+    throw new Error("Mock Stage 3 handler expected stage2_prd_srs_json marker");
+  }
+  const spec = JSON.parse(userPrompt.slice(idx + marker.length).trim()) as Stage2RequirementsSpec;
+  const reqIds = [
+    ...spec.srs.functional_requirements.map((r) => r.req_id),
+    ...spec.srs.non_functional_requirements.map((r) => r.req_id),
+  ];
+
+  return {
+    architecture: {
+      overview: "Hexagonal control plane separating RLS persistence, AI gateway, and verification.",
+      components: [
+        {
+          component_id: "COMP-CONTROL-PLANE",
+          name: "ControlPlaneCoreApi",
+          responsibility: "Enforces RBAC, cost budgets, AC-10 filtering, and freeze invariants.",
+          requirement_ids: reqIds,
+        },
+      ],
+    },
+    database_erd: {
+      entities: [
+        {
+          entity_name: "pipeline_spec_ledger",
+          primary_key: "artifact_id",
+          columns: ["artifact_id UUID", "project_id UUID", "artifact_sha256 CHAR(64)"],
+          foreign_keys: ["project_id -> projects(project_id)"],
+          rls_tier: "TIER_2",
+          requirement_ids: reqIds,
+        },
+      ],
+    },
+    api_spec: {
+      endpoints: [
+        {
+          method: "POST",
+          path: "/api/v1/projects/:projectId/pipeline-sessions/:id/freeze",
+          summary: "Commits immutable BaselineSpecFreeze after Stage 4 consistency & approval",
+          auth_role: "PROJECT_APPROVER",
+          requirement_ids: reqIds,
+        },
+      ],
+    },
+    security_design: {
+      threat_controls: [
+        {
+          threat_id: "THREAT-AC10-HALLUCINATION",
+          threat: "Unconfirmed Stage 1 assumption promoted silently into SRS",
+          mitigation: "3-layer firewall (context filter + domain check + PG trigger)",
+          requirement_ids: reqIds,
+        },
+      ],
+    },
+    adrs: [
+      {
+        adr_id: "ADR-001",
+        title: "Enforce Append-Only Stage Artifacts with Canonical SHA-256",
+        status: "ACCEPTED",
+        context: "Compliance requires cryptographic lineage from Stage 1 discovery to freeze.",
+        decision: "Compute canonical JSON SHA-256 and REVOKE UPDATE/DELETE on artifact tables.",
+        consequences: "Post-freeze edits require a new pipeline session version.",
+        requirement_ids: reqIds,
+      },
+    ],
+  };
+}
+
+async function startMockModelProviderServers(): Promise<MockModelProviderHarness> {
+  const hits: Record<ModelProviderName, number> = {
+    anthropic: 0,
+    openai: 0,
+    google: 0,
+  };
+  const requests: RecordedProviderRequest[] = [];
+  let stage1Factory: (req: RecordedProviderRequest) => Stage1DiscoveryBundle = () =>
+    buildDefaultStage1Bundle();
+  const overrides = new Map<
+    ModelProviderName | "any",
+    ProviderResponseOverride | ((req: RecordedProviderRequest) => ProviderResponseOverride)
+  >();
+
+  const makeHandler =
+    (provider: ModelProviderName) =>
+    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      try {
+        hits[provider] += 1;
+        const bodyText = await readHttpBody(req);
+        const body = (bodyText ? JSON.parse(bodyText) : {}) as Record<string, unknown>;
+
+        let systemPrompt = "";
+        let userPrompt = "";
+        if (provider === "anthropic") {
+          systemPrompt = typeof body.system === "string" ? body.system : "";
+          const msgs = Array.isArray(body.messages) ? body.messages : [];
+          const first = msgs[0] as { content?: unknown } | undefined;
+          userPrompt = typeof first?.content === "string" ? first.content : "";
+        } else if (provider === "openai") {
+          const msgs = Array.isArray(body.messages)
+            ? (body.messages as Array<{ role?: string; content?: unknown }>)
+            : [];
+          systemPrompt =
+            typeof msgs.find((m) => m.role === "system")?.content === "string"
+              ? (msgs.find((m) => m.role === "system")!.content as string)
+              : "";
+          userPrompt =
+            typeof msgs.find((m) => m.role === "user")?.content === "string"
+              ? (msgs.find((m) => m.role === "user")!.content as string)
+              : "";
+        } else {
+          const sys = body.systemInstruction as { parts?: Array<{ text?: string }> } | undefined;
+          systemPrompt = sys?.parts?.[0]?.text ?? "";
+          const contents = Array.isArray(body.contents)
+            ? (body.contents as Array<{ parts?: Array<{ text?: string }> }>)
+            : [];
+          userPrompt = contents[0]?.parts?.[0]?.text ?? "";
+        }
+
+        const recorded: RecordedProviderRequest = {
+          provider,
+          method: req.method ?? "POST",
+          url: req.url ?? "/",
+          headers: req.headers,
+          systemPrompt,
+          userPrompt,
+          rawBody: body,
+        };
+        requests.push(recorded);
+
+        const rawOverride = overrides.get(provider) ?? overrides.get("any");
+        const resolvedOverride =
+          typeof rawOverride === "function" ? rawOverride(recorded) : rawOverride;
+
+        if (resolvedOverride?.statusCode && resolvedOverride.statusCode >= 400) {
+          res.writeHead(resolvedOverride.statusCode, { "Content-Type": "text/plain", Connection: "close" });
+          res.end(resolvedOverride.text ?? `Simulated HTTP ${resolvedOverride.statusCode}`);
+          return;
+        }
+
+        let responseText: string;
+        if (resolvedOverride?.text !== undefined) {
+          responseText = resolvedOverride.text;
+        } else if (userPrompt.includes("Verified Stage 1 Items")) {
+          responseText = JSON.stringify(buildDynamicStage2Payload(userPrompt));
+        } else if (userPrompt.includes("Stage 2 PRD & SRS:")) {
+          responseText = JSON.stringify(buildDynamicStage3Payload(userPrompt));
+        } else if (userPrompt.includes("Raw Product Idea:")) {
+          responseText = JSON.stringify(stage1Factory(recorded));
+        } else {
+          responseText = JSON.stringify({
+            ok: true,
+            provider,
+            model:
+              provider === "google"
+                ? (req.url ?? "").split("/models/")[1]?.split(":")[0] ?? "gemini-2.5-pro"
+                : String(body.model ?? "unknown"),
+          });
+        }
+
+        const inputTokens = resolvedOverride?.inputTokens ?? 120;
+        const outputTokens = resolvedOverride?.outputTokens ?? 80;
+
+        if (provider === "anthropic") {
+          writeJsonResponse(res, 200, {
+            id: `msg_${hits.anthropic}`,
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: responseText }],
+            usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+          });
+          return;
+        }
+        if (provider === "openai") {
+          writeJsonResponse(res, 200, {
+            id: `chatcmpl_${hits.openai}`,
+            choices: [{ index: 0, message: { role: "assistant", content: responseText } }],
+            usage: {
+              prompt_tokens: inputTokens,
+              completion_tokens: outputTokens,
+              total_tokens: inputTokens + outputTokens,
+            },
+          });
+          return;
+        }
+        writeJsonResponse(res, 200, {
+          candidates: [{ content: { role: "model", parts: [{ text: responseText }] } }],
+          usageMetadata: {
+            promptTokenCount: inputTokens,
+            candidatesTokenCount: outputTokens,
+            totalTokenCount: inputTokens + outputTokens,
+          },
+        });
+      } catch (err: unknown) {
+        writeJsonResponse(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
+    };
+
+  const listenServer = async (provider: ModelProviderName) => {
+    const srv = createServer((req, res) => {
+      void makeHandler(provider)(req, res);
+    });
+    await new Promise<void>((resolve, reject) => {
+      srv.once("error", reject);
+      srv.listen(0, "127.0.0.1", () => {
+        srv.off("error", reject);
+        resolve();
+      });
+    });
+    const addr = srv.address();
+    if (!addr || typeof addr === "string") {
+      throw new Error(`Failed to bind mock ${provider} server`);
+    }
+    return { server: srv, baseUrl: `http://127.0.0.1:${addr.port}` };
+  };
+
+  const [anth, oai, goog] = await Promise.all([
+    listenServer("anthropic"),
+    listenServer("openai"),
+    listenServer("google"),
+  ]);
+
+  return {
+    anthropicBaseUrl: anth.baseUrl,
+    openaiBaseUrl: oai.baseUrl,
+    googleBaseUrl: goog.baseUrl,
+    hits,
+    requests,
+    setStage1Factory(factory) {
+      stage1Factory = factory;
+    },
+    setResponseOverride(provider, override) {
+      if (override === null) {
+        overrides.delete(provider);
+      } else {
+        overrides.set(provider, override);
+      }
+    },
+    resetCounts() {
+      hits.anthropic = 0;
+      hits.openai = 0;
+      hits.google = 0;
+      requests.length = 0;
+    },
+    async close() {
+      await Promise.all(
+        [anth.server, oai.server, goog.server].map(
+          (srv) =>
+            new Promise<void>((resolve) => {
+              srv.closeAllConnections?.();
+              srv.close(() => resolve());
+            })
+        )
+      );
+    },
+  };
+}
+
+function createEchoRegistry(): PromptRegistry {
+  const reg = createDefaultPipelinePromptRegistry();
+  reg.register({
+    promptId: "m6a.provider.echo",
+    version: "1.0.0",
+    description: "Provider equivalence probe",
+    requiredVariables: ["subject"],
+    systemTemplate: "Respond ONLY with JSON matching { ok, provider, model }.",
+    userTemplate: "Evaluate subject={{subject}}",
+    outputSchema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["ok", "provider", "model"],
+      properties: {
+        ok: { type: "boolean" },
+        provider: { type: "string", enum: ["anthropic", "openai", "google"] },
+        model: { type: "string", minLength: 1 },
+      },
+    },
+  });
+  return reg;
+}
+
+describe("M6A Acceptance Gates (Model Provider v2, AC-12b Cost Guard & Stages 1–4 Pipeline)", () => {
+  it("M6A-AC1: Config-driven runtime multi-provider swap (anthropic/openai/google) and fail-closed config/HTTP validation", async () => {
+    const mock = await startMockModelProviderServers();
+    const store = new SoftwareFactoryControlPlaneStore();
+    let httpServer: CoreApiHttpServer | null = null;
+    try {
+      const registry = createEchoRegistry();
+      const ledger = new InMemoryCostGuardLedger();
+      const projectId = randomUUID();
+      const costSession = ledger.createSession({
+        project_id: projectId,
+        max_tokens_per_request: 4000,
+        max_cost_micro_usd_per_request: 500_000,
+        session_token_budget: 20_000,
+        session_cost_budget_micro_usd: 2_000_000,
+      });
+
+      const baseExecutor = new ManagedModelProviderExecutor({
+        client: new LiveModelProviderClient({
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anthropic-key-local",
+          baseUrl: mock.anthropicBaseUrl,
+        }),
+        promptRegistry: registry,
+        costGuard: ledger,
+      });
+
+      // 1. Runtime config swap purely via env / withProviderConfig on identical prompt
+      const envProfiles: Array<{
+        provider: ModelProviderName;
+        env: NodeJS.ProcessEnv;
+      }> = [
+        {
+          provider: "anthropic",
+          env: {
+            SF_MODEL_PROVIDER: "anthropic",
+            SF_MODEL_NAME: "claude-sonnet-4-20250514",
+            SF_MODEL_API_KEY: "test-anthropic-key-local",
+            SF_MODEL_BASE_URL: mock.anthropicBaseUrl,
+          },
+        },
+        {
+          provider: "openai",
+          env: {
+            SF_MODEL_PROVIDER: "openai",
+            SF_MODEL_NAME: "gpt-4.1",
+            SF_MODEL_API_KEY: "test-openai-key-local",
+            SF_MODEL_BASE_URL: mock.openaiBaseUrl,
+          },
+        },
+        {
+          provider: "google",
+          env: {
+            SF_MODEL_PROVIDER: "google",
+            SF_MODEL_NAME: "gemini-2.5-pro",
+            SF_MODEL_API_KEY: "test-google-key-local",
+            SF_MODEL_BASE_URL: mock.googleBaseUrl,
+          },
+        },
+      ];
+
+      const shaSet = new Set<string>();
+      for (const profile of envProfiles) {
+        const cfg = loadModelProviderConfigFromEnv(profile.env);
+        const swapped = baseExecutor.withProviderConfig(cfg, profile.env);
+        const res = await swapped.executeStructuredPrompt<{
+          ok: boolean;
+          provider: string;
+          model: string;
+        }>({
+          projectId,
+          costSessionId: costSession.cost_session_id,
+          stage: "STAGE_1_IDEA_DISCOVERY",
+          promptId: "m6a.provider.echo",
+          variables: { subject: "equivalence" },
+        });
+        assert.equal(res.parsed.ok, true);
+        assert.equal(res.parsed.provider, profile.provider);
+        assert.equal(res.usage.inputTokens, 120);
+        assert.equal(res.usage.outputTokens, 80);
+        assert.equal(res.usage.totalTokens, 200);
+        shaSet.add(res.renderedPrompt.promptSha256);
+      }
+      assert.equal(shaSet.size, 1, "All 3 providers must execute identical rendered promptSha256");
+      assert.equal(mock.hits.anthropic, 1);
+      assert.equal(mock.hits.openai, 1);
+      assert.equal(mock.hits.google, 1);
+
+      // Verify provider-specific HTTP auth headers
+      const anthReq = mock.requests.find((r) => r.provider === "anthropic")!;
+      assert.equal(anthReq.headers["x-api-key"], "test-anthropic-key-local");
+      assert.equal(anthReq.headers["anthropic-version"], "2023-06-01");
+      const oaiReq = mock.requests.find((r) => r.provider === "openai")!;
+      assert.equal(oaiReq.headers.authorization, "Bearer test-openai-key-local");
+      const googReq = mock.requests.find((r) => r.provider === "google")!;
+      assert.equal(googReq.headers["x-goog-api-key"], "test-google-key-local");
+      assert.ok(googReq.url.includes("/v1beta/models/gemini-2.5-pro:generateContent"));
+
+      // 2. Fail-closed unit config checks
+      assert.throws(
+        () =>
+          new LiveModelProviderClient(
+            { provider: "openai", model: "gpt-4.1", baseUrl: mock.openaiBaseUrl },
+            {}
+          ),
+        (err: unknown) =>
+          err instanceof ModelProviderConfigurationError &&
+          err.code === "ERR_MODEL_PROVIDER_NOT_CONFIGURED"
+      );
+      assert.throws(
+        () =>
+          new LiveModelProviderClient({
+            provider: "anthropic",
+            model: "claude-sonnet-4-20250514",
+            apiKey: "test-anthropic-key-local",
+            baseUrl: "http://api.external-untrusted.example",
+          }),
+        (err: unknown) =>
+          err instanceof ModelProviderConfigurationError &&
+          err.code === "ERR_MODEL_PROVIDER_NOT_CONFIGURED"
+      );
+
+      // 3. CoreApiHttpServer runtime swapping & fail-closed HTTP 503 / 502 mapping
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: "m6a-ac1-http",
+            name: "M6A AC1 HTTP",
+            repo_bare_path: "/tmp/m6a-ac1.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "dev-alice",
+            member_role: "DEVELOPER",
+          });
+          return p;
+        }
+      );
+
+      const coreApi = new CoreApiService(store, {
+        env: {},
+        defaultModelConfig: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anthropic-key-local",
+          baseUrl: mock.anthropicBaseUrl,
+        },
+      });
+      httpServer = new CoreApiHttpServer({ coreApi });
+      const { baseUrl } = await httpServer.start();
+      const client = new HttpCoreApiClient(baseUrl);
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "dev-alice",
+        roles: ["DEVELOPER"],
+      });
+
+      const created = await client.createPipelineSession(proj.project_id, authDev, {
+        title: "AC1 Runtime Swap",
+        raw_idea_text: "Build multi-tenant ledger with strict audit logs.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 40_000,
+          session_cost_budget_micro_usd: 5_000_000,
+        },
+      });
+
+      // Missing key on runtime model_config -> 503 ERR_MODEL_PROVIDER_NOT_CONFIGURED
+      await assert.rejects(
+        () =>
+          client.runPipelineStage1Extract(proj.project_id, authDev, created.session.pipeline_session_id, {
+            model_config: {
+              provider: "openai",
+              model: "gpt-4.1",
+              baseUrl: mock.openaiBaseUrl,
+            },
+          }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 503 &&
+          err.body.error_code === "ERR_MODEL_PROVIDER_NOT_CONFIGURED"
+      );
+
+      // Non-loopback plain http:// rejected even if caller tries allowInsecureHttpBaseUrl: true over HTTP
+      await assert.rejects(
+        () =>
+          client.runPipelineStage1Extract(proj.project_id, authDev, created.session.pipeline_session_id, {
+            model_config: {
+              provider: "openai",
+              model: "gpt-4.1",
+              apiKey: "test-openai-key-local",
+              baseUrl: "http://evil-remote.example.com",
+              allowInsecureHttpBaseUrl: true,
+            },
+          }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 503 &&
+          err.body.error_code === "ERR_MODEL_PROVIDER_NOT_CONFIGURED"
+      );
+
+      // Upstream HTTP 502 -> 502 ERR_MODEL_PROVIDER_UPSTREAM + FAILED_PROVIDER ledger persisted
+      mock.setResponseOverride("google", { statusCode: 502, text: "Bad Gateway Upstream" });
+      await assert.rejects(
+        () =>
+          client.runPipelineStage1Extract(proj.project_id, authDev, created.session.pipeline_session_id, {
+            model_config: {
+              provider: "google",
+              model: "gemini-2.5-pro",
+              apiKey: "test-google-key-local",
+              baseUrl: mock.googleBaseUrl,
+            },
+          }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 502 &&
+          err.body.error_code === "ERR_MODEL_PROVIDER_UPSTREAM"
+      );
+      mock.setResponseOverride("google", null);
+
+      const costAfter502 = await client.getCostSession(
+        proj.project_id,
+        authDev,
+        created.costSession!.cost_session_id
+      );
+      assert.ok(costAfter502.ledgers.some((l) => l.status === "FAILED_PROVIDER"));
+    } finally {
+      await Promise.allSettled([httpServer?.stop(), mock.close()]);
+    }
+  });
+
+  it("M6A-AC2: Immutable PromptRegistry versioning and fail-closed StructuredOutputValidation with FAILED_VALIDATION billing", async () => {
+    const mock = await startMockModelProviderServers();
+    const store = new SoftwareFactoryControlPlaneStore();
+    let httpServer: CoreApiHttpServer | null = null;
+    try {
+      const registry = createDefaultPipelinePromptRegistry();
+      const specV1: PromptTemplateSpec = {
+        promptId: "m6a.contract.test",
+        version: "1.0.0",
+        description: "Test contract v1",
+        requiredVariables: ["topic"],
+        systemTemplate: "Return JSON for {{topic}}",
+        userTemplate: "Topic={{topic}}",
+        outputSchema: {
+          type: "object",
+          additionalProperties: false,
+          required: ["priority", "label"],
+          properties: {
+            priority: { type: "string", enum: ["MUST", "SHOULD"] },
+            label: { type: "string", minLength: 1 },
+          },
+        },
+      };
+      const regV1 = registry.register(specV1);
+      // Idempotent re-register of exact same spec is allowed
+      const regV1Repeat = registry.register({ ...specV1 });
+      assert.equal(regV1.promptSha256, regV1Repeat.promptSha256);
+
+      // Mutating an already registered (promptId, version) throws PromptVersionConflictError (409)
+      assert.throws(
+        () =>
+          registry.register({
+            ...specV1,
+            systemTemplate: "Mutated silently!",
+          }),
+        (err: unknown) =>
+          err instanceof PromptVersionConflictError &&
+          err.httpStatus === 409 &&
+          err.code === "ERR_PROMPT_VERSION_CONFLICT"
+      );
+
+      // New version 2.0.0 yields distinct promptSha256
+      const regV2 = registry.register({
+        ...specV1,
+        version: "2.0.0",
+        systemTemplate: "Return strict v2 JSON for {{topic}}",
+      });
+      assert.notEqual(regV1.promptSha256, regV2.promptSha256);
+
+      assert.throws(
+        () => registry.render("nonexistent.prompt", "1.0.0", {}),
+        (err: unknown) => err instanceof PromptNotFoundError && err.httpStatus === 404
+      );
+      assert.throws(
+        () => registry.render("m6a.contract.test", "1.0.0", {}),
+        (err: unknown) => err instanceof PromptRenderError && err.httpStatus === 400
+      );
+
+      // Direct fail-closed StructuredJsonSchema validation assertions
+      const testSchema = regV1.spec.outputSchema!;
+      const validFenced = parseAndValidateStructuredOutput<{ priority: string; label: string }>(
+        '```json\n{"priority":"MUST","label":"clean-fence"}\n```',
+        testSchema
+      );
+      assert.equal(validFenced.priority, "MUST");
+      assert.equal(validFenced.label, "clean-fence");
+
+      for (const badPayload of [
+        'Here is the JSON:\n```json\n{"priority":"MUST","label":"prose"}\n```',
+        '{"priority":"MUST","label":"extra","unexpected":1}',
+        '{"priority":"COULD","label":"bad-enum"}',
+      ]) {
+        assert.throws(
+          () => parseAndValidateStructuredOutput(badPayload, testSchema),
+          (err: unknown) =>
+            err instanceof StructuredOutputValidationError &&
+            err.httpStatus === 422 &&
+            err.code === "ERR_STRUCTURED_OUTPUT_INVALID" &&
+            err.validationErrors.length > 0
+        );
+      }
+
+      // Wire CoreApiHttpServer + mock invalid model responses
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: "m6a-ac2-struct",
+            name: "M6A AC2 Structured",
+            repo_bare_path: "/tmp/m6a-ac2.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "dev-alice",
+            member_role: "DEVELOPER",
+          });
+          return p;
+        }
+      );
+
+      const coreApi = new CoreApiService(store, {
+        promptRegistry: registry,
+        defaultModelConfig: {
+          provider: "openai",
+          model: "gpt-4.1",
+          apiKey: "test-openai-key-local",
+          baseUrl: mock.openaiBaseUrl,
+        },
+      });
+      httpServer = new CoreApiHttpServer({ coreApi });
+      const { baseUrl } = await httpServer.start();
+      const client = new HttpCoreApiClient(baseUrl);
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "dev-alice",
+        roles: ["DEVELOPER"],
+      });
+
+      const created = await client.createPipelineSession(proj.project_id, authDev, {
+        title: "AC2 Structured Failure Test",
+        raw_idea_text: "Validate fail-closed schema enforcement.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 40_000,
+          session_cost_budget_micro_usd: 5_000_000,
+        },
+      });
+
+      // (a) Leading/trailing prose wrapping fenced JSON -> 422 ERR_STRUCTURED_OUTPUT_INVALID
+      mock.setResponseOverride("openai", {
+        text: `Here is the discovery JSON:\n\`\`\`json\n${JSON.stringify(buildDefaultStage1Bundle())}\n\`\`\``,
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+      await assert.rejects(
+        () =>
+          client.runPipelineStage1Extract(
+            proj.project_id,
+            authDev,
+            created.session.pipeline_session_id
+          ),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 422 &&
+          err.body.error_code === "ERR_STRUCTURED_OUTPUT_INVALID"
+      );
+
+      // (b) Additional unknown property -> 422
+      const withExtraProp = {
+        ...buildDefaultStage1Bundle(),
+        unexpected_hallucinated_key: true,
+      };
+      mock.setResponseOverride("openai", {
+        text: JSON.stringify(withExtraProp),
+        inputTokens: 110,
+        outputTokens: 60,
+      });
+      await assert.rejects(
+        () =>
+          client.runPipelineStage1Extract(
+            proj.project_id,
+            authDev,
+            created.session.pipeline_session_id
+          ),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 422 &&
+          err.body.error_code === "ERR_STRUCTURED_OUTPUT_INVALID"
+      );
+
+      // Verify zero artifacts or discovery items were persisted on invalid output,
+      // while FAILED_VALIDATION calls WERE billed and logged durably!
+      const bundleAfterInvalid = await client.getPipelineBundle(
+        proj.project_id,
+        authDev,
+        created.session.pipeline_session_id
+      );
+      assert.equal(bundleAfterInvalid.artifacts.length, 0);
+      assert.equal(bundleAfterInvalid.discoveryItems.length, 0);
+      assert.equal(bundleAfterInvalid.modelCallLedgers.length, 2);
+      assert.ok(bundleAfterInvalid.modelCallLedgers.every((l) => l.status === "FAILED_VALIDATION"));
+      assert.equal(bundleAfterInvalid.costSession!.tokens_used_total, 150 + 170);
+      assert.ok(bundleAfterInvalid.costSession!.cost_used_micro_usd > 0);
+
+      // (c) Clean single ```json fence (without outside prose) IS accepted
+      mock.setResponseOverride("openai", {
+        text: `\`\`\`json\n${JSON.stringify(buildDefaultStage1Bundle())}\n\`\`\``,
+        inputTokens: 100,
+        outputTokens: 50,
+      });
+      const validOutcome = await client.runPipelineStage1Extract(
+        proj.project_id,
+        authDev,
+        created.session.pipeline_session_id
+      );
+      assert.equal(validOutcome.artifact.stage, "STAGE_1_IDEA_DISCOVERY");
+      assert.equal(validOutcome.ledger.status, "ALLOWED");
+
+      // (d) Invalid enum in Stage 2 (priority: "BLOCKER") -> 422 ERR_STRUCTURED_OUTPUT_INVALID
+      const factItem = validOutcome.discoveryItems.find((i) => i.kind === "FACT")!;
+      mock.setResponseOverride("openai", {
+        text: JSON.stringify({
+          prd: {
+            product_vision: "v",
+            target_personas: ["Dev"],
+            goals: ["g"],
+            non_goals: [],
+          },
+          srs: {
+            functional_requirements: [
+              {
+                req_id: "REQ-1",
+                title: "t",
+                description: "d",
+                priority: "BLOCKER",
+                source_discovery_item_ids: [factItem.item_id],
+                acceptance_criteria: [{ ac_id: "AC-1", given: "g", when: "w", then: "t" }],
+              },
+            ],
+            non_functional_requirements: [],
+          },
+        }),
+      });
+      await assert.rejects(
+        () =>
+          client.runPipelineStage2Requirements(
+            proj.project_id,
+            authDev,
+            created.session.pipeline_session_id
+          ),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 422 &&
+          err.body.error_code === "ERR_STRUCTURED_OUTPUT_INVALID"
+      );
+      mock.setResponseOverride("openai", null);
+    } finally {
+      await Promise.allSettled([httpServer?.stop(), mock.close()]);
+    }
+  });
+
+  it("M6A-AC3: AC-12b Per-Request & Cumulative Session Token/Cost Guard in exact integer micro-USD", async () => {
+    const mock = await startMockModelProviderServers();
+    const store = new SoftwareFactoryControlPlaneStore();
+    let httpServer: CoreApiHttpServer | null = null;
+    try {
+      // 1. Exact BigInt integer ceiling math verification (no IEEE-754 drift)
+      assert.equal(
+        computeCostMicroUsd(1, 0, {
+          inputMicroUsdPerMillionTokens: 150_000,
+          outputMicroUsdPerMillionTokens: 600_000,
+        }),
+        1,
+        "Fractional micro-USD (0.15) must ceiling cleanly to 1 integer micro-USD"
+      );
+      assert.equal(
+        computeCostMicroUsd(1_000_000, 1_000_000, {
+          inputMicroUsdPerMillionTokens: 3_000_000,
+          outputMicroUsdPerMillionTokens: 15_000_000,
+        }),
+        18_000_000
+      );
+
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: "m6a-ac3-cost",
+            name: "M6A AC3 Cost Guard",
+            repo_bare_path: "/tmp/m6a-ac3.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "dev-alice",
+            member_role: "DEVELOPER",
+          });
+          return p;
+        }
+      );
+
+      // Pricing rate: input = 1_000_000 micro-USD / 1M tokens (1 micro-USD/token),
+      // output = 2_000_000 micro-USD / 1M tokens (2 micro-USD/token).
+      const coreApi = new CoreApiService(store, {
+        modelPricingOverrides: {
+          "anthropic:claude-sonnet-4-20250514": {
+            inputMicroUsdPerMillionTokens: 1_000_000,
+            outputMicroUsdPerMillionTokens: 2_000_000,
+          },
+        },
+        defaultModelConfig: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anthropic-key-local",
+          baseUrl: mock.anthropicBaseUrl,
+        },
+      });
+      httpServer = new CoreApiHttpServer({ coreApi });
+      const { baseUrl } = await httpServer.start();
+      const client = new HttpCoreApiClient(baseUrl);
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "dev-alice",
+        roles: ["DEVELOPER"],
+      });
+
+      // Case A: Pre-flight PER_REQUEST_TOKENS & PER_REQUEST_COST -> 0 upstream HTTP calls!
+      const tinyCostSess = await client.createCostSession(proj.project_id, authDev, {
+        max_tokens_per_request: 250,
+        max_cost_micro_usd_per_request: 400,
+        session_token_budget: 10_000,
+        session_cost_budget_micro_usd: 10_000,
+      });
+      const tinyPipeline = await client.createPipelineSession(proj.project_id, authDev, {
+        cost_session_id: tinyCostSess.cost_session_id,
+        title: "Preflight Reject Pipeline",
+        raw_idea_text: "Validate preflight rejects over-budget requests before HTTP call.",
+      });
+
+      mock.resetCounts();
+      await assert.rejects(
+        () =>
+          client.runPipelineStage1Extract(proj.project_id, authDev, tinyPipeline.session.pipeline_session_id, {
+            max_tokens: 500, // exceeds max_tokens_per_request=250
+          }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 402 &&
+          err.body.error_code === "ERR_COST_LIMIT_EXCEEDED" &&
+          err.body.limit_scope === "PER_REQUEST_TOKENS"
+      );
+      assert.equal(mock.hits.anthropic, 0, "PER_REQUEST_TOKENS preflight block must fire 0 HTTP calls");
+
+      // Estimated input tokens for Stage 1 prompt is ~200+ tokens; max_tokens=20 gives ~240 <= 250 tokens
+      // but cost ~240*1 + 20*2 = ~280... let's pass a tiny per-request cost cap or small tokens
+      const perCostSess = await client.createCostSession(proj.project_id, authDev, {
+        max_tokens_per_request: 5000,
+        max_cost_micro_usd_per_request: 100, // Stage 1 input ~200 tokens >= 200 micro-USD > 100
+        session_token_budget: 10_000,
+        session_cost_budget_micro_usd: 10_000,
+      });
+      await assert.rejects(
+        () =>
+          client.runPipelineStage1Extract(proj.project_id, authDev, tinyPipeline.session.pipeline_session_id, {
+            cost_session_id: perCostSess.cost_session_id,
+            max_tokens: 10,
+          }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 402 &&
+          err.body.error_code === "ERR_COST_LIMIT_EXCEEDED" &&
+          err.body.limit_scope === "PER_REQUEST_COST"
+      );
+      assert.equal(mock.hits.anthropic, 0, "PER_REQUEST_COST preflight block must fire 0 HTTP calls");
+
+      const blockedInfo = await client.getCostSession(
+        proj.project_id,
+        authDev,
+        tinyCostSess.cost_session_id
+      );
+      assert.equal(blockedInfo.ledgers[0]?.status, "BLOCKED_PREFLIGHT");
+
+      // Case B: Call 1 ALLOWED, Call 2 triggers BLOCKED_POSTCALL & EXHAUSTED, Call 3 SESSION_EXHAUSTED (0 HTTP calls)
+      // Budget: session_cost_budget_micro_usd = 1000, max_cost_micro_usd_per_request = 2000
+      const postCallPipe = await client.createPipelineSession(proj.project_id, authDev, {
+        title: "Postcall Cumulative Budget Pipeline",
+        raw_idea_text: "Build billing ledger service.",
+        cost_budget: {
+          max_tokens_per_request: 2000,
+          max_cost_micro_usd_per_request: 2000,
+          session_token_budget: 1200,
+          session_cost_budget_micro_usd: 1000,
+        },
+      });
+      const csId = postCallPipe.costSession!.cost_session_id;
+
+      // Call 1: actual input=100, output=100 -> 200 tokens, 100*1 + 100*2 = 300 micro-USD (<= 1000)
+      mock.resetCounts();
+      mock.setResponseOverride("anthropic", { inputTokens: 100, outputTokens: 100 });
+      const call1 = await client.runPipelineStage1Extract(
+        proj.project_id,
+        authDev,
+        postCallPipe.session.pipeline_session_id,
+        { max_tokens: 50 }
+      );
+      assert.equal(call1.costSession.tokens_used_total, 200);
+      assert.equal(call1.costSession.cost_used_micro_usd, 300);
+      assert.equal(call1.costSession.status, "ACTIVE");
+      assert.equal(mock.hits.anthropic, 1);
+
+      // Call 2 (Stage 2): confirm assumption first, then let preflight pass (max_tokens=16 -> est cost < 400, remaining 700),
+      // while actual provider returns input=400, output=300 (cost = 400 + 600 = 1000 -> total 1300 > 1000!)
+      const assumItem = call1.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      await client.resolvePipelineStage1Item(
+        proj.project_id,
+        authDev,
+        postCallPipe.session.pipeline_session_id,
+        assumItem.item_id,
+        { decision: "CONFIRM" }
+      );
+
+      mock.setResponseOverride("anthropic", { inputTokens: 400, outputTokens: 300 });
+      await assert.rejects(
+        () =>
+          client.runPipelineStage2Requirements(
+            proj.project_id,
+            authDev,
+            postCallPipe.session.pipeline_session_id,
+            { max_tokens: 16 }
+          ),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 402 &&
+          err.body.error_code === "ERR_SESSION_BUDGET_EXCEEDED" &&
+          err.body.limit_scope === "SESSION_COST_BUDGET"
+      );
+      assert.equal(mock.hits.anthropic, 2, "Call 2 executed once before postcall detected overage");
+
+      // Session must now be EXHAUSTED, ledger[1] must be BLOCKED_POSTCALL, and Stage 2 artifact must NOT exist!
+      const afterOver = await client.getCostSession(proj.project_id, authDev, csId);
+      assert.equal(afterOver.session.status, "EXHAUSTED");
+      assert.equal(afterOver.session.tokens_used_total, 200 + 700);
+      assert.equal(afterOver.session.cost_used_micro_usd, 300 + 1000);
+      assert.equal(afterOver.ledgers[1]?.status, "BLOCKED_POSTCALL");
+
+      const bundleOver = await client.getPipelineBundle(
+        proj.project_id,
+        authDev,
+        postCallPipe.session.pipeline_session_id
+      );
+      assert.equal(
+        bundleOver.artifacts.filter((a) => a.stage === "STAGE_2_REQUIREMENTS").length,
+        0,
+        "Artifact must NOT be persisted when postcall exceeds session budget"
+      );
+
+      // Call 3 on EXHAUSTED session -> immediate preflight SESSION_EXHAUSTED with 0 HTTP calls!
+      mock.setResponseOverride("anthropic", null);
+      await assert.rejects(
+        () =>
+          client.runPipelineStage2Requirements(
+            proj.project_id,
+            authDev,
+            postCallPipe.session.pipeline_session_id,
+            { max_tokens: 16 }
+          ),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 402 &&
+          err.body.error_code === "ERR_SESSION_BUDGET_EXCEEDED" &&
+          err.body.limit_scope === "SESSION_EXHAUSTED"
+      );
+      assert.equal(mock.hits.anthropic, 2, "EXHAUSTED session must block Call 3 with 0 HTTP hits");
+
+      // Direct CostBudgetExceededError unit assertion
+      const unitExec = new ManagedModelProviderExecutor({
+        client: new LiveModelProviderClient({
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anthropic-key-local",
+          baseUrl: mock.anthropicBaseUrl,
+        }),
+        promptRegistry: createDefaultPipelinePromptRegistry(),
+        costGuard: store as CostGuardRecorder,
+      });
+      await assert.rejects(
+        () =>
+          unitExec.executeStructuredPrompt({
+            projectId: proj.project_id,
+            costSessionId: csId,
+            stage: "STAGE_1_IDEA_DISCOVERY",
+            promptId: STAGE1_DISCOVERY_PROMPT_ID,
+            variables: {
+              project_id: proj.project_id,
+              pipeline_session_id: postCallPipe.session.pipeline_session_id,
+              title: "Blocked",
+              raw_idea_text: "Blocked",
+            },
+          }),
+        (err: unknown) => err instanceof CostBudgetExceededError && err.limitScope === "SESSION_EXHAUSTED"
+      );
+    } finally {
+      await Promise.allSettled([httpServer?.stop(), mock.close()]);
+    }
+  });
+
+  it("M6A-AC4: AC-10 Anti-Hallucination & Stage 1 Confirmation Firewall (3-Layer Enforcement)", async () => {
+    const mock = await startMockModelProviderServers();
+    const store = new SoftwareFactoryControlPlaneStore();
+    let httpServer: CoreApiHttpServer | null = null;
+    try {
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: "m6a-ac4-ac10",
+            name: "M6A AC4 AC-10",
+            repo_bare_path: "/tmp/m6a-ac4.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "dev-alice",
+            member_role: "DEVELOPER",
+          });
+          return p;
+        }
+      );
+
+      const coreApi = new CoreApiService(store, {
+        defaultModelConfig: {
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anthropic-key-local",
+          baseUrl: mock.anthropicBaseUrl,
+        },
+      });
+      httpServer = new CoreApiHttpServer({ coreApi });
+      const { baseUrl } = await httpServer.start();
+      const client = new HttpCoreApiClient(baseUrl);
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "dev-alice",
+        roles: ["DEVELOPER"],
+      });
+
+      // 1. Direct ASSUMPTION with AUTO_VERIFIED must fail closed
+      const pOnlyAssump = await client.createPipelineSession(proj.project_id, authDev, {
+        title: "Unconfirmed-Only Session",
+        raw_idea_text: "Only hypotheses so far.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 40_000,
+          session_cost_budget_micro_usd: 5_000_000,
+        },
+      });
+
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "dev-alice",
+              currentRole: "core_api_service",
+            },
+            () =>
+              store.createStage1DiscoveryItems({
+                project_id: proj.project_id,
+                pipeline_session_id: pOnlyAssump.session.pipeline_session_id,
+                items: [
+                  {
+                    kind: "ASSUMPTION",
+                    title: "Direct Bypass",
+                    statement: "Should never auto-verify",
+                    rationale: "Negative probe",
+                    confirmation_status: "AUTO_VERIFIED",
+                  },
+                ],
+              })
+          ),
+        (err: unknown) =>
+          err instanceof Ac10ViolationError && err.code === "ERR_AC10_UNCONFIRMED_ASSUMPTION"
+      );
+
+      // 2. Stage 1 returns ONLY unconfirmed Assumption + Recommendation (0 facts) -> Stage 2 blocked with 0 HTTP calls!
+      mock.setStage1Factory(() => ({
+        summary: "Hypotheses needing clarification",
+        facts: [],
+        assumptions: [
+          {
+            title: "Need Postgres HA?",
+            statement: "Assume multi-AZ failover is desired.",
+            rationale: "Enterprise SLA assumption",
+            clarification_question: "Confirm multi-AZ requirement?",
+          },
+        ],
+        recommendations: [
+          {
+            title: "Add Webhook Retry",
+            statement: "Recommend exponential backoff webhooks.",
+            rationale: "Best practice",
+            clarification_question: "Include webhook retry in v1?",
+          },
+        ],
+      }));
+
+      const s1OnlyAssump = await client.runPipelineStage1Extract(
+        proj.project_id,
+        authDev,
+        pOnlyAssump.session.pipeline_session_id
+      );
+      assert.equal(s1OnlyAssump.discoveryItems.length, 2);
+      assert.ok(s1OnlyAssump.discoveryItems.every((i) => i.confirmation_status === "UNCONFIRMED"));
+      assert.ok(s1OnlyAssump.discoveryItems.every((i) => Boolean(i.clarification_question)));
+
+      const unconfirmedAssump = s1OnlyAssump.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      const unconfirmedRec = s1OnlyAssump.discoveryItems.find((i) => i.kind === "RECOMMENDATION")!;
+
+      const hitsBeforeStage2Fail = mock.hits.anthropic;
+      await assert.rejects(
+        () =>
+          client.runPipelineStage2Requirements(
+            proj.project_id,
+            authDev,
+            pOnlyAssump.session.pipeline_session_id
+          ),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 422 &&
+          err.body.error_code === "ERR_AC10_UNCONFIRMED_ASSUMPTION" &&
+          Array.isArray(err.body.offending_item_ids) &&
+          (err.body.offending_item_ids as string[]).includes(unconfirmedAssump.item_id)
+      );
+      assert.equal(
+        mock.hits.anthropic,
+        hitsBeforeStage2Fail,
+        "AC-10 precondition must block Stage 2 before calling model provider"
+      );
+
+      // 3. Layer 2 Domain Validation blocks Stage 2 artifact directly citing UNCONFIRMED item ID
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "dev-alice",
+              currentRole: "core_api_service",
+            },
+            () =>
+              store.recordStageArtifact({
+                project_id: proj.project_id,
+                pipeline_session_id: pOnlyAssump.session.pipeline_session_id,
+                stage: "STAGE_2_REQUIREMENTS",
+                artifact_kind: "STAGE_2_PRD_SRS",
+                provider: "anthropic",
+                model: "claude-sonnet-4-20250514",
+                prompt_id: STAGE2_REQUIREMENTS_PROMPT_ID,
+                prompt_version: "1.0.0",
+                prompt_sha256: "a".repeat(64),
+                created_by_principal_id: "dev-alice",
+                content_json: {
+                  prd: {
+                    product_vision: "test",
+                    target_personas: ["Op"],
+                    goals: ["g"],
+                    non_goals: [],
+                  },
+                  srs: {
+                    functional_requirements: [
+                      {
+                        req_id: "REQ-HALLUCINATED-1",
+                        title: "Tampered",
+                        description: "Cites unconfirmed item",
+                        priority: "MUST",
+                        source_discovery_item_ids: [unconfirmedAssump.item_id],
+                        acceptance_criteria: [
+                          { ac_id: "AC-1", given: "g", when: "w", then: "t" },
+                        ],
+                      },
+                    ],
+                    non_functional_requirements: [],
+                  },
+                },
+              })
+          ),
+        (err: unknown) =>
+          err instanceof Ac10ViolationError &&
+          err.offendingItemIds.includes(unconfirmedAssump.item_id)
+      );
+
+      // 4. Confirm Assumption, keep Recommendation REJECTED -> Layer 1 filters out REJECTED & UNCONFIRMED,
+      // passes ONLY CONFIRMED item to Stage 2, and unblocks Stage 2 cleanly!
+      const confirmedAssump = await client.resolvePipelineStage1Item(
+        proj.project_id,
+        authDev,
+        pOnlyAssump.session.pipeline_session_id,
+        unconfirmedAssump.item_id,
+        { decision: "CONFIRM", resolution_note: "Customer confirmed Multi-AZ is required" }
+      );
+      assert.equal(confirmedAssump.confirmation_status, "CONFIRMED");
+
+      const rejectedRec = await client.resolvePipelineStage1Item(
+        proj.project_id,
+        authDev,
+        pOnlyAssump.session.pipeline_session_id,
+        unconfirmedRec.item_id,
+        { decision: "REJECT", resolution_note: "Deferred webhook retry out of v1" }
+      );
+      assert.equal(rejectedRec.confirmation_status, "REJECTED");
+
+      // Also verify Layer 2 rejects citing REJECTED item ID
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "dev-alice",
+              currentRole: "core_api_service",
+            },
+            () =>
+              store.recordStageArtifact({
+                project_id: proj.project_id,
+                pipeline_session_id: pOnlyAssump.session.pipeline_session_id,
+                stage: "STAGE_2_REQUIREMENTS",
+                artifact_kind: "STAGE_2_PRD_SRS",
+                provider: "anthropic",
+                model: "claude-sonnet-4-20250514",
+                prompt_id: STAGE2_REQUIREMENTS_PROMPT_ID,
+                prompt_version: "1.0.0",
+                prompt_sha256: "a".repeat(64),
+                created_by_principal_id: "dev-alice",
+                content_json: {
+                  prd: { product_vision: "v", target_personas: ["Op"], goals: ["g"], non_goals: [] },
+                  srs: {
+                    functional_requirements: [
+                      {
+                        req_id: "REQ-REJECTED-REF",
+                        title: "Rejected",
+                        description: "Cites rejected item",
+                        priority: "MUST",
+                        source_discovery_item_ids: [rejectedRec.item_id],
+                        acceptance_criteria: [
+                          { ac_id: "AC-1", given: "g", when: "w", then: "t" },
+                        ],
+                      },
+                    ],
+                    non_functional_requirements: [],
+                  },
+                },
+              })
+          ),
+        (err: unknown) =>
+          err instanceof Ac10ViolationError && err.offendingItemIds.includes(rejectedRec.item_id)
+      );
+
+      // Execute Stage 2 after human CONFIRM: inspect exact LLM request payload!
+      mock.resetCounts();
+      const s2Outcome = await client.runPipelineStage2Requirements(
+        proj.project_id,
+        authDev,
+        pOnlyAssump.session.pipeline_session_id
+      );
+      assert.equal(mock.requests.length, 1);
+      const stage2PromptSent = mock.requests[0]!.userPrompt;
+      assert.ok(
+        stage2PromptSent.includes(confirmedAssump.item_id),
+        "CONFIRMED item ID must enter Stage 2 context"
+      );
+      assert.equal(
+        stage2PromptSent.includes(rejectedRec.item_id),
+        false,
+        "REJECTED item ID must be filtered out of Stage 2 context (Layer 1 firewall)"
+      );
+      assert.equal(s2Outcome.artifact.stage, "STAGE_2_REQUIREMENTS");
+    } finally {
+      await Promise.allSettled([httpServer?.stop(), mock.close()]);
+    }
+  });
+
+  it("M6A-AC5: End-to-End Stages 1 -> Q&A -> 2 -> 3 -> 4 Checker -> Web Approval Gate -> FROZEN BaselineSpecFreeze", async () => {
+    const mock = await startMockModelProviderServers();
+    const stack = await createControlPlaneStackRuntime({
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+      withGatewayHttp: false,
+    });
+    try {
+      const store = stack.coreApiRuntime!.store;
+      const coreApi = stack.coreApiRuntime!.coreApi;
+      const coreClient = new HttpCoreApiClient(stack.coreApiRuntime!.coreApiEndpoint!.baseUrl);
+      const webBaseUrl = stack.webEndpoint!.baseUrl;
+
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: `m6a-ac5-e2e-${randomUUID().slice(0, 8)}`,
+            name: "M6A AC5 Full E2E",
+            repo_bare_path: "/tmp/m6a-ac5.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          return p;
+        }
+      );
+
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      const created = await coreClient.createPipelineSession(proj.project_id, authDev, {
+        title: "Factory Billing Control Plane",
+        raw_idea_text: "Build multi-tenant ledger with immutable audit logs and freeze approval.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 50_000,
+          session_cost_budget_micro_usd: 10_000_000,
+        },
+      });
+      const sessionId = created.session.pipeline_session_id;
+
+      // Stage 1 using default Anthropic provider
+      const s1 = await coreClient.runPipelineStage1Extract(proj.project_id, authDev, sessionId);
+      assert.equal(s1.session.current_stage, "STAGE_1_IDEA_DISCOVERY");
+      assert.equal(s1.ledger.provider, "anthropic");
+
+      const facts = s1.discoveryItems.filter((i) => i.kind === "FACT");
+      const assumption = s1.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      const rec = s1.discoveryItems.find((i) => i.kind === "RECOMMENDATION")!;
+      assert.ok(facts.length >= 2);
+      assert.ok(facts.every((f) => f.confirmation_status === "AUTO_VERIFIED"));
+      assert.equal(assumption.confirmation_status, "UNCONFIRMED");
+      assert.equal(rec.confirmation_status, "UNCONFIRMED");
+
+      // Confirm Assumption, Reject Recommendation
+      await coreClient.resolvePipelineStage1Item(proj.project_id, authDev, sessionId, assumption.item_id, {
+        decision: "CONFIRM",
+        resolution_note: "Confirmed OIDC SSO for operators",
+      });
+      await coreClient.resolvePipelineStage1Item(proj.project_id, authDev, sessionId, rec.item_id, {
+        decision: "REJECT",
+        resolution_note: "CSV export deferred to M7",
+      });
+
+      // Stage 2 swapping provider cleanly to OpenAI
+      const s2 = await coreClient.runPipelineStage2Requirements(proj.project_id, authDev, sessionId, {
+        model_config: {
+          provider: "openai",
+          model: "gpt-4.1",
+          apiKey: "test-openai-key-local",
+          baseUrl: mock.openaiBaseUrl,
+        },
+      });
+      assert.equal(s2.session.current_stage, "STAGE_2_REQUIREMENTS");
+      assert.equal(s2.artifact.provider, "openai");
+      assert.equal(s2.artifact.prompt_id, STAGE2_REQUIREMENTS_PROMPT_ID);
+
+      // Stage 3 swapping provider cleanly to Google Gemini
+      const s3 = await coreClient.runPipelineStage3Architecture(proj.project_id, authDev, sessionId, {
+        model_config: {
+          provider: "google",
+          model: "gemini-2.5-pro",
+          apiKey: "test-google-key-local",
+          baseUrl: mock.googleBaseUrl,
+        },
+      });
+      assert.equal(s3.session.current_stage, "STAGE_3_ARCHITECTURE");
+      assert.equal(s3.artifact.provider, "google");
+      assert.equal(s3.artifact.prompt_id, STAGE3_ARCHITECTURE_PROMPT_ID);
+
+      // Stage 4 Deterministic CrossArtifactConsistencyChecker
+      const s4 = await coreClient.runPipelineStage4ConsistencyCheck(
+        proj.project_id,
+        authDev,
+        sessionId
+      );
+      assert.equal(s4.session.current_stage, "STAGE_4_SPEC_FREEZE");
+      assert.equal(s4.report.passed, true);
+      assert.equal(s4.report.checks.length, 5);
+      assert.ok(s4.report.checks.every((c) => c.passed));
+
+      // Inspect Web Console HTML, Markdown, and JSON views
+      const htmlResp = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(proj.project_id)}/pipeline-sessions/${encodeURIComponent(sessionId)}?format=html`,
+        { headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover) } }
+      );
+      assert.equal(htmlResp.status, 200);
+      const htmlText = await htmlResp.text();
+      assert.ok(htmlText.includes("Factory Billing Control Plane"));
+      assert.ok(htmlText.includes(s3.artifact.artifact_sha256));
+
+      const mdResp = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(proj.project_id)}/pipeline-sessions/${encodeURIComponent(sessionId)}?format=md`,
+        { headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover) } }
+      );
+      assert.equal(mdResp.status, 200);
+      const mdText = await mdResp.text();
+      assert.ok(mdText.includes("# Product Pipeline — Factory Billing Control Plane"));
+      assert.ok(mdText.includes("## Stage 4 Consistency Check"));
+
+      const jsonResp = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(proj.project_id)}/pipeline-sessions/${encodeURIComponent(sessionId)}?format=json`,
+        { headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover) } }
+      );
+      assert.equal(jsonResp.status, 200);
+      const preFreezeBundle = (await jsonResp.json()) as ProductPipelineBundle;
+      assert.equal(preFreezeBundle.artifacts.length, 4);
+
+      // Web Console: PROJECT_APPROVER submits STAGE_4_SPEC_FREEZE Approval Gate & Freeze
+      const webGateResp = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(proj.project_id)}/pipeline-sessions/${encodeURIComponent(sessionId)}/approval-gates`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover),
+          },
+          body: JSON.stringify({
+            gate_stage: "STAGE_4_SPEC_FREEZE",
+            decision: "APPROVED",
+            rationale: "All CHK-01..CHK-05 passed and Stage 1..3 hashes verified.",
+          }),
+        }
+      );
+      assert.equal(webGateResp.status, 201);
+      const gate = (await webGateResp.json()) as {
+        gate_id: string;
+        target_artifact_id: string;
+        target_artifact_sha256: string;
+      };
+      assert.equal(gate.target_artifact_id, s4.artifact.artifact_id);
+      assert.equal(gate.target_artifact_sha256, s4.artifact.artifact_sha256);
+
+      const webFreezeResp = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(proj.project_id)}/pipeline-sessions/${encodeURIComponent(sessionId)}/freeze`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover),
+          },
+          body: JSON.stringify({
+            approval_gate_id: gate.gate_id,
+          }),
+        }
+      );
+      assert.equal(webFreezeResp.status, 201);
+      const frozen = (await webFreezeResp.json()) as {
+        baseline_id: string;
+        status: string;
+        freeze_bundle_sha256: string;
+      };
+      assert.equal(frozen.status, "FROZEN");
+
+      // Verify final bundle, SHA-256 digests, cost accumulation across 3 providers, and outbox event
+      const finalBundle = await coreClient.getPipelineBundle(proj.project_id, authDev, sessionId);
+      assert.equal(finalBundle.session.status, "FROZEN");
+      assert.equal(finalBundle.session.frozen_baseline_id, frozen.baseline_id);
+      assert.equal(finalBundle.baselineFreeze?.baseline_id, frozen.baseline_id);
+      assert.equal(finalBundle.modelCallLedgers.length, 3);
+      assert.deepEqual(
+        finalBundle.modelCallLedgers.map((l) => l.provider),
+        ["anthropic", "openai", "google"]
+      );
+      const sumTokens = finalBundle.modelCallLedgers.reduce((acc, l) => acc + l.actual_total_tokens, 0);
+      const sumCost = finalBundle.modelCallLedgers.reduce((acc, l) => acc + l.actual_cost_micro_usd, 0);
+      assert.equal(finalBundle.costSession?.tokens_used_total, sumTokens);
+      assert.equal(finalBundle.costSession?.cost_used_micro_usd, sumCost);
+      assert.ok(sumCost > 0);
+
+      for (const art of finalBundle.artifacts) {
+        assert.equal(
+          computeCanonicalPayloadSha256(art.content_json),
+          art.artifact_sha256,
+          `Artifact ${art.stage} SHA-256 must match canonical JSON`
+        );
+      }
+
+      const outboxEvents = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () => store.listOutboxEventsForProject()
+      );
+      assert.ok(
+        outboxEvents.some(
+          (ev) =>
+            ev.event_type === "pipeline.baseline_frozen" &&
+            ev.aggregate_id === sessionId
+        )
+      );
+    } finally {
+      await Promise.allSettled([stack.close(), mock.close()]);
+    }
+  });
+
+  it("M6A-AC6: Checker rejection blocks freeze (422), DEVELOPER RBAC 403, Cross-Tenant isolation & FROZEN immutability", async () => {
+    const mock = await startMockModelProviderServers();
+    const stack = await createControlPlaneStackRuntime({
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+      withGatewayHttp: false,
+    });
+    try {
+      const store = stack.coreApiRuntime!.store;
+      const coreApi = stack.coreApiRuntime!.coreApi;
+      const coreClient = new HttpCoreApiClient(stack.coreApiRuntime!.coreApiEndpoint!.baseUrl);
+      const webBaseUrl = stack.webEndpoint!.baseUrl;
+
+      let projAId = "";
+      let projBId = "";
+      await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const ac6Suffix = randomUUID().slice(0, 8);
+          const pA = await store.createProject({
+            slug: `m6a-ac6-a-${ac6Suffix}`,
+            name: "M6A AC6 Project A",
+            repo_bare_path: "/tmp/m6a-ac6-a.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          const pB = await store.createProject({
+            slug: `m6a-ac6-b-${ac6Suffix}`,
+            name: "M6A AC6 Project B",
+            repo_bare_path: "/tmp/m6a-ac6-b.git",
+            initial_main_commit_hash: "3".repeat(40),
+            initial_main_tree_hash: "4".repeat(40),
+          });
+          projAId = pA.project_id;
+          projBId = pB.project_id;
+          await store.addProjectMembership({
+            project_id: projAId,
+            principal_id: "alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: projAId,
+            principal_id: "auditor-carol",
+            member_role: "AUDITOR",
+          });
+          await store.addProjectMembership({
+            project_id: projAId,
+            principal_id: "bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          await store.addProjectMembership({
+            project_id: projBId,
+            principal_id: "eve-b-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+        }
+      );
+
+      const authDevA = coreApi.issueAuthContext({
+        projectId: projAId,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authAuditorA = coreApi.issueAuthContext({
+        projectId: projAId,
+        principalId: "auditor-carol",
+        roles: ["AUDITOR"],
+      });
+      const authApproverA = coreApi.issueAuthContext({
+        projectId: projAId,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+      const authApproverB = coreApi.issueAuthContext({
+        projectId: projBId,
+        principalId: "eve-b-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      // 1. Standalone Checker unit negative probes (CHK-02, CHK-03, CHK-04, CHK-05)
+      const nowIso = new Date().toISOString();
+      const s1Items = [
+        {
+          item_id: randomUUID(),
+          project_id: projAId,
+          pipeline_session_id: randomUUID(),
+          kind: "FACT" as const,
+          title: "Fact 1",
+          statement: "S1",
+          rationale: "R1",
+          clarification_question: null,
+          confirmation_status: "AUTO_VERIFIED" as const,
+          confirmed_by_principal_id: null,
+          confirmed_at: null,
+          resolution_note: null,
+          created_at: nowIso,
+          updated_at: nowIso,
+        },
+        {
+          item_id: randomUUID(),
+          project_id: projAId,
+          pipeline_session_id: randomUUID(),
+          kind: "FACT" as const,
+          title: "Uncovered Fact 2",
+          statement: "S2",
+          rationale: "R2",
+          clarification_question: null,
+          confirmation_status: "AUTO_VERIFIED" as const,
+          confirmed_by_principal_id: null,
+          confirmed_at: null,
+          resolution_note: null,
+          created_at: nowIso,
+          updated_at: nowIso,
+        },
+      ];
+      const sessRefId = s1Items[0]!.pipeline_session_id;
+      const fixedItems = s1Items.map((x) => ({ ...x, pipeline_session_id: sessRefId }));
+      const badS2Json: Stage2RequirementsSpec = {
+        prd: { product_vision: "v", target_personas: ["p"], goals: ["g"], non_goals: [] },
+        srs: {
+          functional_requirements: [
+            {
+              req_id: "REQ-DUP",
+              title: "Req 1",
+              description: "d",
+              priority: "MUST",
+              source_discovery_item_ids: [fixedItems[0]!.item_id],
+              acceptance_criteria: [],
+            },
+            {
+              req_id: "REQ-DUP",
+              title: "Duplicate Req",
+              description: "d2",
+              priority: "SHOULD",
+              source_discovery_item_ids: [fixedItems[0]!.item_id],
+              acceptance_criteria: [{ ac_id: "AC-1", given: "g", when: "w", then: "t" }],
+            },
+          ],
+          non_functional_requirements: [],
+        },
+      };
+      const badS3Json: Stage3ArchitectureSpec = {
+        architecture: {
+          overview: "",
+          components: [],
+        },
+        database_erd: { entities: [] },
+        api_spec: { endpoints: [] },
+        security_design: { threat_controls: [] },
+        adrs: [
+          {
+            adr_id: "ADR-DANGLING",
+            title: "Dangling",
+            status: "ACCEPTED",
+            context: "c",
+            decision: "d",
+            consequences: "c",
+            requirement_ids: ["REQ-NONEXISTENT"],
+          },
+        ],
+      };
+      const mkArt = (
+        stage: PipelineStageName,
+        kind:
+          | "STAGE_1_DISCOVERY_BUNDLE"
+          | "STAGE_2_PRD_SRS"
+          | "STAGE_3_ARCHITECTURE_DESIGN",
+        content: Record<string, unknown>,
+        tamperedHash?: string
+      ) => ({
+        artifact_id: randomUUID(),
+        project_id: projAId,
+        pipeline_session_id: sessRefId,
+        stage,
+        artifact_kind: kind,
+        version: 1,
+        provider: "anthropic" as const,
+        model: "claude-sonnet-4-20250514",
+        prompt_id: "p",
+        prompt_version: "1.0.0",
+        prompt_sha256: "a".repeat(64),
+        content_json: content,
+        artifact_sha256: tamperedHash ?? computeCanonicalPayloadSha256(content),
+        created_by_principal_id: "alice-dev",
+        created_at: nowIso,
+      });
+
+      const unitCheck = runCrossArtifactConsistencyCheck({
+        pipelineSessionId: sessRefId,
+        stage1Items: fixedItems,
+        stage1Artifact: mkArt("STAGE_1_IDEA_DISCOVERY", "STAGE_1_DISCOVERY_BUNDLE", { ok: true }),
+        stage2Artifact: mkArt("STAGE_2_REQUIREMENTS", "STAGE_2_PRD_SRS", badS2Json as unknown as Record<string, unknown>),
+        stage3Artifact: mkArt(
+          "STAGE_3_ARCHITECTURE",
+          "STAGE_3_ARCHITECTURE_DESIGN",
+          badS3Json as unknown as Record<string, unknown>,
+          "0".repeat(64)
+        ),
+      });
+      assert.equal(unitCheck.passed, false);
+      assert.equal(unitCheck.checks.find((c) => c.check_id === "CHK-02")?.passed, false);
+      assert.equal(unitCheck.checks.find((c) => c.check_id === "CHK-03")?.passed, false);
+      assert.equal(unitCheck.checks.find((c) => c.check_id === "CHK-04")?.passed, false);
+      assert.equal(unitCheck.checks.find((c) => c.check_id === "CHK-05")?.passed, false);
+
+      // 2. Live pipeline: Stage 3 returns empty adrs (valid schema, fails CHK-04!) -> Checker blocks freeze!
+      const badPipe = await coreClient.createPipelineSession(projAId, authDevA, {
+        title: "Checker Rejection Gate Test",
+        raw_idea_text: "Needs full 5-part architecture.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 40_000,
+          session_cost_budget_micro_usd: 5_000_000,
+        },
+      });
+      const badSessId = badPipe.session.pipeline_session_id;
+      const badS1 = await coreClient.runPipelineStage1Extract(projAId, authDevA, badSessId);
+      const badAssump = badS1.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      const badRec = badS1.discoveryItems.find((i) => i.kind === "RECOMMENDATION")!;
+      await coreClient.resolvePipelineStage1Item(projAId, authDevA, badSessId, badAssump.item_id, {
+        decision: "REJECT",
+      });
+      await coreClient.resolvePipelineStage1Item(projAId, authDevA, badSessId, badRec.item_id, {
+        decision: "REJECT",
+      });
+      await coreClient.runPipelineStage2Requirements(projAId, authDevA, badSessId);
+
+      // Force Stage 3 to return empty `adrs: []` (matches JSON schema, violates CHK-04!)
+      mock.setResponseOverride("anthropic", (req) => ({
+        text: JSON.stringify({
+          ...buildDynamicStage3Payload(req.userPrompt),
+          adrs: [],
+        }),
+      }));
+      await coreClient.runPipelineStage3Architecture(projAId, authDevA, badSessId);
+      mock.setResponseOverride("anthropic", null);
+
+      const badS4 = await coreClient.runPipelineStage4ConsistencyCheck(projAId, authDevA, badSessId);
+      assert.equal(badS4.report.passed, false);
+      assert.equal(badS4.report.checks.find((c) => c.check_id === "CHK-04")?.passed, false);
+
+      // Even if approver records a gate decision against the failed report, freeze MUST fail closed with 422!
+      const badGate = await coreClient.submitPipelineApprovalGate(projAId, authApproverA, badSessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: badS4.artifact.artifact_id,
+        target_artifact_sha256: badS4.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(projAId, authApproverA, badSessId, {
+            approval_gate_id: badGate.gate_id,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // 3. Produce a clean Stage 3 & Stage 4 on the same session to verify RBAC + FROZEN immutability
+      const goodS3 = await coreClient.runPipelineStage3Architecture(projAId, authDevA, badSessId);
+      const goodS4 = await coreClient.runPipelineStage4ConsistencyCheck(projAId, authDevA, badSessId, {
+        stage3_artifact_id: goodS3.artifact.artifact_id,
+      });
+      assert.equal(goodS4.report.passed, true);
+
+      // AUDITOR cannot execute Stage 1..4 extraction/check (403)
+      await assert.rejects(
+        () => coreClient.runPipelineStage4ConsistencyCheck(projAId, authAuditorA, badSessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+
+      // DEVELOPER cannot approve gate or freeze on Core API OR Web Console (403)
+      await assert.rejects(
+        () =>
+          coreClient.submitPipelineApprovalGate(projAId, authDevA, badSessId, {
+            gate_stage: "STAGE_4_SPEC_FREEZE",
+            decision: "APPROVED",
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+      const devWebGate = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(projAId)}/pipeline-sessions/${encodeURIComponent(badSessId)}/approval-gates`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDevA),
+          },
+          body: JSON.stringify({
+            gate_stage: "STAGE_4_SPEC_FREEZE",
+            decision: "APPROVED",
+          }),
+        }
+      );
+      assert.equal(devWebGate.status, 403);
+
+      // Tampered target_artifact_sha256 rejected by composite FK / validation
+      await assert.rejects(
+        () =>
+          coreClient.submitPipelineApprovalGate(projAId, authApproverA, badSessId, {
+            gate_stage: "STAGE_4_SPEC_FREEZE",
+            target_artifact_id: goodS4.artifact.artifact_id,
+            target_artifact_sha256: "f".repeat(64),
+            decision: "APPROVED",
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 404
+      );
+
+      // Cross-tenant isolation: Project B Approver cannot view, approve, or freeze Project A session
+      await assert.rejects(
+        () => coreClient.getPipelineBundle(projAId, authApproverB, badSessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+      await assert.rejects(
+        () =>
+          coreClient.submitPipelineApprovalGate(projBId, authApproverB, badSessId, {
+            gate_stage: "STAGE_4_SPEC_FREEZE",
+            decision: "APPROVED",
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 404
+      );
+
+      // Approver approves goodS4 and freezes baseline, while DEVELOPER freeze attempt returns 403
+      const goodGate = await coreClient.submitPipelineApprovalGate(projAId, authApproverA, badSessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: goodS4.artifact.artifact_id,
+        target_artifact_sha256: goodS4.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(projAId, authDevA, badSessId, {
+            approval_gate_id: goodGate.gate_id,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+
+      const frozen = await coreClient.freezePipelineBaseline(projAId, authApproverA, badSessId, {
+        approval_gate_id: goodGate.gate_id,
+      });
+      assert.equal(frozen.status, "FROZEN");
+
+      // 4. FROZEN Immutability: any post-freeze resolve, re-generation, check, or duplicate freeze fails closed with 0 LLM hits!
+      mock.resetCounts();
+      await assert.rejects(
+        () =>
+          coreClient.resolvePipelineStage1Item(projAId, authDevA, badSessId, badAssump.item_id, {
+            decision: "CONFIRM",
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      await assert.rejects(
+        () => coreClient.runPipelineStage1Extract(projAId, authDevA, badSessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      await assert.rejects(
+        () => coreClient.runPipelineStage2Requirements(projAId, authDevA, badSessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      await assert.rejects(
+        () => coreClient.runPipelineStage3Architecture(projAId, authDevA, badSessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      await assert.rejects(
+        () => coreClient.runPipelineStage4ConsistencyCheck(projAId, authDevA, badSessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(projAId, authApproverA, badSessId, {
+            approval_gate_id: goodGate.gate_id,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && (err.statusCode === 422 || err.statusCode === 409)
+      );
+      assert.equal(mock.hits.anthropic, 0, "FROZEN pipeline must trigger 0 model provider calls");
+    } finally {
+      await Promise.allSettled([stack.close(), mock.close()]);
+    }
+  });
+
+  it("M6A-AC7: Live PostgreSQL 16/17 (0006): FORCE RLS across 7 tables, Append-Only & Column GRANTs, SQL Triggers, JSONB SHA-256 Round-Trip & Live HTTP E2E", async (t) => {
+    const pgConfig = buildPostgresPoolConfigFromEnv();
+    if (!pgConfig) {
+      t.skip("PostgreSQL connection env (PGHOST/DATABASE_URL) not configured on local workstation");
+      return;
+    }
+
+    const mock = await startMockModelProviderServers();
+    const stack = await createControlPlaneStackRuntime({
+      poolConfig: pgConfig,
+      requirePostgres: true,
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+      withGatewayHttp: false,
+    });
+    try {
+      assert.equal(stack.mode, "postgres");
+      assert.ok(stack.pool !== null);
+      const pool = stack.pool!;
+      const store = stack.coreApiRuntime!.store;
+      const coreApi = stack.coreApiRuntime!.coreApi;
+      const coreClient = new HttpCoreApiClient(stack.coreApiRuntime!.coreApiEndpoint!.baseUrl);
+      const webBaseUrl = stack.webEndpoint!.baseUrl;
+
+      const suffix = randomUUID().slice(0, 8);
+      let projectAId = "";
+      let projectBId = "";
+      await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "m6a-pg-bootstrap" },
+        async () => {
+          const pA = await store.createProject({
+            slug: `m6a-pg-a-${suffix}`,
+            name: `M6A PG Project A ${suffix}`,
+            repo_bare_path: `/tmp/m6a-pg-a-${suffix}.git`,
+            initial_main_commit_hash: "a".repeat(40),
+            initial_main_tree_hash: "b".repeat(40),
+          });
+          const pB = await store.createProject({
+            slug: `m6a-pg-b-${suffix}`,
+            name: `M6A PG Project B ${suffix}`,
+            repo_bare_path: `/tmp/m6a-pg-b-${suffix}.git`,
+            initial_main_commit_hash: "c".repeat(40),
+            initial_main_tree_hash: "d".repeat(40),
+          });
+          projectAId = pA.project_id;
+          projectBId = pB.project_id;
+          await store.addProjectMembership({
+            project_id: projectAId,
+            principal_id: "pg-alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: projectAId,
+            principal_id: "pg-bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          await store.addProjectMembership({
+            project_id: projectBId,
+            principal_id: "pg-carol-dev",
+            member_role: "DEVELOPER",
+          });
+        }
+      );
+
+      const authDevA = coreApi.issueAuthContext({
+        projectId: projectAId,
+        principalId: "pg-alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApproverA = coreApi.issueAuthContext({
+        projectId: projectAId,
+        principalId: "pg-bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      // 1. Live PG E2E: Stages 1 (Anthropic) -> Resolve -> 2 (OpenAI) -> 3 (Google) -> 4 -> Web Gate & Freeze
+      const created = await coreClient.createPipelineSession(projectAId, authDevA, {
+        title: `PG Live Pipeline ${suffix}`,
+        raw_idea_text: "Build RLS-enforced billing & spec freeze pipeline on PostgreSQL.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 2_000_000,
+          session_token_budget: 60_000,
+          session_cost_budget_micro_usd: 15_000_000,
+        },
+      });
+      const sessId = created.session.pipeline_session_id;
+
+      const s1 = await coreClient.runPipelineStage1Extract(projectAId, authDevA, sessId);
+      const assumpItem = s1.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+      const recItem = s1.discoveryItems.find((i) => i.kind === "RECOMMENDATION")!;
+
+      // Direct PG SQL trigger tests BEFORE freeze:
+      // (a) Direct SQL ASSUMPTION AUTO_VERIFIED blocked with 23514
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `INSERT INTO stage1_discovery_items (
+                  item_id, project_id, pipeline_session_id, kind, title, statement, rationale, confirmation_status
+                ) VALUES ($1::uuid, $2::uuid, $3::uuid, 'ASSUMPTION', 'BadSQL', 'S', 'R', 'AUTO_VERIFIED');`,
+                [randomUUID(), projectAId, sessId]
+              )
+          ),
+        (err: unknown) =>
+          (err instanceof PostgresRlsError ||
+            typeof (err as { sqlState?: string }).sqlState === "string") &&
+          (err as { sqlState: string }).sqlState === "23514"
+      );
+
+      // (b) Direct SQL Stage 2 INSERT referencing UNCONFIRMED assumption blocked by trg_stage_artifact_invariants (23514 AC-10)
+      const directBadS2Content = {
+        prd: { product_vision: "v", target_personas: ["Op"], goals: ["g"], non_goals: [] },
+        srs: {
+          functional_requirements: [
+            {
+              req_id: "REQ-PG-TRIGGER",
+              title: "Trigger Probe",
+              description: "d",
+              priority: "MUST",
+              source_discovery_item_ids: [assumpItem.item_id],
+              acceptance_criteria: [{ ac_id: "AC-1", given: "g", when: "w", then: "t" }],
+            },
+          ],
+          non_functional_requirements: [],
+        },
+      };
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            () =>
+              pool.queryInActiveTx(
+                `INSERT INTO stage_artifacts (
+                  artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                  provider, model, prompt_id, prompt_version, prompt_sha256,
+                  content_json, artifact_sha256, created_by_principal_id
+                ) VALUES (
+                  $1::uuid, $2::uuid, $3::uuid, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 99,
+                  'anthropic', 'claude-sonnet-4-20250514', 'p', '1.0.0', $4::char(64),
+                  $5::jsonb, $6::char(64), 'pg-alice-dev'
+                );`,
+                [
+                  randomUUID(),
+                  projectAId,
+                  sessId,
+                  "a".repeat(64),
+                  directBadS2Content,
+                  computeCanonicalPayloadSha256(directBadS2Content),
+                ]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // Confirm assumption, reject recommendation, finish Stages 2..4 + Freeze
+      await coreClient.resolvePipelineStage1Item(projectAId, authDevA, sessId, assumpItem.item_id, {
+        decision: "CONFIRM",
+      });
+      await coreClient.resolvePipelineStage1Item(projectAId, authDevA, sessId, recItem.item_id, {
+        decision: "REJECT",
+      });
+
+      const s2 = await coreClient.runPipelineStage2Requirements(projectAId, authDevA, sessId, {
+        model_config: {
+          provider: "openai",
+          model: "gpt-4.1",
+          apiKey: "test-openai-key-local",
+          baseUrl: mock.openaiBaseUrl,
+        },
+      });
+      await coreClient.runPipelineStage3Architecture(projectAId, authDevA, sessId, {
+        model_config: {
+          provider: "google",
+          model: "gemini-2.5-pro",
+          apiKey: "test-google-key-local",
+          baseUrl: mock.googleBaseUrl,
+        },
+      });
+      const s4 = await coreClient.runPipelineStage4ConsistencyCheck(projectAId, authDevA, sessId);
+      assert.equal(s4.report.passed, true);
+
+      // Verify JSONB round-trip canonical SHA-256 directly from PG
+      const bundleFromPg = await coreClient.getPipelineBundle(projectAId, authDevA, sessId);
+      assert.equal(bundleFromPg.artifacts.length, 4);
+      for (const art of bundleFromPg.artifacts) {
+        assert.equal(
+          computeCanonicalPayloadSha256(art.content_json),
+          art.artifact_sha256,
+          `PG JSONB round-trip SHA-256 mismatch on ${art.stage}`
+        );
+      }
+
+      // Direct PG SQL trigger: marking session FROZEN without committed baseline_spec_freezes row fails (23514)
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-bob-approver",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `UPDATE product_pipeline_sessions
+                 SET status = 'FROZEN', frozen_baseline_id = $1::uuid
+                 WHERE pipeline_session_id = $2::uuid;`,
+                [randomUUID(), sessId]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // Web Console Approve & Freeze against live PostgreSQL
+      const webGateRes = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(projectAId)}/pipeline-sessions/${encodeURIComponent(sessId)}/approval-gates`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApproverA),
+          },
+          body: JSON.stringify({ gate_stage: "STAGE_4_SPEC_FREEZE", decision: "APPROVED" }),
+        }
+      );
+      assert.equal(webGateRes.status, 201);
+
+      const webFreezeRes = await fetch(
+        `${webBaseUrl}/projects/${encodeURIComponent(projectAId)}/pipeline-sessions/${encodeURIComponent(sessId)}/freeze`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApproverA),
+          },
+          body: JSON.stringify({}),
+        }
+      );
+      assert.equal(webFreezeRes.status, 201);
+
+      // 2. Post-freeze direct SQL trigger checks under app_runtime:
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `UPDATE stage1_discovery_items SET resolution_note = 'Post freeze edit' WHERE item_id = $1::uuid;`,
+                [assumpItem.item_id]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query(
+                `UPDATE product_pipeline_sessions SET status = 'ACTIVE' WHERE pipeline_session_id = $1::uuid;`,
+                [sessId]
+              )
+          ),
+        (err: unknown) => (err as { sqlState?: string }).sqlState === "23514"
+      );
+
+      // 3. Append-only 42501 & Column-level UPDATE GRANT 42501 across M6A tables under app_runtime
+      const assert42501 = async (fn: () => Promise<unknown>, label: string): Promise<void> => {
+        await assert.rejects(
+          fn,
+          (err: unknown) => (err as { sqlState?: string }).sqlState === "42501",
+          `Expected SQLSTATE 42501 for ${label}`
+        );
+      };
+
+      const txA = {
+        currentProjectId: projectAId,
+        currentPrincipalId: "pg-alice-dev",
+        currentRole: "core_api_service" as const,
+      };
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txA, (conn) =>
+            conn.query(`UPDATE model_call_ledgers SET actual_cost_micro_usd = 0 WHERE pipeline_session_id = $1::uuid;`, [sessId])
+          ),
+        "UPDATE model_call_ledgers"
+      );
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txA, (conn) =>
+            conn.query(`UPDATE stage_artifacts SET model = 'tampered' WHERE artifact_id = $1::uuid;`, [s2.artifact.artifact_id])
+          ),
+        "UPDATE stage_artifacts"
+      );
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txA, (conn) =>
+            conn.query(`UPDATE stage_approval_gates SET decision = 'REJECTED' WHERE pipeline_session_id = $1::uuid;`, [sessId])
+          ),
+        "UPDATE stage_approval_gates"
+      );
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txA, (conn) =>
+            conn.query(`UPDATE baseline_spec_freezes SET freeze_bundle_sha256 = repeat('0', 64) WHERE pipeline_session_id = $1::uuid;`, [sessId])
+          ),
+        "UPDATE baseline_spec_freezes"
+      );
+
+      for (const tbl of [
+        "model_cost_sessions",
+        "model_call_ledgers",
+        "product_pipeline_sessions",
+        "stage1_discovery_items",
+        "stage_artifacts",
+        "stage_approval_gates",
+        "baseline_spec_freezes",
+      ]) {
+        await assert42501(
+          () =>
+            pool.withRlsTransaction(txA, (conn) =>
+              conn.query(`DELETE FROM ${tbl} WHERE project_id = $1::uuid;`, [projectAId])
+            ),
+          `DELETE FROM ${tbl}`
+        );
+      }
+
+      // Column-level GRANT blocks on protected columns
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txA, (conn) =>
+            conn.query(
+              `UPDATE model_cost_sessions SET session_cost_budget_micro_usd = 999999999 WHERE cost_session_id = $1::uuid;`,
+              [created.costSession!.cost_session_id]
+            )
+          ),
+        "UPDATE non-whitelisted model_cost_sessions.session_cost_budget_micro_usd"
+      );
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txA, (conn) =>
+            conn.query(
+              `UPDATE product_pipeline_sessions SET raw_idea_text = 'tampered' WHERE pipeline_session_id = $1::uuid;`,
+              [sessId]
+            )
+          ),
+        "UPDATE non-whitelisted product_pipeline_sessions.raw_idea_text"
+      );
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txA, (conn) =>
+            conn.query(
+              `UPDATE stage1_discovery_items SET statement = 'tampered' WHERE item_id = $1::uuid;`,
+              [assumpItem.item_id]
+            )
+          ),
+        "UPDATE non-whitelisted stage1_discovery_items.statement"
+      );
+
+      // 4. Cross-Tenant RLS Invisibility & INSERT 42501 across DISCARD ALL
+      const m6aTables = [
+        "model_cost_sessions",
+        "model_call_ledgers",
+        "product_pipeline_sessions",
+        "stage1_discovery_items",
+        "stage_artifacts",
+        "stage_approval_gates",
+        "baseline_spec_freezes",
+      ];
+      const txB = {
+        currentProjectId: projectBId,
+        currentPrincipalId: "pg-carol-dev",
+        currentRole: "core_api_service" as const,
+      };
+      await pool.withRlsTransaction(txB, async (conn) => {
+        for (const tbl of m6aTables) {
+          const cntRes = await conn.query<{ cnt: string }>(
+            `SELECT count(*)::text AS cnt FROM ${tbl} WHERE project_id = $1::uuid;`,
+            [projectAId]
+          );
+          assert.equal(cntRes.rows[0]?.cnt, "0", `Project B must see 0 Project A rows in ${tbl}`);
+        }
+      });
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txB, (conn) =>
+            conn.query(
+              `INSERT INTO model_cost_sessions (
+                 cost_session_id, project_id, max_tokens_per_request,
+                 max_cost_micro_usd_per_request, session_token_budget,
+                 session_cost_budget_micro_usd
+               ) VALUES (gen_random_uuid(), $1::uuid, 1000, 100000, 5000, 500000);`,
+              [projectAId]
+            )
+          ),
+        "Cross-tenant INSERT INTO model_cost_sessions"
+      );
+      await assert42501(
+        () =>
+          pool.withRlsTransaction(txB, (conn) =>
+            conn.query(
+              `INSERT INTO product_pipeline_sessions (
+                 pipeline_session_id, project_id, title, raw_idea_text, created_by_principal_id
+               ) VALUES (gen_random_uuid(), $1::uuid, 'Intrusion', 'Cross-tenant', 'pg-carol-dev');`,
+              [projectAId]
+            )
+          ),
+        "Cross-tenant INSERT INTO product_pipeline_sessions"
+      );
+
+      // Unscoped role sees 0 rows across all 7 M6A tables
+      await pool.withRlsTransaction(
+        {
+          currentProjectId: null,
+          currentPrincipalId: null,
+          currentRole: "anonymous",
+        },
+        async (conn) => {
+          for (const tbl of m6aTables) {
+            const cntRes = await conn.query<{ cnt: string }>(`SELECT count(*)::text AS cnt FROM ${tbl};`);
+            assert.equal(cntRes.rows[0]?.cnt, "0", `Unscoped anonymous must see 0 rows in ${tbl}`);
+          }
+        }
+      );
+
+      // 5. Durable AC-12b BLOCKED_POSTCALL + EXHAUSTED + SESSION_EXHAUSTED in PostgreSQL
+      const tightPipe = await coreClient.createPipelineSession(projectAId, authDevA, {
+        title: `PG Durable Budget ${suffix}`,
+        raw_idea_text: "Validate durable EXHAUSTED status in PostgreSQL.",
+        cost_budget: {
+          max_tokens_per_request: 3000,
+          max_cost_micro_usd_per_request: 1_000_000,
+          session_token_budget: 250,
+          session_cost_budget_micro_usd: 1_000_000,
+        },
+      });
+      mock.setResponseOverride("anthropic", { inputTokens: 200, outputTokens: 150 }); // 350 > 250
+      await assert.rejects(
+        () => coreClient.runPipelineStage1Extract(projectAId, authDevA, tightPipe.session.pipeline_session_id, { max_tokens: 16 }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 402 &&
+          err.body.error_code === "ERR_SESSION_BUDGET_EXCEEDED"
+      );
+      mock.setResponseOverride("anthropic", null);
+
+      const pgTightCost = await coreClient.getCostSession(
+        projectAId,
+        authDevA,
+        tightPipe.costSession!.cost_session_id
+      );
+      assert.equal(pgTightCost.session.status, "EXHAUSTED");
+      assert.equal(pgTightCost.ledgers[0]?.status, "BLOCKED_POSTCALL");
+
+      const hitsBeforePgExhausted = mock.hits.anthropic;
+      await assert.rejects(
+        () => coreClient.runPipelineStage1Extract(projectAId, authDevA, tightPipe.session.pipeline_session_id, { max_tokens: 16 }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 402 &&
+          err.body.error_code === "ERR_SESSION_BUDGET_EXCEEDED" &&
+          err.body.limit_scope === "SESSION_EXHAUSTED"
+      );
+      assert.equal(mock.hits.anthropic, hitsBeforePgExhausted);
+
+      assert.ok(pool.getStats().discardAllExecuted > 0);
+    } finally {
+      await Promise.allSettled([stack.close(), mock.close()]);
+      if (stack.pool) {
+        assert.equal(stack.pool.getStats().totalConnections, 0);
+      }
+    }
+  });
+});

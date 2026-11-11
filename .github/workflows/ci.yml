@@ -50,7 +50,7 @@ jobs:
       - name: TypeScript Typecheck
         run: npm run typecheck
 
-      - name: Verify PostgreSQL Migrations & RLS Matrix (RLS-T1..RLS-T8 + M4/M5)
+      - name: Verify PostgreSQL Migrations & RLS Matrix (RLS-T1..RLS-T8 + M4/M5/M6A)
         env:
           PGHOST: 127.0.0.1
           PGPORT: 5432
@@ -64,6 +64,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
           psql -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
@@ -95,9 +97,36 @@ jobs:
             v_ad_b UUID := '64444444-4444-4444-4444-444444444444';
             v_mo_a UUID := '73333333-3333-3333-3333-333333333333';
             v_mo_b UUID := '74444444-4444-4444-4444-444444444444';
+            v_mcs_a UUID := '83333333-3333-3333-3333-333333333331';
+            v_mcs_b UUID := '84444444-4444-4444-4444-444444444441';
+            v_pps_a UUID := '83333333-3333-3333-3333-333333333332';
+            v_pps_a_act UUID := '83333333-3333-3333-3333-333333333333';
+            v_pps_b UUID := '84444444-4444-4444-4444-444444444442';
+            v_s1_fact_a UUID := '93333333-3333-3333-3333-333333333331';
+            v_s1_assump_a UUID := '93333333-3333-3333-3333-333333333332';
+            v_s1_act_unconf_a UUID := '93333333-3333-3333-3333-333333333333';
+            v_s1_fact_b UUID := '94444444-4444-4444-4444-444444444441';
+            v_sa1_a UUID := 'a5333333-3333-3333-3333-333333333331';
+            v_sa2_a UUID := 'a5333333-3333-3333-3333-333333333332';
+            v_sa3_a UUID := 'a5333333-3333-3333-3333-333333333333';
+            v_sa4_a UUID := 'a5333333-3333-3333-3333-333333333334';
+            v_sa4_fail_a UUID := 'a5333333-3333-3333-3333-333333333335';
+            v_sa1_b UUID := 'a5444444-4444-4444-4444-444444444441';
+            v_sag1_a UUID := 'b5333333-3333-3333-3333-333333333331';
+            v_sag4_a UUID := 'b5333333-3333-3333-3333-333333333334';
+            v_sag4_fail_a UUID := 'b5333333-3333-3333-3333-333333333335';
+            v_sag1_b UUID := 'b5444444-4444-4444-4444-444444444441';
+            v_bsf_a UUID := 'c5333333-3333-3333-3333-333333333331';
             v_caught BOOLEAN := false;
           BEGIN
             -- Pre-clean any stale fixtures in FK-safe dependency order
+            DELETE FROM baseline_spec_freezes WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM stage_approval_gates WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM stage_artifacts WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM stage1_discovery_items WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM model_call_ledgers WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM product_pipeline_sessions WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM model_cost_sessions WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM resource_usage_metrics WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM merge_operations WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM approval_decisions WHERE project_id IN (v_proj_a, v_proj_b);
@@ -212,6 +241,189 @@ jobs:
             ) VALUES
               (gen_random_uuid(), v_proj_a, v_task_a, v_lease_a, 1, 1, 0, 'DEVELOPER', 250, 15000, 67108864, 'linux-supervisor', 'cgroup-v2'),
               (gen_random_uuid(), v_proj_b, v_task_b, v_lease_b, 1, 1, 0, 'DEVELOPER', 300, 18000, 67108864, 'linux-supervisor', 'cgroup-v2');
+
+            -- Seed M6A fixtures & verify AC-10 / Spec Freeze SQL triggers
+            INSERT INTO model_cost_sessions (
+              cost_session_id, project_id, task_id,
+              max_tokens_per_request, max_cost_micro_usd_per_request,
+              session_token_budget, session_cost_budget_micro_usd,
+              tokens_used_total, cost_used_micro_usd, status
+            ) VALUES
+              (v_mcs_a, v_proj_a, v_task_a, 8000, 500000, 40000, 2000000, 200, 1000, 'ACTIVE'),
+              (v_mcs_b, v_proj_b, v_task_b, 8000, 500000, 40000, 2000000, 200, 1000, 'ACTIVE');
+
+            INSERT INTO product_pipeline_sessions (
+              pipeline_session_id, project_id, cost_session_id, title, raw_idea_text,
+              current_stage, status, created_by_principal_id
+            ) VALUES
+              (v_pps_a,     v_proj_a, v_mcs_a, 'CI Frozen Pipeline A', 'Deterministic release', 'STAGE_4_SPEC_FREEZE', 'ACTIVE', 'alice-dev'),
+              (v_pps_a_act, v_proj_a, v_mcs_a, 'CI Active Pipeline A', 'Active AC-10 probe',    'STAGE_1_IDEA_DISCOVERY', 'ACTIVE', 'alice-dev'),
+              (v_pps_b,     v_proj_b, v_mcs_b, 'CI Pipeline B',        'Cross-tenant pipeline', 'STAGE_1_IDEA_DISCOVERY', 'ACTIVE', 'bob-dev');
+
+            INSERT INTO model_call_ledgers (
+              call_id, project_id, cost_session_id, pipeline_session_id, task_id, stage,
+              provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
+              estimated_input_tokens, reserved_output_tokens, actual_input_tokens, actual_output_tokens,
+              actual_total_tokens, estimated_cost_micro_usd, actual_cost_micro_usd, status, latency_ms
+            ) VALUES
+              (gen_random_uuid(), v_proj_a, v_mcs_a, v_pps_a, v_task_a, 'STAGE_1_IDEA_DISCOVERY', 'anthropic', 'claude-sonnet-4', 'pipeline.stage1.discovery', '1.0.0', repeat('1', 64), repeat('2', 64), 100, 100, 100, 100, 200, 1000, 1000, 'ALLOWED', 25),
+              (gen_random_uuid(), v_proj_b, v_mcs_b, v_pps_b, v_task_b, 'STAGE_1_IDEA_DISCOVERY', 'openai',    'gpt-4.1',         'pipeline.stage1.discovery', '1.0.0', repeat('3', 64), repeat('4', 64), 100, 100, 100, 100, 200, 1000, 1000, 'ALLOWED', 30);
+
+            INSERT INTO stage1_discovery_items (
+              item_id, project_id, pipeline_session_id, kind, title, statement, rationale,
+              clarification_question, confirmation_status, confirmed_by_principal_id, confirmed_at
+            ) VALUES
+              (v_s1_fact_a,       v_proj_a, v_pps_a,     'FACT',       'Fact A',   'Confirmed fact',       'Given',  NULL,          'AUTO_VERIFIED', NULL,             NULL),
+              (v_s1_assump_a,     v_proj_a, v_pps_a,     'ASSUMPTION', 'Assump A', 'Confirmed assumption', 'Q&A ok', 'Confirm SLA?', 'CONFIRMED',    'alice-approver', clock_timestamp()),
+              (v_s1_act_unconf_a, v_proj_a, v_pps_a_act, 'ASSUMPTION', 'Unconf A', 'Unconfirmed assumption','Pending','Confirm?',    'UNCONFIRMED',   NULL,             NULL),
+              (v_s1_fact_b,       v_proj_b, v_pps_b,     'FACT',       'Fact B',   'Project B fact',       'Given',  NULL,          'AUTO_VERIFIED', NULL,             NULL);
+
+            -- M6A pre-freeze negative checks: chk_s1_assumption_not_auto_verified, chk_s1_recommendation_not_auto_verified, trg_stage_artifact_invariants
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage1_discovery_items (
+                item_id, project_id, pipeline_session_id, kind, title, statement, rationale, confirmation_status
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, 'ASSUMPTION', 'Bad Assump', 'Invalid auto-verify', 'R', 'AUTO_VERIFIED'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'chk_s1_assumption_not_auto_verified failed'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage1_discovery_items (
+                item_id, project_id, pipeline_session_id, kind, title, statement, rationale, confirmation_status
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, 'RECOMMENDATION', 'Bad Rec', 'Invalid auto-verify', 'R', 'AUTO_VERIFIED'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'chk_s1_recommendation_not_auto_verified failed'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage_artifacts (
+                artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 1,
+                'openai', 'gpt-4.1', 'pipeline.stage2', '1.0.0', repeat('5', 64),
+                jsonb_build_object('srs', jsonb_build_object('functional_requirements', jsonb_build_array(jsonb_build_object('req_id', 'FR-BAD', 'source_discovery_item_ids', jsonb_build_array(v_s1_act_unconf_a::text))))),
+                repeat('6', 64), 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_stage_artifact_invariants failed to reject UNCONFIRMED Stage 2 reference'; END IF;
+
+            INSERT INTO stage_artifacts (
+              artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+              provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+            ) VALUES
+              (v_sa1_a, v_proj_a, v_pps_a, 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE', 1, 'anthropic', 'claude-sonnet-4', 'pipeline.stage1', '1.0.0', repeat('a', 64), '{"items":[]}'::jsonb, repeat('1', 64), 'alice-dev'),
+              (v_sa2_a, v_proj_a, v_pps_a, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 1, 'openai', 'gpt-4.1', 'pipeline.stage2', '1.0.0', repeat('b', 64), jsonb_build_object('srs', jsonb_build_object('functional_requirements', jsonb_build_array(jsonb_build_object('req_id', 'FR-1', 'source_discovery_item_ids', jsonb_build_array(v_s1_fact_a::text, v_s1_assump_a::text))))), repeat('2', 64), 'alice-dev'),
+              (v_sa3_a, v_proj_a, v_pps_a, 'STAGE_3_ARCHITECTURE', 'STAGE_3_ARCHITECTURE_DESIGN', 1, 'google', 'gemini-2.5-pro', 'pipeline.stage3', '1.0.0', repeat('c', 64), '{"sections":5}'::jsonb, repeat('3', 64), 'alice-dev'),
+              (v_sa4_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 1, 'system', 'consistency-checker', 'pipeline.stage4', '1.0.0', repeat('d', 64), '{"passed":true}'::jsonb, repeat('4', 64), 'alice-approver'),
+              (v_sa4_fail_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 2, 'system', 'consistency-checker', 'pipeline.stage4', '1.0.0', repeat('d', 64), '{"passed":false}'::jsonb, repeat('e', 64), 'alice-approver'),
+              (v_sa1_b, v_proj_b, v_pps_b, 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE', 1, 'anthropic', 'claude-sonnet-4', 'pipeline.stage1', '1.0.0', repeat('f', 64), '{"items":[]}'::jsonb, repeat('9', 64), 'bob-dev');
+
+            INSERT INTO stage_approval_gates (
+              gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id, target_artifact_sha256,
+              approver_principal_id, decision, rationale
+            ) VALUES
+              (v_sag1_a,      v_proj_a, v_pps_a, 'STAGE_1_DISCOVERY',  v_sa1_a,      repeat('1', 64), 'alice-approver', 'APPROVED', 'Stage 1 ok'),
+              (v_sag4_a,      v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_a,      repeat('4', 64), 'alice-approver', 'APPROVED', 'Ready to freeze'),
+              (v_sag4_fail_a, v_proj_a, v_pps_a, 'STAGE_4_SPEC_FREEZE', v_sa4_fail_a, repeat('e', 64), 'alice-approver', 'APPROVED', 'Negative probe gate'),
+              (v_sag1_b,      v_proj_b, v_pps_b, 'STAGE_1_DISCOVERY',  v_sa1_b,      repeat('9', 64), 'bob-approver',   'APPROVED', 'Project B gate');
+
+            -- M6A pre-freeze negative checks: trg_pipeline_session_freeze_lock, fk_bsf_gate, trg_baseline_freeze_invariants
+            v_caught := false;
+            BEGIN
+              UPDATE product_pipeline_sessions SET status = 'FROZEN', frozen_baseline_id = gen_random_uuid() WHERE pipeline_session_id = v_pps_a;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_pipeline_session_freeze_lock failed to reject premature FROZEN status'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO baseline_spec_freezes (
+                baseline_id, project_id, pipeline_session_id,
+                stage1_artifact_id, stage1_artifact_sha256,
+                stage2_artifact_id, stage2_artifact_sha256,
+                stage3_artifact_id, stage3_artifact_sha256,
+                validation_report_artifact_id, validation_report_sha256,
+                approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a,
+                v_sa1_a, repeat('1', 64), v_sa2_a, repeat('2', 64), v_sa3_a, repeat('3', 64),
+                v_sa4_a, repeat('4', 64), v_sag1_a, 'alice-approver', repeat('7', 64)
+              );
+            EXCEPTION WHEN foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'fk_bsf_gate failed to reject wrong-stage gate binding'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO baseline_spec_freezes (
+                baseline_id, project_id, pipeline_session_id,
+                stage1_artifact_id, stage1_artifact_sha256,
+                stage2_artifact_id, stage2_artifact_sha256,
+                stage3_artifact_id, stage3_artifact_sha256,
+                validation_report_artifact_id, validation_report_sha256,
+                approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a,
+                v_sa1_a, repeat('1', 64), v_sa2_a, repeat('2', 64), v_sa3_a, repeat('3', 64),
+                v_sa4_fail_a, repeat('e', 64), v_sag4_fail_a, 'alice-approver', repeat('7', 64)
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_baseline_freeze_invariants failed to reject passed=false report'; END IF;
+
+            -- Commit valid BaselineSpecFreeze & lock v_pps_a to FROZEN
+            INSERT INTO baseline_spec_freezes (
+              baseline_id, project_id, pipeline_session_id,
+              stage1_artifact_id, stage1_artifact_sha256,
+              stage2_artifact_id, stage2_artifact_sha256,
+              stage3_artifact_id, stage3_artifact_sha256,
+              validation_report_artifact_id, validation_report_sha256,
+              approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+            ) VALUES (
+              v_bsf_a, v_proj_a, v_pps_a,
+              v_sa1_a, repeat('1', 64), v_sa2_a, repeat('2', 64), v_sa3_a, repeat('3', 64),
+              v_sa4_a, repeat('4', 64), v_sag4_a, 'alice-approver', repeat('8', 64)
+            );
+            UPDATE product_pipeline_sessions
+              SET status = 'FROZEN', frozen_baseline_id = v_bsf_a, current_stage = 'STAGE_4_SPEC_FREEZE'
+              WHERE pipeline_session_id = v_pps_a;
+
+            -- Post-freeze immutability trigger probes
+            v_caught := false;
+            BEGIN
+              UPDATE stage1_discovery_items SET resolution_note = 'Post-freeze mutation' WHERE item_id = v_s1_assump_a;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_s1_mutable_until_frozen failed after baseline freeze'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage_artifacts (
+                artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+                provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a, 'STAGE_3_ARCHITECTURE', 'STAGE_3_ARCHITECTURE_DESIGN', 2,
+                'google', 'gemini-2.5-pro', 'pipeline.stage3', '1.0.0', repeat('c', 64), '{"sections":5}'::jsonb, repeat('0', 64), 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_stage_artifact_invariants failed to block post-freeze artifact'; END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE product_pipeline_sessions SET status = 'ACTIVE' WHERE pipeline_session_id = v_pps_a;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_pipeline_session_freeze_lock failed to block unfreezing'; END IF;
 
             -- M5 checks: chk_projects_main_ref_sha1, recovered_by_reconciler, resource_usage_metrics CHECK constraints
             v_caught := false;
@@ -401,26 +613,52 @@ jobs:
           END
           $$;
 
-          -- M4-FIX-07 & M5: Seeded Multi-Tenant RLS, Column GRANT & DISCARD ALL Probes under app_runtime
+          -- M4-FIX-07, M5 & M6A: Seeded Multi-Tenant RLS, Column GRANT & DISCARD ALL Probes under app_runtime
           BEGIN;
           SET LOCAL ROLE app_runtime;
           DO $$
           DECLARE
-            v_proj_a  UUID := '33333333-3333-3333-3333-333333333333';
-            v_proj_b  UUID := '44444444-4444-4444-4444-444444444444';
-            v_task_a  UUID := 'a3333333-3333-3333-3333-333333333333';
-            v_task_b  UUID := 'b4444444-4444-4444-4444-444444444444';
-            v_lease_a UUID := 'c3333333-3333-3333-3333-333333333333';
-            v_lease_b UUID := 'c4444444-4444-4444-4444-444444444444';
-            v_cand_b  UUID := 'e4444444-4444-4444-4444-444444444444';
-            v_vr_b    UUID := 'f4444444-4444-4444-4444-444444444444';
-            v_ra_a    UUID := '23333333-3333-3333-3333-333333333333';
-            v_ra_b    UUID := '24444444-4444-4444-4444-444444444444';
-            v_ad_b    UUID := '64444444-4444-4444-4444-444444444444';
+            v_proj_a          UUID := '33333333-3333-3333-3333-333333333333';
+            v_proj_b          UUID := '44444444-4444-4444-4444-444444444444';
+            v_task_a          UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_task_b          UUID := 'b4444444-4444-4444-4444-444444444444';
+            v_lease_a         UUID := 'c3333333-3333-3333-3333-333333333333';
+            v_lease_b         UUID := 'c4444444-4444-4444-4444-444444444444';
+            v_cand_b          UUID := 'e4444444-4444-4444-4444-444444444444';
+            v_vr_b            UUID := 'f4444444-4444-4444-4444-444444444444';
+            v_ra_a            UUID := '23333333-3333-3333-3333-333333333333';
+            v_ra_b            UUID := '24444444-4444-4444-4444-444444444444';
+            v_ad_b            UUID := '64444444-4444-4444-4444-444444444444';
+            v_mcs_a           UUID := '83333333-3333-3333-3333-333333333331';
+            v_mcs_b           UUID := '84444444-4444-4444-4444-444444444441';
+            v_pps_a_act       UUID := '83333333-3333-3333-3333-333333333333';
+            v_pps_b           UUID := '84444444-4444-4444-4444-444444444442';
+            v_s1_act_unconf_a UUID := '93333333-3333-3333-3333-333333333333';
+            v_sa1_b           UUID := 'a5444444-4444-4444-4444-444444444441';
             v_cnt INTEGER;
             v_caught BOOLEAN;
+            v_forced BOOLEAN;
             tbl TEXT;
           BEGIN
+            -- Verify FORCE ROW LEVEL SECURITY on all 7 M6A tables
+            FOREACH tbl IN ARRAY ARRAY[
+              'model_cost_sessions',
+              'model_call_ledgers',
+              'product_pipeline_sessions',
+              'stage1_discovery_items',
+              'stage_artifacts',
+              'stage_approval_gates',
+              'baseline_spec_freezes'
+            ]
+            LOOP
+              SELECT c.relforcerowsecurity INTO v_forced
+              FROM pg_class c
+              WHERE c.relname = tbl AND c.relnamespace = 'public'::regnamespace;
+              IF v_forced IS NOT TRUE THEN
+                RAISE EXCEPTION 'FORCE ROW LEVEL SECURITY missing on %', tbl;
+              END IF;
+            END LOOP;
+
             -- 1. Default deny when app.current_project_id is unset (despite seeded rows)
             SELECT count(*) INTO v_cnt FROM review_sessions;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'review_sessions RLS default deny failed (saw %)', v_cnt; END IF;
@@ -430,6 +668,19 @@ jobs:
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'merge_operations RLS default deny failed (saw %)', v_cnt; END IF;
             SELECT count(*) INTO v_cnt FROM resource_usage_metrics;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'resource_usage_metrics RLS default deny failed (saw %)', v_cnt; END IF;
+            FOREACH tbl IN ARRAY ARRAY[
+              'model_cost_sessions',
+              'model_call_ledgers',
+              'product_pipeline_sessions',
+              'stage1_discovery_items',
+              'stage_artifacts',
+              'stage_approval_gates',
+              'baseline_spec_freezes'
+            ]
+            LOOP
+              EXECUTE format('SELECT count(*) FROM %I', tbl) INTO v_cnt;
+              IF v_cnt <> 0 THEN RAISE EXCEPTION '% RLS default deny failed (saw %)', tbl, v_cnt; END IF;
+            END LOOP;
 
             -- 2. Scoped to Project A as core_api_service
             PERFORM set_config('app.current_project_id', v_proj_a::text, true);
@@ -456,6 +707,35 @@ jobs:
             SELECT count(*) INTO v_cnt FROM resource_usage_metrics WHERE project_id = v_proj_b;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'resource_usage_metrics leaked Project B rows to Project A'; END IF;
 
+            SELECT count(*) INTO v_cnt FROM model_cost_sessions;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'model_cost_sessions tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM product_pipeline_sessions;
+            IF v_cnt <> 2 THEN RAISE EXCEPTION 'product_pipeline_sessions tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM model_call_ledgers;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'model_call_ledgers tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM stage1_discovery_items;
+            IF v_cnt <> 3 THEN RAISE EXCEPTION 'stage1_discovery_items tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM stage_artifacts;
+            IF v_cnt <> 5 THEN RAISE EXCEPTION 'stage_artifacts tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM stage_approval_gates;
+            IF v_cnt <> 3 THEN RAISE EXCEPTION 'stage_approval_gates tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM baseline_spec_freezes;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'baseline_spec_freezes tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+
+            FOREACH tbl IN ARRAY ARRAY[
+              'model_cost_sessions',
+              'model_call_ledgers',
+              'product_pipeline_sessions',
+              'stage1_discovery_items',
+              'stage_artifacts',
+              'stage_approval_gates',
+              'baseline_spec_freezes'
+            ]
+            LOOP
+              EXECUTE format('SELECT count(*) FROM %I WHERE project_id = $1', tbl) INTO v_cnt USING v_proj_b;
+              IF v_cnt <> 0 THEN RAISE EXCEPTION '% leaked Project B rows to Project A', tbl; END IF;
+            END LOOP;
+
             -- Same-tenant INSERT into resource_usage_metrics succeeds for core_api_service
             INSERT INTO resource_usage_metrics (
               metric_id, project_id, task_id, lease_id, lease_epoch,
@@ -466,7 +746,20 @@ jobs:
               1, 0, 'VERIFIER', 40, 1200, 16777216, 'docker', 'cgroup-v2'
             );
 
-            -- 3. Cross-tenant INSERT blocked (42501 insufficient_privilege)
+            -- Same-tenant whitelisted UPDATE on model_cost_sessions & stage1_discovery_items succeeds
+            UPDATE model_cost_sessions
+              SET tokens_used_total = 250, cost_used_micro_usd = 1250, updated_at = clock_timestamp()
+              WHERE cost_session_id = v_mcs_a;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'model_cost_sessions whitelisted UPDATE failed: %', v_cnt; END IF;
+
+            UPDATE stage1_discovery_items
+              SET resolution_note = 'ci-rls-probe', updated_at = clock_timestamp()
+              WHERE item_id = v_s1_act_unconf_a;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'stage1_discovery_items whitelisted UPDATE failed: %', v_cnt; END IF;
+
+            -- 3. Cross-tenant INSERT blocked (42501 insufficient_privilege; 23503 under SECURITY INVOKER RLS triggers)
             v_caught := false;
             BEGIN
               INSERT INTO review_sessions (
@@ -524,7 +817,69 @@ jobs:
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into resource_usage_metrics was not blocked'; END IF;
 
-            -- 4. Cross-tenant UPDATE affects 0 rows & projects_core_api_main_ref_update scoping
+            v_caught := false;
+            BEGIN
+              INSERT INTO model_cost_sessions (
+                cost_session_id, project_id, max_tokens_per_request, max_cost_micro_usd_per_request,
+                session_token_budget, session_cost_budget_micro_usd
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, 1000, 1000, 2000, 2000
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into model_cost_sessions was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO product_pipeline_sessions (
+                pipeline_session_id, project_id, title, raw_idea_text, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, 'Intrusion', 'Cross-tenant', 'intruder'
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into product_pipeline_sessions was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO model_call_ledgers (
+                call_id, project_id, cost_session_id, pipeline_session_id, stage,
+                provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
+                estimated_input_tokens, reserved_output_tokens, estimated_cost_micro_usd, status
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_mcs_b, v_pps_b, 'STAGE_1_IDEA_DISCOVERY',
+                'openai', 'gpt-4.1', 'p', '1.0.0', repeat('1', 64), repeat('2', 64),
+                10, 10, 10, 'ALLOWED'
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into model_call_ledgers was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage_approval_gates (
+                gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id,
+                target_artifact_sha256, approver_principal_id, decision
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_pps_b, 'STAGE_1_DISCOVERY', v_sa1_b,
+                repeat('9', 64), 'intruder', 'APPROVED'
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into stage_approval_gates was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage1_discovery_items (
+                item_id, project_id, pipeline_session_id, kind, title, statement, rationale, confirmation_status
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_pps_b, 'FACT', 'Intrusion', 'Cross-tenant', 'R', 'AUTO_VERIFIED'
+              );
+            EXCEPTION WHEN insufficient_privilege OR foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into stage1_discovery_items was not blocked'; END IF;
+
+            -- 4. Cross-tenant UPDATE affects 0 rows & column-GRANT enforcement
             UPDATE review_sessions SET status = 'REVOKED' WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified review_sessions rows: %', v_cnt; END IF;
@@ -536,6 +891,18 @@ jobs:
             UPDATE merge_operations SET status = 'MERGED' WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified merge_operations rows: %', v_cnt; END IF;
+
+            UPDATE model_cost_sessions SET status = 'EXHAUSTED' WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified model_cost_sessions rows: %', v_cnt; END IF;
+
+            UPDATE product_pipeline_sessions SET status = 'CANCELLED' WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified product_pipeline_sessions rows: %', v_cnt; END IF;
+
+            UPDATE stage1_discovery_items SET resolution_note = 'hijack' WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified stage1_discovery_items rows: %', v_cnt; END IF;
 
             UPDATE projects SET main_ref_commit_hash = repeat('9', 40), updated_at = clock_timestamp() WHERE project_id = v_proj_a;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
@@ -550,11 +917,38 @@ jobs:
               RAISE EXCEPTION 'Non-whitelisted UPDATE on projects.slug was unexpectedly allowed for app_runtime';
             END IF;
 
+            v_caught := false;
+            BEGIN
+              UPDATE model_cost_sessions SET session_cost_budget_micro_usd = 9999999 WHERE cost_session_id = v_mcs_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Non-whitelisted UPDATE on model_cost_sessions.session_cost_budget_micro_usd was unexpectedly allowed';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE product_pipeline_sessions SET raw_idea_text = 'tampered' WHERE pipeline_session_id = v_pps_a_act;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Non-whitelisted UPDATE on product_pipeline_sessions.raw_idea_text was unexpectedly allowed';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE stage1_discovery_items SET statement = 'tampered' WHERE item_id = v_s1_act_unconf_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Non-whitelisted UPDATE on stage1_discovery_items.statement was unexpectedly allowed';
+            END IF;
+
             UPDATE projects SET main_ref_commit_hash = repeat('9', 40) WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant projects UPDATE modified Project B rows: %', v_cnt; END IF;
 
-            -- 5. Append-only UPDATE denied on resource_usage_metrics, DELETE denied on M4 & M5 tables for app_runtime
+            -- 5. Append-only UPDATE denied on append-only tables, DELETE denied on M4/M5/M6A tables for app_runtime
             v_caught := false;
             BEGIN
               UPDATE resource_usage_metrics SET wall_time_ms = 0 WHERE project_id = v_proj_a;
@@ -564,7 +958,55 @@ jobs:
               RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on resource_usage_metrics';
             END IF;
 
-            FOREACH tbl IN ARRAY ARRAY['review_sessions', 'approval_requests', 'merge_operations', 'resource_usage_metrics']
+            v_caught := false;
+            BEGIN
+              UPDATE model_call_ledgers SET actual_cost_micro_usd = 0 WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on model_call_ledgers';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE stage_artifacts SET model = 'tampered' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on stage_artifacts';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE stage_approval_gates SET decision = 'REJECTED' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on stage_approval_gates';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE baseline_spec_freezes SET freeze_bundle_sha256 = repeat('0', 64) WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on baseline_spec_freezes';
+            END IF;
+
+            FOREACH tbl IN ARRAY ARRAY[
+              'review_sessions',
+              'approval_requests',
+              'merge_operations',
+              'resource_usage_metrics',
+              'model_cost_sessions',
+              'model_call_ledgers',
+              'product_pipeline_sessions',
+              'stage1_discovery_items',
+              'stage_artifacts',
+              'stage_approval_gates',
+              'baseline_spec_freezes'
+            ]
             LOOP
               v_caught := false;
               BEGIN
@@ -612,25 +1054,42 @@ jobs:
           DO $$
           DECLARE
             v_cnt INTEGER;
+            tbl TEXT;
           BEGIN
-            SELECT count(*) INTO v_cnt FROM review_sessions;
-            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked review_sessions rows: %', v_cnt; END IF;
-            SELECT count(*) INTO v_cnt FROM approval_requests;
-            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked approval_requests rows: %', v_cnt; END IF;
-            SELECT count(*) INTO v_cnt FROM merge_operations;
-            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked merge_operations rows: %', v_cnt; END IF;
-            SELECT count(*) INTO v_cnt FROM resource_usage_metrics;
-            IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked resource_usage_metrics rows: %', v_cnt; END IF;
+            FOREACH tbl IN ARRAY ARRAY[
+              'review_sessions',
+              'approval_requests',
+              'merge_operations',
+              'resource_usage_metrics',
+              'model_cost_sessions',
+              'model_call_ledgers',
+              'product_pipeline_sessions',
+              'stage1_discovery_items',
+              'stage_artifacts',
+              'stage_approval_gates',
+              'baseline_spec_freezes'
+            ]
+            LOOP
+              EXECUTE format('SELECT count(*) FROM %I', tbl) INTO v_cnt;
+              IF v_cnt <> 0 THEN RAISE EXCEPTION 'DISCARD ALL leaked % rows: %', tbl, v_cnt; END IF;
+            END LOOP;
           END
           $$;
           COMMIT;
 
-          -- Cleanup M4/M5 CI fixtures cleanly as owner
+          -- Cleanup M4/M5/M6A CI fixtures cleanly as owner
           DO $$
           DECLARE
             v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
             v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
           BEGIN
+            DELETE FROM baseline_spec_freezes WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM stage_approval_gates WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM stage_artifacts WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM stage1_discovery_items WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM model_call_ledgers WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM product_pipeline_sessions WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM model_cost_sessions WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM resource_usage_metrics WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM merge_operations WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM approval_decisions WHERE project_id IN (v_proj_a, v_proj_b);
@@ -647,7 +1106,7 @@ jobs:
             DELETE FROM audit_logs WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM project_memberships WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM projects WHERE project_id IN (v_proj_a, v_proj_b);
-            RAISE NOTICE 'M4 & M5 Seeded Multi-Tenant RLS, Column-GRANT & Composite FK Matrix PASSED.';
+            RAISE NOTICE 'M4, M5 & M6A Seeded Multi-Tenant RLS, Column-GRANT & Composite FK Matrix PASSED.';
           END
           $$;
           SQL
@@ -723,11 +1182,13 @@ jobs:
           $$;
           SQL
 
-          # 3. Apply upgraded HEAD 0004 & 0005 twice (upgrade + idempotent re-run) on pre-populated DB
+          # 3. Apply upgraded HEAD 0004, 0005 & 0006 twice (upgrade + idempotent re-run) on pre-populated DB
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
           # 4. Assert upgraded constraints actually replaced the old definitions
@@ -740,10 +1201,13 @@ jobs:
             v_vr2 UUID := 'f3333333-3333-3333-3333-333333333334';
             v_ra2 UUID := '23333333-3333-3333-3333-333333333334';
             v_ar1 UUID := '53333333-3333-3333-3333-333333333333';
+            v_pps UUID := '83333333-3333-3333-3333-333333333339';
             v_caught BOOLEAN := false;
             v_uq_cols INTEGER;
             v_fk_cols INTEGER;
             v_fk_ref_cols INTEGER;
+            v_forced BOOLEAN;
+            m6a_tbl TEXT;
           BEGIN
             SELECT array_length(conkey, 1) INTO v_uq_cols
             FROM pg_constraint
@@ -826,7 +1290,52 @@ jobs:
               RAISE EXCEPTION 'Upgraded 10-column fk_ad_approval_request failed to reject mismatched approval_request_id';
             END IF;
 
-            RAISE NOTICE 'M4 & M5 Upgrade Path Verification (86076639 -> HEAD) PASSED.';
+            -- M6A tables & FORCE RLS + AC-10 check on upgraded DB
+            FOREACH m6a_tbl IN ARRAY ARRAY[
+              'model_cost_sessions',
+              'model_call_ledgers',
+              'product_pipeline_sessions',
+              'stage1_discovery_items',
+              'stage_artifacts',
+              'stage_approval_gates',
+              'baseline_spec_freezes'
+            ]
+            LOOP
+              SELECT c.relforcerowsecurity INTO v_forced
+              FROM pg_class c
+              WHERE c.relname = m6a_tbl AND c.relnamespace = 'public'::regnamespace;
+              IF v_forced IS NOT TRUE THEN
+                RAISE EXCEPTION 'Upgraded DB missing FORCE ROW LEVEL SECURITY on %', m6a_tbl;
+              END IF;
+            END LOOP;
+
+            INSERT INTO product_pipeline_sessions (
+              pipeline_session_id, project_id, title, raw_idea_text, created_by_principal_id
+            ) VALUES (
+              v_pps, v_proj, 'Upgrade M6A Session', 'Verify AC-10 post upgrade', 'alice-dev'
+            );
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO stage1_discovery_items (
+                item_id, project_id, pipeline_session_id, kind, title, statement, rationale, confirmation_status
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_pps, 'ASSUMPTION', 'Bad Assump', 'Invalid auto-verify', 'R', 'AUTO_VERIFIED'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Upgraded chk_s1_assumption_not_auto_verified failed';
+            END IF;
+
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_stage_artifact_invariants') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_stage_artifact_invariants trigger';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_baseline_freeze_invariants') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_baseline_freeze_invariants trigger';
+            END IF;
+
+            RAISE NOTICE 'M4, M5 & M6A Upgrade Path Verification (86076639 -> HEAD) PASSED.';
           END
           $$;
           BEGIN;

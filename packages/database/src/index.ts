@@ -3,12 +3,22 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import {
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
+  type BaselineSpecFreezeRecord,
   type CandidateBoundLineage,
+  type CostPreflightCheckInput,
+  type CostPreflightCheckResult,
+  type CostSessionRecord,
+  type FinalizeModelCallInput,
+  type FinalizeModelCallResult,
   type LeaseSyncStatusResponse,
   type MergeCandidateRecord,
   type MergeOperationRecord,
+  type ModelCallLedgerRecord,
+  type ModelCallStatus,
   type OutboxEventRecord,
   type ProcessedWorkerEventRecord,
+  type ProductPipelineBundle,
+  type ProductPipelineSessionRecord,
   type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
   type ReviewArtifactStatus,
@@ -16,6 +26,9 @@ import {
   type ReviewSessionStatus,
   type ServerEventAckContract,
   type SnapshotRetentionClass,
+  type Stage1DiscoveryItemRecord,
+  type StageApprovalGateRecord,
+  type StageArtifactRecord,
   type TaskLeaseRecord,
   type TaskRecord,
   type TaskStatus,
@@ -28,6 +41,8 @@ import {
   WORKER_EVENT_STATE_TRANSITIONS,
   computeCanonicalPayloadSha256,
   computeTaskExecutionIdempotencyKey,
+  evaluatePostcallLimits,
+  evaluatePreflightLimits,
 } from "@software-factory/shared-types";
 import {
   type GitTreeChangeEntry,
@@ -39,14 +54,30 @@ import {
   ApprovalExpiredOrStaleError,
   type CasMergeResult,
   type ControlPlaneStore,
+  type CreateCostSessionInput,
+  type CreateProductPipelineSessionInput,
+  type CreateStage1DiscoveryItemsInput,
+  type FreezeBaselineSpecInput,
   PostgresRlsError,
   type ProjectMemberRole,
   type ProjectMembershipRecord,
   type ProjectRecord,
   type RecordResourceUsageMetricInput,
+  type RecordStageApprovalGateInput,
+  type RecordStageArtifactInput,
+  type ResolveStage1DiscoveryItemInput,
   type RlsSessionContext,
   SimulatedPostMergeCrashError,
 } from "./types.ts";
+import {
+  buildProductPipelineBundle,
+  computeBaselineFreezeBundleSha256,
+  normalizeCreateStage1DiscoveryItem,
+  validateCreateCostSessionInput,
+  validateFreezeBaselineSpecInvariants,
+  validateStage2Ac10References,
+  validateStageArtifactKindAndHash,
+} from "./m6a-validation.ts";
 import {
   PostgresControlPlaneRepository,
   type PostgresPoolConfig,
@@ -57,6 +88,7 @@ import {
 } from "./postgres-pool.ts";
 
 export * from "./types.ts";
+export * from "./m6a-validation.ts";
 export * from "./postgres-pool.ts";
 
 /**
@@ -95,6 +127,13 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   private mergeOperations: Map<string, MergeOperationRecord> = new Map();
   private resourceUsageMetrics: Map<string, ResourceUsageMetricRecord> = new Map();
   private outboxEvents: Map<string, OutboxEventRecord> = new Map();
+  private costSessions: Map<string, CostSessionRecord> = new Map();
+  private modelCallLedgers: Map<string, ModelCallLedgerRecord> = new Map();
+  private pipelineSessions: Map<string, ProductPipelineSessionRecord> = new Map();
+  private stage1DiscoveryItems: Map<string, Stage1DiscoveryItemRecord> = new Map();
+  private stageArtifacts: Map<string, StageArtifactRecord> = new Map();
+  private stageApprovalGates: Map<string, StageApprovalGateRecord> = new Map();
+  private baselineSpecFreezes: Map<string, BaselineSpecFreezeRecord> = new Map();
 
   // Simulated bare Git repository state per project: ref -> commit_hash, and commit_hash -> metadata
   private gitRefsByProject: Map<string, Map<string, string>> = new Map();
@@ -3259,6 +3298,782 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       }
     }
     return list;
+  }
+
+  // ===========================================================================
+  // Milestone M6A: Model Cost Guard (AC-12b) & Stages 1–4 Product Pipeline
+  // ===========================================================================
+
+  public createCostSession(input: CreateCostSessionInput): CostSessionRecord {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!this.projects.has(input.project_id)) {
+      throw new PostgresRlsError("23503", `Project ${input.project_id} does not exist`);
+    }
+    if (input.task_id) {
+      const task = this.tasks.get(input.task_id);
+      if (!task || task.project_id !== input.project_id) {
+        throw new PostgresRlsError("23503", `Task ${input.task_id} not found for project ${input.project_id}`);
+      }
+    }
+    validateCreateCostSessionInput(input);
+    const costSessionId = input.cost_session_id ?? randomUUID();
+    if (this.costSessions.has(costSessionId)) {
+      throw new PostgresRlsError("23505", `Cost session ${costSessionId} already exists`);
+    }
+    const nowIso = this.clockTimestampIso();
+    const record: CostSessionRecord = {
+      cost_session_id: costSessionId,
+      project_id: input.project_id,
+      pipeline_session_id: input.pipeline_session_id ?? null,
+      task_id: input.task_id ?? null,
+      max_tokens_per_request: input.max_tokens_per_request,
+      max_cost_micro_usd_per_request: input.max_cost_micro_usd_per_request,
+      session_token_budget: input.session_token_budget,
+      session_cost_budget_micro_usd: input.session_cost_budget_micro_usd,
+      tokens_used_total: 0,
+      cost_used_micro_usd: 0,
+      status: "ACTIVE",
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+    this.costSessions.set(costSessionId, record);
+    return { ...record };
+  }
+
+  public getCostSession(costSessionId: string): CostSessionRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    const found = this.costSessions.get(costSessionId);
+    if (!found || found.project_id !== currentProjectId) {
+      return null;
+    }
+    return { ...found };
+  }
+
+  public listModelCallLedgers(filter?: {
+    readonly cost_session_id?: string;
+    readonly pipeline_session_id?: string;
+  }): ModelCallLedgerRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ModelCallLedgerRecord[] = [];
+    for (const l of this.modelCallLedgers.values()) {
+      if (l.project_id !== currentProjectId) {
+        continue;
+      }
+      if (filter?.cost_session_id && l.cost_session_id !== filter.cost_session_id) {
+        continue;
+      }
+      if (filter?.pipeline_session_id && l.pipeline_session_id !== filter.pipeline_session_id) {
+        continue;
+      }
+      list.push({ ...l });
+    }
+    return list;
+  }
+
+  public async preflightCheckCostSession(
+    input: CostPreflightCheckInput
+  ): Promise<CostPreflightCheckResult> {
+    const run = (): Promise<CostPreflightCheckResult> => {
+      this.assertWritePermissionForProject(input.project_id);
+      return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () => {
+        const session = this.costSessions.get(input.cost_session_id);
+        if (!session || session.project_id !== input.project_id) {
+          throw new PostgresRlsError(
+            "23503",
+            `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+          );
+        }
+        const resolvedPipelineId = input.pipeline_session_id ?? session.pipeline_session_id;
+        if (resolvedPipelineId) {
+          const ps = this.pipelineSessions.get(resolvedPipelineId);
+          if (!ps || ps.project_id !== input.project_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Pipeline session ${resolvedPipelineId} not found for project ${input.project_id}`
+            );
+          }
+        }
+        const resolvedTaskId = input.task_id ?? session.task_id;
+        if (resolvedTaskId) {
+          const task = this.tasks.get(resolvedTaskId);
+          if (!task || task.project_id !== input.project_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task ${resolvedTaskId} not found for project ${input.project_id}`
+            );
+          }
+        }
+
+        const violation = evaluatePreflightLimits(session, input);
+        if (!violation) {
+          return { allowed: true, session: { ...session } };
+        }
+
+        const nowIso = this.clockTimestampIso();
+        const blockedLedger: ModelCallLedgerRecord = {
+          call_id: randomUUID(),
+          project_id: input.project_id,
+          cost_session_id: input.cost_session_id,
+          pipeline_session_id: resolvedPipelineId,
+          task_id: resolvedTaskId,
+          stage: input.stage,
+          provider: input.provider,
+          model: input.model,
+          prompt_id: input.prompt_id,
+          prompt_version: input.prompt_version,
+          prompt_sha256: input.prompt_sha256,
+          request_sha256: input.request_sha256,
+          estimated_input_tokens: input.estimated_input_tokens,
+          reserved_output_tokens: input.reserved_output_tokens,
+          actual_input_tokens: 0,
+          actual_output_tokens: 0,
+          actual_total_tokens: 0,
+          estimated_cost_micro_usd: input.estimated_cost_micro_usd,
+          actual_cost_micro_usd: 0,
+          status: "BLOCKED_PREFLIGHT",
+          block_reason: `${violation.limitScope}: ${violation.reason}`,
+          error_message: violation.reason,
+          latency_ms: 0,
+          created_at: nowIso,
+        };
+        this.modelCallLedgers.set(blockedLedger.call_id, blockedLedger);
+        return {
+          allowed: false,
+          limitScope: violation.limitScope,
+          reason: violation.reason,
+          session: { ...session },
+          blockedLedger: { ...blockedLedger },
+        };
+      });
+    };
+
+    if (this.asyncLocalStorage.getStore() !== undefined) {
+      return run();
+    }
+    return this.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      run
+    );
+  }
+
+  public async finalizeModelCallLedger(
+    input: FinalizeModelCallInput
+  ): Promise<FinalizeModelCallResult> {
+    const run = (): Promise<FinalizeModelCallResult> => {
+      this.assertWritePermissionForProject(input.project_id);
+      return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () => {
+        const session = this.costSessions.get(input.cost_session_id);
+        if (!session || session.project_id !== input.project_id) {
+          throw new PostgresRlsError(
+            "23503",
+            `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+          );
+        }
+        const resolvedPipelineId = input.pipeline_session_id ?? session.pipeline_session_id;
+        if (resolvedPipelineId) {
+          const ps = this.pipelineSessions.get(resolvedPipelineId);
+          if (!ps || ps.project_id !== input.project_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Pipeline session ${resolvedPipelineId} not found for project ${input.project_id}`
+            );
+          }
+        }
+        const resolvedTaskId = input.task_id ?? session.task_id;
+        if (resolvedTaskId) {
+          const task = this.tasks.get(resolvedTaskId);
+          if (!task || task.project_id !== input.project_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task ${resolvedTaskId} not found for project ${input.project_id}`
+            );
+          }
+        }
+
+        const nowIso = this.clockTimestampIso();
+        const actualTotalTokens = input.actual_input_tokens + input.actual_output_tokens;
+        const evalRes = evaluatePostcallLimits(
+          session,
+          actualTotalTokens,
+          input.actual_cost_micro_usd
+        );
+
+        const updatedSession: CostSessionRecord = {
+          ...session,
+          tokens_used_total: evalRes.nextTokensUsedTotal,
+          cost_used_micro_usd: evalRes.nextCostUsedMicroUsd,
+          status: evalRes.nextStatus,
+          updated_at: nowIso,
+        };
+        this.costSessions.set(session.cost_session_id, updatedSession);
+
+        const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
+        const ledger: ModelCallLedgerRecord = {
+          call_id: randomUUID(),
+          project_id: input.project_id,
+          cost_session_id: input.cost_session_id,
+          pipeline_session_id: resolvedPipelineId,
+          task_id: resolvedTaskId,
+          stage: input.stage,
+          provider: input.provider,
+          model: input.model,
+          prompt_id: input.prompt_id,
+          prompt_version: input.prompt_version,
+          prompt_sha256: input.prompt_sha256,
+          request_sha256: input.request_sha256,
+          estimated_input_tokens: input.estimated_input_tokens,
+          reserved_output_tokens: input.reserved_output_tokens,
+          actual_input_tokens: input.actual_input_tokens,
+          actual_output_tokens: input.actual_output_tokens,
+          actual_total_tokens: actualTotalTokens,
+          estimated_cost_micro_usd: input.estimated_cost_micro_usd,
+          actual_cost_micro_usd: input.actual_cost_micro_usd,
+          status,
+          block_reason: evalRes.exceeded
+            ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
+            : null,
+          error_message: evalRes.exceeded?.reason ?? input.error_message ?? null,
+          latency_ms: Math.max(0, Math.trunc(input.latency_ms)),
+          created_at: nowIso,
+        };
+        this.modelCallLedgers.set(ledger.call_id, ledger);
+
+        return {
+          allowed: !evalRes.exceeded,
+          ...(evalRes.exceeded
+            ? { limitScope: evalRes.exceeded.limitScope, reason: evalRes.exceeded.reason }
+            : {}),
+          session: { ...updatedSession },
+          ledger: { ...ledger },
+        };
+      });
+    };
+
+    if (this.asyncLocalStorage.getStore() !== undefined) {
+      return run();
+    }
+    return this.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      run
+    );
+  }
+
+  public createProductPipelineSession(
+    input: CreateProductPipelineSessionInput
+  ): ProductPipelineSessionRecord {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!this.projects.has(input.project_id)) {
+      throw new PostgresRlsError("23503", `Project ${input.project_id} does not exist`);
+    }
+    if (
+      !input.title.trim() ||
+      !input.raw_idea_text.trim() ||
+      !input.created_by_principal_id.trim()
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "title, raw_idea_text, and created_by_principal_id must be non-empty"
+      );
+    }
+    if (input.cost_session_id) {
+      const cs = this.costSessions.get(input.cost_session_id);
+      if (!cs || cs.project_id !== input.project_id) {
+        throw new PostgresRlsError(
+          "23503",
+          `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+        );
+      }
+    }
+    const pipelineSessionId = input.pipeline_session_id ?? randomUUID();
+    if (this.pipelineSessions.has(pipelineSessionId)) {
+      throw new PostgresRlsError("23505", `Pipeline session ${pipelineSessionId} already exists`);
+    }
+    const nowIso = this.clockTimestampIso();
+    const record: ProductPipelineSessionRecord = {
+      pipeline_session_id: pipelineSessionId,
+      project_id: input.project_id,
+      cost_session_id: input.cost_session_id ?? null,
+      title: input.title,
+      raw_idea_text: input.raw_idea_text,
+      current_stage: "STAGE_1_IDEA_DISCOVERY",
+      status: "ACTIVE",
+      frozen_baseline_id: null,
+      created_by_principal_id: input.created_by_principal_id,
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+    this.pipelineSessions.set(pipelineSessionId, record);
+    return { ...record };
+  }
+
+  public getProductPipelineSession(pipelineSessionId: string): ProductPipelineSessionRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    const found = this.pipelineSessions.get(pipelineSessionId);
+    if (!found || found.project_id !== currentProjectId) {
+      return null;
+    }
+    return { ...found };
+  }
+
+  public listProductPipelineSessions(): ProductPipelineSessionRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: ProductPipelineSessionRecord[] = [];
+    for (const ps of this.pipelineSessions.values()) {
+      if (ps.project_id === currentProjectId) {
+        list.push({ ...ps });
+      }
+    }
+    return list;
+  }
+
+  public async updateProductPipelineSessionCostSession(input: {
+    readonly project_id: string;
+    readonly pipeline_session_id: string;
+    readonly cost_session_id: string;
+  }): Promise<ProductPipelineSessionRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    return this.withSerializedLock(`pipeline-session:${input.pipeline_session_id}`, () => {
+      const session = this.pipelineSessions.get(input.pipeline_session_id);
+      if (!session || session.project_id !== input.project_id) {
+        throw new PostgresRlsError(
+          "23503",
+          `Pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      if (session.status !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Frozen pipeline session ${input.pipeline_session_id} cannot be mutated`
+        );
+      }
+      const cs = this.costSessions.get(input.cost_session_id);
+      if (!cs || cs.project_id !== input.project_id) {
+        throw new PostgresRlsError(
+          "23503",
+          `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+        );
+      }
+      const updated: ProductPipelineSessionRecord = {
+        ...session,
+        cost_session_id: input.cost_session_id,
+        updated_at: this.clockTimestampIso(),
+      };
+      this.pipelineSessions.set(updated.pipeline_session_id, updated);
+      return { ...updated };
+    });
+  }
+
+  public async createStage1DiscoveryItems(
+    input: CreateStage1DiscoveryItemsInput
+  ): Promise<Stage1DiscoveryItemRecord[]> {
+    this.assertWritePermissionForProject(input.project_id);
+    return this.withSerializedLock(`pipeline-session:${input.pipeline_session_id}`, () => {
+      const session = this.pipelineSessions.get(input.pipeline_session_id);
+      if (!session || session.project_id !== input.project_id) {
+        throw new PostgresRlsError(
+          "23503",
+          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      if (session.status !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${session.status}; stage1_discovery_items cannot be added or modified after baseline freeze`
+        );
+      }
+
+      const nowIso = this.clockTimestampIso();
+      const created: Stage1DiscoveryItemRecord[] = [];
+      const seenIds = new Set<string>();
+      for (const rawItem of input.items) {
+        const normalized = normalizeCreateStage1DiscoveryItem(rawItem);
+        const itemId = rawItem.item_id ?? randomUUID();
+        if (this.stage1DiscoveryItems.has(itemId) || seenIds.has(itemId)) {
+          throw new PostgresRlsError("23505", `Stage 1 discovery item ${itemId} already exists`);
+        }
+        seenIds.add(itemId);
+        created.push({
+          item_id: itemId,
+          project_id: input.project_id,
+          pipeline_session_id: input.pipeline_session_id,
+          kind: rawItem.kind,
+          title: normalized.title,
+          statement: normalized.statement,
+          rationale: rawItem.rationale,
+          clarification_question: rawItem.clarification_question ?? null,
+          confirmation_status: normalized.confirmation_status,
+          confirmed_by_principal_id: null,
+          confirmed_at: null,
+          resolution_note: null,
+          created_at: nowIso,
+          updated_at: nowIso,
+        });
+      }
+
+      for (const rec of created) {
+        this.stage1DiscoveryItems.set(rec.item_id, rec);
+      }
+      return created.map((r) => ({ ...r }));
+    });
+  }
+
+  public async resolveStage1DiscoveryItem(
+    input: ResolveStage1DiscoveryItemInput
+  ): Promise<Stage1DiscoveryItemRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!input.actor_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "actor_principal_id is required to resolve Stage 1 item");
+    }
+    return this.withSerializedLock(`pipeline-session:${input.pipeline_session_id}`, () => {
+      const session = this.pipelineSessions.get(input.pipeline_session_id);
+      if (!session || session.project_id !== input.project_id) {
+        throw new PostgresRlsError(
+          "23503",
+          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      if (session.status !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${session.status}; stage1_discovery_items cannot be modified after baseline freeze`
+        );
+      }
+      const existing = this.stage1DiscoveryItems.get(input.item_id);
+      if (
+        !existing ||
+        existing.project_id !== input.project_id ||
+        existing.pipeline_session_id !== input.pipeline_session_id
+      ) {
+        throw new PostgresRlsError(
+          "23503",
+          `Stage 1 discovery item ${input.item_id} not found in pipeline session ${input.pipeline_session_id}`
+        );
+      }
+      const nowIso = this.clockTimestampIso();
+      const updated: Stage1DiscoveryItemRecord = {
+        ...existing,
+        confirmation_status: input.decision === "CONFIRM" ? "CONFIRMED" : "REJECTED",
+        confirmed_by_principal_id: input.actor_principal_id,
+        confirmed_at: nowIso,
+        resolution_note: input.resolution_note ?? existing.resolution_note,
+        updated_at: nowIso,
+      };
+      this.stage1DiscoveryItems.set(updated.item_id, updated);
+      return { ...updated };
+    });
+  }
+
+  public listStage1DiscoveryItems(pipelineSessionId: string): Stage1DiscoveryItemRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: Stage1DiscoveryItemRecord[] = [];
+    for (const item of this.stage1DiscoveryItems.values()) {
+      if (item.project_id === currentProjectId && item.pipeline_session_id === pipelineSessionId) {
+        list.push({ ...item });
+      }
+    }
+    return list;
+  }
+
+  public async recordStageArtifact(
+    input: RecordStageArtifactInput
+  ): Promise<StageArtifactRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!input.created_by_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "created_by_principal_id must be non-empty");
+    }
+    return this.withSerializedLock(`pipeline-session:${input.pipeline_session_id}`, () => {
+      const session = this.pipelineSessions.get(input.pipeline_session_id);
+      if (!session || session.project_id !== input.project_id) {
+        throw new PostgresRlsError(
+          "23503",
+          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      if (session.status !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${session.status}; new stage artifacts are forbidden after baseline freeze`
+        );
+      }
+
+      const artifactSha = validateStageArtifactKindAndHash({
+        stage: input.stage,
+        artifact_kind: input.artifact_kind,
+        content_json: input.content_json,
+        artifact_sha256: input.artifact_sha256,
+      });
+
+      if (input.stage === "STAGE_2_REQUIREMENTS") {
+        const sessionItems = this.listStage1DiscoveryItems(input.pipeline_session_id);
+        validateStage2Ac10References(input.content_json, sessionItems, input.pipeline_session_id);
+      }
+
+      let maxVersion = 0;
+      for (const existing of this.stageArtifacts.values()) {
+        if (
+          existing.pipeline_session_id === input.pipeline_session_id &&
+          existing.stage === input.stage &&
+          existing.version > maxVersion
+        ) {
+          maxVersion = existing.version;
+        }
+      }
+
+      const artifactId = input.artifact_id ?? randomUUID();
+      if (this.stageArtifacts.has(artifactId)) {
+        throw new PostgresRlsError("23505", `Stage artifact ${artifactId} already exists`);
+      }
+
+      const nowIso = this.clockTimestampIso();
+      const record: StageArtifactRecord = {
+        artifact_id: artifactId,
+        project_id: input.project_id,
+        pipeline_session_id: input.pipeline_session_id,
+        stage: input.stage,
+        artifact_kind: input.artifact_kind,
+        version: maxVersion + 1,
+        provider: input.provider,
+        model: input.model,
+        prompt_id: input.prompt_id,
+        prompt_version: input.prompt_version,
+        prompt_sha256: input.prompt_sha256,
+        content_json: structuredClone(input.content_json),
+        artifact_sha256: artifactSha,
+        created_by_principal_id: input.created_by_principal_id,
+        created_at: nowIso,
+      };
+      this.stageArtifacts.set(artifactId, record);
+
+      if (input.advance_session_stage) {
+        this.pipelineSessions.set(session.pipeline_session_id, {
+          ...session,
+          current_stage: input.advance_session_stage,
+          updated_at: nowIso,
+        });
+      }
+
+      return { ...record, content_json: structuredClone(record.content_json) };
+    });
+  }
+
+  public listStageArtifacts(pipelineSessionId: string): StageArtifactRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: StageArtifactRecord[] = [];
+    for (const art of this.stageArtifacts.values()) {
+      if (art.project_id === currentProjectId && art.pipeline_session_id === pipelineSessionId) {
+        list.push({ ...art, content_json: structuredClone(art.content_json) });
+      }
+    }
+    return list;
+  }
+
+  public getStageArtifactById(artifactId: string): StageArtifactRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    const found = this.stageArtifacts.get(artifactId);
+    if (!found || found.project_id !== currentProjectId) {
+      return null;
+    }
+    return { ...found, content_json: structuredClone(found.content_json) };
+  }
+
+  public async recordStageApprovalGate(
+    input: RecordStageApprovalGateInput
+  ): Promise<StageApprovalGateRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!input.approver_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "approver_principal_id must be non-empty");
+    }
+    return this.withSerializedLock(`pipeline-session:${input.pipeline_session_id}`, () => {
+      const session = this.pipelineSessions.get(input.pipeline_session_id);
+      if (!session || session.project_id !== input.project_id) {
+        throw new PostgresRlsError(
+          "23503",
+          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      const artifact = this.stageArtifacts.get(input.target_artifact_id);
+      if (
+        !artifact ||
+        artifact.project_id !== input.project_id ||
+        artifact.pipeline_session_id !== input.pipeline_session_id ||
+        artifact.artifact_sha256 !== input.target_artifact_sha256
+      ) {
+        throw new PostgresRlsError(
+          "23503",
+          `Target artifact ${input.target_artifact_id} or sha256 does not match session ${input.pipeline_session_id}`
+        );
+      }
+      const gateId = input.gate_id ?? randomUUID();
+      if (this.stageApprovalGates.has(gateId)) {
+        throw new PostgresRlsError("23505", `Stage approval gate ${gateId} already exists`);
+      }
+      const record: StageApprovalGateRecord = {
+        gate_id: gateId,
+        project_id: input.project_id,
+        pipeline_session_id: input.pipeline_session_id,
+        gate_stage: input.gate_stage,
+        target_artifact_id: input.target_artifact_id,
+        target_artifact_sha256: input.target_artifact_sha256,
+        approver_principal_id: input.approver_principal_id,
+        decision: input.decision,
+        rationale: input.rationale ?? null,
+        decided_at: this.clockTimestampIso(),
+      };
+      this.stageApprovalGates.set(gateId, record);
+      return { ...record };
+    });
+  }
+
+  public listStageApprovalGates(pipelineSessionId: string): StageApprovalGateRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const list: StageApprovalGateRecord[] = [];
+    for (const gate of this.stageApprovalGates.values()) {
+      if (gate.project_id === currentProjectId && gate.pipeline_session_id === pipelineSessionId) {
+        list.push({ ...gate });
+      }
+    }
+    return list;
+  }
+
+  public async freezeBaselineSpec(
+    input: FreezeBaselineSpecInput
+  ): Promise<BaselineSpecFreezeRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!input.frozen_by_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "frozen_by_principal_id must be non-empty");
+    }
+    return this.withSerializedLock(`pipeline-session:${input.pipeline_session_id}`, () => {
+      const session = this.pipelineSessions.get(input.pipeline_session_id) ?? null;
+      const existingFreeze = this.getBaselineSpecFreeze(input.pipeline_session_id);
+      validateFreezeBaselineSpecInvariants({
+        request: input,
+        session,
+        stage1Artifact: this.stageArtifacts.get(input.stage1_artifact_id) ?? null,
+        stage2Artifact: this.stageArtifacts.get(input.stage2_artifact_id) ?? null,
+        stage3Artifact: this.stageArtifacts.get(input.stage3_artifact_id) ?? null,
+        validationReportArtifact:
+          this.stageArtifacts.get(input.validation_report_artifact_id) ?? null,
+        approvalGate: this.stageApprovalGates.get(input.approval_gate_id) ?? null,
+        existingFreeze,
+      });
+
+      const baselineId = input.baseline_id ?? randomUUID();
+      if (this.baselineSpecFreezes.has(baselineId)) {
+        throw new PostgresRlsError("23505", `Baseline freeze ${baselineId} already exists`);
+      }
+
+      const nowIso = this.clockTimestampIso();
+      const freezeBundleSha = computeBaselineFreezeBundleSha256(input);
+      const record: BaselineSpecFreezeRecord = {
+        baseline_id: baselineId,
+        project_id: input.project_id,
+        pipeline_session_id: input.pipeline_session_id,
+        stage1_artifact_id: input.stage1_artifact_id,
+        stage1_artifact_sha256: input.stage1_artifact_sha256,
+        stage2_artifact_id: input.stage2_artifact_id,
+        stage2_artifact_sha256: input.stage2_artifact_sha256,
+        stage3_artifact_id: input.stage3_artifact_id,
+        stage3_artifact_sha256: input.stage3_artifact_sha256,
+        validation_report_artifact_id: input.validation_report_artifact_id,
+        validation_report_sha256: input.validation_report_sha256,
+        approval_gate_id: input.approval_gate_id,
+        frozen_by_principal_id: input.frozen_by_principal_id,
+        freeze_bundle_sha256: freezeBundleSha,
+        status: "FROZEN",
+        frozen_at: nowIso,
+      };
+      this.baselineSpecFreezes.set(baselineId, record);
+
+      this.pipelineSessions.set(session!.pipeline_session_id, {
+        ...session!,
+        status: "FROZEN",
+        frozen_baseline_id: baselineId,
+        current_stage: "STAGE_4_SPEC_FREEZE",
+        updated_at: nowIso,
+      });
+
+      this.insertOutboxEventInternal(
+        input.project_id,
+        "product_pipeline",
+        input.pipeline_session_id,
+        "pipeline.baseline_frozen",
+        {
+          pipeline_session_id: input.pipeline_session_id,
+          baseline_id: baselineId,
+          freeze_bundle_sha256: freezeBundleSha,
+          frozen_by_principal_id: input.frozen_by_principal_id,
+        }
+      );
+
+      return { ...record };
+    });
+  }
+
+  public getBaselineSpecFreeze(pipelineSessionId: string): BaselineSpecFreezeRecord | null {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return null;
+    }
+    for (const freeze of this.baselineSpecFreezes.values()) {
+      if (
+        freeze.project_id === currentProjectId &&
+        freeze.pipeline_session_id === pipelineSessionId
+      ) {
+        return { ...freeze };
+      }
+    }
+    return null;
+  }
+
+  public getProductPipelineBundle(pipelineSessionId: string): ProductPipelineBundle | null {
+    const session = this.getProductPipelineSession(pipelineSessionId);
+    if (!session) {
+      return null;
+    }
+    const costSession = session.cost_session_id
+      ? this.getCostSession(session.cost_session_id)
+      : null;
+    return buildProductPipelineBundle({
+      session,
+      costSession,
+      modelCallLedgers: this.listModelCallLedgers({ pipeline_session_id: pipelineSessionId }),
+      discoveryItems: this.listStage1DiscoveryItems(pipelineSessionId),
+      artifacts: this.listStageArtifacts(pipelineSessionId),
+      approvalGates: this.listStageApprovalGates(pipelineSessionId),
+      baselineFreeze: this.getBaselineSpecFreeze(pipelineSessionId),
+    });
   }
 
   private insertOutboxEventInternal(

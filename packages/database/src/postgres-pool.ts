@@ -6,18 +6,38 @@ import tls from "node:tls";
 import {
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
+  type BaselineSpecFreezeRecord,
   type CandidateBoundLineage,
+  type CostPreflightCheckInput,
+  type CostPreflightCheckResult,
+  type CostSessionRecord,
+  type FinalizeModelCallInput,
+  type FinalizeModelCallResult,
   type LeaseSyncStatusResponse,
   type MergeCandidateRecord,
   type MergeOperationRecord,
+  type ModelCallLedgerRecord,
+  type ModelCallStatus,
+  type ModelProviderName,
   type OutboxEventRecord,
+  type PipelineSessionStatus,
+  type PipelineStageName,
   type ProcessedWorkerEventRecord,
+  type ProductPipelineBundle,
+  type ProductPipelineSessionRecord,
   type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
   type ReviewSessionRecord,
   type ReviewSessionStatus,
   type ServerEventAckContract,
   type SnapshotRetentionClass,
+  type Stage1ConfirmationStatus,
+  type Stage1DiscoveryItemRecord,
+  type Stage1ItemKind,
+  type StageApprovalGateRecord,
+  type StageApprovalGateStage,
+  type StageArtifactKind,
+  type StageArtifactRecord,
   type TaskLeaseRecord,
   type TaskRecord,
   type TaskStatus,
@@ -30,6 +50,8 @@ import {
   WORKER_EVENT_STATE_TRANSITIONS,
   computeCanonicalPayloadSha256,
   computeTaskExecutionIdempotencyKey,
+  evaluatePostcallLimits,
+  evaluatePreflightLimits,
 } from "@software-factory/shared-types";
 import {
   type GitTreeChangeEntry,
@@ -38,17 +60,34 @@ import {
   validateGitTreeImport,
 } from "@software-factory/task-contract";
 import {
+  Ac10ViolationError,
   ApprovalExpiredOrStaleError,
   type CasMergeResult,
   type ControlPlaneStore,
+  type CreateCostSessionInput,
+  type CreateProductPipelineSessionInput,
+  type CreateStage1DiscoveryItemsInput,
+  type FreezeBaselineSpecInput,
   PostgresRlsError,
   type ProjectMemberRole,
   type ProjectMembershipRecord,
   type ProjectRecord,
   type RecordResourceUsageMetricInput,
+  type RecordStageApprovalGateInput,
+  type RecordStageArtifactInput,
+  type ResolveStage1DiscoveryItemInput,
   type RlsSessionContext,
   SimulatedPostMergeCrashError,
 } from "./types.ts";
+import {
+  buildProductPipelineBundle,
+  computeBaselineFreezeBundleSha256,
+  normalizeCreateStage1DiscoveryItem,
+  validateCreateCostSessionInput,
+  validateFreezeBaselineSpecInvariants,
+  validateStage2Ac10References,
+  validateStageArtifactKindAndHash,
+} from "./m6a-validation.ts";
 
 export type PostgresSslMode = "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
 
@@ -1355,21 +1394,32 @@ export class PostgresRuntimePool {
 }
 
 function mapPgError(error: unknown): never {
-  if (error instanceof PostgresRlsError || error instanceof ApprovalExpiredOrStaleError || error instanceof SimulatedPostMergeCrashError) {
+  if (
+    error instanceof PostgresRlsError ||
+    error instanceof ApprovalExpiredOrStaleError ||
+    error instanceof SimulatedPostMergeCrashError
+  ) {
     throw error;
   }
   if (error instanceof PostgresQueryError) {
     const sqlState = error.sqlState;
+    const msgWithDetail = error.detail ? `${error.message} (${error.detail})` : error.message;
+    if (
+      sqlState === "23514" &&
+      (/AC-10 violation/i.test(error.message) ||
+        /chk_s1_(?:assumption|recommendation)_not_auto_verified/i.test(
+          error.constraint ?? error.message
+        ))
+    ) {
+      throw new Ac10ViolationError(msgWithDetail);
+    }
     if (
       sqlState === "42501" ||
       sqlState === "23503" ||
       sqlState === "23505" ||
       sqlState === "23514"
     ) {
-      throw new PostgresRlsError(
-        sqlState,
-        error.detail ? `${error.message} (${error.detail})` : error.message
-      );
+      throw new PostgresRlsError(sqlState, msgWithDetail);
     }
   }
   throw error;
@@ -1690,6 +1740,146 @@ function mapOutboxRow(row: Record<string, unknown>): OutboxEventRecord {
     payload_json: (row.payload_json as Record<string, unknown>) ?? {},
     published_at: row.published_at ? String(row.published_at) : null,
     created_at: String(row.created_at),
+  };
+}
+
+function mapCostSessionRow(row: Record<string, unknown>): CostSessionRecord {
+  return {
+    cost_session_id: String(row.cost_session_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: row.pipeline_session_id ? String(row.pipeline_session_id) : null,
+    task_id: row.task_id ? String(row.task_id) : null,
+    max_tokens_per_request: Number(row.max_tokens_per_request),
+    max_cost_micro_usd_per_request: Number(row.max_cost_micro_usd_per_request),
+    session_token_budget: Number(row.session_token_budget),
+    session_cost_budget_micro_usd: Number(row.session_cost_budget_micro_usd),
+    tokens_used_total: Number(row.tokens_used_total),
+    cost_used_micro_usd: Number(row.cost_used_micro_usd),
+    status: String(row.status) as CostSessionRecord["status"],
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapModelCallLedgerRow(row: Record<string, unknown>): ModelCallLedgerRecord {
+  return {
+    call_id: String(row.call_id),
+    project_id: String(row.project_id),
+    cost_session_id: String(row.cost_session_id),
+    pipeline_session_id: row.pipeline_session_id ? String(row.pipeline_session_id) : null,
+    task_id: row.task_id ? String(row.task_id) : null,
+    stage: String(row.stage),
+    provider: String(row.provider) as ModelProviderName,
+    model: String(row.model),
+    prompt_id: String(row.prompt_id),
+    prompt_version: String(row.prompt_version),
+    prompt_sha256: String(row.prompt_sha256).trimEnd(),
+    request_sha256: String(row.request_sha256).trimEnd(),
+    estimated_input_tokens: Number(row.estimated_input_tokens),
+    reserved_output_tokens: Number(row.reserved_output_tokens),
+    actual_input_tokens: Number(row.actual_input_tokens),
+    actual_output_tokens: Number(row.actual_output_tokens),
+    actual_total_tokens: Number(row.actual_total_tokens),
+    estimated_cost_micro_usd: Number(row.estimated_cost_micro_usd),
+    actual_cost_micro_usd: Number(row.actual_cost_micro_usd),
+    status: String(row.status) as ModelCallStatus,
+    block_reason: row.block_reason ? String(row.block_reason) : null,
+    error_message: row.error_message ? String(row.error_message) : null,
+    latency_ms: Number(row.latency_ms),
+    created_at: String(row.created_at),
+  };
+}
+
+function mapProductPipelineSessionRow(row: Record<string, unknown>): ProductPipelineSessionRecord {
+  return {
+    pipeline_session_id: String(row.pipeline_session_id),
+    project_id: String(row.project_id),
+    cost_session_id: row.cost_session_id ? String(row.cost_session_id) : null,
+    title: String(row.title),
+    raw_idea_text: String(row.raw_idea_text),
+    current_stage: String(row.current_stage) as PipelineStageName,
+    status: String(row.status) as PipelineSessionStatus,
+    frozen_baseline_id: row.frozen_baseline_id ? String(row.frozen_baseline_id) : null,
+    created_by_principal_id: String(row.created_by_principal_id),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapStage1DiscoveryItemRow(row: Record<string, unknown>): Stage1DiscoveryItemRecord {
+  return {
+    item_id: String(row.item_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    kind: String(row.kind) as Stage1ItemKind,
+    title: String(row.title),
+    statement: String(row.statement),
+    rationale: String(row.rationale),
+    clarification_question: row.clarification_question ? String(row.clarification_question) : null,
+    confirmation_status: String(row.confirmation_status) as Stage1ConfirmationStatus,
+    confirmed_by_principal_id: row.confirmed_by_principal_id
+      ? String(row.confirmed_by_principal_id)
+      : null,
+    confirmed_at: row.confirmed_at ? String(row.confirmed_at) : null,
+    resolution_note: row.resolution_note ? String(row.resolution_note) : null,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapStageArtifactRow(row: Record<string, unknown>): StageArtifactRecord {
+  return {
+    artifact_id: String(row.artifact_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    stage: String(row.stage) as PipelineStageName,
+    artifact_kind: String(row.artifact_kind) as StageArtifactKind,
+    version: Number(row.version),
+    provider: String(row.provider) as ModelProviderName | "system",
+    model: String(row.model),
+    prompt_id: String(row.prompt_id),
+    prompt_version: String(row.prompt_version),
+    prompt_sha256: String(row.prompt_sha256).trimEnd(),
+    content_json: (row.content_json as Record<string, unknown>) ?? {},
+    artifact_sha256: String(row.artifact_sha256).trimEnd(),
+    created_by_principal_id: String(row.created_by_principal_id),
+    created_at: String(row.created_at),
+  };
+}
+
+function mapStageApprovalGateRow(row: Record<string, unknown>): StageApprovalGateRecord {
+  return {
+    gate_id: String(row.gate_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    gate_stage: String(row.gate_stage) as StageApprovalGateStage,
+    target_artifact_id: String(row.target_artifact_id),
+    target_artifact_sha256: String(row.target_artifact_sha256).trimEnd(),
+    approver_principal_id: String(row.approver_principal_id),
+    decision: String(row.decision) as StageApprovalGateRecord["decision"],
+    rationale: row.rationale ? String(row.rationale) : null,
+    decided_at: String(row.decided_at),
+  };
+}
+
+function mapBaselineSpecFreezeRow(row: Record<string, unknown>): BaselineSpecFreezeRecord {
+  return {
+    baseline_id: String(row.baseline_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    stage1_artifact_id: String(row.stage1_artifact_id),
+    stage1_artifact_sha256: String(row.stage1_artifact_sha256).trimEnd(),
+    stage2_artifact_id: String(row.stage2_artifact_id),
+    stage2_artifact_sha256: String(row.stage2_artifact_sha256).trimEnd(),
+    stage3_artifact_id: String(row.stage3_artifact_id),
+    stage3_artifact_sha256: String(row.stage3_artifact_sha256).trimEnd(),
+    validation_report_artifact_id: String(row.validation_report_artifact_id),
+    validation_report_sha256: String(row.validation_report_sha256).trimEnd(),
+    approval_gate_id: String(row.approval_gate_id),
+    frozen_by_principal_id: String(row.frozen_by_principal_id),
+    freeze_bundle_sha256: String(row.freeze_bundle_sha256).trimEnd(),
+    status: "FROZEN",
+    frozen_at: String(row.frozen_at),
   };
 }
 
@@ -4535,6 +4725,760 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       approvalRequests,
       approvalDecisions,
       mergeOperations,
+    });
+  }
+
+  // ===========================================================================
+  // Milestone M6A: Model Cost Guard (AC-12b) & Stages 1–4 Product Pipeline
+  // ===========================================================================
+
+  public async createCostSession(input: CreateCostSessionInput): Promise<CostSessionRecord> {
+    try {
+      validateCreateCostSessionInput(input);
+      const costSessionId = input.cost_session_id ?? randomUUID();
+      const res = await this.pool.queryInActiveTx(
+        `INSERT INTO model_cost_sessions (
+          cost_session_id, project_id, pipeline_session_id, task_id,
+          max_tokens_per_request, max_cost_micro_usd_per_request,
+          session_token_budget, session_cost_budget_micro_usd,
+          tokens_used_total, cost_used_micro_usd, status
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+          $5::bigint, $6::bigint, $7::bigint, $8::bigint,
+          0, 0, 'ACTIVE'
+        ) RETURNING *;`,
+        [
+          costSessionId,
+          input.project_id,
+          input.pipeline_session_id ?? null,
+          input.task_id ?? null,
+          input.max_tokens_per_request,
+          input.max_cost_micro_usd_per_request,
+          input.session_token_budget,
+          input.session_cost_budget_micro_usd,
+        ]
+      );
+      return mapCostSessionRow(res.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async getCostSession(costSessionId: string): Promise<CostSessionRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM model_cost_sessions WHERE cost_session_id = $1::uuid LIMIT 1;",
+      [costSessionId]
+    );
+    return res.rows[0] ? mapCostSessionRow(res.rows[0]) : null;
+  }
+
+  public async listModelCallLedgers(filter?: {
+    readonly cost_session_id?: string;
+    readonly pipeline_session_id?: string;
+  }): Promise<ModelCallLedgerRecord[]> {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+    if (filter?.cost_session_id) {
+      params.push(filter.cost_session_id);
+      conditions.push(`cost_session_id = $${params.length}::uuid`);
+    }
+    if (filter?.pipeline_session_id) {
+      params.push(filter.pipeline_session_id);
+      conditions.push(`pipeline_session_id = $${params.length}::uuid`);
+    }
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")} ` : "";
+    const res = await this.pool.queryInActiveTx(
+      `SELECT * FROM model_call_ledgers ${whereClause}ORDER BY created_at ASC;`,
+      params
+    );
+    return res.rows.map(mapModelCallLedgerRow);
+  }
+
+  public async preflightCheckCostSession(
+    input: CostPreflightCheckInput
+  ): Promise<CostPreflightCheckResult> {
+    const run = async (): Promise<CostPreflightCheckResult> => {
+      try {
+        const sessRes = await this.pool.queryInActiveTx(
+          `SELECT * FROM model_cost_sessions
+           WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
+           FOR UPDATE;`,
+          [input.cost_session_id, input.project_id]
+        );
+        const sessRow = sessRes.rows[0];
+        if (!sessRow) {
+          throw new PostgresRlsError(
+            "23503",
+            `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+          );
+        }
+        const session = mapCostSessionRow(sessRow);
+        const violation = evaluatePreflightLimits(session, input);
+        if (!violation) {
+          return { allowed: true, session };
+        }
+
+        const callId = randomUUID();
+        const blockReason = `${violation.limitScope}: ${violation.reason}`;
+        const ledgerRes = await this.pool.queryInActiveTx(
+          `INSERT INTO model_call_ledgers (
+            call_id, project_id, cost_session_id, pipeline_session_id, task_id,
+            stage, provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
+            estimated_input_tokens, reserved_output_tokens,
+            actual_input_tokens, actual_output_tokens, actual_total_tokens,
+            estimated_cost_micro_usd, actual_cost_micro_usd,
+            status, block_reason, error_message, latency_ms
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+            $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
+            $13::integer, $14::integer,
+            0, 0, 0,
+            $15::bigint, 0,
+            'BLOCKED_PREFLIGHT', $16::text, $17::text, 0
+          ) RETURNING *;`,
+          [
+            callId,
+            input.project_id,
+            input.cost_session_id,
+            input.pipeline_session_id ?? session.pipeline_session_id,
+            input.task_id ?? session.task_id,
+            input.stage,
+            input.provider,
+            input.model,
+            input.prompt_id,
+            input.prompt_version,
+            input.prompt_sha256,
+            input.request_sha256,
+            input.estimated_input_tokens,
+            input.reserved_output_tokens,
+            input.estimated_cost_micro_usd,
+            blockReason,
+            violation.reason,
+          ]
+        );
+        return {
+          allowed: false,
+          limitScope: violation.limitScope,
+          reason: violation.reason,
+          session,
+          blockedLedger: mapModelCallLedgerRow(ledgerRes.rows[0]!),
+        };
+      } catch (error) {
+        mapPgError(error);
+      }
+    };
+
+    if (this.pool.getActiveTxSession()) {
+      return run();
+    }
+    return this.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      run
+    );
+  }
+
+  public async finalizeModelCallLedger(
+    input: FinalizeModelCallInput
+  ): Promise<FinalizeModelCallResult> {
+    const run = async (): Promise<FinalizeModelCallResult> => {
+      try {
+        const sessRes = await this.pool.queryInActiveTx(
+          `SELECT * FROM model_cost_sessions
+           WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
+           FOR UPDATE;`,
+          [input.cost_session_id, input.project_id]
+        );
+        const sessRow = sessRes.rows[0];
+        if (!sessRow) {
+          throw new PostgresRlsError(
+            "23503",
+            `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+          );
+        }
+        const session = mapCostSessionRow(sessRow);
+        const actualTotalTokens = input.actual_input_tokens + input.actual_output_tokens;
+        const evalRes = evaluatePostcallLimits(
+          session,
+          actualTotalTokens,
+          input.actual_cost_micro_usd
+        );
+
+        const updRes = await this.pool.queryInActiveTx(
+          `UPDATE model_cost_sessions
+           SET tokens_used_total = $1::bigint,
+               cost_used_micro_usd = $2::bigint,
+               status = $3::text,
+               updated_at = clock_timestamp()
+           WHERE cost_session_id = $4::uuid AND project_id = $5::uuid
+           RETURNING *;`,
+          [
+            evalRes.nextTokensUsedTotal,
+            evalRes.nextCostUsedMicroUsd,
+            evalRes.nextStatus,
+            input.cost_session_id,
+            input.project_id,
+          ]
+        );
+        const updatedSession = mapCostSessionRow(updRes.rows[0]!);
+
+        const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
+        const blockReason = evalRes.exceeded
+          ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
+          : null;
+        const errorMessage = evalRes.exceeded?.reason ?? input.error_message ?? null;
+        const callId = randomUUID();
+
+        const ledgerRes = await this.pool.queryInActiveTx(
+          `INSERT INTO model_call_ledgers (
+            call_id, project_id, cost_session_id, pipeline_session_id, task_id,
+            stage, provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
+            estimated_input_tokens, reserved_output_tokens,
+            actual_input_tokens, actual_output_tokens, actual_total_tokens,
+            estimated_cost_micro_usd, actual_cost_micro_usd,
+            status, block_reason, error_message, latency_ms
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+            $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
+            $13::integer, $14::integer,
+            $15::integer, $16::integer, $17::integer,
+            $18::bigint, $19::bigint,
+            $20::text, $21::text, $22::text, $23::integer
+          ) RETURNING *;`,
+          [
+            callId,
+            input.project_id,
+            input.cost_session_id,
+            input.pipeline_session_id ?? session.pipeline_session_id,
+            input.task_id ?? session.task_id,
+            input.stage,
+            input.provider,
+            input.model,
+            input.prompt_id,
+            input.prompt_version,
+            input.prompt_sha256,
+            input.request_sha256,
+            input.estimated_input_tokens,
+            input.reserved_output_tokens,
+            input.actual_input_tokens,
+            input.actual_output_tokens,
+            actualTotalTokens,
+            input.estimated_cost_micro_usd,
+            input.actual_cost_micro_usd,
+            status,
+            blockReason,
+            errorMessage,
+            Math.max(0, Math.trunc(input.latency_ms)),
+          ]
+        );
+        const ledger = mapModelCallLedgerRow(ledgerRes.rows[0]!);
+        return {
+          allowed: !evalRes.exceeded,
+          ...(evalRes.exceeded
+            ? { limitScope: evalRes.exceeded.limitScope, reason: evalRes.exceeded.reason }
+            : {}),
+          session: updatedSession,
+          ledger,
+        };
+      } catch (error) {
+        mapPgError(error);
+      }
+    };
+
+    if (this.pool.getActiveTxSession()) {
+      return run();
+    }
+    return this.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      run
+    );
+  }
+
+  public async createProductPipelineSession(
+    input: CreateProductPipelineSessionInput
+  ): Promise<ProductPipelineSessionRecord> {
+    try {
+      const pipelineSessionId = input.pipeline_session_id ?? randomUUID();
+      const res = await this.pool.queryInActiveTx(
+        `INSERT INTO product_pipeline_sessions (
+          pipeline_session_id, project_id, cost_session_id,
+          title, raw_idea_text, current_stage, status, created_by_principal_id
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid,
+          $4::text, $5::text, 'STAGE_1_IDEA_DISCOVERY', 'ACTIVE', $6::text
+        ) RETURNING *;`,
+        [
+          pipelineSessionId,
+          input.project_id,
+          input.cost_session_id ?? null,
+          input.title,
+          input.raw_idea_text,
+          input.created_by_principal_id,
+        ]
+      );
+      return mapProductPipelineSessionRow(res.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async getProductPipelineSession(
+    pipelineSessionId: string
+  ): Promise<ProductPipelineSessionRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM product_pipeline_sessions WHERE pipeline_session_id = $1::uuid LIMIT 1;",
+      [pipelineSessionId]
+    );
+    return res.rows[0] ? mapProductPipelineSessionRow(res.rows[0]) : null;
+  }
+
+  public async listProductPipelineSessions(): Promise<ProductPipelineSessionRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM product_pipeline_sessions ORDER BY created_at ASC;"
+    );
+    return res.rows.map(mapProductPipelineSessionRow);
+  }
+
+  public async updateProductPipelineSessionCostSession(input: {
+    readonly project_id: string;
+    readonly pipeline_session_id: string;
+    readonly cost_session_id: string;
+  }): Promise<ProductPipelineSessionRecord> {
+    try {
+      const res = await this.pool.queryInActiveTx(
+        `UPDATE product_pipeline_sessions
+         SET cost_session_id = $1::uuid,
+             updated_at = clock_timestamp()
+         WHERE pipeline_session_id = $2::uuid AND project_id = $3::uuid
+         RETURNING *;`,
+        [input.cost_session_id, input.pipeline_session_id, input.project_id]
+      );
+      if (!res.rows[0]) {
+        throw new PostgresRlsError(
+          "23503",
+          `Pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      return mapProductPipelineSessionRow(res.rows[0]);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async createStage1DiscoveryItems(
+    input: CreateStage1DiscoveryItemsInput
+  ): Promise<Stage1DiscoveryItemRecord[]> {
+    try {
+      const sessRes = await this.pool.queryInActiveTx(
+        `SELECT status FROM product_pipeline_sessions
+         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+         FOR UPDATE;`,
+        [input.pipeline_session_id, input.project_id]
+      );
+      const sessRow = sessRes.rows[0];
+      if (!sessRow) {
+        throw new PostgresRlsError(
+          "23503",
+          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      if (String(sessRow.status) !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; stage1_discovery_items cannot be added or modified after baseline freeze`
+        );
+      }
+
+      const normalizedItems = input.items.map((raw) => ({
+        raw,
+        normalized: normalizeCreateStage1DiscoveryItem(raw),
+      }));
+
+      const inserted: Stage1DiscoveryItemRecord[] = [];
+      for (const { raw, normalized } of normalizedItems) {
+        const itemId = raw.item_id ?? randomUUID();
+        const res = await this.pool.queryInActiveTx(
+          `INSERT INTO stage1_discovery_items (
+            item_id, project_id, pipeline_session_id, kind,
+            title, statement, rationale, clarification_question, confirmation_status
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::text,
+            $5::text, $6::text, $7::text, $8::text, $9::text
+          ) RETURNING *;`,
+          [
+            itemId,
+            input.project_id,
+            input.pipeline_session_id,
+            raw.kind,
+            normalized.title,
+            normalized.statement,
+            raw.rationale,
+            raw.clarification_question ?? null,
+            normalized.confirmation_status,
+          ]
+        );
+        inserted.push(mapStage1DiscoveryItemRow(res.rows[0]!));
+      }
+      return inserted;
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async resolveStage1DiscoveryItem(
+    input: ResolveStage1DiscoveryItemInput
+  ): Promise<Stage1DiscoveryItemRecord> {
+    if (!input.actor_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "actor_principal_id is required to resolve Stage 1 item");
+    }
+    try {
+      const nextStatus = input.decision === "CONFIRM" ? "CONFIRMED" : "REJECTED";
+      const res = await this.pool.queryInActiveTx(
+        `UPDATE stage1_discovery_items
+         SET confirmation_status = $1::text,
+             confirmed_by_principal_id = $2::text,
+             confirmed_at = clock_timestamp(),
+             resolution_note = COALESCE($3::text, resolution_note),
+             updated_at = clock_timestamp()
+         WHERE item_id = $4::uuid
+           AND pipeline_session_id = $5::uuid
+           AND project_id = $6::uuid
+         RETURNING *;`,
+        [
+          nextStatus,
+          input.actor_principal_id,
+          input.resolution_note ?? null,
+          input.item_id,
+          input.pipeline_session_id,
+          input.project_id,
+        ]
+      );
+      if (!res.rows[0]) {
+        throw new PostgresRlsError(
+          "23503",
+          `Stage 1 discovery item ${input.item_id} not found in pipeline session ${input.pipeline_session_id}`
+        );
+      }
+      return mapStage1DiscoveryItemRow(res.rows[0]);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async listStage1DiscoveryItems(
+    pipelineSessionId: string
+  ): Promise<Stage1DiscoveryItemRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM stage1_discovery_items WHERE pipeline_session_id = $1::uuid ORDER BY created_at ASC;",
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapStage1DiscoveryItemRow);
+  }
+
+  public async recordStageArtifact(
+    input: RecordStageArtifactInput
+  ): Promise<StageArtifactRecord> {
+    try {
+      const sessRes = await this.pool.queryInActiveTx(
+        `SELECT status FROM product_pipeline_sessions
+         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+         FOR UPDATE;`,
+        [input.pipeline_session_id, input.project_id]
+      );
+      const sessRow = sessRes.rows[0];
+      if (!sessRow) {
+        throw new PostgresRlsError(
+          "23503",
+          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+        );
+      }
+      if (String(sessRow.status) !== "ACTIVE") {
+        throw new PostgresRlsError(
+          "23514",
+          `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; new stage artifacts are forbidden after baseline freeze`
+        );
+      }
+
+      const artifactSha = validateStageArtifactKindAndHash({
+        stage: input.stage,
+        artifact_kind: input.artifact_kind,
+        content_json: input.content_json,
+        artifact_sha256: input.artifact_sha256,
+      });
+
+      if (input.stage === "STAGE_2_REQUIREMENTS") {
+        const items = await this.listStage1DiscoveryItems(input.pipeline_session_id);
+        validateStage2Ac10References(input.content_json, items, input.pipeline_session_id);
+      }
+
+      const verRes = await this.pool.queryInActiveTx<{ next_version: number }>(
+        `SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+         FROM stage_artifacts
+         WHERE pipeline_session_id = $1::uuid AND stage = $2::text;`,
+        [input.pipeline_session_id, input.stage]
+      );
+      const nextVersion = Number(verRes.rows[0]?.next_version ?? 1);
+      const artifactId = input.artifact_id ?? randomUUID();
+
+      const insRes = await this.pool.queryInActiveTx(
+        `INSERT INTO stage_artifacts (
+          artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+          provider, model, prompt_id, prompt_version, prompt_sha256,
+          content_json, artifact_sha256, created_by_principal_id
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::integer,
+          $7::text, $8::text, $9::text, $10::text, $11::char(64),
+          $12::jsonb, $13::char(64), $14::text
+        ) RETURNING *;`,
+        [
+          artifactId,
+          input.project_id,
+          input.pipeline_session_id,
+          input.stage,
+          input.artifact_kind,
+          nextVersion,
+          input.provider,
+          input.model,
+          input.prompt_id,
+          input.prompt_version,
+          input.prompt_sha256,
+          input.content_json,
+          artifactSha,
+          input.created_by_principal_id,
+        ]
+      );
+
+      if (input.advance_session_stage) {
+        await this.pool.queryInActiveTx(
+          `UPDATE product_pipeline_sessions
+           SET current_stage = $1::text, updated_at = clock_timestamp()
+           WHERE pipeline_session_id = $2::uuid AND project_id = $3::uuid;`,
+          [input.advance_session_stage, input.pipeline_session_id, input.project_id]
+        );
+      }
+
+      return mapStageArtifactRow(insRes.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async listStageArtifacts(pipelineSessionId: string): Promise<StageArtifactRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM stage_artifacts WHERE pipeline_session_id = $1::uuid ORDER BY created_at ASC, version ASC;",
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapStageArtifactRow);
+  }
+
+  public async getStageArtifactById(artifactId: string): Promise<StageArtifactRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+      [artifactId]
+    );
+    return res.rows[0] ? mapStageArtifactRow(res.rows[0]) : null;
+  }
+
+  public async recordStageApprovalGate(
+    input: RecordStageApprovalGateInput
+  ): Promise<StageApprovalGateRecord> {
+    try {
+      const gateId = input.gate_id ?? randomUUID();
+      const res = await this.pool.queryInActiveTx(
+        `INSERT INTO stage_approval_gates (
+          gate_id, project_id, pipeline_session_id, gate_stage,
+          target_artifact_id, target_artifact_sha256,
+          approver_principal_id, decision, rationale
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::text,
+          $5::uuid, $6::char(64),
+          $7::text, $8::text, $9::text
+        ) RETURNING *;`,
+        [
+          gateId,
+          input.project_id,
+          input.pipeline_session_id,
+          input.gate_stage,
+          input.target_artifact_id,
+          input.target_artifact_sha256,
+          input.approver_principal_id,
+          input.decision,
+          input.rationale ?? null,
+        ]
+      );
+      return mapStageApprovalGateRow(res.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async listStageApprovalGates(
+    pipelineSessionId: string
+  ): Promise<StageApprovalGateRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM stage_approval_gates WHERE pipeline_session_id = $1::uuid ORDER BY decided_at ASC;",
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapStageApprovalGateRow);
+  }
+
+  public async freezeBaselineSpec(
+    input: FreezeBaselineSpecInput
+  ): Promise<BaselineSpecFreezeRecord> {
+    try {
+      const sessRes = await this.pool.queryInActiveTx(
+        `SELECT * FROM product_pipeline_sessions
+         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+         FOR UPDATE;`,
+        [input.pipeline_session_id, input.project_id]
+      );
+      const session = sessRes.rows[0] ? mapProductPipelineSessionRow(sessRes.rows[0]) : null;
+
+      const s1Res = await this.pool.queryInActiveTx(
+        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+        [input.stage1_artifact_id]
+      );
+      const s2Res = await this.pool.queryInActiveTx(
+        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+        [input.stage2_artifact_id]
+      );
+      const s3Res = await this.pool.queryInActiveTx(
+        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+        [input.stage3_artifact_id]
+      );
+      const s4Res = await this.pool.queryInActiveTx(
+        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+        [input.validation_report_artifact_id]
+      );
+      const gateRes = await this.pool.queryInActiveTx(
+        "SELECT * FROM stage_approval_gates WHERE gate_id = $1::uuid LIMIT 1;",
+        [input.approval_gate_id]
+      );
+      const existingRes = await this.pool.queryInActiveTx(
+        "SELECT * FROM baseline_spec_freezes WHERE pipeline_session_id = $1::uuid LIMIT 1;",
+        [input.pipeline_session_id]
+      );
+
+      validateFreezeBaselineSpecInvariants({
+        request: input,
+        session,
+        stage1Artifact: s1Res.rows[0] ? mapStageArtifactRow(s1Res.rows[0]) : null,
+        stage2Artifact: s2Res.rows[0] ? mapStageArtifactRow(s2Res.rows[0]) : null,
+        stage3Artifact: s3Res.rows[0] ? mapStageArtifactRow(s3Res.rows[0]) : null,
+        validationReportArtifact: s4Res.rows[0] ? mapStageArtifactRow(s4Res.rows[0]) : null,
+        approvalGate: gateRes.rows[0] ? mapStageApprovalGateRow(gateRes.rows[0]) : null,
+        existingFreeze: existingRes.rows[0] ? mapBaselineSpecFreezeRow(existingRes.rows[0]) : null,
+      });
+
+      const baselineId = input.baseline_id ?? randomUUID();
+      const freezeBundleSha = computeBaselineFreezeBundleSha256(input);
+
+      const insRes = await this.pool.queryInActiveTx(
+        `INSERT INTO baseline_spec_freezes (
+          baseline_id, project_id, pipeline_session_id,
+          stage1_artifact_id, stage1_artifact_sha256,
+          stage2_artifact_id, stage2_artifact_sha256,
+          stage3_artifact_id, stage3_artifact_sha256,
+          validation_report_artifact_id, validation_report_sha256,
+          approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256, status
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid,
+          $4::uuid, $5::char(64),
+          $6::uuid, $7::char(64),
+          $8::uuid, $9::char(64),
+          $10::uuid, $11::char(64),
+          $12::uuid, $13::text, $14::char(64), 'FROZEN'
+        ) RETURNING *;`,
+        [
+          baselineId,
+          input.project_id,
+          input.pipeline_session_id,
+          input.stage1_artifact_id,
+          input.stage1_artifact_sha256,
+          input.stage2_artifact_id,
+          input.stage2_artifact_sha256,
+          input.stage3_artifact_id,
+          input.stage3_artifact_sha256,
+          input.validation_report_artifact_id,
+          input.validation_report_sha256,
+          input.approval_gate_id,
+          input.frozen_by_principal_id,
+          freezeBundleSha,
+        ]
+      );
+
+      await this.pool.queryInActiveTx(
+        `UPDATE product_pipeline_sessions
+         SET status = 'FROZEN',
+             frozen_baseline_id = $1::uuid,
+             current_stage = 'STAGE_4_SPEC_FREEZE',
+             updated_at = clock_timestamp()
+         WHERE pipeline_session_id = $2::uuid AND project_id = $3::uuid;`,
+        [baselineId, input.pipeline_session_id, input.project_id]
+      );
+
+      await this.insertOutboxEventSql(
+        input.project_id,
+        "product_pipeline",
+        input.pipeline_session_id,
+        "pipeline.baseline_frozen",
+        {
+          pipeline_session_id: input.pipeline_session_id,
+          baseline_id: baselineId,
+          freeze_bundle_sha256: freezeBundleSha,
+          frozen_by_principal_id: input.frozen_by_principal_id,
+        }
+      );
+
+      return mapBaselineSpecFreezeRow(insRes.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async getBaselineSpecFreeze(
+    pipelineSessionId: string
+  ): Promise<BaselineSpecFreezeRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM baseline_spec_freezes WHERE pipeline_session_id = $1::uuid LIMIT 1;",
+      [pipelineSessionId]
+    );
+    return res.rows[0] ? mapBaselineSpecFreezeRow(res.rows[0]) : null;
+  }
+
+  public async getProductPipelineBundle(
+    pipelineSessionId: string
+  ): Promise<ProductPipelineBundle | null> {
+    const session = await this.getProductPipelineSession(pipelineSessionId);
+    if (!session) {
+      return null;
+    }
+    const costSession = session.cost_session_id
+      ? await this.getCostSession(session.cost_session_id)
+      : null;
+    const modelCallLedgers = await this.listModelCallLedgers({
+      pipeline_session_id: pipelineSessionId,
+    });
+    const discoveryItems = await this.listStage1DiscoveryItems(pipelineSessionId);
+    const artifacts = await this.listStageArtifacts(pipelineSessionId);
+    const approvalGates = await this.listStageApprovalGates(pipelineSessionId);
+    const baselineFreeze = await this.getBaselineSpecFreeze(pipelineSessionId);
+
+    return buildProductPipelineBundle({
+      session,
+      costSession,
+      modelCallLedgers,
+      discoveryItems,
+      artifacts,
+      approvalGates,
+      baselineFreeze,
     });
   }
 }

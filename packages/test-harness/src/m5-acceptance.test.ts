@@ -2048,7 +2048,7 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
       const lease2 = await coreClient.dispatchTaskLease(projectAId, authOp, task2.task_id, {
         worker_id: `pg-worker-orphan-${suffix}`,
         heartbeat_interval_ms: 1000,
-        lease_ttl_ms: 5000,
+        lease_ttl_ms: 12000,
       });
       const wt2 = tokenService.issueLeasePushToken({
         projectId: projectAId,
@@ -2108,8 +2108,8 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
       });
       assert.equal(crashRes2.outcome, "SIMULATED_CRASH_BEFORE_COMPLETED");
 
-      // Wait for real PostgreSQL clock_timestamp() to pass 5000ms TTL
-      await new Promise((r) => setTimeout(r, 5150));
+      // Wait for real PostgreSQL clock_timestamp() to pass 12000ms TTL
+      await new Promise((r) => setTimeout(r, 12150));
       const recoveredPg = await coreClient.runOrphanedPushReconciler(projectAId, authOp);
       const matchedRec = recoveredPg.find((r) => r.task_id === task2.task_id);
       assert.ok(matchedRec);
