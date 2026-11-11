@@ -388,7 +388,7 @@ export interface ControlPlaneStore {
     };
     simulateCrashAfterGitUpdateRef?: boolean;
   }): Promise<CasMergeResult>;
-  getMainRefCommitHash(): string | null | Promise<string | null>;
+  getMainRefCommitHash(projectId?: string): string | null | Promise<string | null>;
   getMergeCandidateById(
     mergeCandidateId: string
   ): MergeCandidateRecord | null | Promise<MergeCandidateRecord | null>;

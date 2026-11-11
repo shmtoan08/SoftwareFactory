@@ -1,6 +1,8 @@
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, pbkdf2Sync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { readFileSync } from "node:fs";
 import net from "node:net";
+import tls from "node:tls";
 import {
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
@@ -48,6 +50,8 @@ import {
   SimulatedPostMergeCrashError,
 } from "./types.ts";
 
+export type PostgresSslMode = "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
+
 export interface PostgresPoolConfig {
   readonly host: string;
   readonly port: number;
@@ -56,7 +60,19 @@ export interface PostgresPoolConfig {
   readonly password?: string;
   readonly maxConnections?: number;
   readonly connectTimeoutMs?: number;
+  readonly queryTimeoutMs?: number;
+  readonly acquireTimeoutMs?: number;
+  readonly socketTimeoutMs?: number;
+  readonly maxRecvBufferBytes?: number;
+  readonly maxScramIterations?: number;
   readonly applicationName?: string;
+  readonly sslMode?: PostgresSslMode;
+  readonly sslRootCertPath?: string;
+  readonly sslCaPem?: string;
+  readonly sslServername?: string;
+  readonly allowInsecureRemoteDisableSsl?: boolean;
+  readonly allowInsecureCleartextAuth?: boolean;
+  readonly allowLegacyMd5Auth?: boolean;
 }
 
 export interface PostgresPoolStats {
@@ -94,9 +110,85 @@ export class PostgresQueryError extends Error {
   }
 }
 
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().replace(/^\[|\]$/g, "").toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized.startsWith("127.")
+  );
+}
+
+function parseSslMode(raw: string | undefined): PostgresSslMode | undefined {
+  if (!raw || raw.trim().length === 0) {
+    return undefined;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (
+    normalized === "disable" ||
+    normalized === "prefer" ||
+    normalized === "require" ||
+    normalized === "verify-ca" ||
+    normalized === "verify-full"
+  ) {
+    return normalized;
+  }
+  throw new Error(`Unsupported PostgreSQL sslmode: ${raw}`);
+}
+
+function parseOptionalPositiveInt(raw: string | undefined): number | undefined {
+  if (!raw || raw.trim().length === 0) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(raw.trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Expected positive integer config value, got: ${raw}`);
+  }
+  return parsed;
+}
+
 export function buildPostgresPoolConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env
 ): PostgresPoolConfig | null {
+  const parseSharedOptions = (urlParams?: URLSearchParams) => {
+    const sslMode = parseSslMode(urlParams?.get("sslmode") ?? env.PGSSLMODE);
+    const sslRootCertPath =
+      urlParams?.get("sslrootcert")?.trim() || env.PGSSLROOTCERT?.trim() || undefined;
+    const connectSeconds = parseOptionalPositiveInt(
+      urlParams?.get("connect_timeout") ?? undefined
+    );
+    const connectTimeoutMs =
+      parseOptionalPositiveInt(env.PGCONNECT_TIMEOUT_MS) ??
+      (connectSeconds !== undefined ? connectSeconds * 1000 : undefined);
+    const queryTimeoutMs =
+      parseOptionalPositiveInt(urlParams?.get("query_timeout") ?? undefined) ??
+      parseOptionalPositiveInt(env.PGQUERY_TIMEOUT_MS);
+    const acquireTimeoutMs =
+      parseOptionalPositiveInt(urlParams?.get("acquire_timeout") ?? undefined) ??
+      parseOptionalPositiveInt(env.PGACQUIRE_TIMEOUT_MS);
+    const socketTimeoutMs = parseOptionalPositiveInt(env.PGSOCKET_TIMEOUT_MS);
+    const maxRecvBufferBytes = parseOptionalPositiveInt(env.PGMAX_RECV_BUFFER_BYTES);
+    const maxScramIterations = parseOptionalPositiveInt(env.PGMAX_SCRAM_ITERATIONS);
+    return {
+      ...(sslMode ? { sslMode } : {}),
+      ...(sslRootCertPath ? { sslRootCertPath } : {}),
+      ...(connectTimeoutMs !== undefined ? { connectTimeoutMs } : {}),
+      ...(queryTimeoutMs !== undefined ? { queryTimeoutMs } : {}),
+      ...(acquireTimeoutMs !== undefined ? { acquireTimeoutMs } : {}),
+      ...(socketTimeoutMs !== undefined ? { socketTimeoutMs } : {}),
+      ...(maxRecvBufferBytes !== undefined ? { maxRecvBufferBytes } : {}),
+      ...(maxScramIterations !== undefined ? { maxScramIterations } : {}),
+      ...(env.PG_ALLOW_INSECURE_CLEARTEXT_AUTH === "1"
+        ? { allowInsecureCleartextAuth: true }
+        : {}),
+      ...(env.PG_ALLOW_LEGACY_MD5_AUTH === "1" ? { allowLegacyMd5Auth: true } : {}),
+      ...(env.PG_ALLOW_INSECURE_REMOTE_DISABLE_SSL === "1"
+        ? { allowInsecureRemoteDisableSsl: true }
+        : {}),
+    };
+  };
+
   if (env.DATABASE_URL && env.DATABASE_URL.trim().length > 0) {
     const parsed = new URL(env.DATABASE_URL);
     return {
@@ -106,7 +198,8 @@ export function buildPostgresPoolConfigFromEnv(
       user: decodeURIComponent(parsed.username || "postgres"),
       password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
       maxConnections: env.PGPOOL_MAX ? Number.parseInt(env.PGPOOL_MAX, 10) : 10,
-      applicationName: "software-factory-runtime",
+      applicationName: parsed.searchParams.get("application_name") || "software-factory-runtime",
+      ...parseSharedOptions(parsed.searchParams),
     };
   }
   if (!env.PGHOST || env.PGHOST.trim().length === 0) {
@@ -120,6 +213,7 @@ export function buildPostgresPoolConfigFromEnv(
     password: env.PGPASSWORD,
     maxConnections: env.PGPOOL_MAX ? Number.parseInt(env.PGPOOL_MAX, 10) : 10,
     applicationName: "software-factory-runtime",
+    ...parseSharedOptions(),
   };
 }
 
@@ -272,38 +366,88 @@ function parsePgErrorFields(payload: Buffer): {
   return { sqlState, message, constraint, detail };
 }
 
+interface WireWaiter {
+  resolve: (frame: WireFrame) => void;
+  reject: (err: Error) => void;
+  cleanup?: () => void;
+}
+
 class PooledPgConnection {
   public readonly id: string = randomUUID();
-  private readonly socket: net.Socket;
+  private readonly socket: net.Socket | tls.TLSSocket;
   private readonly config: PostgresPoolConfig;
+  private readonly maxRecvBufferBytes: number;
+  private readonly queryTimeoutMs: number;
+  private readonly connectTimeoutMs: number;
+  private readonly socketTimeoutMs: number;
+  private readonly maxScramIterations: number;
   private recvBuffer: Buffer = Buffer.alloc(0);
-  private waiters: Array<(frame: WireFrame) => void> = [];
+  private waiters: WireWaiter[] = [];
   private wireQueue: Promise<void> = Promise.resolve();
   private closed = false;
   private closeError: Error | null = null;
   public lastTxStatus: "I" | "T" | "E" = "I";
 
-  private constructor(socket: net.Socket, config: PostgresPoolConfig) {
+  private constructor(socket: net.Socket | tls.TLSSocket, config: PostgresPoolConfig) {
     this.socket = socket;
     this.config = config;
+    this.maxRecvBufferBytes = Math.max(4096, config.maxRecvBufferBytes ?? 16 * 1024 * 1024);
+    this.queryTimeoutMs = Math.max(1, config.queryTimeoutMs ?? 15_000);
+    this.connectTimeoutMs = Math.max(1, config.connectTimeoutMs ?? 5_000);
+    this.socketTimeoutMs = config.socketTimeoutMs ?? 60_000;
+    this.maxScramIterations = Math.max(4096, config.maxScramIterations ?? 200_000);
+
+    if (this.socketTimeoutMs > 0 && Number.isFinite(this.socketTimeoutMs)) {
+      this.socket.setTimeout(this.socketTimeoutMs);
+    }
+
+    this.socket.on("timeout", () => {
+      const err = new Error(`PostgreSQL socket timeout after ${this.socketTimeoutMs}ms`);
+      this.failConnection(err);
+    });
+
     this.socket.on("data", (chunk: Buffer) => {
+      if (this.closed) {
+        return;
+      }
+      if (this.recvBuffer.length + chunk.length > this.maxRecvBufferBytes) {
+        this.failConnection(
+          new Error(
+            `PostgreSQL wire recvBuffer exceeded maxRecvBufferBytes (${this.maxRecvBufferBytes})`
+          )
+        );
+        return;
+      }
       this.recvBuffer = Buffer.concat([this.recvBuffer, chunk]);
       this.drainWaiters();
     });
     this.socket.on("error", (err) => {
       this.closed = true;
-      this.closeError = err;
+      this.closeError ??= err;
       this.rejectAllWaiters(err);
     });
     this.socket.on("close", () => {
       this.closed = true;
       const err = this.closeError ?? new Error("PostgreSQL connection closed unexpectedly");
+      this.closeError ??= err;
       this.rejectAllWaiters(err);
     });
   }
 
   public isAlive(): boolean {
     return !this.closed && !this.socket.destroyed;
+  }
+
+  private failConnection(err: Error): void {
+    if (!this.closeError) {
+      this.closeError = err;
+    }
+    this.closed = true;
+    this.recvBuffer = Buffer.alloc(0);
+    this.rejectAllWaiters(err);
+    if (!this.socket.destroyed) {
+      this.socket.destroy(err);
+    }
   }
 
   private enqueueWireOp<T>(fn: () => Promise<T>): Promise<T> {
@@ -319,7 +463,8 @@ class PooledPgConnection {
     while (this.waiters.length > 0) {
       const waiter = this.waiters.shift();
       if (waiter) {
-        waiter({ type: "__ERROR__", payload: Buffer.from(err.message, "utf8") });
+        waiter.cleanup?.();
+        waiter.reject(err);
       }
     }
   }
@@ -330,6 +475,14 @@ class PooledPgConnection {
     }
     const type = String.fromCharCode(this.recvBuffer.readUInt8(0));
     const totalLen = this.recvBuffer.readInt32BE(1);
+    if (totalLen < 4 || 1 + totalLen > this.maxRecvBufferBytes) {
+      this.failConnection(
+        new Error(
+          `PostgreSQL wire frame length ${totalLen} outside allowed range (4..${this.maxRecvBufferBytes})`
+        )
+      );
+      return null;
+    }
     const frameEnd = 1 + totalLen;
     if (this.recvBuffer.length < frameEnd) {
       return null;
@@ -347,12 +500,13 @@ class PooledPgConnection {
       }
       const waiter = this.waiters.shift();
       if (waiter) {
-        waiter(frame);
+        waiter.cleanup?.();
+        waiter.resolve(frame);
       }
     }
   }
 
-  private nextFrame(): Promise<WireFrame> {
+  private nextFrame(deadlineAtMs?: number): Promise<WireFrame> {
     const queued = this.tryPopFrame();
     if (queued) {
       return Promise.resolve(queued);
@@ -362,20 +516,84 @@ class PooledPgConnection {
         this.closeError ?? new Error("PostgreSQL connection is already closed")
       );
     }
+    const remainingMs =
+      deadlineAtMs !== undefined ? deadlineAtMs - Date.now() : this.queryTimeoutMs;
+    if (remainingMs <= 0) {
+      const err = new Error(
+        `PostgreSQL wire read timed out after ${this.queryTimeoutMs}ms`
+      );
+      this.failConnection(err);
+      return Promise.reject(err);
+    }
+
     return new Promise((resolve, reject) => {
-      this.waiters.push((frame) => {
-        if (frame.type === "__ERROR__") {
-          reject(new Error(frame.payload.toString("utf8")));
-          return;
+      let settled = false;
+      const waiter: WireWaiter = {
+        resolve: (frame) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(frame);
+        },
+        reject: (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(err);
+        },
+        cleanup: () => {
+          clearTimeout(timer);
+        },
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        const idx = this.waiters.indexOf(waiter);
+        if (idx !== -1) {
+          this.waiters.splice(idx, 1);
         }
-        resolve(frame);
-      });
+        const err = new Error(
+          `PostgreSQL wire read timed out after ${Math.max(1, remainingMs)}ms`
+        );
+        this.failConnection(err);
+        waiter.reject(err);
+      }, remainingMs);
+      this.waiters.push(waiter);
     });
   }
 
+  private static resolveEffectiveSslMode(config: PostgresPoolConfig): PostgresSslMode {
+    if (config.sslMode) {
+      return config.sslMode;
+    }
+    return isLoopbackHost(config.host) ? "prefer" : "require";
+  }
+
+  private static resolveTlsCa(config: PostgresPoolConfig): string | undefined {
+    if (config.sslCaPem && config.sslCaPem.trim().length > 0) {
+      return config.sslCaPem;
+    }
+    if (config.sslRootCertPath && config.sslRootCertPath.trim().length > 0) {
+      return readFileSync(config.sslRootCertPath, "utf8");
+    }
+    return undefined;
+  }
+
   public static async connect(config: PostgresPoolConfig): Promise<PooledPgConnection> {
-    const timeoutMs = config.connectTimeoutMs ?? 5000;
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
+    const sslMode = PooledPgConnection.resolveEffectiveSslMode(config);
+    if (
+      sslMode === "disable" &&
+      !isLoopbackHost(config.host) &&
+      config.allowInsecureRemoteDisableSsl !== true
+    ) {
+      throw new Error(
+        `Refusing insecure sslmode=disable for non-loopback PostgreSQL host "${config.host}" without allowInsecureRemoteDisableSsl`
+      );
+    }
+
+    const timeoutMs = Math.max(1, config.connectTimeoutMs ?? 5000);
+    const deadlineAtMs = Date.now() + timeoutMs;
+
+    const tcpSocket = await new Promise<net.Socket>((resolve, reject) => {
       const sock = net.createConnection({
         host: config.host,
         port: config.port,
@@ -394,12 +612,152 @@ class PooledPgConnection {
       });
     });
 
-    const conn = new PooledPgConnection(socket, config);
-    await conn.authenticateStartup();
-    return conn;
+    let activeSocket: net.Socket | tls.TLSSocket = tcpSocket;
+
+    if (sslMode !== "disable") {
+      try {
+        const sslResponseByte = await new Promise<number>((resolve, reject) => {
+          const remainingMs = Math.max(1, deadlineAtMs - Date.now());
+          let settled = false;
+          const cleanup = (): void => {
+            clearTimeout(timer);
+            tcpSocket.removeListener("data", onData);
+            tcpSocket.removeListener("error", onError);
+            tcpSocket.removeListener("close", onClose);
+          };
+          const onData = (chunk: Buffer): void => {
+            if (settled || chunk.length === 0) return;
+            settled = true;
+            cleanup();
+            resolve(chunk.readUInt8(0));
+          };
+          const onError = (err: Error): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(err);
+          };
+          const onClose = (): void => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(new Error("PostgreSQL closed socket during SSL negotiation"));
+          };
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            const err = new Error(`PostgreSQL SSL negotiation timeout after ${timeoutMs}ms`);
+            tcpSocket.destroy(err);
+            reject(err);
+          }, remainingMs);
+
+          tcpSocket.on("data", onData);
+          tcpSocket.once("error", onError);
+          tcpSocket.once("close", onClose);
+
+          // PG wire SSLRequest: length=8, request code=80877103
+          const sslReq = Buffer.allocUnsafe(8);
+          sslReq.writeInt32BE(8, 0);
+          sslReq.writeInt32BE(80877103, 4);
+          tcpSocket.write(sslReq);
+        });
+
+        if (sslResponseByte === 0x53 /* 'S' */) {
+          const caPem = PooledPgConnection.resolveTlsCa(config);
+          const verifyHost = (config.sslServername ?? config.host).trim().replace(/^\[|\]$/g, "");
+          const tlsOptions: tls.ConnectionOptions = {
+            socket: tcpSocket,
+            ...(caPem ? { ca: caPem } : {}),
+            ...(verifyHost && net.isIP(verifyHost) === 0 ? { servername: verifyHost } : {}),
+          };
+
+          if (sslMode === "verify-full") {
+            tlsOptions.rejectUnauthorized = true;
+            tlsOptions.host = verifyHost;
+          } else if (sslMode === "verify-ca") {
+            tlsOptions.rejectUnauthorized = true;
+            tlsOptions.checkServerIdentity = () => undefined;
+          } else if (caPem) {
+            tlsOptions.rejectUnauthorized = true;
+            tlsOptions.checkServerIdentity = () => undefined;
+          } else {
+            tlsOptions.rejectUnauthorized = false;
+          }
+
+          activeSocket = await new Promise<tls.TLSSocket>((resolve, reject) => {
+            const remainingMs = Math.max(1, deadlineAtMs - Date.now());
+            let settled = false;
+            const tlsSock = tls.connect(tlsOptions);
+            const cleanup = (): void => {
+              clearTimeout(timer);
+              tlsSock.removeListener("secureConnect", onSecure);
+              tlsSock.removeListener("error", onError);
+              tlsSock.removeListener("close", onClose);
+            };
+            const onSecure = (): void => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve(tlsSock);
+            };
+            const onError = (err: Error): void => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              tlsSock.destroy();
+              reject(err);
+            };
+            const onClose = (): void => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(new Error("PostgreSQL TLS handshake closed before completion"));
+            };
+            const timer = setTimeout(() => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              const err = new Error(`PostgreSQL TLS handshake timeout after ${timeoutMs}ms`);
+              tlsSock.destroy(err);
+              reject(err);
+            }, remainingMs);
+
+            tlsSock.once("secureConnect", onSecure);
+            tlsSock.once("error", onError);
+            tlsSock.once("close", onClose);
+          });
+        } else if (sslResponseByte === 0x4e /* 'N' */) {
+          if (sslMode !== "prefer") {
+            throw new Error(
+              `PostgreSQL server refused TLS (responded 'N' to SSLRequest) under sslmode=${sslMode}`
+            );
+          }
+        } else {
+          throw new Error(
+            `Unexpected PostgreSQL SSLRequest response byte: 0x${sslResponseByte.toString(16)}`
+          );
+        }
+      } catch (err) {
+        if (!tcpSocket.destroyed) {
+          tcpSocket.destroy();
+        }
+        throw err;
+      }
+    }
+
+    const conn = new PooledPgConnection(activeSocket, config);
+    try {
+      await conn.authenticateStartup();
+      return conn;
+    } catch (err) {
+      await conn.close();
+      throw err;
+    }
   }
 
   private async authenticateStartup(): Promise<void> {
+    const deadlineAtMs = Date.now() + this.connectTimeoutMs;
     this.socket.write(buildStartupPacket(this.config));
 
     let scramState:
@@ -411,7 +769,7 @@ class PooledPgConnection {
       | undefined;
 
     while (true) {
-      const frame = await this.nextFrame();
+      const frame = await this.nextFrame(deadlineAtMs);
       if (frame.type === "E") {
         const parsed = parsePgErrorFields(frame.payload);
         throw new PostgresQueryError(parsed.sqlState, parsed.message, parsed.constraint, parsed.detail);
@@ -423,11 +781,21 @@ class PooledPgConnection {
         }
         const password = this.config.password ?? "";
         if (authCode === 3) {
-          // Cleartext password
+          if (this.config.allowInsecureCleartextAuth !== true) {
+            throw new Error(
+              "PostgreSQL cleartext password authentication (authCode=3) rejected by default; use SCRAM-SHA-256 or set allowInsecureCleartextAuth: true"
+            );
+          }
+          // Cleartext password (explicitly opted-in only)
           const body = Buffer.concat([Buffer.from(password, "utf8"), Buffer.from([0])]);
           this.socket.write(buildTypedMessage("p", body));
         } else if (authCode === 5) {
-          // MD5 password with 4-byte salt
+          if (this.config.allowLegacyMd5Auth !== true) {
+            throw new Error(
+              "PostgreSQL legacy MD5 authentication (authCode=5) rejected by default; use SCRAM-SHA-256 or set allowLegacyMd5Auth: true"
+            );
+          }
+          // MD5 password with 4-byte salt (explicitly opted-in only)
           const salt = frame.payload.subarray(4, 8);
           const inner = createHash("md5")
             .update(password + this.config.user, "utf8")
@@ -487,9 +855,20 @@ class PooledPgConnection {
           if (!combinedNonce.startsWith(scramState.clientNonce)) {
             throw new Error("SCRAM-SHA-256 server nonce mismatch");
           }
-          const salt = Buffer.from(saltB64, "base64");
+          if (!/^\d+$/.test(iterStr)) {
+            throw new Error(`Invalid SCRAM-SHA-256 iteration count: ${iterStr}`);
+          }
           const iterations = Number.parseInt(iterStr, 10);
-          const { pbkdf2Sync } = await import("node:crypto");
+          if (
+            !Number.isFinite(iterations) ||
+            iterations < 4096 ||
+            iterations > this.maxScramIterations
+          ) {
+            throw new Error(
+              `SCRAM-SHA-256 iteration count ${iterations} outside allowed bounds (4096..${this.maxScramIterations})`
+            );
+          }
+          const salt = Buffer.from(saltB64, "base64");
           const saltedPassword = pbkdf2Sync(password, salt, iterations, 32, "sha256");
           const clientKey = createHmac("sha256", saltedPassword).update("Client Key").digest();
           const storedKey = createHash("sha256").update(clientKey).digest();
@@ -535,6 +914,11 @@ class PooledPgConnection {
     sql: string
   ): Promise<PostgresQueryResult<TRow>> {
     return this.enqueueWireOp(() => {
+      if (this.closed || this.socket.destroyed) {
+        return Promise.reject(
+          this.closeError ?? new Error("PostgreSQL connection is closed")
+        );
+      }
       const body = Buffer.concat([Buffer.from(sql, "utf8"), Buffer.from([0])]);
       this.socket.write(buildTypedMessage("Q", body));
       return this.collectQueryResult<TRow>();
@@ -550,6 +934,11 @@ class PooledPgConnection {
     }
 
     return this.enqueueWireOp(() => {
+      if (this.closed || this.socket.destroyed) {
+        return Promise.reject(
+          this.closeError ?? new Error("PostgreSQL connection is closed")
+        );
+      }
       // Parse ('P'): unnamed statement "", SQL, 0 pre-specified param OIDs
       const sqlBuf = Buffer.from(sql, "utf8");
       const parseBody = Buffer.allocUnsafe(1 + sqlBuf.length + 1 + 2);
@@ -603,6 +992,7 @@ class PooledPgConnection {
   private async collectQueryResult<TRow extends Record<string, unknown>>(): Promise<
     PostgresQueryResult<TRow>
   > {
+    const deadlineAtMs = Date.now() + this.queryTimeoutMs;
     let columns: PostgresColumnMeta[] = [];
     const rows: TRow[] = [];
     let rowCount = 0;
@@ -610,7 +1000,7 @@ class PooledPgConnection {
     let queryError: PostgresQueryError | null = null;
 
     while (true) {
-      const frame = await this.nextFrame();
+      const frame = await this.nextFrame(deadlineAtMs);
       switch (frame.type) {
         case "1":
         case "2":
@@ -694,22 +1084,41 @@ class PooledPgConnection {
   }
 
   public async close(): Promise<void> {
-    if (!this.closed) {
-      try {
-        this.socket.write(buildTypedMessage("X", Buffer.alloc(0)));
-      } catch {
-        // ignore write errors during close
-      }
-      this.closed = true;
-      this.socket.end();
-      this.socket.destroy();
+    if (this.closed) {
+      return;
     }
+    this.closed = true;
+    this.closeError ??= new Error("PostgreSQL connection closed");
+    try {
+      await Promise.race([
+        this.enqueueWireOp(async () => {
+          if (!this.socket.destroyed && this.socket.writable) {
+            this.socket.write(buildTypedMessage("X", Buffer.alloc(0)));
+          }
+        }),
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 50).unref();
+        }),
+      ]);
+    } catch {
+      // ignore write errors during close
+    }
+    this.rejectAllWaiters(this.closeError);
+    this.socket.end();
+    this.socket.destroy();
   }
 }
 
 interface ActiveTxState {
   readonly conn: PooledPgConnection;
   readonly session: RlsSessionContext;
+}
+
+interface PoolAcquireWaiter {
+  settled: boolean;
+  resolve: (conn: PooledPgConnection) => void;
+  reject: (err: Error) => void;
+  cleanup: () => void;
 }
 
 /**
@@ -720,13 +1129,11 @@ interface ActiveTxState {
 export class PostgresRuntimePool {
   private readonly config: PostgresPoolConfig;
   private readonly maxConnections: number;
+  private readonly acquireTimeoutMs: number;
   private readonly allConnections: Set<PooledPgConnection> = new Set();
   private readonly idleConnections: PooledPgConnection[] = [];
   private readonly activeConnections: Set<PooledPgConnection> = new Set();
-  private readonly waiters: Array<{
-    resolve: (conn: PooledPgConnection) => void;
-    reject: (err: Error) => void;
-  }> = [];
+  private readonly waiters: PoolAcquireWaiter[] = [];
   private readonly txAsyncStorage = new AsyncLocalStorage<ActiveTxState>();
   private transactionsExecuted = 0;
   private discardAllExecuted = 0;
@@ -735,6 +1142,7 @@ export class PostgresRuntimePool {
   constructor(config: PostgresPoolConfig) {
     this.config = config;
     this.maxConnections = Math.max(1, config.maxConnections ?? 10);
+    this.acquireTimeoutMs = Math.max(1, config.acquireTimeoutMs ?? 10_000);
   }
 
   public getStats(): PostgresPoolStats {
@@ -753,6 +1161,16 @@ export class PostgresRuntimePool {
     return this.txAsyncStorage.getStore()?.session ?? null;
   }
 
+  private popActiveWaiter(): PoolAcquireWaiter | undefined {
+    while (this.waiters.length > 0) {
+      const next = this.waiters.shift();
+      if (next && !next.settled) {
+        return next;
+      }
+    }
+    return undefined;
+  }
+
   private async acquire(): Promise<PooledPgConnection> {
     if (this.closed) {
       throw new Error("PostgresRuntimePool is closed");
@@ -768,13 +1186,45 @@ export class PostgresRuntimePool {
 
     if (this.allConnections.size < this.maxConnections) {
       const conn = await PooledPgConnection.connect(this.config);
+      if (this.closed) {
+        await conn.close();
+        throw new Error("PostgresRuntimePool is closed");
+      }
       this.allConnections.add(conn);
       this.activeConnections.add(conn);
       return conn;
     }
 
     return new Promise((resolve, reject) => {
-      this.waiters.push({ resolve, reject });
+      const waiter: PoolAcquireWaiter = {
+        settled: false,
+        resolve: (conn) => {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          waiter.cleanup();
+          resolve(conn);
+        },
+        reject: (err) => {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          waiter.cleanup();
+          reject(err);
+        },
+        cleanup: () => {
+          clearTimeout(timer);
+        },
+      };
+      const timer = setTimeout(() => {
+        if (waiter.settled) return;
+        const idx = this.waiters.indexOf(waiter);
+        if (idx !== -1) {
+          this.waiters.splice(idx, 1);
+        }
+        waiter.reject(
+          new Error(`PostgreSQL pool acquire timeout after ${this.acquireTimeoutMs}ms`)
+        );
+      }, this.acquireTimeoutMs);
+      this.waiters.push(waiter);
     });
   }
 
@@ -784,7 +1234,7 @@ export class PostgresRuntimePool {
     const finalizeBroken = async (): Promise<void> => {
       this.allConnections.delete(conn);
       await conn.close();
-      const next = this.waiters.shift();
+      const next = this.popActiveWaiter();
       if (next) {
         this.acquire().then(next.resolve, next.reject);
       }
@@ -805,7 +1255,7 @@ export class PostgresRuntimePool {
         await finalizeBroken();
         return;
       }
-      const next = this.waiters.shift();
+      const next = this.popActiveWaiter();
       if (next) {
         this.activeConnections.add(conn);
         next.resolve(conn);
@@ -2102,13 +2552,19 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
 
     const startMs = Date.now();
     const abortController = new AbortController();
+    let cancelledByTimeout = false;
+    let enteredDbWork = false;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
       timeoutId = setTimeout(() => {
+        cancelledByTimeout = true;
         abortController.abort(new Error("ERR_GATEKEEPER_TIMEOUT"));
         reject(new Error("ERR_GATEKEEPER_TIMEOUT"));
       }, deadlineMs);
     });
+
+    const isAborted = (): boolean =>
+      cancelledByTimeout || abortController.signal.aborted || Date.now() - startMs > deadlineMs;
 
     const runVerification = async (): Promise<{
       allowed: boolean;
@@ -2119,7 +2575,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       if (input.authorizeCheckHook) {
         await input.authorizeCheckHook(abortController.signal);
       }
-      if (abortController.signal.aborted || Date.now() - startMs > deadlineMs) {
+      if (isAborted()) {
         return {
           allowed: false,
           error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
@@ -2137,120 +2593,199 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         };
       }
 
-      const rowRes = await this.pool.queryInActiveTx(
-        `SELECT l.lease_id, l.status AS lease_status, l.revoked_at, l.lease_epoch,
-                (l.expires_at <= clock_timestamp()) AS is_expired,
-                t.task_contract_json, t.base_main_commit_hash
-         FROM task_leases l
-         INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
-         WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
-         LIMIT 1;`,
-        [input.lease_id, input.task_id, input.project_id]
-      );
-      const row = rowRes.rows[0];
-      if (
-        !row ||
-        Number(row.lease_epoch) !== input.lease_epoch ||
-        String(row.lease_status) !== "ACTIVE" ||
-        row.revoked_at !== null ||
-        Boolean(row.is_expired)
-      ) {
-        return {
-          allowed: false,
-          error_code: "ERR_GATEKEEPER_STALE_OR_EXPIRED_LEASE",
-          reason: "Pre-receive denied: lease is not ACTIVE or has expired/revoked",
-        };
+      enteredDbWork = true;
+      const inActiveTx = this.pool.getActiveTxSession() !== null;
+      let savepointCreated = false;
+      const rollbackSavepointIfNeeded = async (): Promise<void> => {
+        if (!savepointCreated) {
+          return;
+        }
+        savepointCreated = false;
+        try {
+          await this.pool.queryInActiveTx(
+            "ROLLBACK TO SAVEPOINT sf_gatekeeper_pre_receive; RELEASE SAVEPOINT sf_gatekeeper_pre_receive; SET LOCAL statement_timeout = 0;"
+          );
+        } catch {
+          // best-effort cleanup on aborted/closed connection
+        }
+      };
+
+      if (inActiveTx) {
+        const remainingMs = Math.max(1, Math.min(600_000, Math.trunc(deadlineMs - (Date.now() - startMs))));
+        await this.pool.queryInActiveTx(
+          `SAVEPOINT sf_gatekeeper_pre_receive; SET LOCAL statement_timeout = ${remainingMs};`
+        );
+        savepointCreated = true;
       }
 
-      if (!input.changes) {
-        return {
-          allowed: false,
-          error_code: "ERR_GATEKEEPER_MISSING_CHANGES",
-          reason:
-            "Pre-receive denied: Git changes manifest is required for TrustedImportValidator verification",
-        };
-      }
+      try {
+        const rowRes = await this.pool.queryInActiveTx(
+          `SELECT l.lease_id, l.status AS lease_status, l.revoked_at, l.lease_epoch,
+                  (l.expires_at <= clock_timestamp()) AS is_expired,
+                  t.task_contract_json, t.base_main_commit_hash
+           FROM task_leases l
+           INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
+           WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
+           LIMIT 1;`,
+          [input.lease_id, input.task_id, input.project_id]
+        );
+        if (isAborted()) {
+          await rollbackSavepointIfNeeded();
+          return {
+            allowed: false,
+            error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+            reason: `Pre-receive hard timeout exceeded: gatekeeper exceeded ${deadlineMs}ms deadline`,
+          };
+        }
 
-      const contract = row.task_contract_json as unknown as TaskContractSpec;
-      const validation = validateGitTreeImport({
-        agent_commit_hash: input.agent_commit_hash,
-        verified_tree_hash: input.verified_tree_hash,
-        parent_commit_hashes: input.parent_commit_hashes,
-        expected_base_main_commit_hash: String(row.base_main_commit_hash),
-        changes: input.changes,
-        contract,
-      });
+        const row = rowRes.rows[0];
+        if (
+          !row ||
+          Number(row.lease_epoch) !== input.lease_epoch ||
+          String(row.lease_status) !== "ACTIVE" ||
+          row.revoked_at !== null ||
+          Boolean(row.is_expired)
+        ) {
+          await rollbackSavepointIfNeeded();
+          return {
+            allowed: false,
+            error_code: "ERR_GATEKEEPER_STALE_OR_EXPIRED_LEASE",
+            reason: "Pre-receive denied: lease is not ACTIVE or has expired/revoked",
+          };
+        }
 
-      if (!validation.valid) {
-        return {
-          allowed: false,
-          error_code: validation.error_code,
-          reason: `TrustedImportValidator rejected push at pre-receive: [${validation.error_code}] ${validation.message}`,
-        };
-      }
+        if (!input.changes) {
+          await rollbackSavepointIfNeeded();
+          return {
+            allowed: false,
+            error_code: "ERR_GATEKEEPER_MISSING_CHANGES",
+            reason:
+              "Pre-receive denied: Git changes manifest is required for TrustedImportValidator verification",
+          };
+        }
 
-      const elapsedMs = Date.now() - startMs;
-      if (abortController.signal.aborted || elapsedMs > deadlineMs) {
-        return {
-          allowed: false,
-          error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
-          reason: `Pre-receive hard timeout exceeded: execution took ${elapsedMs}ms (> ${deadlineMs}ms)`,
-        };
-      }
+        const contract = row.task_contract_json as unknown as TaskContractSpec;
+        const validation = validateGitTreeImport({
+          agent_commit_hash: input.agent_commit_hash,
+          verified_tree_hash: input.verified_tree_hash,
+          parent_commit_hashes: input.parent_commit_hashes,
+          expected_base_main_commit_hash: String(row.base_main_commit_hash),
+          changes: input.changes,
+          contract,
+        });
 
-      let refs = this.fallbackGitRefsByProject.get(input.project_id);
-      if (!refs) {
-        refs = new Map();
-        this.fallbackGitRefsByProject.set(input.project_id, refs);
-      }
-      let commits = this.fallbackGitCommitsByProject.get(input.project_id);
-      if (!commits) {
-        commits = new Map();
-        this.fallbackGitCommitsByProject.set(input.project_id, commits);
-      }
-      commits.set(input.agent_commit_hash, {
-        commitHash: input.agent_commit_hash,
-        treeHash: input.verified_tree_hash,
-        parents: [...input.parent_commit_hashes],
-        taskId: input.task_id,
-      });
-      refs.set(expectedStagingRef, input.agent_commit_hash);
-      refs.set(input.staging_ref, input.agent_commit_hash);
+        if (!validation.valid) {
+          await rollbackSavepointIfNeeded();
+          return {
+            allowed: false,
+            error_code: validation.error_code,
+            reason: `TrustedImportValidator rejected push at pre-receive: [${validation.error_code}] ${validation.message}`,
+          };
+        }
 
-      const existingRes = await this.pool.queryInActiveTx(
-        `SELECT import_id FROM verified_code_imports
-         WHERE lease_id = $1::uuid AND agent_commit_hash = $2::text LIMIT 1;`,
-        [input.lease_id, input.agent_commit_hash]
-      );
-      if (existingRes.rows[0]) {
+        if (isAborted()) {
+          await rollbackSavepointIfNeeded();
+          return {
+            allowed: false,
+            error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+            reason: `Pre-receive hard timeout exceeded: gatekeeper exceeded ${deadlineMs}ms deadline`,
+          };
+        }
+
+        const existingRes = await this.pool.queryInActiveTx(
+          `SELECT import_id FROM verified_code_imports
+           WHERE lease_id = $1::uuid AND agent_commit_hash = $2::text LIMIT 1;`,
+          [input.lease_id, input.agent_commit_hash]
+        );
+        if (isAborted()) {
+          await rollbackSavepointIfNeeded();
+          return {
+            allowed: false,
+            error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+            reason: `Pre-receive hard timeout exceeded: gatekeeper exceeded ${deadlineMs}ms deadline`,
+          };
+        }
+        if (existingRes.rows[0]) {
+          if (savepointCreated) {
+            savepointCreated = false;
+            await this.pool.queryInActiveTx(
+              "RELEASE SAVEPOINT sf_gatekeeper_pre_receive; SET LOCAL statement_timeout = 0;"
+            );
+          }
+          return {
+            allowed: true,
+            import_id: String(existingRes.rows[0].import_id),
+          };
+        }
+
+        const insRes = await this.pool.queryInActiveTx(
+          `INSERT INTO verified_code_imports (
+            project_id, task_id, lease_id, lease_epoch, agent_commit_hash,
+            verified_tree_hash, staging_ref, changed_files_count, deleted_lines_count, recovered_by_reconciler
+          ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::text, $6::text, $7::text, $8::integer, $9::integer, FALSE)
+          RETURNING import_id;`,
+          [
+            input.project_id,
+            input.task_id,
+            input.lease_id,
+            input.lease_epoch,
+            validation.agent_commit_hash,
+            validation.verified_tree_hash,
+            input.staging_ref,
+            validation.changed_files_count,
+            validation.deleted_lines_count,
+          ]
+        );
+        if (isAborted()) {
+          await rollbackSavepointIfNeeded();
+          return {
+            allowed: false,
+            error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+            reason: `Pre-receive hard timeout exceeded: gatekeeper exceeded ${deadlineMs}ms deadline`,
+          };
+        }
+
+        if (savepointCreated) {
+          savepointCreated = false;
+          await this.pool.queryInActiveTx(
+            "RELEASE SAVEPOINT sf_gatekeeper_pre_receive; SET LOCAL statement_timeout = 0;"
+          );
+        }
+
+        let refs = this.fallbackGitRefsByProject.get(input.project_id);
+        if (!refs) {
+          refs = new Map();
+          this.fallbackGitRefsByProject.set(input.project_id, refs);
+        }
+        let commits = this.fallbackGitCommitsByProject.get(input.project_id);
+        if (!commits) {
+          commits = new Map();
+          this.fallbackGitCommitsByProject.set(input.project_id, commits);
+        }
+        commits.set(input.agent_commit_hash, {
+          commitHash: input.agent_commit_hash,
+          treeHash: input.verified_tree_hash,
+          parents: [...input.parent_commit_hashes],
+          taskId: input.task_id,
+        });
+        refs.set(expectedStagingRef, input.agent_commit_hash);
+        refs.set(input.staging_ref, input.agent_commit_hash);
+
         return {
           allowed: true,
-          import_id: String(existingRes.rows[0].import_id),
+          import_id: String(insRes.rows[0]!.import_id),
         };
+      } catch (err) {
+        await rollbackSavepointIfNeeded();
+        if (isAborted()) {
+          return {
+            allowed: false,
+            error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
+            reason: `Pre-receive hard timeout exceeded: gatekeeper exceeded ${deadlineMs}ms deadline`,
+          };
+        }
+        throw err;
       }
-
-      const insRes = await this.pool.queryInActiveTx(
-        `INSERT INTO verified_code_imports (
-          project_id, task_id, lease_id, lease_epoch, agent_commit_hash,
-          verified_tree_hash, staging_ref, changed_files_count, deleted_lines_count, recovered_by_reconciler
-        ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::text, $6::text, $7::text, $8::integer, $9::integer, FALSE)
-        RETURNING import_id;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.lease_id,
-          input.lease_epoch,
-          validation.agent_commit_hash,
-          validation.verified_tree_hash,
-          input.staging_ref,
-          validation.changed_files_count,
-          validation.deleted_lines_count,
-        ]
-      );
-      return {
-        allowed: true,
-        import_id: String(insRes.rows[0]!.import_id),
-      };
     };
 
     const verificationPromise = runVerification();
@@ -2258,6 +2793,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     try {
       return await Promise.race([verificationPromise, timeoutPromise]);
     } catch {
+      cancelledByTimeout = true;
+      abortController.abort(new Error("ERR_GATEKEEPER_TIMEOUT"));
+      if (enteredDbWork) {
+        await verificationPromise.catch(() => {});
+      }
       return {
         allowed: false,
         error_code: "ERR_GATEKEEPER_FAIL_CLOSED_UNAVAILABLE",
@@ -3272,9 +3812,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       const stateRes = await this.pool.queryInActiveTx(
         `SELECT p.approval_ttl_seconds, p.main_ref_commit_hash,
                 t.status AS task_status, t.rework_count, t.max_rework_cycles,
-                mc.is_superseded, mc.agent_commit_hash AS mc_agent, mc.base_main_commit_hash AS mc_base,
+                mc.task_id AS mc_task_id, mc.is_superseded,
+                mc.agent_commit_hash AS mc_agent, mc.base_main_commit_hash AS mc_base,
                 mc.merge_candidate_hash AS mc_cand, mc.verified_tree_hash AS mc_tree,
+                ra.task_id AS ra_task_id, ra.merge_candidate_id AS ra_mc_id,
+                ra.verification_run_id AS ra_vr_id, ra.merge_candidate_hash AS ra_cand,
+                ra.verified_tree_hash AS ra_tree,
                 ra.is_invalidated AS ra_invalidated, ra.status AS ra_status, ra.verdict AS ra_verdict,
+                vr.task_id AS vr_task_id, vr.merge_candidate_id AS vr_mc_id,
                 vr.verdict AS vr_verdict
          FROM projects p
          INNER JOIN tasks t ON t.project_id = p.project_id AND t.task_id = $2::uuid
@@ -3305,6 +3850,18 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         );
       }
       if (
+        String(row.mc_task_id) !== input.task_id ||
+        String(row.mc_agent) !== input.agent_commit_hash ||
+        String(row.mc_base) !== input.base_main_commit_hash ||
+        String(row.mc_cand) !== input.merge_candidate_hash ||
+        String(row.mc_tree) !== input.verified_tree_hash ||
+        String(row.ra_task_id) !== input.task_id ||
+        String(row.ra_mc_id) !== input.merge_candidate_id ||
+        String(row.ra_vr_id) !== input.verification_run_id ||
+        String(row.ra_cand) !== input.merge_candidate_hash ||
+        String(row.ra_tree) !== input.verified_tree_hash ||
+        String(row.vr_task_id) !== input.task_id ||
+        String(row.vr_mc_id) !== input.merge_candidate_id ||
         Boolean(row.is_superseded) ||
         Boolean(row.ra_invalidated) ||
         String(row.ra_status) !== "VALID" ||
@@ -3331,6 +3888,24 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             [input.merge_candidate_id, input.review_artifact_id]
           );
       const arRow = arRes.rows[0];
+      if (
+        input.approval_request_id &&
+        (!arRow ||
+          String(arRow.project_id) !== input.project_id ||
+          String(arRow.task_id) !== input.task_id ||
+          String(arRow.merge_candidate_id) !== input.merge_candidate_id ||
+          String(arRow.review_artifact_id) !== input.review_artifact_id ||
+          String(arRow.verification_run_id) !== input.verification_run_id ||
+          String(arRow.agent_commit_hash) !== String(row.mc_agent) ||
+          String(arRow.base_main_commit_hash) !== String(row.mc_base) ||
+          String(arRow.merge_candidate_hash) !== String(row.mc_cand) ||
+          String(arRow.verified_tree_hash) !== String(row.mc_tree))
+      ) {
+        throw new PostgresRlsError(
+          "23503",
+          `ApprovalRequest ${input.approval_request_id} violates composite binding to candidate ${input.merge_candidate_id} / review ${input.review_artifact_id}`
+        );
+      }
       const approvalRequestId = arRow ? String(arRow.approval_request_id) : null;
 
       if (input.decision === "APPROVED") {
@@ -3759,9 +4334,22 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     }
   }
 
-  public async getMainRefCommitHash(): Promise<string | null> {
+  public async getMainRefCommitHash(projectId?: string): Promise<string | null> {
+    const activeSession = this.pool.getActiveTxSession();
+    const targetProjectId = projectId ?? activeSession?.currentProjectId ?? null;
+    if (!targetProjectId) {
+      return null;
+    }
+    if (
+      activeSession &&
+      activeSession.currentRole !== "system_admin_role" &&
+      activeSession.currentProjectId !== targetProjectId
+    ) {
+      return null;
+    }
     const res = await this.pool.queryInActiveTx(
-      "SELECT main_ref_commit_hash FROM projects LIMIT 1;"
+      "SELECT main_ref_commit_hash FROM projects WHERE project_id = $1::uuid LIMIT 1;",
+      [targetProjectId]
     );
     const val = res.rows[0]?.main_ref_commit_hash;
     return val ? String(val) : null;
@@ -3845,6 +4433,23 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     input: RecordResourceUsageMetricInput
   ): Promise<ResourceUsageMetricRecord> {
     try {
+      validateAndNormalizeResourceUsageMetricInput(input);
+      let taskDefaults: { current_attempt_no: number; rework_count: number } | undefined;
+      if (input.attempt_no === undefined || input.rework_cycle === undefined) {
+        const taskRes = await this.pool.queryInActiveTx(
+          "SELECT current_attempt_no, rework_count FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid LIMIT 1;",
+          [input.project_id, input.task_id]
+        );
+        const taskRow = taskRes.rows[0];
+        if (taskRow) {
+          taskDefaults = {
+            current_attempt_no: Number(taskRow.current_attempt_no ?? 1),
+            rework_count: Number(taskRow.rework_count ?? 0),
+          };
+        }
+      }
+      const normalized = validateAndNormalizeResourceUsageMetricInput(input, taskDefaults);
+
       const res = await this.pool.queryInActiveTx(
         `INSERT INTO resource_usage_metrics (
           project_id, task_id, lease_id, lease_epoch, attempt_no, rework_cycle,
@@ -3858,14 +4463,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
           input.project_id,
           input.task_id,
           input.lease_id ?? null,
-          input.lease_epoch,
-          input.attempt_no ?? 1,
-          input.rework_cycle ?? 0,
+          normalized.lease_epoch,
+          normalized.attempt_no,
+          normalized.rework_cycle,
           input.phase,
-          Math.max(0, Math.round(input.wall_time_ms)),
-          Math.max(0, Math.round(input.cpu_usage_usec)),
-          Math.max(0, Math.round(input.peak_memory_bytes)),
-          input.sandbox_backend_mode,
+          normalized.wall_time_ms,
+          normalized.cpu_usage_usec,
+          normalized.peak_memory_bytes,
+          normalized.sandbox_backend_mode,
           input.metrics_source,
         ]
       );
@@ -3900,35 +4505,21 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     if (!task) {
       return null;
     }
-    const [
-      mainHeadCommitHash,
-      taskLeases,
-      processedEvents,
-      resourceUsageMetrics,
-      imports,
-      allMergeCandidates,
-      verificationRuns,
-      reviewSessions,
-      reviewArtifacts,
-      approvalRequests,
-      approvalDecisions,
-      mergeOperations,
-    ] = await Promise.all([
+    const mainHeadCommitHash =
       liveMainHeadHash !== undefined
-        ? Promise.resolve(liveMainHeadHash)
-        : this.getMainRefCommitHash(),
-      this.listTaskLeasesForTask(taskId),
-      this.listProcessedWorkerEventsForTask(taskId),
-      this.listResourceUsageMetricsForTask(taskId),
-      this.getVerifiedImportsForTask(taskId),
-      this.listMergeCandidatesForTask(taskId),
-      this.listVerificationRunsForTask(taskId),
-      this.listReviewSessionsForTask(taskId),
-      this.listReviewArtifactsForTask(taskId),
-      this.listApprovalRequestsForTask(taskId),
-      this.listApprovalDecisionsForTask(taskId),
-      this.listMergeOperationsForTask(taskId),
-    ]);
+        ? liveMainHeadHash
+        : await this.getMainRefCommitHash(task.project_id);
+    const taskLeases = await this.listTaskLeasesForTask(taskId);
+    const processedEvents = await this.listProcessedWorkerEventsForTask(taskId);
+    const resourceUsageMetrics = await this.listResourceUsageMetricsForTask(taskId);
+    const imports = await this.getVerifiedImportsForTask(taskId);
+    const allMergeCandidates = await this.listMergeCandidatesForTask(taskId);
+    const verificationRuns = await this.listVerificationRunsForTask(taskId);
+    const reviewSessions = await this.listReviewSessionsForTask(taskId);
+    const reviewArtifacts = await this.listReviewArtifactsForTask(taskId);
+    const approvalRequests = await this.listApprovalRequestsForTask(taskId);
+    const approvalDecisions = await this.listApprovalDecisionsForTask(taskId);
+    const mergeOperations = await this.listMergeOperationsForTask(taskId);
 
     return buildCandidateBoundLineage({
       task,
@@ -3948,6 +4539,61 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   }
 }
 
+export function validateAndNormalizeResourceUsageMetricInput(
+  input: RecordResourceUsageMetricInput,
+  taskDefaults?: { readonly current_attempt_no: number; readonly rework_count: number }
+): {
+  readonly lease_epoch: number;
+  readonly attempt_no: number;
+  readonly rework_cycle: number;
+  readonly wall_time_ms: number;
+  readonly cpu_usage_usec: number;
+  readonly peak_memory_bytes: number;
+  readonly sandbox_backend_mode: string;
+} {
+  if (!Number.isFinite(input.lease_epoch) || input.lease_epoch < 0) {
+    throw new PostgresRlsError("23514", "lease_epoch must be a non-negative finite number");
+  }
+  if (
+    input.attempt_no !== undefined &&
+    (!Number.isFinite(input.attempt_no) || input.attempt_no < 1)
+  ) {
+    throw new PostgresRlsError("23514", "attempt_no must be >= 1");
+  }
+  if (
+    input.rework_cycle !== undefined &&
+    (!Number.isFinite(input.rework_cycle) || input.rework_cycle < 0)
+  ) {
+    throw new PostgresRlsError("23514", "rework_cycle must be >= 0");
+  }
+  if (!Number.isFinite(input.wall_time_ms) || input.wall_time_ms < 0) {
+    throw new PostgresRlsError("23514", "wall_time_ms must be >= 0");
+  }
+  if (!Number.isFinite(input.cpu_usage_usec) || input.cpu_usage_usec < 0) {
+    throw new PostgresRlsError("23514", "cpu_usage_usec must be >= 0");
+  }
+  if (!Number.isFinite(input.peak_memory_bytes) || input.peak_memory_bytes < 0) {
+    throw new PostgresRlsError("23514", "peak_memory_bytes must be >= 0");
+  }
+  const trimmedMode = input.sandbox_backend_mode.trim();
+  if (!trimmedMode) {
+    throw new PostgresRlsError("23514", "sandbox_backend_mode must be non-empty");
+  }
+
+  const defaultAttemptNo = Math.max(1, Math.round(taskDefaults?.current_attempt_no ?? 1));
+  const defaultReworkCycle = Math.max(0, Math.round(taskDefaults?.rework_count ?? 0));
+
+  return {
+    lease_epoch: Math.round(input.lease_epoch),
+    attempt_no: Math.max(1, Math.round(input.attempt_no ?? defaultAttemptNo)),
+    rework_cycle: Math.max(0, Math.round(input.rework_cycle ?? defaultReworkCycle)),
+    wall_time_ms: Math.round(input.wall_time_ms),
+    cpu_usage_usec: Math.round(input.cpu_usage_usec),
+    peak_memory_bytes: Math.round(input.peak_memory_bytes),
+    sandbox_backend_mode: trimmedMode,
+  };
+}
+
 export function buildCandidateBoundLineage(input: {
   readonly task: TaskRecord;
   readonly mainHeadCommitHash: string | null;
@@ -3964,12 +4610,13 @@ export function buildCandidateBoundLineage(input: {
   readonly mergeOperations: readonly MergeOperationRecord[];
 }): CandidateBoundLineage {
   const { task } = input;
+  const designatedMc = task.active_merge_candidate_id
+    ? input.allMergeCandidates.find(
+        (c) => c.merge_candidate_id === task.active_merge_candidate_id
+      )
+    : undefined;
   const activeMc =
-    (task.active_merge_candidate_id
-      ? input.allMergeCandidates.find(
-          (c) => c.merge_candidate_id === task.active_merge_candidate_id
-        )
-      : undefined) ??
+    (designatedMc && !designatedMc.is_superseded ? designatedMc : undefined) ??
     [...input.allMergeCandidates].reverse().find((c) => !c.is_superseded) ??
     input.allMergeCandidates[input.allMergeCandidates.length - 1] ??
     null;
@@ -4003,16 +4650,32 @@ export function buildCandidateBoundLineage(input: {
         .find((s) => s.merge_candidate_id === activeMc.merge_candidate_id) ?? null
     : null;
 
-  const approvalRequest = activeMc
+  const approvalForCandidate = activeMc
+    ? [...input.approvalDecisions]
+        .reverse()
+        .find((a) => a.merge_candidate_id === activeMc.merge_candidate_id) ?? null
+    : null;
+
+  const approvalRequest = approvalForCandidate?.approval_request_id
+    ? input.approvalRequests.find(
+        (r) => r.approval_request_id === approvalForCandidate.approval_request_id
+      ) ?? null
+    : activeMc
     ? [...input.approvalRequests]
         .reverse()
         .find((r) => r.merge_candidate_id === activeMc.merge_candidate_id) ?? null
     : null;
 
-  const approvalForCandidate = activeMc
-    ? [...input.approvalDecisions]
+  const mergeOpForCandidate = activeMc
+    ? [...input.mergeOperations]
         .reverse()
-        .find((a) => a.merge_candidate_id === activeMc.merge_candidate_id) ?? null
+        .find(
+          (m) => m.merge_candidate_id === activeMc.merge_candidate_id && m.status === "MERGED"
+        ) ??
+      [...input.mergeOperations]
+        .reverse()
+        .find((m) => m.merge_candidate_id === activeMc.merge_candidate_id) ??
+      null
     : null;
 
   const missingLinks: string[] = [];
@@ -4025,14 +4688,36 @@ export function buildCandidateBoundLineage(input: {
   if (!reviewArtifact) missingLinks.push("review_artifacts");
   if (!approvalRequest) missingLinks.push("approval_requests");
   if (!approvalForCandidate) missingLinks.push("approval_decisions");
-  if (input.mergeOperations.length === 0) missingLinks.push("merge_operations");
+  if (!mergeOpForCandidate || mergeOpForCandidate.status !== "MERGED") {
+    missingLinks.push("merge_operations");
+  }
 
   const hashBindingVerified = Boolean(
     activeMc &&
+      !activeMc.is_superseded &&
       verifiedImport &&
       verificationRun &&
       reviewArtifact &&
       approvalForCandidate &&
+      verificationRun.verdict === "PASS" &&
+      (verificationRun.overall_status ?? "PASSED") === "PASSED" &&
+      reviewArtifact.verdict === "PASS" &&
+      !reviewArtifact.is_invalidated &&
+      (reviewArtifact.status ?? "VALID") === "VALID" &&
+      approvalForCandidate.decision === "APPROVED" &&
+      (approvalForCandidate.status === "ACTIVE" || approvalForCandidate.status === "CONSUMED") &&
+      (!approvalForCandidate.approval_request_id ||
+        (approvalRequest !== null &&
+          approvalRequest.approval_request_id === approvalForCandidate.approval_request_id)) &&
+      (!approvalRequest ||
+        (approvalRequest.merge_candidate_id === activeMc.merge_candidate_id &&
+          approvalRequest.review_artifact_id === reviewArtifact.review_artifact_id &&
+          approvalRequest.verification_run_id === verificationRun.verification_run_id &&
+          approvalRequest.agent_commit_hash === activeMc.agent_commit_hash &&
+          approvalRequest.base_main_commit_hash === activeMc.base_main_commit_hash &&
+          approvalRequest.merge_candidate_hash === activeMc.merge_candidate_hash &&
+          approvalRequest.verified_tree_hash === activeMc.verified_tree_hash &&
+          approvalRequest.status === "APPROVED")) &&
       activeMc.agent_commit_hash === verifiedImport.agent_commit_hash &&
       verificationRun.merge_candidate_hash === activeMc.merge_candidate_hash &&
       verificationRun.verified_tree_hash === activeMc.verified_tree_hash &&
@@ -4043,11 +4728,17 @@ export function buildCandidateBoundLineage(input: {
       approvalForCandidate.merge_candidate_hash === activeMc.merge_candidate_hash &&
       approvalForCandidate.verified_tree_hash === activeMc.verified_tree_hash &&
       approvalForCandidate.verification_run_id === verificationRun.verification_run_id &&
-      approvalForCandidate.review_artifact_id === reviewArtifact.review_artifact_id
+      approvalForCandidate.review_artifact_id === reviewArtifact.review_artifact_id &&
+      (!mergeOpForCandidate ||
+        (mergeOpForCandidate.approval_id === approvalForCandidate.approval_id &&
+          mergeOpForCandidate.base_main_commit_hash === activeMc.base_main_commit_hash &&
+          mergeOpForCandidate.merge_candidate_hash === activeMc.merge_candidate_hash &&
+          mergeOpForCandidate.verified_tree_hash === activeMc.verified_tree_hash))
   );
 
   const gitLogHeadMatchesCandidate = Boolean(
     activeMc &&
+      !activeMc.is_superseded &&
       input.mainHeadCommitHash &&
       task.merged_commit_hash &&
       input.mainHeadCommitHash === activeMc.merge_candidate_hash &&

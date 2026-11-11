@@ -1,10 +1,13 @@
+import { spawnSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type {
-  LeaseSyncStatusResponse,
-  ResourceUsageMetricRecord,
-  ServerEventAckContract,
-  WorkerEventEnvelope,
+import {
+  type LeaseSyncStatusResponse,
+  type ResourceUsageMetricRecord,
+  type ServerEventAckContract,
+  type WorkerEventEnvelope,
+  canonicalizeJson,
 } from "@software-factory/shared-types";
 import {
   type GitTreeChangeEntry,
@@ -355,6 +358,7 @@ export class AgentGatewayService implements AgentGatewayTransportClient {
   }
 
   public issueReviewerSessionCredential(input: {
+    project_id?: string;
     task_id: string;
     merge_candidate_id: string;
     verification_run_id: string;
@@ -431,7 +435,7 @@ export class AgentGatewayService implements AgentGatewayTransportClient {
     }
 
     return this.reviewerCredentialService.issueReviewerSessionToken({
-      projectId: this.projectId,
+      projectId: input.project_id ?? this.projectId,
       taskId: input.task_id,
       mergeCandidateId: input.merge_candidate_id,
       verificationRunId: input.verification_run_id,
@@ -779,24 +783,129 @@ export class AgentGatewayHttpServer {
             };
           }
 
-          let changes = body.changes;
-          let verifiedTreeHash = body.verified_tree_hash;
-          let parentCommitHashes = body.parent_commit_hashes;
+          const projectRepoPath = project.repo_bare_path?.trim();
+          const requestedRepoPath = body.repo_path?.trim();
+          if (requestedRepoPath && projectRepoPath) {
+            const canonicalProjectRepo = existsSync(projectRepoPath)
+              ? realpathSync(projectRepoPath)
+              : projectRepoPath;
+            const canonicalRequestedRepo = existsSync(requestedRepoPath)
+              ? realpathSync(requestedRepoPath)
+              : requestedRepoPath;
+            if (canonicalRequestedRepo !== canonicalProjectRepo) {
+              return {
+                allowed: false,
+                error_code: "ERR_GATEKEEPER_TAMPERED_IMPORT",
+                reason: "Pre-receive repo_path does not match registered project bare repository",
+              };
+            }
+          }
 
-          if (!changes) {
-            const repoPath = body.repo_path?.trim() || project.repo_bare_path;
-            const inspected = inspectRealGitCommitForImport({
-              repoPath,
-              expectedBaseMainCommitHash: task.base_main_commit_hash,
-              agentCommitHash: body.new_sha,
-              contract: task.task_contract_json as unknown as TaskContractSpec,
-              gitObjectDirectory: body.git_object_directory?.trim() || undefined,
-              gitAlternateObjectDirectories:
-                body.git_alternate_object_directories?.trim() || undefined,
+          const effectiveRepoPath = projectRepoPath || requestedRepoPath;
+          const gitObjectDir = body.git_object_directory?.trim() || undefined;
+          const gitAltObjectDirs = body.git_alternate_object_directories?.trim() || undefined;
+          const isRealRepoOnDisk = (() => {
+            if (!effectiveRepoPath || !existsSync(effectiveRepoPath)) {
+              return false;
+            }
+            const probe = spawnSync("git", ["rev-parse", "--git-dir"], {
+              cwd: effectiveRepoPath,
+              env: {
+                ...process.env,
+                ...(gitObjectDir ? { GIT_OBJECT_DIRECTORY: gitObjectDir } : {}),
+                ...(gitAltObjectDirs
+                  ? { GIT_ALTERNATE_OBJECT_DIRECTORIES: gitAltObjectDirs }
+                  : {}),
+              },
+              encoding: "utf8",
+              timeout: 5_000,
             });
+            return probe.status === 0;
+          })();
+
+          let changes: readonly GitTreeChangeEntry[];
+          let verifiedTreeHash: string;
+          let parentCommitHashes: readonly string[];
+
+          if (isRealRepoOnDisk) {
+            let inspected: ReturnType<typeof inspectRealGitCommitForImport>;
+            try {
+              inspected = inspectRealGitCommitForImport({
+                repoPath: effectiveRepoPath!,
+                expectedBaseMainCommitHash: task.base_main_commit_hash,
+                agentCommitHash: body.new_sha,
+                contract: task.task_contract_json as unknown as TaskContractSpec,
+                gitObjectDirectory: gitObjectDir,
+                gitAlternateObjectDirectories: gitAltObjectDirs,
+              });
+            } catch (inspectErr: unknown) {
+              return {
+                allowed: false,
+                error_code: "ERR_GATEKEEPER_INSPECTION_FAILED",
+                reason: `Failed to inspect Git commit '${body.new_sha}': ${
+                  inspectErr instanceof Error ? inspectErr.message : String(inspectErr)
+                }`,
+              };
+            }
+
+            if (
+              body.verified_tree_hash !== undefined &&
+              body.verified_tree_hash.toLowerCase() !== inspected.verified_tree_hash.toLowerCase()
+            ) {
+              return {
+                allowed: false,
+                error_code: "ERR_GATEKEEPER_TAMPERED_IMPORT",
+                reason: `Caller verified_tree_hash (${body.verified_tree_hash}) does not match real Git tree (${inspected.verified_tree_hash})`,
+              };
+            }
+            if (
+              body.parent_commit_hashes !== undefined &&
+              canonicalizeJson(body.parent_commit_hashes) !==
+                canonicalizeJson(inspected.parent_commit_hashes)
+            ) {
+              return {
+                allowed: false,
+                error_code: "ERR_GATEKEEPER_TAMPERED_IMPORT",
+                reason: "Caller parent_commit_hashes do not match real Git commit parents",
+              };
+            }
+            if (
+              body.changes !== undefined &&
+              canonicalizeJson(body.changes) !== canonicalizeJson(inspected.changes)
+            ) {
+              return {
+                allowed: false,
+                error_code: "ERR_GATEKEEPER_TAMPERED_IMPORT",
+                reason: "Caller changes manifest does not match real Git commit diff-tree",
+              };
+            }
+
             changes = inspected.changes;
             verifiedTreeHash = inspected.verified_tree_hash;
             parentCommitHashes = inspected.parent_commit_hashes;
+          } else {
+            if (!body.changes || !body.verified_tree_hash || !body.parent_commit_hashes) {
+              return {
+                allowed: false,
+                error_code: "ERR_GATEKEEPER_MISSING_INSPECTION_METADATA",
+                reason:
+                  "Real Git repository unavailable on disk and pre-receive requires verified_tree_hash, parent_commit_hashes, and changes",
+              };
+            }
+            if (
+              !/^[0-9a-f]{40}$/i.test(body.verified_tree_hash) ||
+              body.verified_tree_hash.toLowerCase() === body.new_sha.toLowerCase()
+            ) {
+              return {
+                allowed: false,
+                error_code: "ERR_GATEKEEPER_TAMPERED_IMPORT",
+                reason:
+                  "verified_tree_hash must be a valid 40-char Git tree hash distinct from commit new_sha",
+              };
+            }
+            changes = body.changes;
+            verifiedTreeHash = body.verified_tree_hash;
+            parentCommitHashes = body.parent_commit_hashes;
           }
 
           return this.store.pushStagingGitRefWithGatekeeper({
@@ -806,8 +915,8 @@ export class AgentGatewayHttpServer {
             lease_epoch: claims.leaseEpoch,
             staging_ref: body.ref_name,
             agent_commit_hash: body.new_sha,
-            verified_tree_hash: verifiedTreeHash ?? body.new_sha,
-            parent_commit_hashes: parentCommitHashes ?? [],
+            verified_tree_hash: verifiedTreeHash,
+            parent_commit_hashes: parentCommitHashes,
             changes,
             simulateControlPlaneOutage: this.simulateControlPlaneOutage,
             deadlineMs: this.deadlineMs,
@@ -1141,3 +1250,5 @@ export class HttpAgentGatewayClient implements AgentGatewayTransportClient {
     }
   }
 }
+
+export * from "./runtime.ts";

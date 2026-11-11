@@ -511,6 +511,14 @@ export class CoreApiService {
     return this.assertMembershipRole(verified, membership, targetProjectId, requiredRoles);
   }
 
+  public authorizeAction(
+    auth: CoreApiAuthContext,
+    targetProjectId: string,
+    requiredRoles: readonly ProjectMemberRole[]
+  ): Promise<CoreApiAuthContext> {
+    return this.authorize(auth, targetProjectId, requiredRoles);
+  }
+
   public createTask(
     projectId: string,
     auth: CoreApiAuthContext,
@@ -734,8 +742,15 @@ export class CoreApiService {
         const project = await this.store.getProjectById(projectId);
         const repoPath = input.repo_path ?? project?.repo_bare_path;
         let liveMainSha = input.current_main_commit_hash;
-        if (!liveMainSha && this.isRealGitRepoOnDisk(repoPath, input.git_dir)) {
-          liveMainSha = this.createRealGitCasBridge(repoPath!, input.git_dir).getCurrentMainHead();
+        if (this.isRealGitRepoOnDisk(repoPath, input.git_dir)) {
+          const diskMainSha = this.createRealGitCasBridge(repoPath!, input.git_dir).getCurrentMainHead();
+          if (liveMainSha && liveMainSha !== diskMainSha) {
+            throw new PostgresRlsError(
+              "23514",
+              `Caller-supplied current_main_commit_hash (${liveMainSha}) does not match live Git refs/heads/main HEAD (${diskMainSha})`
+            );
+          }
+          liveMainSha = diskMainSha;
         }
         return this.store.submitHumanApproval({
           project_id: projectId,
@@ -1311,6 +1326,7 @@ export class CoreApiService {
     );
 
     const issuedCredential = input.agent_gateway.issueReviewerSessionCredential({
+      project_id: projectId,
       task_id: task.task_id,
       merge_candidate_id: candidate.merge_candidate_id,
       verification_run_id: verificationRun.verification_run_id,
@@ -1340,11 +1356,15 @@ export class CoreApiService {
         sandboxBackend: reviewerSandbox,
       });
 
-    const reviewSessionId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      issuedCredential.claims.reviewerSessionId
-    )
-      ? issuedCredential.claims.reviewerSessionId
-      : undefined;
+    const reviewSessionId = issuedCredential.claims.reviewerSessionId;
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reviewSessionId)
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `Issued reviewer_session_id '${reviewSessionId}' must be a valid UUID`
+      );
+    }
     const startedSession = await this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
@@ -2128,3 +2148,4 @@ export function buildM5EvidenceBundle(input: {
 }
 
 export * from "./http-server.ts";
+export * from "./runtime.ts";

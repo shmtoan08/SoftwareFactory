@@ -63,6 +63,17 @@ export function decodeCoreApiAuthHeader(
   }
 }
 
+export interface CoreApiVerifyHttpPolicy {
+  /** Allow verified ORG_ADMIN callers to override isolation or command/image allowlists on POST /verify. Default: false. */
+  readonly allowAdminVerifyOverrides?: boolean;
+  /** Allowed binary executables for tier1/tier2/tier3 commands. Default: ["node", process.execPath]. */
+  readonly allowedCommandBinaries?: readonly string[];
+  /** Allowed Docker image tags/digests. Default: ["node:22-alpine"]. */
+  readonly allowedDockerImages?: readonly string[];
+  /** Allowed extra_env keys. Default: []. */
+  readonly allowedEnvKeys?: readonly string[];
+}
+
 export interface CoreApiHttpServerOptions {
   readonly coreApi: CoreApiService;
   readonly host?: string;
@@ -73,6 +84,8 @@ export interface CoreApiHttpServerOptions {
   readonly defaultOrphanedDiffProvider?: Parameters<
     ControlPlaneStore["runLeaseExpiryAndOrphanedPushReconciler"]
   >[0];
+  readonly verifyPolicy?: CoreApiVerifyHttpPolicy;
+  readonly enableTestFaultInjection?: boolean;
 }
 
 class BadRequestHttpError extends Error {
@@ -96,6 +109,13 @@ export class CoreApiHttpServer {
   private readonly defaultVerifier?: Docker3TierVerifier;
   private readonly defaultAgentGateway?: AgentGatewayService;
   private readonly defaultOrphanedDiffProvider?: CoreApiHttpServerOptions["defaultOrphanedDiffProvider"];
+  private readonly verifyPolicy: {
+    readonly allowAdminVerifyOverrides: boolean;
+    readonly allowedCommandBinaries: readonly string[];
+    readonly allowedDockerImages: readonly string[];
+    readonly allowedEnvKeys: readonly string[];
+  };
+  private readonly enableTestFaultInjection: boolean;
   private server: Server | null = null;
 
   constructor(options: CoreApiHttpServerOptions) {
@@ -106,6 +126,16 @@ export class CoreApiHttpServer {
     this.defaultVerifier = options.defaultVerifier;
     this.defaultAgentGateway = options.defaultAgentGateway;
     this.defaultOrphanedDiffProvider = options.defaultOrphanedDiffProvider;
+    this.verifyPolicy = {
+      allowAdminVerifyOverrides: options.verifyPolicy?.allowAdminVerifyOverrides ?? false,
+      allowedCommandBinaries: options.verifyPolicy?.allowedCommandBinaries ?? [
+        "node",
+        process.execPath,
+      ],
+      allowedDockerImages: options.verifyPolicy?.allowedDockerImages ?? ["node:22-alpine"],
+      allowedEnvKeys: options.verifyPolicy?.allowedEnvKeys ?? [],
+    };
+    this.enableTestFaultInjection = options.enableTestFaultInjection ?? false;
   }
 
   public async start(): Promise<{ port: number; baseUrl: string }> {
@@ -435,6 +465,78 @@ export class CoreApiHttpServer {
             "merge_candidate_id, trusted_acceptance_dir, and tier1_command are required"
           );
         }
+
+        // Authenticate caller first so forged tokens never probe HTTP /verify policy rules
+        await this.coreApi.authorizeAction(auth, projectId, ["DEVELOPER", "ORG_ADMIN"]);
+
+        const policyViolations: string[] = [];
+        if (body.execution_mode === "subprocess" || body.execution_mode === "sandbox") {
+          policyViolations.push(
+            `execution_mode '${body.execution_mode}' is restricted; HTTP /verify requires 'auto' or 'docker'`
+          );
+        }
+        if (body.require_docker === false) {
+          policyViolations.push("require_docker=false is forbidden on HTTP /verify");
+        }
+        if (body.network_disabled === false) {
+          policyViolations.push("network_disabled=false is forbidden on HTTP /verify");
+        }
+        if (
+          body.docker_image !== undefined &&
+          !this.verifyPolicy.allowedDockerImages.includes(body.docker_image)
+        ) {
+          policyViolations.push(
+            `docker_image '${body.docker_image}' is not in HTTP /verify allowlist`
+          );
+        }
+        if (body.extra_env !== undefined) {
+          if (!body.extra_env || typeof body.extra_env !== "object" || Array.isArray(body.extra_env)) {
+            policyViolations.push("extra_env must be a plain key/value object");
+          } else {
+            for (const envKey of Object.keys(body.extra_env)) {
+              if (!this.verifyPolicy.allowedEnvKeys.includes(envKey)) {
+                policyViolations.push(
+                  `extra_env key '${envKey}' is not in HTTP /verify allowlist`
+                );
+              }
+            }
+          }
+        }
+        const commandsToValidate: Array<[string, TierCommandSpec | undefined]> = [
+          ["tier1_command", body.tier1_command],
+          ["tier2_command", body.tier2_command],
+          ["tier3_command", body.tier3_command],
+        ];
+        for (const [label, cmdSpec] of commandsToValidate) {
+          if (!cmdSpec) {
+            continue;
+          }
+          const cmdBin = typeof cmdSpec.command === "string" ? cmdSpec.command.trim() : "";
+          if (!cmdBin || !this.verifyPolicy.allowedCommandBinaries.includes(cmdBin)) {
+            policyViolations.push(
+              `${label}.command '${cmdBin}' is not in HTTP /verify command allowlist`
+            );
+          }
+        }
+
+        if (policyViolations.length > 0) {
+          let adminOverrideAuthorized = false;
+          if (this.verifyPolicy.allowAdminVerifyOverrides) {
+            try {
+              await this.coreApi.authorizeAction(auth, projectId, ["ORG_ADMIN"]);
+              adminOverrideAuthorized = true;
+            } catch {
+              adminOverrideAuthorized = false;
+            }
+          }
+          if (!adminOverrideAuthorized) {
+            throw new PostgresRlsError(
+              "42501",
+              `HTTP /verify policy violation: ${policyViolations.join("; ")}`
+            );
+          }
+        }
+
         const verified = await this.coreApi.verifyMergeCandidate(projectId, auth, {
           ...body,
           task_id: taskId,
@@ -529,6 +631,12 @@ export class CoreApiHttpServer {
         }>(req);
         if (!body.merge_candidate_id || !body.approval_id) {
           throw new BadRequestHttpError("merge_candidate_id and approval_id are required");
+        }
+        if (body.simulateCrashAfterGitUpdateRef !== undefined && !this.enableTestFaultInjection) {
+          throw new PostgresRlsError(
+            "42501",
+            "simulateCrashAfterGitUpdateRef is disabled unless CoreApiHttpServer enableTestFaultInjection is enabled"
+          );
         }
         const mergeResult = await this.coreApi.executeCasMerge(projectId, auth, {
           ...body,
@@ -917,6 +1025,7 @@ export class HttpCoreApiClient {
       ttl_ms?: number;
       repo_path?: string;
       git_dir?: string;
+      current_main_commit_hash?: string;
     }
   ): Promise<ApprovalDecisionRecord> {
     const res = await this.requestJson<ApprovalDecisionRecord>(

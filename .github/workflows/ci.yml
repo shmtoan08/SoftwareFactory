@@ -537,9 +537,18 @@ jobs:
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified merge_operations rows: %', v_cnt; END IF;
 
-            UPDATE projects SET main_ref_commit_hash = repeat('9', 40) WHERE project_id = v_proj_a;
+            UPDATE projects SET main_ref_commit_hash = repeat('9', 40), updated_at = clock_timestamp() WHERE project_id = v_proj_a;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 1 THEN RAISE EXCEPTION 'projects_core_api_main_ref_update failed for Project A: got %', v_cnt; END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE projects SET slug = 'hijacked-slug' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Non-whitelisted UPDATE on projects.slug was unexpectedly allowed for app_runtime';
+            END IF;
 
             UPDATE projects SET main_ref_commit_hash = repeat('9', 40) WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
@@ -820,6 +829,32 @@ jobs:
             RAISE NOTICE 'M4 & M5 Upgrade Path Verification (86076639 -> HEAD) PASSED.';
           END
           $$;
+          BEGIN;
+          SET LOCAL ROLE app_runtime;
+          SELECT
+            set_config('app.current_project_id', '33333333-3333-3333-3333-333333333333', true),
+            set_config('app.current_principal_id', 'core-api', true),
+            set_config('app.current_role', 'core_api_service', true);
+          DO $$
+          DECLARE
+            v_proj UUID := '33333333-3333-3333-3333-333333333333';
+            v_caught BOOLEAN := false;
+            v_cnt INTEGER;
+          BEGIN
+            UPDATE projects SET main_ref_commit_hash = repeat('1', 40), updated_at = clock_timestamp() WHERE project_id = v_proj;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'Upgraded projects column-GRANT update failed: %', v_cnt; END IF;
+
+            BEGIN
+              UPDATE projects SET slug = 'hijacked-upgrade' WHERE project_id = v_proj;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Upgraded column-GRANT failed to block projects.slug UPDATE for app_runtime';
+            END IF;
+          END
+          $$;
+          COMMIT;
           SQL
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_upgrade_test;"

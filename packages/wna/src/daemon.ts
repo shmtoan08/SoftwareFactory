@@ -132,6 +132,7 @@ export interface WnaLeaseExecutionResult {
   readonly recordedMetric: ResourceUsageMetricRecord | null;
   readonly outboxAcks: readonly ServerEventAckContract[];
   readonly reconnectSyncInvoked: boolean;
+  readonly error?: string;
 }
 
 /**
@@ -208,29 +209,6 @@ export class WnaWorkerDaemon {
     mkdirSync(taskWorktreeRoot, { recursive: true, mode: 0o755 });
     mkdirSync(this.outboxDir, { recursive: true, mode: 0o700 });
 
-    if (existsSync(worktreePath)) {
-      rmSync(worktreePath, { recursive: true, force: true });
-      try {
-        execFileSync("git", ["worktree", "prune"], {
-          cwd: input.repoBarePath,
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 30_000,
-        });
-      } catch {
-        // best-effort prune
-      }
-    }
-
-    execFileSync(
-      "git",
-      ["worktree", "add", "--detach", worktreePath, task.base_main_commit_hash],
-      {
-        cwd: input.repoBarePath,
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: 30_000,
-      }
-    );
-
     const outbox = new LocalOutboxBuffer({
       projectId: task.project_id,
       taskId: task.task_id,
@@ -251,6 +229,8 @@ export class WnaWorkerDaemon {
     let agentExecution: AgentExecutionResult | null = null;
     let pushedCommitHash: string | null = null;
     let pushStdout = "";
+    let currentPhase = "worktree_prepare";
+    let terminalEventEnqueued = false;
 
     const reportDeveloperMetric = async (
       snap: SandboxResourceMetricsSnapshot | null,
@@ -280,6 +260,30 @@ export class WnaWorkerDaemon {
     };
 
     try {
+      if (existsSync(worktreePath)) {
+        rmSync(worktreePath, { recursive: true, force: true });
+        try {
+          execFileSync("git", ["worktree", "prune"], {
+            cwd: input.repoBarePath,
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 30_000,
+          });
+        } catch {
+          // best-effort prune
+        }
+      }
+
+      execFileSync(
+        "git",
+        ["worktree", "add", "--detach", worktreePath, task.base_main_commit_hash],
+        {
+          cwd: input.repoBarePath,
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 30_000,
+        }
+      );
+
+      currentPhase = "task_accepted";
       outbox.enqueueEvent("task.accepted", {
         worker_id: lease.worker_id,
         worktree_path: worktreePath,
@@ -287,6 +291,7 @@ export class WnaWorkerDaemon {
       const r1 = await this.flushOutboxWithReconnect(outbox, outboxAcks);
       reconnectSyncInvoked = reconnectSyncInvoked || r1.reconnectSyncInvoked;
       if (outbox.isFenced()) {
+        terminalEventEnqueued = true;
         return {
           outcome: "FENCED_STALE_LEASE",
           worktreePath,
@@ -304,6 +309,7 @@ export class WnaWorkerDaemon {
         };
       }
 
+      currentPhase = "task_started";
       outbox.enqueueEvent("task.started", {
         worktree_path: worktreePath,
         base_main_commit_hash: task.base_main_commit_hash,
@@ -311,6 +317,7 @@ export class WnaWorkerDaemon {
       const r2 = await this.flushOutboxWithReconnect(outbox, outboxAcks);
       reconnectSyncInvoked = reconnectSyncInvoked || r2.reconnectSyncInvoked;
       if (outbox.isFenced()) {
+        terminalEventEnqueued = true;
         return {
           outcome: "FENCED_STALE_LEASE",
           worktreePath,
@@ -344,7 +351,9 @@ export class WnaWorkerDaemon {
         hostEnvironmentToSanitize: input.hostEnvironmentToSanitize,
       };
 
+      currentPhase = "agent_prepare";
       const plan = await input.adapter.prepareInvocation(agentCtx);
+      currentPhase = "sandbox_spawn";
       const spawnRes = this.sandboxBackend.spawnRealProcessInSandbox({
         taskId: task.task_id,
         leaseEpoch: lease.lease_epoch,
@@ -361,6 +370,7 @@ export class WnaWorkerDaemon {
       });
       securityMetadata = spawnRes.securityMetadata;
 
+      currentPhase = "agent_execute";
       let timedOut = false;
       let agentTimeoutId: ReturnType<typeof setTimeout> | undefined;
       const exitRes = await Promise.race([
@@ -399,9 +409,13 @@ export class WnaWorkerDaemon {
           metricsSnapshot,
           securityMetadata.backendMode
         );
+        const failureReason =
+          agentExecution.error ?? `Agent exited with code ${agentExecution.exitCode}`;
+        terminalEventEnqueued = true;
         outbox.enqueueEvent("task.failed", {
-          error: agentExecution.error ?? `Agent exited with code ${agentExecution.exitCode}`,
+          error: failureReason,
           exit_code: agentExecution.exitCode,
+          phase: currentPhase,
         });
         const rf = await this.flushOutboxWithReconnect(outbox, outboxAcks);
         reconnectSyncInvoked = reconnectSyncInvoked || rf.reconnectSyncInvoked;
@@ -419,9 +433,11 @@ export class WnaWorkerDaemon {
           recordedMetric,
           outboxAcks,
           reconnectSyncInvoked,
+          error: failureReason,
         };
       }
 
+      currentPhase = "task_progress";
       outbox.enqueueEvent("task.progress", {
         phase: "staging_push_ready",
         agent_commit_hash: agentExecution.agentCommitHash,
@@ -430,6 +446,7 @@ export class WnaWorkerDaemon {
       const r3 = await this.flushOutboxWithReconnect(outbox, outboxAcks);
       reconnectSyncInvoked = reconnectSyncInvoked || r3.reconnectSyncInvoked;
       if (outbox.isFenced()) {
+        terminalEventEnqueued = true;
         cleanupEvidence =
           this.sandboxBackend.getLastCleanupEvidence(task.task_id, lease.lease_epoch) ??
           (await this.sandboxBackend.killAndVerifyClean(task.task_id, lease.lease_epoch));
@@ -451,6 +468,7 @@ export class WnaWorkerDaemon {
         };
       }
 
+      currentPhase = "staging_push";
       const pushResult = await runGitCommandAsync({
         args: ["push", input.repoBarePath, `${agentExecution.agentCommitHash}:${stagingRef}`],
         cwd: worktreePath,
@@ -472,6 +490,7 @@ export class WnaWorkerDaemon {
       metricsSnapshot = this.sandboxBackend.readMetrics(task.task_id, lease.lease_epoch);
 
       if (input.simulateCrashAfterPushBeforeCompletedEvent) {
+        terminalEventEnqueued = true;
         return {
           outcome: "SIMULATED_CRASH_BEFORE_COMPLETED",
           worktreePath,
@@ -494,6 +513,8 @@ export class WnaWorkerDaemon {
         securityMetadata.backendMode
       );
 
+      currentPhase = "task_completed";
+      terminalEventEnqueued = true;
       outbox.enqueueEvent("task.completed", {
         agent_commit_hash: agentExecution.agentCommitHash,
         verified_tree_hash: agentExecution.verifiedTreeHash,
@@ -523,6 +544,63 @@ export class WnaWorkerDaemon {
         outboxAcks,
         reconnectSyncInvoked,
       };
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      if (!cleanupEvidence) {
+        try {
+          cleanupEvidence = await this.sandboxBackend.killAndVerifyClean(
+            task.task_id,
+            lease.lease_epoch
+          );
+        } catch {
+          // best-effort cleanup on failure
+        }
+      }
+      if (!metricsSnapshot) {
+        try {
+          metricsSnapshot = this.sandboxBackend.readMetrics(task.task_id, lease.lease_epoch);
+        } catch {
+          // ignore metrics read failure
+        }
+      }
+      if (!recordedMetric && metricsSnapshot) {
+        recordedMetric = await reportDeveloperMetric(
+          metricsSnapshot,
+          securityMetadata?.backendMode ??
+            (process.platform === "linux" ? "linux-supervisor" : "real-process")
+        );
+      }
+      if (!terminalEventEnqueued && !outbox.isFenced()) {
+        terminalEventEnqueued = true;
+        outbox.enqueueEvent("task.failed", {
+          error: errorMsg,
+          phase: currentPhase,
+        });
+        try {
+          const rf = await this.flushOutboxWithReconnect(outbox, outboxAcks);
+          reconnectSyncInvoked = reconnectSyncInvoked || rf.reconnectSyncInvoked;
+          return {
+            outcome: outbox.isFenced() ? "FENCED_STALE_LEASE" : "FAILED",
+            worktreePath,
+            stagingRef,
+            outboxFilePath: outbox.outboxFilePath,
+            agentExecution,
+            pushedCommitHash,
+            pushStdout,
+            securityMetadata,
+            cleanupEvidence,
+            metricsSnapshot,
+            recordedMetric,
+            outboxAcks,
+            reconnectSyncInvoked,
+            error: errorMsg,
+          };
+        } catch {
+          // If gateway itself is unreachable while flushing task.failed, keep event in WAL and rethrow original error
+          throw err;
+        }
+      }
+      throw err;
     } finally {
       try {
         if (!cleanupEvidence) {

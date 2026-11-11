@@ -33,6 +33,10 @@ export interface ModelProviderConfig {
   readonly apiKeyEnvVar?: string;
   readonly baseUrl?: string;
   readonly timeoutMs?: number;
+  /** Explicitly opt in to plain http:// on non-loopback hosts (unsafe outside tests). Default: false. */
+  readonly allowInsecureHttpBaseUrl?: boolean;
+  /** Optional hostname allowlist for custom baseUrl endpoints. */
+  readonly allowedHosts?: readonly string[];
 }
 
 export interface ModelCompletionRequest {
@@ -62,10 +66,82 @@ function defaultEnvVarForProvider(provider: ModelProviderName): string {
   }
 }
 
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "[::1]"
+  );
+}
+
+function validateModelBaseUrl(config: ModelProviderConfig): void {
+  if (config.baseUrl === undefined) {
+    return;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(config.baseUrl);
+  } catch {
+    throw new ModelProviderConfigurationError(
+      config.provider,
+      `Invalid model provider baseUrl '${config.baseUrl}' for '${config.provider}'`
+    );
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new ModelProviderConfigurationError(
+      config.provider,
+      `Unsupported URL scheme '${parsed.protocol}' in baseUrl '${config.baseUrl}'; expected https://`
+    );
+  }
+  if (
+    parsed.protocol === "http:" &&
+    !isLoopbackHostname(parsed.hostname) &&
+    config.allowInsecureHttpBaseUrl !== true
+  ) {
+    throw new ModelProviderConfigurationError(
+      config.provider,
+      `Insecure http:// baseUrl '${config.baseUrl}' is forbidden for non-loopback host '${parsed.hostname}'; use https:// or set allowInsecureHttpBaseUrl: true`
+    );
+  }
+  if (config.allowedHosts && config.allowedHosts.length > 0) {
+    const normalizedHost = parsed.hostname.toLowerCase();
+    const allowed = config.allowedHosts.some((h) => h.trim().toLowerCase() === normalizedHost);
+    if (!allowed) {
+      throw new ModelProviderConfigurationError(
+        config.provider,
+        `Model provider baseUrl host '${parsed.hostname}' is not in allowedHosts [${config.allowedHosts.join(", ")}]`
+      );
+    }
+  }
+}
+
+function extractTextContent(rawContent: unknown): string {
+  if (typeof rawContent === "string") {
+    return rawContent;
+  }
+  if (Array.isArray(rawContent)) {
+    return rawContent
+      .filter(
+        (part): part is { type?: unknown; text: string } =>
+          Boolean(part) &&
+          typeof part === "object" &&
+          typeof (part as { text?: unknown }).text === "string" &&
+          ((part as { type?: unknown }).type === undefined ||
+            (part as { type?: unknown }).type === "text" ||
+            (part as { type?: unknown }).type === "output_text")
+      )
+      .map((part) => part.text)
+      .join("\n");
+  }
+  return "";
+}
+
 /**
  * Live Model Provider HTTP Adapter (`anthropic`, `openai`, `google`).
- * Fail-closed: throws `ModelProviderConfigurationError` if no API key is configured.
- * Supports both production HTTPS endpoints and custom/local OpenAI/Anthropic/Gemini compatible URLs.
+ * Fail-closed: throws `ModelProviderConfigurationError` if no API key is configured
+ * or if a non-loopback `http://` baseUrl is configured without explicit opt-in.
  */
 export class LiveModelProviderClient {
   public readonly config: ModelProviderConfig;
@@ -73,6 +149,7 @@ export class LiveModelProviderClient {
 
   constructor(config: ModelProviderConfig, env: NodeJS.ProcessEnv = process.env) {
     this.config = config;
+    validateModelBaseUrl(config);
     const envVar = config.apiKeyEnvVar ?? defaultEnvVarForProvider(config.provider);
     const key = (config.apiKey ?? env[envVar] ?? "").trim();
     if (!key) {
@@ -131,10 +208,12 @@ export class LiveModelProviderClient {
           usage?: Record<string, unknown>;
         };
         const text =
-          json.content
-            ?.filter((c) => c.type === "text" && typeof c.text === "string")
-            .map((c) => c.text)
-            .join("\n") ?? "";
+          Array.isArray(json.content)
+            ? json.content
+                .filter((c) => Boolean(c) && c.type === "text" && typeof c.text === "string")
+                .map((c) => c.text)
+                .join("\n")
+            : "";
         return {
           provider: "anthropic",
           model: this.config.model,
@@ -173,10 +252,10 @@ export class LiveModelProviderClient {
           );
         }
         const json = (await resp.json()) as {
-          choices?: Array<{ message?: { content?: string } }>;
+          choices?: Array<{ message?: { content?: unknown } }>;
           usage?: Record<string, unknown>;
         };
-        const text = json.choices?.[0]?.message?.content ?? "";
+        const text = extractTextContent(json.choices?.[0]?.message?.content);
         return {
           provider: "openai",
           model: this.config.model,
@@ -219,11 +298,14 @@ export class LiveModelProviderClient {
         candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
         usageMetadata?: Record<string, unknown>;
       };
-      const text =
-        json.candidates?.[0]?.content?.parts
-          ?.map((p) => p.text ?? "")
-          .filter(Boolean)
-          .join("\n") ?? "";
+      const parts = json.candidates?.[0]?.content?.parts;
+      const text = Array.isArray(parts)
+        ? parts
+            .filter((p): p is { text: string } => Boolean(p) && typeof p.text === "string")
+            .map((p) => p.text)
+            .filter(Boolean)
+            .join("\n")
+        : "";
       return {
         provider: "google",
         model: this.config.model,
@@ -291,7 +373,7 @@ export async function evaluateIndependentReviewWithLiveModel(
     temperature: 0,
   });
 
-  const rawText = completion.contentText.trim();
+  const rawText = typeof completion?.contentText === "string" ? completion.contentText.trim() : "";
   const jsonStart = rawText.indexOf("{");
   const jsonEnd = rawText.lastIndexOf("}");
   if (jsonStart === -1 || jsonEnd <= jsonStart) {

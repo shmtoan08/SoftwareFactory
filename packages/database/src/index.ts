@@ -47,7 +47,14 @@ import {
   type RlsSessionContext,
   SimulatedPostMergeCrashError,
 } from "./types.ts";
-import { buildCandidateBoundLineage } from "./postgres-pool.ts";
+import {
+  PostgresControlPlaneRepository,
+  type PostgresPoolConfig,
+  PostgresRuntimePool,
+  buildCandidateBoundLineage,
+  buildPostgresPoolConfigFromEnv,
+  validateAndNormalizeResourceUsageMetricInput,
+} from "./postgres-pool.ts";
 
 export * from "./types.ts";
 export * from "./postgres-pool.ts";
@@ -2929,12 +2936,19 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     });
   }
 
-  public getMainRefCommitHash(): string | null {
-    const currentProjectId = this.requireCurrentProjectId();
-    if (!currentProjectId) {
+  public getMainRefCommitHash(projectId?: string): string | null {
+    const session = this.getCurrentRlsSession();
+    const targetProjectId = projectId ?? (session.currentProjectId?.trim() || null);
+    if (!targetProjectId) {
       return null;
     }
-    return this.gitRefsByProject.get(currentProjectId)?.get("refs/heads/main") ?? null;
+    if (
+      session.currentRole !== "system_admin_role" &&
+      session.currentProjectId !== targetProjectId
+    ) {
+      return null;
+    }
+    return this.gitRefsByProject.get(targetProjectId)?.get("refs/heads/main") ?? null;
   }
 
   public getMergeCandidateById(mergeCandidateId: string): MergeCandidateRecord | null {
@@ -3167,22 +3181,23 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         throw new PostgresRlsError("23503", `Lease ${input.lease_id} not found for project ${input.project_id}`);
       }
     }
-    if (!input.sandbox_backend_mode.trim()) {
-      throw new PostgresRlsError("23514", "sandbox_backend_mode must be non-empty");
-    }
+    const normalized = validateAndNormalizeResourceUsageMetricInput(input, {
+      current_attempt_no: task.current_attempt_no,
+      rework_count: task.rework_count,
+    });
     const record: ResourceUsageMetricRecord = {
       metric_id: randomUUID(),
       project_id: input.project_id,
       task_id: input.task_id,
       lease_id: input.lease_id ?? null,
-      lease_epoch: Math.max(0, Math.round(input.lease_epoch)),
-      attempt_no: Math.max(1, Math.round(input.attempt_no ?? task.current_attempt_no ?? 1)),
-      rework_cycle: Math.max(0, Math.round(input.rework_cycle ?? task.rework_count ?? 0)),
+      lease_epoch: normalized.lease_epoch,
+      attempt_no: normalized.attempt_no,
+      rework_cycle: normalized.rework_cycle,
       phase: input.phase,
-      wall_time_ms: Math.max(0, Math.round(input.wall_time_ms)),
-      cpu_usage_usec: Math.max(0, Math.round(input.cpu_usage_usec)),
-      peak_memory_bytes: Math.max(0, Math.round(input.peak_memory_bytes)),
-      sandbox_backend_mode: input.sandbox_backend_mode.trim(),
+      wall_time_ms: normalized.wall_time_ms,
+      cpu_usage_usec: normalized.cpu_usage_usec,
+      peak_memory_bytes: normalized.peak_memory_bytes,
+      sandbox_backend_mode: normalized.sandbox_backend_mode,
       metrics_source: input.metrics_source,
       recorded_at: this.clockTimestampIso(),
     };
@@ -3215,7 +3230,9 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     return buildCandidateBoundLineage({
       task,
       mainHeadCommitHash:
-        liveMainHeadHash !== undefined ? liveMainHeadHash : this.getMainRefCommitHash(),
+        liveMainHeadHash !== undefined
+          ? liveMainHeadHash
+          : this.getMainRefCommitHash(task.project_id),
       taskLeases: this.listTaskLeasesForTask(taskId),
       processedEvents: this.listProcessedWorkerEventsForTask(taskId),
       resourceUsageMetrics: this.listResourceUsageMetricsForTask(taskId),
@@ -3263,4 +3280,54 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       created_at: this.clockTimestampIso(),
     });
   }
+}
+
+export interface ControlPlaneStoreFromEnvOptions {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly poolConfig?: PostgresPoolConfig;
+  readonly requirePostgres?: boolean;
+  readonly clockFn?: () => Date;
+}
+
+export interface ControlPlaneStoreHandle {
+  readonly mode: "postgres" | "memory";
+  readonly pool: PostgresRuntimePool | null;
+  readonly store: ControlPlaneStore;
+  close(): Promise<void>;
+}
+
+/**
+ * Selects PostgreSQL runtime (`PostgresRuntimePool` + `PostgresControlPlaneRepository`) whenever
+ * `DATABASE_URL` or `PGHOST` (or explicit `poolConfig`) is configured, or falls back to
+ * `SoftwareFactoryControlPlaneStore` when `requirePostgres` is false (`M5-FIX-11`).
+ */
+export function createControlPlaneStoreFromEnv(
+  options?: ControlPlaneStoreFromEnvOptions
+): ControlPlaneStoreHandle {
+  const env = options?.env ?? process.env;
+  const pgConfig = options?.poolConfig ?? buildPostgresPoolConfigFromEnv(env);
+  if (!pgConfig) {
+    if (options?.requirePostgres) {
+      throw new Error(
+        "PostgreSQL runtime is required (set DATABASE_URL or PGHOST/PGDATABASE/PGUSER/PGPASSWORD)"
+      );
+    }
+    const store = new SoftwareFactoryControlPlaneStore(options?.clockFn);
+    return {
+      mode: "memory",
+      pool: null,
+      store,
+      close: async () => {},
+    };
+  }
+  const pool = new PostgresRuntimePool(pgConfig);
+  const store = new PostgresControlPlaneRepository(pool);
+  return {
+    mode: "postgres",
+    pool,
+    store,
+    close: async () => {
+      await pool.close();
+    },
+  };
 }

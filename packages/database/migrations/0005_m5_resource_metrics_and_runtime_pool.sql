@@ -71,6 +71,8 @@ REVOKE ALL ON resource_usage_metrics FROM PUBLIC;
 GRANT SELECT, INSERT ON resource_usage_metrics TO app_runtime;
 
 -- 5. Allow core_api_service to update project main_ref_commit_hash within active tenant scope
+-- Enforce column-level least privilege (M5-FIX-12): narrow table-level UPDATE grant from 0001
+-- so app_runtime can only update main_ref_commit_hash and updated_at on projects.
 DROP POLICY IF EXISTS projects_core_api_main_ref_update ON projects;
 CREATE POLICY projects_core_api_main_ref_update ON projects
   FOR UPDATE
@@ -83,3 +85,5 @@ CREATE POLICY projects_core_api_main_ref_update ON projects
     AND current_app_role() = 'core_api_service'
   );
 
+REVOKE UPDATE ON projects FROM app_runtime;
+GRANT UPDATE (main_ref_commit_hash, updated_at) ON projects TO app_runtime;

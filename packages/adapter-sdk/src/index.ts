@@ -1,11 +1,14 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   DEFAULT_MAX_CHANGED_FILES,
   DEFAULT_MAX_DELETED_LINES,
   DEFAULT_SYSTEM_FORBIDDEN_PATHS,
   type TaskContractSpec,
+  evaluatePathPolicyPrecedence,
+  isSafeRelativePosixPath,
+  matchesAnyGlob,
 } from "@software-factory/task-contract";
 import { LiveModelProviderClient, type ModelProviderConfig } from "./model-providers.ts";
 
@@ -257,24 +260,130 @@ export interface WorkspaceFileEdit {
   readonly content: string;
 }
 
+function validateWorkspaceFileEdits(
+  rawFiles: unknown,
+  taskContract?: TaskContractSpec
+): readonly WorkspaceFileEdit[] {
+  if (!Array.isArray(rawFiles) || rawFiles.length === 0) {
+    throw new Error(
+      "Workspace edits must be a non-empty array of { path, content }; empty edits are rejected fail-closed"
+    );
+  }
+  const maxChangedFiles = taskContract?.max_changed_files ?? DEFAULT_MAX_CHANGED_FILES;
+  if (rawFiles.length > maxChangedFiles) {
+    throw new Error(
+      `Workspace edit count (${rawFiles.length}) exceeds max_changed_files (${maxChangedFiles})`
+    );
+  }
+
+  const seenLowerPaths = new Set<string>();
+  const validated: WorkspaceFileEdit[] = [];
+
+  for (const item of rawFiles) {
+    if (!item || typeof item !== "object") {
+      throw new Error("Workspace edit entry must be an object with string 'path' and 'content'");
+    }
+    const candidate = item as { path?: unknown; content?: unknown };
+    if (typeof candidate.path !== "string" || typeof candidate.content !== "string") {
+      throw new Error("Workspace edit entry must contain string 'path' and 'content'");
+    }
+    if (!isSafeRelativePosixPath(candidate.path)) {
+      throw new Error(`Unsafe workspace edit path rejected: '${candidate.path}'`);
+    }
+    const lowerPath = candidate.path.toLowerCase();
+    if (seenLowerPaths.has(lowerPath)) {
+      throw new Error(`Duplicate or case-colliding workspace edit path: '${candidate.path}'`);
+    }
+    seenLowerPaths.add(lowerPath);
+
+    if (taskContract) {
+      const verdict = evaluatePathPolicyPrecedence(candidate.path, taskContract);
+      if (!verdict.allowed) {
+        throw new Error(
+          `Workspace edit path '${candidate.path}' rejected by TaskContract (${verdict.reason}${
+            verdict.matchedRule ? `: ${verdict.matchedRule}` : ""
+          })`
+        );
+      }
+    } else {
+      const matchedForbidden = matchesAnyGlob(candidate.path, DEFAULT_SYSTEM_FORBIDDEN_PATHS, true);
+      if (matchedForbidden !== null) {
+        throw new Error(
+          `Workspace edit path '${candidate.path}' rejected by default forbidden rule '${matchedForbidden}'`
+        );
+      }
+    }
+
+    validated.push({
+      path: candidate.path,
+      content: candidate.content,
+    });
+  }
+
+  return validated;
+}
+
+function assertWorktreeTargetNoSymlinkEscape(rootDir: string, relativePosixPath: string): string {
+  const realRoot = realpathSync(rootDir);
+  const absTarget = resolve(realRoot, relativePosixPath);
+  if (absTarget === realRoot || !absTarget.startsWith(`${realRoot}/`) && !absTarget.startsWith(`${realRoot}\\`)) {
+    throw new Error(`Path traversal blocked: ${relativePosixPath}`);
+  }
+  const segments = relativePosixPath.split("/");
+  let cursor = realRoot;
+  for (let i = 0; i < segments.length; i += 1) {
+    cursor = join(cursor, segments[i]!);
+    try {
+      const st = lstatSync(cursor);
+      if (st.isSymbolicLink()) {
+        throw new Error(`Symlink target blocked in workspace edit: ${relativePosixPath}`);
+      }
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        break;
+      }
+      throw err;
+    }
+  }
+  return absTarget;
+}
+
 const WORKSPACE_AGENT_INLINE_RUNNER = [
   'const fs = require("node:fs");',
   'const path = require("node:path");',
   'const { execFileSync } = require("node:child_process");',
   'const payload = JSON.parse(Buffer.from(process.argv[1], "base64").toString("utf8"));',
-  'const root = path.resolve(payload.worktreePath);',
-  'const addedPaths = [];',
-  'for (const file of payload.files) {',
-  '  const abs = path.resolve(root, file.path);',
-  '  if (abs !== root && !abs.startsWith(root + path.sep)) {',
+  'if (!Array.isArray(payload.files) || payload.files.length === 0) {',
+  '  throw new Error("WorkspaceCodingAgentAdapter requires at least one file edit; empty commits are forbidden");',
+  "}",
+  "const root = fs.realpathSync(path.resolve(payload.worktreePath));",
+  "const addedPaths = [];",
+  "for (const file of payload.files) {",
+  '  if (!file || typeof file.path !== "string" || typeof file.content !== "string") {',
+  '    throw new Error("Invalid workspace file edit payload");',
+  "  }",
+  "  const abs = path.resolve(root, file.path);",
+  '  if (abs === root || (!abs.startsWith(root + path.sep))) {',
   '    throw new Error("Path traversal blocked: " + file.path);',
-  '  }',
-  '  fs.mkdirSync(path.dirname(abs), { recursive: true });',
+  "  }",
+  '  let cursor = root;',
+  '  for (const seg of file.path.split("/")) {',
+  "    cursor = path.join(cursor, seg);",
+  "    try {",
+  "      if (fs.lstatSync(cursor).isSymbolicLink()) {",
+  '        throw new Error("Symlink blocked: " + file.path);',
+  "      }",
+  "    } catch (e) {",
+  '      if (e && e.code === "ENOENT") break;',
+  "      throw e;",
+  "    }",
+  "  }",
+  "  fs.mkdirSync(path.dirname(abs), { recursive: true });",
   '  fs.writeFileSync(abs, file.content, "utf8");',
-  '  addedPaths.push(file.path);',
-  '}',
-  'execFileSync("git", ["add", ...addedPaths], { cwd: root, stdio: "pipe" });',
-  'execFileSync("git", ["-c", "user.name=" + payload.authorName, "-c", "user.email=" + payload.authorEmail, "commit", "--allow-empty", "-m", payload.commitMessage], { cwd: root, stdio: "pipe" });',
+  "  addedPaths.push(file.path);",
+  "}",
+  'execFileSync("git", ["add", "--", ...addedPaths], { cwd: root, stdio: "pipe" });',
+  'execFileSync("git", ["-c", "user.name=" + payload.authorName, "-c", "user.email=" + payload.authorEmail, "commit", "-m", payload.commitMessage], { cwd: root, stdio: "pipe" });',
   'const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();',
   'const tree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root, encoding: "utf8" }).trim();',
   'process.stdout.write(JSON.stringify({ agent_commit_hash: head, verified_tree_hash: tree }) + "\\n");',
@@ -315,22 +424,39 @@ export class WorkspaceCodingAgentAdapter implements AgentRuntimeAdapter {
 
   public async prepareInvocation(ctx: AgentTaskContext): Promise<AgentInvocationPlan> {
     const assembled = TaskContextAssembler.assemble(ctx);
-    let files: readonly WorkspaceFileEdit[] = [];
+    let rawFiles: unknown;
     if (this.editsResolver) {
-      files = await this.editsResolver(ctx);
+      rawFiles = await this.editsResolver(ctx);
     } else if (this.modelClient) {
       const resp = await this.modelClient.complete({
         systemPrompt:
           'You are an autonomous coding agent. Output JSON array of file edits: [{"path":"...","content":"..."}]',
         userPrompt: assembled.promptInstruction,
       });
-      const raw = resp.contentText.trim();
+      const raw = typeof resp?.contentText === "string" ? resp.contentText.trim() : "";
       const s = raw.indexOf("[");
       const e = raw.lastIndexOf("]");
-      if (s !== -1 && e > s) {
-        files = JSON.parse(raw.slice(s, e + 1)) as WorkspaceFileEdit[];
+      if (s === -1 || e <= s) {
+        throw new Error(
+          `WorkspaceCodingAgentAdapter (${this.writerProvider}/${this.writerModel}) returned non-JSON response without an edit array`
+        );
       }
+      try {
+        rawFiles = JSON.parse(raw.slice(s, e + 1));
+      } catch (err: unknown) {
+        throw new Error(
+          `WorkspaceCodingAgentAdapter (${this.writerProvider}/${this.writerModel}) returned malformed JSON edits: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    } else {
+      throw new Error(
+        "WorkspaceCodingAgentAdapter requires editsResolver or modelClient; empty commits are forbidden"
+      );
     }
+
+    const files = validateWorkspaceFileEdits(rawFiles, ctx.taskContract);
 
     const payload = {
       worktreePath: ctx.worktreePath,
@@ -402,18 +528,17 @@ export class WorkspaceCodingAgentAdapter implements AgentRuntimeAdapter {
 export function applyWorkspaceEditsSync(
   worktreePath: string,
   files: readonly WorkspaceFileEdit[],
-  commitMessage: string
+  commitMessage: string,
+  taskContract?: TaskContractSpec
 ): { readonly commitHash: string; readonly treeHash: string } {
-  const root = resolve(worktreePath);
-  for (const file of files) {
-    const abs = resolve(root, file.path);
-    if (abs !== root && !abs.startsWith(`${root}/`) && !abs.startsWith(`${root}\\`)) {
-      throw new Error(`Path traversal blocked: ${file.path}`);
-    }
+  const validated = validateWorkspaceFileEdits(files, taskContract);
+  const root = realpathSync(resolve(worktreePath));
+  for (const file of validated) {
+    const abs = assertWorktreeTargetNoSymlinkEscape(root, file.path);
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, file.content, "utf8");
   }
-  execFileSync("git", ["add", ...files.map((f) => f.path)], { cwd: root, stdio: "pipe" });
+  execFileSync("git", ["add", "--", ...validated.map((f) => f.path)], { cwd: root, stdio: "pipe" });
   execFileSync(
     "git",
     [
@@ -422,7 +547,6 @@ export function applyWorkspaceEditsSync(
       "-c",
       "user.email=agent@software-factory.local",
       "commit",
-      "--allow-empty",
       "-m",
       commitMessage,
     ],

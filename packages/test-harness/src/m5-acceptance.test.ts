@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHmac, pbkdf2Sync, randomUUID } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -9,19 +9,23 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import tls from "node:tls";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   LiveModelProviderClient,
   ModelProviderConfigurationError,
   WorkspaceCodingAgentAdapter,
+  applyWorkspaceEditsSync,
   evaluateIndependentReviewWithLiveModel,
 } from "@software-factory/adapter-sdk";
 import {
@@ -30,14 +34,17 @@ import {
   EphemeralGitPushTokenService,
   EphemeralReviewerCredentialService,
   HttpAgentGatewayClient,
+  createAgentGatewayRuntime,
 } from "@software-factory/agent-gateway";
 import {
   CORE_API_AUTH_HEADER,
   CoreApiHttpServer,
   type CoreApiAuthContext,
   CoreApiService,
+  type CoreApiVerifyHttpPolicy,
   HttpCoreApiClient,
   HttpCoreApiError,
+  createCoreApiRuntime,
   encodeCoreApiAuthHeader,
 } from "@software-factory/core-api";
 import {
@@ -46,15 +53,24 @@ import {
   PostgresRlsError,
   PostgresRuntimePool,
   SoftwareFactoryControlPlaneStore,
+  buildCandidateBoundLineage,
   buildPostgresPoolConfigFromEnv,
+  createControlPlaneStoreFromEnv,
 } from "@software-factory/database";
 import {
+  type ApprovalDecisionRecord,
   type M5AcceptanceCriterionReport,
   type M5EnvironmentCapabilities,
   type M5EvidenceBundle,
   type M5FaultRecoveryScenarioReport,
+  type ProcessedWorkerEventRecord,
   type ResourceUsageMetricRecord,
+  type ReviewArtifactRecord,
+  type VerificationRunRecord,
   canonicalizeJson,
+  computeCanonicalPayloadSha256,
+  computeEventIdempotencyKey,
+  computeTaskExecutionIdempotencyKey,
   sha256Hex,
 } from "@software-factory/shared-types";
 import type { TaskContractSpec } from "@software-factory/task-contract";
@@ -63,7 +79,10 @@ import {
   ImmutableSourceSnapshotStore,
   probeDockerVerifierSupport,
 } from "@software-factory/verifier";
-import { WebApprovalConsoleHttpServer } from "@software-factory/web";
+import {
+  WebApprovalConsoleHttpServer,
+  createControlPlaneStackRuntime,
+} from "@software-factory/web";
 import {
   LinuxCgroupV2SandboxBackend,
   WnaWorkerDaemon,
@@ -282,6 +301,7 @@ interface M5LiveStackFixture {
   readonly projectId: string;
   readonly authOp: CoreApiAuthContext;
   readonly authApprover: CoreApiAuthContext;
+  readonly authAdmin: CoreApiAuthContext;
   readonly initialMainSha: string;
   readonly contract: TaskContractSpec;
   advanceClockMs(ms: number): void;
@@ -290,6 +310,8 @@ interface M5LiveStackFixture {
 
 async function createM5LiveStackFixture(options?: {
   approvalTtlSeconds?: number;
+  verifyPolicy?: CoreApiVerifyHttpPolicy;
+  enableTestFaultInjection?: boolean;
   transientFaultHook?: {
     failBeforeCommitSeq?: Set<number>;
     dropAfterCommitSeq?: Set<number>;
@@ -338,6 +360,11 @@ async function createM5LiveStackFixture(options?: {
         principal_id: "approver-bob",
         member_role: "PROJECT_APPROVER",
       });
+      store.addProjectMembership({
+        project_id: projectId,
+        principal_id: "org-admin-zoe",
+        member_role: "ORG_ADMIN",
+      });
     }
   );
 
@@ -367,6 +394,8 @@ async function createM5LiveStackFixture(options?: {
     snapshotStore,
     defaultVerifier: verifier,
     defaultAgentGateway: gatewayService,
+    verifyPolicy: options?.verifyPolicy,
+    enableTestFaultInjection: options?.enableTestFaultInjection ?? false,
   });
   const coreInfo = await coreHttp.start();
 
@@ -383,6 +412,12 @@ async function createM5LiveStackFixture(options?: {
     projectId,
     principalId: "approver-bob",
     roles: ["PROJECT_APPROVER"],
+    ttlMs: 3_600_000,
+  });
+  const authAdmin = coreApi.issueAuthContext({
+    projectId,
+    principalId: "org-admin-zoe",
+    roles: ["ORG_ADMIN"],
     ttlMs: 3_600_000,
   });
 
@@ -422,6 +457,7 @@ async function createM5LiveStackFixture(options?: {
     projectId,
     authOp,
     authApprover,
+    authAdmin,
     initialMainSha: gitInit.initialMainSha,
     contract,
     advanceClockMs,
@@ -1145,7 +1181,10 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
     }
 
     // --- M5-AC7c & M5-AC7d: CAS Conflict Rebase -> Approval TTL Expiry -> Post-Merge Crash Reconciliation ---
-    const fxCD = await createM5LiveStackFixture({ approvalTtlSeconds: 60 });
+    const fxCD = await createM5LiveStackFixture({
+      approvalTtlSeconds: 60,
+      enableTestFaultInjection: true,
+    });
     try {
       // 1. M5-AC7c: Run to APPROVED on B_base, advance refs/heads/main concurrently, detect CAS conflict, rebase & merge
       const flowC = await runFullWorkflowToApproval(fxCD, "M5-AC7c CAS Conflict & Rebase", 60_000);
@@ -2088,6 +2127,593 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
       assert.equal(imports2[0]?.recovered_by_reconciler, true);
 
       assert.ok(pool.getStats().discardAllExecuted > 0);
+
+      // Part 3 (M5-FIX-16): getMainRefCommitHash(projectId?) scoping across multiple projects in PG
+      const unscopedAdminHash = await repo.withRlsTransaction(
+        {
+          currentRole: "system_admin_role",
+          currentPrincipalId: "pg-test-bootstrap",
+        },
+        () => repo.getMainRefCommitHash()
+      );
+      assert.equal(unscopedAdminHash, null);
+
+      const scopedAHash = await repo.withRlsTransaction(
+        {
+          currentRole: "system_admin_role",
+          currentPrincipalId: "pg-test-bootstrap",
+        },
+        () => repo.getMainRefCommitHash(projectAId)
+      );
+      assert.equal(scopedAHash, cas1.main_ref_commit_hash);
+
+      const scopedBHash = await repo.withRlsTransaction(
+        {
+          currentRole: "system_admin_role",
+          currentPrincipalId: "pg-test-bootstrap",
+        },
+        () => repo.getMainRefCommitHash(projectBId)
+      );
+      assert.equal(scopedBHash, gitB.initialMainSha);
+
+      // Part 4 (M5-FIX-12): Column-level UPDATE grant on projects rejects arbitrary column writes under app_runtime
+      await assert.rejects(
+        () =>
+          pool.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-op-alice",
+              currentRole: "core_api_service",
+            },
+            (conn) =>
+              conn.query("UPDATE projects SET slug = $2::text WHERE project_id = $1::uuid;", [
+                projectAId,
+                `tampered-${suffix}`,
+              ])
+          ),
+        (err: unknown) =>
+          (err instanceof PostgresRlsError && err.sqlState === "42501") ||
+          (typeof (err as { sqlState?: string }).sqlState === "string" &&
+            (err as { sqlState: string }).sqlState === "42501")
+      );
+
+      // Part 5 (M5-FIX-15): Unified metric defaults & negative rejection in PostgresControlPlaneRepository
+      await assert.rejects(
+        () =>
+          repo.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: `pg-worker-${suffix}`,
+              currentRole: "gateway_service",
+            },
+            () =>
+              repo.recordResourceUsageMetric({
+                project_id: projectAId,
+                task_id: task1.task_id,
+                lease_id: lease1.lease_id,
+                lease_epoch: lease1.lease_epoch,
+                phase: "DEVELOPER",
+                wall_time_ms: -5,
+                cpu_usage_usec: 10,
+                peak_memory_bytes: 1024,
+                sandbox_backend_mode: "real-process",
+                metrics_source: "process-rusage",
+              })
+          ),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+
+      const defaultedPgMetric = await repo.withRlsTransaction(
+        {
+          currentProjectId: projectAId,
+          currentPrincipalId: `pg-worker-${suffix}`,
+          currentRole: "gateway_service",
+        },
+        () =>
+          repo.recordResourceUsageMetric({
+            project_id: projectAId,
+            task_id: task1.task_id,
+            lease_id: lease1.lease_id,
+            lease_epoch: lease1.lease_epoch,
+            phase: "DEVELOPER",
+            wall_time_ms: 12,
+            cpu_usage_usec: 20,
+            peak_memory_bytes: 2048,
+            sandbox_backend_mode: "real-process",
+            metrics_source: "process-rusage",
+          })
+      );
+      assert.equal(defaultedPgMetric.attempt_no, lease1.attempt_no);
+      assert.equal(defaultedPgMetric.rework_cycle, task1.rework_count);
+
+      // Part 6 (cd84dc7 minor #2): Single-connection pool getCandidateBoundLineage without deadlock/interleaving
+      const singleConnPool = new PostgresRuntimePool({
+        ...pgConfig,
+        maxConnections: 1,
+      });
+      try {
+        const singleRepo = new PostgresControlPlaneRepository(singleConnPool);
+        const singleLineage = await singleRepo.withRlsTransaction(
+          {
+            currentProjectId: projectAId,
+            currentPrincipalId: "pg-op-alice",
+            currentRole: "core_api_service",
+          },
+          () => singleRepo.getCandidateBoundLineage(task1.task_id)
+        );
+        assert.ok(singleLineage);
+        assert.equal(singleLineage.lineageComplete, true);
+        assert.equal(singleLineage.hashBindingVerified, true);
+        assert.ok(singleLineage.resourceUsageMetrics.length >= 3);
+      } finally {
+        await singleConnPool.close();
+      }
+
+      // Part 7 (M5-FIX-03): Validate approval_request_id BEFORE stale/expiry side effects on other candidates
+      const synSetup = await repo.withRlsTransaction(
+        {
+          currentProjectId: projectAId,
+          currentPrincipalId: "pg-op-alice",
+          currentRole: "core_api_service",
+        },
+        async () => {
+          const tA = await repo.createTask({
+            project_id: projectAId,
+            title: `PG FIX-03 Target ${suffix}`,
+            task_contract: contract,
+          });
+          const tB = await repo.createTask({
+            project_id: projectAId,
+            title: `PG FIX-03 Donor ${suffix}`,
+            task_contract: contract,
+          });
+          const lA = await repo.grantTaskLease({
+            project_id: projectAId,
+            task_id: tA.task_id,
+            worker_id: `w-fix03-a-${suffix}`,
+          });
+          const lB = await repo.grantTaskLease({
+            project_id: projectAId,
+            task_id: tB.task_id,
+            worker_id: `w-fix03-b-${suffix}`,
+          });
+          return { tA, tB, lA, lB };
+        }
+      );
+
+      const mkHex = (ch: string) => ch.repeat(40);
+      const fix03Built = await repo.withRlsTransaction(
+        {
+          currentProjectId: projectAId,
+          currentPrincipalId: `w-fix03-${suffix}`,
+          currentRole: "gateway_service",
+        },
+        async () => {
+          const impA = await repo.pushStagingGitRefWithGatekeeper({
+            project_id: projectAId,
+            task_id: synSetup.tA.task_id,
+            lease_id: synSetup.lA.lease_id,
+            lease_epoch: synSetup.lA.lease_epoch,
+            staging_ref: `refs/heads/sf/staging/${synSetup.tA.task_id}/${synSetup.lA.lease_epoch}`,
+            agent_commit_hash: mkHex("a"),
+            verified_tree_hash: mkHex("b"),
+            parent_commit_hashes: [synSetup.tA.base_main_commit_hash],
+            changes: [
+              {
+                path: "src/a.mjs",
+                mode: "100644",
+                size_bytes: 12,
+                is_binary: false,
+                added_lines: 1,
+                deleted_lines: 0,
+                blob_sha: mkHex("c"),
+              },
+            ],
+          });
+          const impB = await repo.pushStagingGitRefWithGatekeeper({
+            project_id: projectAId,
+            task_id: synSetup.tB.task_id,
+            lease_id: synSetup.lB.lease_id,
+            lease_epoch: synSetup.lB.lease_epoch,
+            staging_ref: `refs/heads/sf/staging/${synSetup.tB.task_id}/${synSetup.lB.lease_epoch}`,
+            agent_commit_hash: mkHex("d"),
+            verified_tree_hash: mkHex("e"),
+            parent_commit_hashes: [synSetup.tB.base_main_commit_hash],
+            changes: [
+              {
+                path: "src/b.mjs",
+                mode: "100644",
+                size_bytes: 12,
+                is_binary: false,
+                added_lines: 1,
+                deleted_lines: 0,
+                blob_sha: mkHex("f"),
+              },
+            ],
+          });
+          assert.equal(impA.allowed, true);
+          assert.equal(impB.allowed, true);
+          for (const [taskItem, leaseItem] of [
+            [synSetup.tA, synSetup.lA],
+            [synSetup.tB, synSetup.lB],
+          ] as const) {
+            const execKey = computeTaskExecutionIdempotencyKey(
+              projectAId,
+              taskItem.task_id,
+              leaseItem.attempt_no
+            );
+            for (const [seq, evType] of [
+              [1, "task.started"],
+              [2, "task.completed"],
+            ] as const) {
+              const evPayload: Record<string, unknown> = {};
+              const ack = await repo.submitWorkerEvent({
+                schema_version: "1.5",
+                project_id: projectAId,
+                task_id: taskItem.task_id,
+                attempt_no: leaseItem.attempt_no,
+                lease_id: leaseItem.lease_id,
+                lease_epoch: leaseItem.lease_epoch,
+                worker_id: leaseItem.worker_id,
+                sequence_no: seq,
+                event_type: evType,
+                task_execution_idempotency_key: execKey,
+                event_idempotency_key: computeEventIdempotencyKey(
+                  leaseItem.lease_id,
+                  leaseItem.lease_epoch,
+                  seq,
+                  evType
+                ),
+                payload_sha256: computeCanonicalPayloadSha256(evPayload),
+                emitted_at: new Date().toISOString(),
+                payload: evPayload,
+              });
+              assert.equal(ack.ack_status, "ACCEPTED");
+            }
+          }
+          return { impAId: impA.import_id!, impBId: impB.import_id! };
+        }
+      );
+
+      const fix03Ready = await repo.withRlsTransaction(
+        {
+          currentProjectId: projectAId,
+          currentPrincipalId: "pg-op-alice",
+          currentRole: "core_api_service",
+        },
+        async () => {
+          const mcA = await repo.createMergeCandidate({
+            project_id: projectAId,
+            task_id: synSetup.tA.task_id,
+            import_id: fix03Built.impAId,
+            base_main_commit_hash: synSetup.tA.base_main_commit_hash,
+            merge_candidate_hash: mkHex("1"),
+            verified_tree_hash: mkHex("b"),
+          });
+          const mcB = await repo.createMergeCandidate({
+            project_id: projectAId,
+            task_id: synSetup.tB.task_id,
+            import_id: fix03Built.impBId,
+            base_main_commit_hash: synSetup.tB.base_main_commit_hash,
+            merge_candidate_hash: mkHex("2"),
+            verified_tree_hash: mkHex("e"),
+          });
+          const vrA = await repo.recordVerificationRun({
+            project_id: projectAId,
+            task_id: synSetup.tA.task_id,
+            merge_candidate_id: mcA.merge_candidate_id,
+            merge_candidate_hash: mcA.merge_candidate_hash,
+            verified_tree_hash: mcA.verified_tree_hash,
+            verifier_image_digest: "sha256:pg-fix03",
+            verdict: "PASS",
+            overall_status: "PASSED",
+            tier1_trusted_acceptance_passed: true,
+            tier2_protected_baseline_passed: true,
+            tier2_baseline_tamper_detected: false,
+            tier3_agent_tests_passed: true,
+            tier3_assertions: [],
+            exit_code: 0,
+            duration_ms: 5,
+            execution_backend: "docker",
+            hermetic_network_disabled: true,
+            hardlink_cache_forbidden: true,
+            report_sha256: mkHex("3") + "a".repeat(24),
+          });
+          const vrB = await repo.recordVerificationRun({
+            project_id: projectAId,
+            task_id: synSetup.tB.task_id,
+            merge_candidate_id: mcB.merge_candidate_id,
+            merge_candidate_hash: mcB.merge_candidate_hash,
+            verified_tree_hash: mcB.verified_tree_hash,
+            verifier_image_digest: "sha256:pg-fix03",
+            verdict: "PASS",
+            overall_status: "PASSED",
+            tier1_trusted_acceptance_passed: true,
+            tier2_protected_baseline_passed: true,
+            tier2_baseline_tamper_detected: false,
+            tier3_agent_tests_passed: true,
+            tier3_assertions: [],
+            exit_code: 0,
+            duration_ms: 5,
+            execution_backend: "docker",
+            hermetic_network_disabled: true,
+            hardlink_cache_forbidden: true,
+            report_sha256: mkHex("4") + "b".repeat(24),
+          });
+          const raA = await repo.recordReviewArtifact({
+            project_id: projectAId,
+            task_id: synSetup.tA.task_id,
+            merge_candidate_id: mcA.merge_candidate_id,
+            verification_run_id: vrA.verification_run_id,
+            merge_candidate_hash: mcA.merge_candidate_hash,
+            verified_tree_hash: mcA.verified_tree_hash,
+            writer_provider: "anthropic",
+            writer_model: "claude-sonnet-4",
+            reviewer_provider: "google",
+            reviewer_model: "gemini-2.5-pro",
+            developer_principal_id: `dev-a-${suffix}`,
+            reviewer_principal_id: `rev-a-${suffix}`,
+            developer_session_id: `dev-sa-${suffix}`,
+            reviewer_session_id: `rev-sa-${suffix}`,
+            developer_credential_id: `dev-ca-${suffix}`,
+            reviewer_credential_id: `rev-ca-${suffix}`,
+            developer_agent_profile_id: "p-dev-a",
+            reviewer_agent_profile_id: "p-rev-a",
+            verdict: "PASS",
+            approval_request_ttl_ms: 60_000,
+          });
+          const raB = await repo.recordReviewArtifact({
+            project_id: projectAId,
+            task_id: synSetup.tB.task_id,
+            merge_candidate_id: mcB.merge_candidate_id,
+            verification_run_id: vrB.verification_run_id,
+            merge_candidate_hash: mcB.merge_candidate_hash,
+            verified_tree_hash: mcB.verified_tree_hash,
+            writer_provider: "anthropic",
+            writer_model: "claude-sonnet-4",
+            reviewer_provider: "google",
+            reviewer_model: "gemini-2.5-pro",
+            developer_principal_id: `dev-b-${suffix}`,
+            reviewer_principal_id: `rev-b-${suffix}`,
+            developer_session_id: `dev-sb-${suffix}`,
+            reviewer_session_id: `rev-sb-${suffix}`,
+            developer_credential_id: `dev-cb-${suffix}`,
+            reviewer_credential_id: `rev-cb-${suffix}`,
+            developer_agent_profile_id: "p-dev-b",
+            reviewer_agent_profile_id: "p-rev-b",
+            verdict: "PASS",
+            approval_request_ttl_ms: 80,
+          });
+          const reqsB = await repo.listApprovalRequestsForTask(synSetup.tB.task_id);
+          return { mcA, vrA, raA, raB, reqB: reqsB[0]! };
+        }
+      );
+
+      // Let candidate B's approval_request expire, then pass it alongside candidate A's metadata:
+      await new Promise((r) => setTimeout(r, 140));
+      await assert.rejects(
+        () =>
+          repo.withRlsTransaction(
+            {
+              currentProjectId: projectAId,
+              currentPrincipalId: "pg-approver-bob",
+              currentRole: "core_api_service",
+            },
+            () =>
+              repo.submitHumanApproval({
+                project_id: projectAId,
+                task_id: synSetup.tA.task_id,
+                merge_candidate_id: fix03Ready.mcA.merge_candidate_id,
+                approval_request_id: fix03Ready.reqB.approval_request_id,
+                agent_commit_hash: fix03Ready.mcA.agent_commit_hash,
+                base_main_commit_hash: fix03Ready.mcA.base_main_commit_hash,
+                verified_tree_hash: fix03Ready.mcA.verified_tree_hash,
+                merge_candidate_hash: fix03Ready.mcA.merge_candidate_hash,
+                verification_run_id: fix03Ready.vrA.verification_run_id,
+                review_artifact_id: fix03Ready.raA.review_artifact_id,
+                approver_principal_id: "pg-approver-bob",
+                decision: "APPROVED",
+                current_main_commit_hash: cas1.main_ref_commit_hash,
+              })
+          ),
+        (err: unknown) =>
+          err instanceof PostgresRlsError && (err.sqlState === "23514" || err.sqlState === "23503")
+      );
+      const reqBAfterAttempt = await repo.withRlsTransaction(
+        {
+          currentProjectId: projectAId,
+          currentPrincipalId: "pg-op-alice",
+          currentRole: "core_api_service",
+        },
+        () => repo.listApprovalRequestsForTask(synSetup.tB.task_id)
+      );
+      assert.equal(
+        reqBAfterAttempt[0]?.status,
+        "PENDING",
+        "Cross-candidate expired approval_request_id must not mutate candidate B's approval request"
+      );
+
+      // Part 8 (M5-FIX-18): Pre-receive timeout rolls back SQL via SAVEPOINT without persisting verified_code_imports
+      const synProj = await repo.withRlsTransaction(
+        {
+          currentRole: "system_admin_role",
+          currentPrincipalId: "pg-test-bootstrap",
+        },
+        async () => {
+          const p = await repo.createProject({
+            slug: `m5-pg-syn-savepoint-${suffix}`,
+            name: `M5 PG Savepoint ${suffix}`,
+            repo_bare_path: join(rootDir, `missing-bare-${suffix}.git`),
+            initial_main_commit_hash: mkHex("9"),
+            initial_main_tree_hash: mkHex("8"),
+            approval_ttl_seconds: 120,
+          });
+          await repo.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "pg-op-alice",
+            member_role: "DEVELOPER",
+          });
+          return p;
+        }
+      );
+      const synTaskLease = await repo.withRlsTransaction(
+        {
+          currentProjectId: synProj.project_id,
+          currentPrincipalId: "pg-op-alice",
+          currentRole: "core_api_service",
+        },
+        async () => {
+          const t = await repo.createTask({
+            project_id: synProj.project_id,
+            title: `PG Savepoint Task ${suffix}`,
+            task_contract: contract,
+          });
+          const l = await repo.grantTaskLease({
+            project_id: synProj.project_id,
+            task_id: t.task_id,
+            worker_id: `w-savepoint-${suffix}`,
+          });
+          return { t, l };
+        }
+      );
+      const synToken = tokenService.issueLeasePushToken({
+        projectId: synProj.project_id,
+        taskId: synTaskLease.t.task_id,
+        leaseId: synTaskLease.l.lease_id,
+        leaseEpoch: synTaskLease.l.lease_epoch,
+        workerId: synTaskLease.l.worker_id,
+      });
+      const prevDeadline = gatewayHttpA.deadlineMs;
+      const prevHook = gatewayHttpA.authorizeCheckHook;
+      gatewayHttpA.deadlineMs = 40;
+      gatewayHttpA.authorizeCheckHook = async () => {
+        await new Promise((r) => setTimeout(r, 120));
+      };
+      try {
+        const preRes = await fetch(`${gwInfo.baseUrl}/internal/v1/git/pre-receive-verify`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${synToken}`,
+          },
+          body: JSON.stringify({
+            old_sha: "0".repeat(40),
+            new_sha: mkHex("7"),
+            ref_name: `refs/heads/sf/staging/${synTaskLease.t.task_id}/${synTaskLease.l.lease_epoch}`,
+            verified_tree_hash: mkHex("6"),
+            parent_commit_hashes: [synProj.main_ref_commit_hash],
+            changes: [
+              {
+                path: "src/savepoint.mjs",
+                mode: "100644",
+                size_bytes: 16,
+                is_binary: false,
+                added_lines: 2,
+                deleted_lines: 0,
+                blob_sha: mkHex("5"),
+              },
+            ],
+          }),
+        });
+        assert.equal(preRes.status, 504);
+      } finally {
+        gatewayHttpA.deadlineMs = prevDeadline;
+        gatewayHttpA.authorizeCheckHook = prevHook;
+      }
+      const importsAfterTimeout = await repo.withRlsTransaction(
+        {
+          currentProjectId: synProj.project_id,
+          currentPrincipalId: "pg-op-alice",
+          currentRole: "core_api_service",
+        },
+        () => repo.getVerifiedImportsForTask(synTaskLease.t.task_id)
+      );
+      assert.equal(
+        importsAfterTimeout.length,
+        0,
+        "Timed-out pre-receive SQL must roll back via SAVEPOINT"
+      );
+
+      // Part 9 (M5-FIX-11): Production server runtime factories wired to live PostgresRuntimePool + HTTP
+      const stackRuntime = await createControlPlaneStackRuntime({
+        poolConfig: pgConfig,
+        requirePostgres: true,
+        withGatewayHttp: true,
+      });
+      const gwRuntime = await createAgentGatewayRuntime({
+        poolConfig: pgConfig,
+        requirePostgres: true,
+      });
+      try {
+        assert.equal(stackRuntime.mode, "postgres");
+        assert.ok(stackRuntime.pool !== null);
+        assert.equal(gwRuntime.mode, "postgres");
+        assert.ok(gwRuntime.pool !== null);
+
+        const coreHealth = await fetch(`${stackRuntime.coreApiRuntime!.coreApiEndpoint!.baseUrl}/health`);
+        assert.equal(coreHealth.status, 200);
+        const webHealth = await fetch(`${stackRuntime.webEndpoint!.baseUrl}/health`);
+        assert.equal(webHealth.status, 200);
+        const gwHealth = await fetch(`${gwRuntime.endpoint!.baseUrl}/health`);
+        assert.equal(gwHealth.status, 200);
+
+        const prodClient = new HttpCoreApiClient(stackRuntime.coreApiRuntime!.coreApiEndpoint!.baseUrl);
+        const prodOpAuth = stackRuntime.coreApiRuntime!.authenticator.issueAuthContext({
+          projectId: projectAId,
+          principalId: "pg-op-alice",
+          roles: ["DEVELOPER"],
+        });
+        const prodApproverAuth = stackRuntime.coreApiRuntime!.authenticator.issueAuthContext({
+          projectId: projectAId,
+          principalId: "pg-approver-bob",
+          roles: ["PROJECT_APPROVER"],
+        });
+        const createdViaProdRuntime = await prodClient.createTask(projectAId, prodOpAuth, {
+          title: `M5-FIX-11 Live Prod PG Bootstrap Task ${suffix}`,
+          task_contract: contract,
+        });
+        assert.equal(createdViaProdRuntime.project_id, projectAId);
+
+        const lineageRes = await fetch(
+          `${stackRuntime.webEndpoint!.baseUrl}/projects/${encodeURIComponent(
+            projectAId
+          )}/tasks/${encodeURIComponent(createdViaProdRuntime.task_id)}/lineage?format=json`,
+          {
+            headers: {
+              [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(prodOpAuth),
+            },
+          }
+        );
+        assert.equal(lineageRes.status, 200);
+
+        const forbiddenAcRes = await fetch(
+          `${stackRuntime.webEndpoint!.baseUrl}/projects/${encodeURIComponent(
+            projectAId
+          )}/tasks/${encodeURIComponent(createdViaProdRuntime.task_id)}/approval-center?format=json`,
+          {
+            headers: {
+              [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(prodOpAuth),
+            },
+          }
+        );
+        assert.equal(forbiddenAcRes.status, 403);
+
+        const acRes = await fetch(
+          `${stackRuntime.webEndpoint!.baseUrl}/projects/${encodeURIComponent(
+            projectAId
+          )}/tasks/${encodeURIComponent(createdViaProdRuntime.task_id)}/approval-center?format=json`,
+          {
+            headers: {
+              [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(prodApproverAuth),
+            },
+          }
+        );
+        assert.equal(acRes.status, 200);
+      } finally {
+        await Promise.all([stackRuntime.close(), gwRuntime.close()]);
+      }
+      assert.equal(stackRuntime.pool!.getStats().totalConnections, 0);
+      assert.equal(gwRuntime.pool!.getStats().totalConnections, 0);
     } finally {
       await Promise.allSettled([
         webHttpA?.stop(),
@@ -2102,6 +2728,1490 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
       } catch {
         // best-effort temp cleanup
       }
+    }
+  });
+
+  it("M5-Gate-5 (M5-FIX-05, M5-FIX-19, cd84dc7#1): Enforces PostgreSQL wire TLS (SSLRequest/verify-full/prefer/require), rejects cleartext/MD5 by default, and enforces wire timeouts, buffer/SCRAM caps & clean close", async () => {
+    const certDir = mkdtempSync(join(tmpdir(), "sf-pg-tls-cert-"));
+    const openSockets = new Set<net.Socket | tls.TLSSocket>();
+    let server: net.Server | null = null;
+    try {
+      const keyPath = join(certDir, "server.key");
+      const certPath = join(certDir, "server.crt");
+      execFileSync(
+        "openssl",
+        [
+          "req",
+          "-x509",
+          "-newkey",
+          "rsa:2048",
+          "-nodes",
+          "-keyout",
+          keyPath,
+          "-out",
+          certPath,
+          "-days",
+          "1",
+          "-subj",
+          "/CN=localhost",
+          "-addext",
+          "subjectAltName=DNS:localhost,IP:127.0.0.1",
+        ],
+        { stdio: "pipe" }
+      );
+      const serverKeyPem = readFileSync(keyPath, "utf8");
+      const serverCertPem = readFileSync(certPath, "utf8");
+
+      const behavior = {
+        sslMode: "accept" as "accept" | "reject",
+        authMode: "scram" as "scram" | "cleartext" | "md5",
+        scramIterations: 4096,
+        stallQueryMs: 0,
+        sendOversizedFrame: false,
+        tlsConnectionsAccepted: 0,
+        receivedTerminateCount: 0,
+      };
+      const testPassword = "sf-scram-test-password";
+
+      const encodeMsg = (type: string, body: Buffer): Buffer => {
+        const hdr = Buffer.allocUnsafe(5);
+        hdr.writeUInt8(type.charCodeAt(0), 0);
+        hdr.writeInt32BE(4 + body.length, 1);
+        return Buffer.concat([hdr, body]);
+      };
+
+      const startWireSession = (
+        stream: net.Socket | tls.TLSSocket
+      ): void => {
+        let buf = Buffer.alloc(0);
+        let started = false;
+        let clientFirstBare = "";
+        let serverFirstMsg = "";
+        const salt = Buffer.from("0123456789abcdef0123456789abcdef", "hex");
+
+        const sendReadyOk = () => {
+          const authOk = Buffer.alloc(4);
+          authOk.writeInt32BE(0, 0);
+          stream.write(
+            Buffer.concat([
+              encodeMsg("R", authOk),
+              encodeMsg("Z", Buffer.from("I")),
+            ])
+          );
+        };
+
+        const sendRowSelect1 = () => {
+          if (behavior.sendOversizedFrame) {
+            const hugeHdr = Buffer.allocUnsafe(5);
+            hugeHdr.writeUInt8("D".charCodeAt(0), 0);
+            hugeHdr.writeInt32BE(64 * 1024, 1);
+            stream.write(Buffer.concat([hugeHdr, Buffer.alloc(4096, 0x41)]));
+            return;
+          }
+          // RowDescription: 1 col "ok" (tableOid=0, attr=0, typeOid=23, size=4, mod=-1, fmt=0)
+          const nameBuf = Buffer.from("ok\0", "utf8");
+          const descBody = Buffer.allocUnsafe(2 + nameBuf.length + 18);
+          descBody.writeInt16BE(1, 0);
+          nameBuf.copy(descBody, 2);
+          let off = 2 + nameBuf.length;
+          descBody.writeInt32BE(0, off);
+          descBody.writeInt16BE(0, off + 4);
+          descBody.writeInt32BE(23, off + 6);
+          descBody.writeInt16BE(4, off + 10);
+          descBody.writeInt32BE(-1, off + 12);
+          descBody.writeInt16BE(0, off + 16);
+
+          const dataBody = Buffer.allocUnsafe(2 + 4 + 1);
+          dataBody.writeInt16BE(1, 0);
+          dataBody.writeInt32BE(1, 2);
+          dataBody.write("1", 6, "utf8");
+
+          stream.write(
+            Buffer.concat([
+              encodeMsg("T", descBody),
+              encodeMsg("D", dataBody),
+              encodeMsg("C", Buffer.from("SELECT 1\0")),
+              encodeMsg("Z", Buffer.from("I")),
+            ])
+          );
+        };
+
+        const handlePacket = (type: string, payload: Buffer) => {
+          if (type === "X") {
+            behavior.receivedTerminateCount += 1;
+            stream.end();
+            return;
+          }
+          if (type === "p") {
+            if (behavior.authMode === "cleartext" || behavior.authMode === "md5") {
+              sendReadyOk();
+              return;
+            }
+            if (!serverFirstMsg) {
+              // SASLInitialResponse: mech\0 + int32 len + client-first
+              const nulIdx = payload.indexOf(0);
+              const len = payload.readInt32BE(nulIdx + 1);
+              const clientFirst = payload.toString("utf8", nulIdx + 5, nulIdx + 5 + len);
+              clientFirstBare = clientFirst.replace(/^n,,/, "");
+              const nonceMatch = clientFirstBare.match(/r=([^,]+)/);
+              const cNonce = nonceMatch?.[1] ?? "nonce";
+              serverFirstMsg = `r=${cNonce}srv987,s=${salt.toString("base64")},i=${behavior.scramIterations}`;
+              const scramContinue = Buffer.concat([
+                Buffer.from([0, 0, 0, 11]),
+                Buffer.from(serverFirstMsg, "utf8"),
+              ]);
+              stream.write(encodeMsg("R", scramContinue));
+              return;
+            }
+            // SASLResponse: c=...,r=...,p=...
+            const clientFinal = payload.toString("utf8");
+            const withoutProof = clientFinal.replace(/,p=[^,]+$/, "");
+            const authMessage = `${clientFirstBare},${serverFirstMsg},${withoutProof}`;
+            const salted = pbkdf2Sync(testPassword, salt, behavior.scramIterations, 32, "sha256");
+            const serverKey = createHmac("sha256", salted).update("Server Key").digest();
+            const serverSig = createHmac("sha256", serverKey).update(authMessage).digest();
+            const saslFinal = Buffer.concat([
+              Buffer.from([0, 0, 0, 12]),
+              Buffer.from(`v=${serverSig.toString("base64")}`, "utf8"),
+            ]);
+            const authOk = Buffer.alloc(4);
+            authOk.writeInt32BE(0, 0);
+            stream.write(
+              Buffer.concat([
+                encodeMsg("R", saslFinal),
+                encodeMsg("R", authOk),
+                encodeMsg("Z", Buffer.from("I")),
+              ])
+            );
+            return;
+          }
+          if (type === "Q") {
+            const respond = () => sendRowSelect1();
+            if (behavior.stallQueryMs > 0) {
+              setTimeout(respond, behavior.stallQueryMs).unref();
+            } else {
+              respond();
+            }
+            return;
+          }
+          if (type === "P") {
+            // Queue response after Sync arrives
+            return;
+          }
+          if (type === "S") {
+            if (behavior.stallQueryMs > 0) {
+              setTimeout(sendRowSelect1, behavior.stallQueryMs).unref();
+            } else {
+              sendRowSelect1();
+            }
+          }
+        };
+
+        stream.on("data", (chunk: Buffer) => {
+          buf = Buffer.concat([buf, chunk]);
+          if (!started) {
+            if (buf.length < 8) return;
+            const len = buf.readInt32BE(0);
+            if (buf.length < len) return;
+            buf = buf.subarray(len);
+            started = true;
+            if (behavior.authMode === "cleartext") {
+              const body = Buffer.alloc(4);
+              body.writeInt32BE(3, 0);
+              stream.write(encodeMsg("R", body));
+            } else if (behavior.authMode === "md5") {
+              const body = Buffer.alloc(8);
+              body.writeInt32BE(5, 0);
+              Buffer.from([1, 2, 3, 4]).copy(body, 4);
+              stream.write(encodeMsg("R", body));
+            } else {
+              const saslBody = Buffer.concat([
+                Buffer.from([0, 0, 0, 10]),
+                Buffer.from("SCRAM-SHA-256\0\0", "utf8"),
+              ]);
+              stream.write(encodeMsg("R", saslBody));
+            }
+          }
+          while (started && buf.length >= 5) {
+            const msgType = String.fromCharCode(buf.readUInt8(0));
+            const msgLen = buf.readInt32BE(1);
+            if (buf.length < 1 + msgLen) break;
+            const payload = buf.subarray(5, 1 + msgLen);
+            buf = buf.subarray(1 + msgLen);
+            handlePacket(msgType, payload);
+          }
+        });
+      };
+
+      server = net.createServer((rawSocket) => {
+        openSockets.add(rawSocket);
+        rawSocket.on("close", () => openSockets.delete(rawSocket));
+        let preBuf = Buffer.alloc(0);
+        const onPreData = (chunk: Buffer) => {
+          preBuf = Buffer.concat([preBuf, chunk]);
+          if (preBuf.length < 8) return;
+          const pktLen = preBuf.readInt32BE(0);
+          const code = preBuf.readInt32BE(4);
+          if (pktLen === 8 && code === 80877103) {
+            preBuf = preBuf.subarray(8);
+            rawSocket.off("data", onPreData);
+            if (behavior.sslMode === "reject") {
+              rawSocket.write(Buffer.from("N"));
+              startWireSession(rawSocket);
+              return;
+            }
+            behavior.tlsConnectionsAccepted += 1;
+            rawSocket.write(Buffer.from("S"));
+            const tlsSock = new tls.TLSSocket(rawSocket, {
+              isServer: true,
+              key: serverKeyPem,
+              cert: serverCertPem,
+            });
+            openSockets.add(tlsSock);
+            tlsSock.on("close", () => openSockets.delete(tlsSock));
+            tlsSock.on("error", () => {
+              // expected on untrusted client cert rejection tests
+            });
+            startWireSession(tlsSock);
+            return;
+          }
+          // Plain startup without SSLRequest (e.g. sslMode="disable")
+          rawSocket.off("data", onPreData);
+          startWireSession(rawSocket);
+          rawSocket.emit("data", preBuf);
+        };
+        rawSocket.on("data", onPreData);
+      });
+
+      await new Promise<void>((res, rej) => {
+        server!.once("error", rej);
+        server!.listen(0, "127.0.0.1", () => res());
+      });
+      const srvAddr = server.address();
+      assert.ok(srvAddr && typeof srvAddr === "object");
+      const mockPort = srvAddr.port;
+
+      // 1. Remote sslMode="disable" rejected fail-closed
+      const remoteDisableCfg = buildPostgresPoolConfigFromEnv({
+        DATABASE_URL: "postgresql://db.example.com:5432/factory?sslmode=disable",
+      });
+      assert.ok(remoteDisableCfg);
+      const remotePool = new PostgresRuntimePool(remoteDisableCfg);
+      await assert.rejects(
+        () => remotePool.queryInActiveTx("SELECT 1;"),
+        (err: unknown) => err instanceof Error && /Refusing insecure sslmode=disable/i.test(err.message)
+      );
+      await remotePool.close();
+
+      // 2. Real TLS SSLRequest -> 'S' + verify-full with CA cert succeeds and closes with 'X'
+      const tlsPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-full",
+        sslServername: "localhost",
+        sslRootCertPath: certPath,
+      });
+      const tlsRow = await tlsPool.queryInActiveTx<{ ok: number }>("SELECT $1::int AS ok;", [1]);
+      assert.equal(tlsRow.rows[0]?.ok, 1);
+      assert.equal(behavior.tlsConnectionsAccepted, 1);
+      await tlsPool.close();
+      for (let i = 0; i < 40 && behavior.receivedTerminateCount === 0; i += 1) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assert.equal(behavior.receivedTerminateCount, 1);
+
+      // 3. verify-full without trusting self-signed CA rejects TLS certificate
+      const untrustedPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-full",
+        sslServername: "localhost",
+      });
+      await assert.rejects(() => untrustedPool.queryInActiveTx("SELECT 1;"));
+      await untrustedPool.close();
+
+      // 4. sslMode="verify-full" rejects mismatched hostname even when CA matches
+      const wrongHostPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-full",
+        sslServername: "wrong.example.com",
+        sslCaPem: serverCertPem,
+      });
+      await assert.rejects(() => wrongHostPool.queryInActiveTx("SELECT 1;"));
+      await wrongHostPool.close();
+
+      // 5. Server returns 'N': require fails closed, prefer falls back cleanly
+      behavior.sslMode = "reject";
+      const requirePool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "require",
+      });
+      await assert.rejects(
+        () => requirePool.queryInActiveTx("SELECT 1;"),
+        (err: unknown) => err instanceof Error && /refused TLS/i.test(err.message)
+      );
+      await requirePool.close();
+
+      const preferPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "prefer",
+      });
+      const preferRes = await preferPool.queryInActiveTx<{ ok: number }>("SELECT $1::int AS ok;", [1]);
+      assert.equal(preferRes.rows[0]?.ok, 1);
+      await preferPool.close();
+
+      // 6. Reject cleartext & MD5 auth by default; allow cleartext only with explicit opt-in
+      behavior.sslMode = "accept";
+      behavior.authMode = "md5";
+      const md5RejectedPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-ca",
+        sslCaPem: serverCertPem,
+      });
+      await assert.rejects(
+        () => md5RejectedPool.queryInActiveTx("SELECT 1;"),
+        (err: unknown) => err instanceof Error && /legacy MD5 authentication.*rejected by default/i.test(err.message)
+      );
+      await md5RejectedPool.close();
+
+      behavior.authMode = "cleartext";
+      const clearRejectedPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-ca",
+        sslCaPem: serverCertPem,
+      });
+      await assert.rejects(
+        () => clearRejectedPool.queryInActiveTx("SELECT 1;"),
+        (err: unknown) => err instanceof Error && /cleartext password authentication.*rejected by default/i.test(err.message)
+      );
+      await clearRejectedPool.close();
+
+      const clearOptInPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-ca",
+        sslCaPem: serverCertPem,
+        allowInsecureCleartextAuth: true,
+      });
+      const clearRes = await clearOptInPool.queryInActiveTx<{ ok: number }>("SELECT $1::int AS ok;", [1]);
+      assert.equal(clearRes.rows[0]?.ok, 1);
+      await clearOptInPool.close();
+
+      // 7. Wire caps & timeouts (M5-FIX-19)
+      behavior.authMode = "scram";
+      behavior.scramIterations = 50_000;
+      const scramCapPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-ca",
+        sslCaPem: serverCertPem,
+        maxScramIterations: 4096,
+      });
+      await assert.rejects(
+        () => scramCapPool.queryInActiveTx("SELECT 1;"),
+        (err: unknown) => err instanceof Error && /outside allowed bounds/i.test(err.message)
+      );
+      await scramCapPool.close();
+      behavior.scramIterations = 4096;
+
+      behavior.stallQueryMs = 300;
+      const qTimeoutPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-ca",
+        sslCaPem: serverCertPem,
+        queryTimeoutMs: 60,
+      });
+      await assert.rejects(
+        () => qTimeoutPool.queryInActiveTx("SELECT $1::int AS ok;", [1]),
+        (err: unknown) => err instanceof Error && /timed out/i.test(err.message)
+      );
+      await qTimeoutPool.close();
+      behavior.stallQueryMs = 0;
+
+      // Acquire timeout when single pool connection is held
+      const acquireTimeoutPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-ca",
+        sslCaPem: serverCertPem,
+        maxConnections: 1,
+        acquireTimeoutMs: 60,
+      });
+      await acquireTimeoutPool.withRlsTransaction({ currentRole: "anonymous" }, async () => {
+        await assert.rejects(
+          () =>
+            acquireTimeoutPool.withRlsTransaction({ currentRole: "core_api_service" }, () =>
+              Promise.resolve(1)
+            ),
+          (err: unknown) => err instanceof Error && /acquire timeout/i.test(err.message)
+        );
+      });
+      await acquireTimeoutPool.close();
+
+      // Receive buffer overflow limit
+      behavior.sendOversizedFrame = true;
+      const bufCapPool = new PostgresRuntimePool({
+        host: "127.0.0.1",
+        port: mockPort,
+        database: "factory",
+        user: "app_user",
+        password: testPassword,
+        sslMode: "verify-ca",
+        sslCaPem: serverCertPem,
+        maxRecvBufferBytes: 4096,
+      });
+      await assert.rejects(
+        () => bufCapPool.queryInActiveTx("SELECT $1::int AS ok;", [1]),
+        (err: unknown) =>
+          err instanceof Error && /(exceeded maxRecvBufferBytes|outside allowed range)/i.test(err.message)
+      );
+      await bufCapPool.close();
+    } finally {
+      for (const sock of openSockets) {
+        sock.destroy();
+      }
+      if (server) {
+        await new Promise<void>((r) => server!.close(() => r()));
+      }
+      rmSync(certDir, { recursive: true, force: true });
+    }
+  });
+
+  it("M5-Gate-6 (M5-FIX-06, M5-FIX-07, M5-FIX-13, M5-FIX-14): Hardens HTTP /verify, blocks fault injection by default, binds pre-receive inspection to disk Git, and rejects stale current_main_commit_hash", async () => {
+    // 1. Default CoreApiHttpServer blocks unsafe /verify overrides and simulateCrashAfterGitUpdateRef
+    const fx = await createM5LiveStackFixture();
+    try {
+      const flow = await runFullWorkflowToApproval(fx, "M5-Gate-6 Security Hardening");
+      const task = await fx.coreClient.createTask(fx.projectId, fx.authOp, {
+        title: "M5-FIX-06 Subprocess & Allowlist Check",
+        task_contract: fx.contract,
+      });
+      const lease = await fx.coreClient.dispatchTaskLease(fx.projectId, fx.authOp, task.task_id, {
+        worker_id: "w-fix06",
+      });
+      const workerRes = await runWorkerDaemonOverHttp({ fx, task, lease, workerId: "w-fix06" });
+      assert.equal(workerRes.outcome, "COMPLETED");
+      const built = await fx.coreClient.buildCandidate(fx.projectId, fx.authOp, task.task_id, {
+        lease_id: lease.lease_id,
+        lease_epoch: lease.lease_epoch,
+        staging_ref: workerRes.stagingRef,
+        agent_commit_hash: workerRes.pushedCommitHash!,
+        repo_path: fx.bareRepoDir,
+      });
+      assert.equal(built.ok, true);
+      if (!built.ok) throw new Error("Expected buildCandidate success");
+
+      const cmds = buildVerifierCommands(false);
+      const unsafePayloads: Array<Record<string, unknown>> = [
+        { execution_mode: "subprocess", ...cmds },
+        { execution_mode: "sandbox", ...cmds },
+        { execution_mode: "auto", require_docker: false, ...cmds },
+        { execution_mode: "auto", network_disabled: false, ...cmds },
+        { execution_mode: "auto", docker_image: "ubuntu:latest", ...cmds },
+        { execution_mode: "auto", extra_env: { EVIL_VAR: "1" }, ...cmds },
+        {
+          execution_mode: "auto",
+          tier1_command: { command: "/bin/sh", args: ["-c", "echo pwned"] },
+          tier2_command: cmds.tier2_command,
+          tier3_command: cmds.tier3_command,
+        },
+      ];
+      for (const payload of unsafePayloads) {
+        for (const callerAuth of [fx.authOp, fx.authAdmin]) {
+          const verInput = {
+            merge_candidate_id: built.mergeCandidate.merge_candidate_id,
+            trusted_acceptance_dir: fx.trustedAcceptanceDir,
+            repo_path: fx.bareRepoDir,
+            ...payload,
+          } as unknown as Parameters<HttpCoreApiClient["verifyCandidate"]>[3];
+          await assert.rejects(
+            () => fx.coreClient.verifyCandidate(fx.projectId, callerAuth, task.task_id, verInput),
+            (err: unknown) =>
+              err instanceof HttpCoreApiError &&
+              err.statusCode === 403 &&
+              err.body.error_code === "ERR_FORBIDDEN_RLS"
+          );
+        }
+      }
+
+      // M5-FIX-07: Default CoreApiHttpServer blocks simulateCrashAfterGitUpdateRef on /cas-merge
+      const approval = await fx.coreClient.submitApproval(
+        fx.projectId,
+        fx.authApprover,
+        flow.task.task_id,
+        {
+          merge_candidate_id: flow.built.mergeCandidate.merge_candidate_id,
+          approval_request_id: flow.reviewed.approvalRequest?.approval_request_id,
+          agent_commit_hash: flow.built.mergeCandidate.agent_commit_hash,
+          base_main_commit_hash: flow.built.mergeCandidate.base_main_commit_hash,
+          verified_tree_hash: flow.built.mergeCandidate.verified_tree_hash,
+          merge_candidate_hash: flow.built.mergeCandidate.merge_candidate_hash,
+          verification_run_id: flow.verified.finalRun.verification_run_id,
+          review_artifact_id: flow.reviewed.reviewArtifact.review_artifact_id,
+          decision: "APPROVED",
+          repo_path: fx.bareRepoDir,
+        }
+      );
+      await assert.rejects(
+        () =>
+          fx.coreClient.executeCasMerge(fx.projectId, fx.authOp, flow.task.task_id, {
+            merge_candidate_id: flow.built.mergeCandidate.merge_candidate_id,
+            approval_id: approval.approval_id,
+            repo_path: fx.bareRepoDir,
+            simulateCrashAfterGitUpdateRef: true,
+          }),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 403 &&
+          err.body.error_code === "ERR_FORBIDDEN_RLS"
+      );
+
+      // M5-FIX-13: Tampered pre-receive metadata vs real bare repo on disk -> 403 ERR_GATEKEEPER_TAMPERED_IMPORT
+      const preTok = fx.tokenService.issueLeasePushToken({
+        projectId: fx.projectId,
+        taskId: task.task_id,
+        leaseId: lease.lease_id,
+        leaseEpoch: lease.lease_epoch,
+        workerId: "w-fix06",
+      });
+      const spoofTreeRes = await fetch(`${fx.gatewayBaseUrl}/internal/v1/git/pre-receive-verify`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${preTok}`,
+        },
+        body: JSON.stringify({
+          old_sha: "0".repeat(40),
+          new_sha: workerRes.pushedCommitHash,
+          ref_name: workerRes.stagingRef,
+          repo_path: fx.bareRepoDir,
+          verified_tree_hash: "f".repeat(40),
+        }),
+      });
+      assert.equal(spoofTreeRes.status, 403);
+      const spoofTreeBody = (await spoofTreeRes.json()) as { error_code: string };
+      assert.equal(spoofTreeBody.error_code, "ERR_GATEKEEPER_TAMPERED_IMPORT");
+
+      const spoofRepoRes = await fetch(`${fx.gatewayBaseUrl}/internal/v1/git/pre-receive-verify`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${preTok}`,
+        },
+        body: JSON.stringify({
+          old_sha: "0".repeat(40),
+          new_sha: workerRes.pushedCommitHash,
+          ref_name: workerRes.stagingRef,
+          repo_path: join(fx.rootDir, "rogue-repo.git"),
+        }),
+      });
+      assert.equal(spoofRepoRes.status, 403);
+      const spoofRepoBody = (await spoofRepoRes.json()) as { error_code: string };
+      assert.equal(spoofRepoBody.error_code, "ERR_GATEKEEPER_TAMPERED_IMPORT");
+
+      // M5-FIX-13 (synthetic non-disk repo): Reject missing verified_tree_hash and reject verified_tree_hash === new_sha
+      const synProject = await fx.store.withRlsTransaction(
+        {
+          currentRole: "system_admin_role",
+          currentPrincipalId: "bootstrap-admin",
+        },
+        () => {
+          const p = fx.store.createProject({
+            slug: `m5-syn-pre-${randomUUID().slice(0, 6)}`,
+            name: "Synthetic Non-Disk Project",
+            repo_bare_path: join(fx.rootDir, "nonexistent-bare.git"),
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+            approval_ttl_seconds: 120,
+          });
+          fx.store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "operator-alice",
+            member_role: "DEVELOPER",
+          });
+          return p;
+        }
+      );
+      const synAuthOp = fx.coreApi.issueAuthContext({
+        projectId: synProject.project_id,
+        principalId: "operator-alice",
+        roles: ["DEVELOPER"],
+      });
+      const synTask = await fx.coreClient.createTask(synProject.project_id, synAuthOp, {
+        title: "Synthetic Pre-Receive Non-Disk Task",
+        task_contract: fx.contract,
+      });
+      const synLease = await fx.coreClient.dispatchTaskLease(synProject.project_id, synAuthOp, synTask.task_id, {
+        worker_id: "w-syn-pre",
+      });
+      const synPreTok = fx.tokenService.issueLeasePushToken({
+        projectId: synProject.project_id,
+        taskId: synTask.task_id,
+        leaseId: synLease.lease_id,
+        leaseEpoch: synLease.lease_epoch,
+        workerId: "w-syn-pre",
+      });
+      const missingTreeRes = await fetch(`${fx.gatewayBaseUrl}/internal/v1/git/pre-receive-verify`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${synPreTok}`,
+        },
+        body: JSON.stringify({
+          old_sha: "0".repeat(40),
+          new_sha: "a".repeat(40),
+          ref_name: `refs/heads/sf/staging/${synTask.task_id}/${synLease.lease_epoch}`,
+        }),
+      });
+      assert.equal(missingTreeRes.status, 403);
+      assert.equal(
+        ((await missingTreeRes.json()) as { error_code: string }).error_code,
+        "ERR_GATEKEEPER_MISSING_INSPECTION_METADATA"
+      );
+
+      const equalTreeRes = await fetch(`${fx.gatewayBaseUrl}/internal/v1/git/pre-receive-verify`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${synPreTok}`,
+        },
+        body: JSON.stringify({
+          old_sha: "0".repeat(40),
+          new_sha: "a".repeat(40),
+          ref_name: `refs/heads/sf/staging/${synTask.task_id}/${synLease.lease_epoch}`,
+          verified_tree_hash: "a".repeat(40),
+          parent_commit_hashes: ["1".repeat(40)],
+          changes: [
+            {
+              path: "src/calculator.mjs",
+              mode: "100644",
+              size_bytes: 12,
+              is_binary: false,
+              added_lines: 1,
+              deleted_lines: 0,
+              blob_sha: "b".repeat(40),
+            },
+          ],
+        }),
+      });
+      assert.equal(equalTreeRes.status, 403);
+      assert.equal(
+        ((await equalTreeRes.json()) as { error_code: string }).error_code,
+        "ERR_GATEKEEPER_TAMPERED_IMPORT"
+      );
+
+      // M5-FIX-14: submitHumanApproval rejects stale caller current_main_commit_hash against moved disk Git HEAD
+      const flowStale = await runFullWorkflowToApproval(fx, "M5-FIX-14 Disk HEAD Check");
+      advanceBareMainExternalCommit({
+        rootDir: fx.rootDir,
+        bareRepoDir: fx.bareRepoDir,
+        relativePath: "docs/ext-move.md",
+        content: "# Moved Main\n",
+        message: "docs: move main externally",
+      });
+      await assert.rejects(
+        () =>
+          fx.coreClient.submitApproval(
+            fx.projectId,
+            fx.authApprover,
+            flowStale.task.task_id,
+            {
+              merge_candidate_id: flowStale.built.mergeCandidate.merge_candidate_id,
+              approval_request_id: flowStale.reviewed.approvalRequest?.approval_request_id,
+              agent_commit_hash: flowStale.built.mergeCandidate.agent_commit_hash,
+              base_main_commit_hash: flowStale.built.mergeCandidate.base_main_commit_hash,
+              verified_tree_hash: flowStale.built.mergeCandidate.verified_tree_hash,
+              merge_candidate_hash: flowStale.built.mergeCandidate.merge_candidate_hash,
+              verification_run_id: flowStale.verified.finalRun.verification_run_id,
+              review_artifact_id: flowStale.reviewed.reviewArtifact.review_artifact_id,
+              decision: "APPROVED",
+              repo_path: fx.bareRepoDir,
+              current_main_commit_hash: fx.initialMainSha,
+            }
+          ),
+        (err: unknown) =>
+          err instanceof HttpCoreApiError &&
+          err.statusCode === 422 &&
+          err.body.sqlState === "23514"
+      );
+    } finally {
+      await fx.closeAndCleanup();
+    }
+
+    // 2. When verifyPolicy.allowAdminVerifyOverrides === true, ORG_ADMIN succeeds while DEVELOPER is still blocked
+    const fxAdmin = await createM5LiveStackFixture({
+      verifyPolicy: { allowAdminVerifyOverrides: true },
+    });
+    try {
+      const task = await fxAdmin.coreClient.createTask(fxAdmin.projectId, fxAdmin.authOp, {
+        title: "M5-FIX-06 Admin Override Check",
+        task_contract: fxAdmin.contract,
+      });
+      const lease = await fxAdmin.coreClient.dispatchTaskLease(fxAdmin.projectId, fxAdmin.authOp, task.task_id, {
+        worker_id: "w-fix06-admin",
+      });
+      const workerRes = await runWorkerDaemonOverHttp({
+        fx: fxAdmin,
+        task,
+        lease,
+        workerId: "w-fix06-admin",
+      });
+      assert.equal(workerRes.outcome, "COMPLETED");
+      const built = await fxAdmin.coreClient.buildCandidate(fxAdmin.projectId, fxAdmin.authOp, task.task_id, {
+        lease_id: lease.lease_id,
+        lease_epoch: lease.lease_epoch,
+        staging_ref: workerRes.stagingRef,
+        agent_commit_hash: workerRes.pushedCommitHash!,
+        repo_path: fxAdmin.bareRepoDir,
+      });
+      assert.equal(built.ok, true);
+      if (!built.ok) throw new Error("Expected buildCandidate success");
+      const cmds = buildVerifierCommands(false);
+      await assert.rejects(
+        () =>
+          fxAdmin.coreClient.verifyCandidate(fxAdmin.projectId, fxAdmin.authOp, task.task_id, {
+            merge_candidate_id: built.mergeCandidate.merge_candidate_id,
+            trusted_acceptance_dir: fxAdmin.trustedAcceptanceDir,
+            repo_path: fxAdmin.bareRepoDir,
+            execution_mode: "subprocess",
+            ...cmds,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+      const adminVer = await fxAdmin.coreClient.verifyCandidate(
+        fxAdmin.projectId,
+        fxAdmin.authAdmin,
+        task.task_id,
+        {
+          merge_candidate_id: built.mergeCandidate.merge_candidate_id,
+          trusted_acceptance_dir: fxAdmin.trustedAcceptanceDir,
+          repo_path: fxAdmin.bareRepoDir,
+          execution_mode: "subprocess",
+          ...cmds,
+        }
+      );
+      assert.equal(adminVer.finalRun.verdict, "PASS");
+    } finally {
+      await fxAdmin.closeAndCleanup();
+    }
+  });
+
+  it("M5-Gate-7 (M5-FIX-08, M5-FIX-09, M5-FIX-10, M5-FIX-17): Enforces WNA task.failed flush on execution errors, blocks policy/empty edits in adapter & applyWorkspaceEditsSync, and enforces https:// + array model content", async () => {
+    // 1. M5-FIX-17: Enforce https:// on non-loopback baseUrl while allowing loopback http:// and explicit opt-in
+    assert.throws(
+      () =>
+        new LiveModelProviderClient({
+          provider: "openai",
+          model: "gpt-4.1",
+          apiKey: "sk-test-token",
+          baseUrl: "http://api.openai.com",
+        }),
+      (err: unknown) => err instanceof ModelProviderConfigurationError
+    );
+    assert.throws(
+      () =>
+        new LiveModelProviderClient({
+          provider: "anthropic",
+          model: "claude-sonnet-4",
+          apiKey: "ant-test-token",
+          baseUrl: "http://10.0.0.5:8080",
+        }),
+      (err: unknown) => err instanceof ModelProviderConfigurationError
+    );
+    assert.throws(
+      () =>
+        new LiveModelProviderClient({
+          provider: "openai",
+          model: "gpt-4.1",
+          apiKey: "sk-test-token",
+          baseUrl: "https://evil.example.com",
+          allowedHosts: ["api.openai.com"],
+        }),
+      (err: unknown) => err instanceof ModelProviderConfigurationError
+    );
+    assert.doesNotThrow(
+      () =>
+        new LiveModelProviderClient({
+          provider: "openai",
+          model: "gpt-4.1",
+          apiKey: "sk-test-token",
+          baseUrl: "https://api.openai.com",
+          allowedHosts: ["api.openai.com"],
+        })
+    );
+    assert.doesNotThrow(
+      () =>
+        new LiveModelProviderClient({
+          provider: "openai",
+          model: "gpt-4.1",
+          apiKey: "sk-test-token",
+          baseUrl: "http://10.0.0.5:8080",
+          allowInsecureHttpBaseUrl: true,
+        })
+    );
+
+    // 2. M5-FIX-10: OpenAI array content (tool-only array fails closed without throwing; multi-part text works)
+    let openaiResponseBody: Record<string, unknown> = {
+      choices: [{ message: { content: [{ type: "tool_call", id: "call_1" }] } }],
+    };
+    const mockOpenAi = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(openaiResponseBody));
+    });
+    await new Promise<void>((r) => mockOpenAi.listen(0, "127.0.0.1", () => r()));
+    const addr = mockOpenAi.address();
+    assert.ok(addr && typeof addr === "object");
+
+    const fx = await createM5LiveStackFixture();
+    try {
+      const openaiClient = new LiveModelProviderClient({
+        provider: "openai",
+        model: "gpt-4.1",
+        apiKey: "openai-array-test-key",
+        baseUrl: `http://127.0.0.1:${addr.port}`,
+      });
+
+      const toolOnlyReview = await evaluateIndependentReviewWithLiveModel(openaiClient, {
+        taskContract: fx.contract,
+        diffText: "+export const y = 2;",
+        changedFiles: ["src/calculator.mjs"],
+        verificationRunSummary: {
+          verification_run_id: randomUUID(),
+          verdict: "PASS",
+          overall_status: "PASS",
+          tier1_trusted_acceptance_passed: true,
+          tier2_protected_baseline_passed: true,
+          tier3_agent_tests_passed: true,
+        },
+      });
+      assert.equal(toolOnlyReview.verdict, "FAIL");
+
+      openaiResponseBody = {
+        choices: [
+          {
+            message: {
+              content: [
+                { type: "text", text: '{"verdict":"PASS","summaryMarkdown":"Multipart array ok",' },
+                { type: "output_text", text: '"findings":[]}' },
+              ],
+            },
+          },
+        ],
+      };
+      const multipartReview = await evaluateIndependentReviewWithLiveModel(openaiClient, {
+        taskContract: fx.contract,
+        diffText: "+export const y = 2;",
+        changedFiles: ["src/calculator.mjs"],
+        verificationRunSummary: {
+          verification_run_id: randomUUID(),
+          verdict: "PASS",
+          overall_status: "PASS",
+          tier1_trusted_acceptance_passed: true,
+          tier2_protected_baseline_passed: true,
+          tier3_agent_tests_passed: true,
+        },
+      });
+      assert.equal(multipartReview.verdict, "PASS");
+
+      // M5-FIX-09: applyWorkspaceEditsSync rejects empty edits and forbidden paths fail-closed
+      assert.throws(
+        () => applyWorkspaceEditsSync(fx.mainWorkDir, [], "empty commit", fx.contract),
+        /non-empty array/i
+      );
+      assert.throws(
+        () =>
+          applyWorkspaceEditsSync(
+            fx.mainWorkDir,
+            [{ path: ".env", content: "SECRET=leaked\n" }],
+            "forbidden commit",
+            fx.contract
+          ),
+        /rejected by TaskContract/i
+      );
+
+      // M5-FIX-09 + M5-FIX-08: Adapter rejects forbidden path (.env), empty [], and malformed JSON,
+      // and WnaWorkerDaemon cleanly transitions task -> ReworkRequired and revokes lease via task.failed!
+      const badPayloads: Array<unknown> = [
+        [],
+        [{ path: ".env", content: "LEAK=1\n" }],
+        [{ path: ".github/workflows/ci.yml", content: "name: pwn\n" }],
+        [{ path: "outside/hack.mjs", content: "export const a = 1;\n" }],
+        [{ path: "../escape.mjs", content: "export const b = 1;\n" }],
+        [
+          { path: "src/CaseFile.mjs", content: "export const a = 1;\n" },
+          { path: "src/casefile.mjs", content: "export const b = 2;\n" },
+        ],
+      ];
+
+      for (const badEdits of badPayloads) {
+        openaiResponseBody = {
+          choices: [{ message: { content: JSON.stringify(badEdits) } }],
+        };
+        const tBad = await fx.coreClient.createTask(fx.projectId, fx.authOp, {
+          title: "M5-FIX-08/09 Bad Model Edits",
+          task_contract: fx.contract,
+        });
+        const lBad = await fx.coreClient.dispatchTaskLease(fx.projectId, fx.authOp, tBad.task_id, {
+          worker_id: "w-bad-edits",
+        });
+        const wt = fx.tokenService.issueLeasePushToken({
+          projectId: fx.projectId,
+          taskId: tBad.task_id,
+          leaseId: lBad.lease_id,
+          leaseEpoch: lBad.lease_epoch,
+          workerId: "w-bad-edits",
+        });
+        const pt = fx.tokenService.issueLeasePushToken({
+          projectId: fx.projectId,
+          taskId: tBad.task_id,
+          leaseId: lBad.lease_id,
+          leaseEpoch: lBad.lease_epoch,
+          workerId: "w-bad-edits",
+        });
+        const daemon = new WnaWorkerDaemon({
+          gateway: new HttpAgentGatewayClient({ baseUrl: fx.gatewayBaseUrl, bearerToken: wt }),
+          worktreeBaseDir: fx.worktreeBaseDir,
+          outboxDir: fx.outboxDir,
+        });
+        const badRes = await daemon.executeLease({
+          task: tBad,
+          lease: lBad,
+          repoBarePath: fx.bareRepoDir,
+          gitPushToken: pt,
+          preReceiveUrl: fx.preReceiveUrl,
+          adapter: new WorkspaceCodingAgentAdapter({ modelClient: openaiClient }),
+          stagingRefKind: "staging",
+          isolateNamespaces: false,
+          dropPrivileges: false,
+        });
+        assert.equal(badRes.outcome, "FAILED");
+        assert.ok(badRes.error);
+
+        const taskAfter = await fx.coreClient.getTask(fx.projectId, fx.authOp, tBad.task_id);
+        assert.equal(taskAfter.status, "ReworkRequired");
+        const lineageAfter = await fx.coreClient.getCandidateLineage(
+          fx.projectId,
+          fx.authOp,
+          tBad.task_id
+        );
+        assert.equal(lineageAfter.taskLeases[0]?.status, "REVOKED");
+      }
+
+      // M5-FIX-08: Pre-receive push failure flushes task.failed and reaps sandbox instead of stranding lease
+      const tPushFail = await fx.coreClient.createTask(fx.projectId, fx.authOp, {
+        title: "M5-FIX-08 Push Failure Flush",
+        task_contract: fx.contract,
+      });
+      const lPushFail = await fx.coreClient.dispatchTaskLease(fx.projectId, fx.authOp, tPushFail.task_id, {
+        worker_id: "w-push-fail",
+      });
+      const wtPush = fx.tokenService.issueLeasePushToken({
+        projectId: fx.projectId,
+        taskId: tPushFail.task_id,
+        leaseId: lPushFail.lease_id,
+        leaseEpoch: lPushFail.lease_epoch,
+        workerId: "w-push-fail",
+      });
+      const daemonPushFail = new WnaWorkerDaemon({
+        gateway: new HttpAgentGatewayClient({ baseUrl: fx.gatewayBaseUrl, bearerToken: wtPush }),
+        worktreeBaseDir: fx.worktreeBaseDir,
+        outboxDir: fx.outboxDir,
+      });
+      const prevDeadline = fx.gatewayHttp.deadlineMs;
+      const prevHook = fx.gatewayHttp.authorizeCheckHook;
+      fx.gatewayHttp.deadlineMs = 15;
+      fx.gatewayHttp.authorizeCheckHook = async () => {
+        await new Promise((r) => setTimeout(r, 80));
+      };
+      try {
+        const pushFailRes = await daemonPushFail.executeLease({
+          task: tPushFail,
+          lease: lPushFail,
+          repoBarePath: fx.bareRepoDir,
+          gitPushToken: wtPush,
+          preReceiveUrl: fx.preReceiveUrl,
+          adapter: new WorkspaceCodingAgentAdapter({
+            editsResolver: () => [
+              { path: "src/calculator.mjs", content: VALID_CALCULATOR_SUBTRACT_SOURCE },
+            ],
+          }),
+          stagingRefKind: "staging",
+          isolateNamespaces: false,
+          dropPrivileges: false,
+        });
+        assert.equal(pushFailRes.outcome, "FAILED");
+        assert.ok(pushFailRes.cleanupEvidence);
+      } finally {
+        fx.gatewayHttp.deadlineMs = prevDeadline;
+        fx.gatewayHttp.authorizeCheckHook = prevHook;
+      }
+      const taskPushAfter = await fx.coreClient.getTask(fx.projectId, fx.authOp, tPushFail.task_id);
+      assert.equal(taskPushAfter.status, "ReworkRequired");
+      const lineagePushAfter = await fx.coreClient.getCandidateLineage(
+        fx.projectId,
+        fx.authOp,
+        tPushFail.task_id
+      );
+      assert.equal(lineagePushAfter.taskLeases[0]?.status, "REVOKED");
+    } finally {
+      await new Promise<void>((r) => mockOpenAi.close(() => r()));
+      await fx.closeAndCleanup();
+    }
+  });
+
+  it("M5-Gate-8 (M5-FIX-04, M5-FIX-11, M5-FIX-15, M5-FIX-16, cd84dc7#3): Enforces runtime bootstrap config, lineage verdict checks, unified metrics, project-scoped hash & strict reviewer session UUID", async () => {
+    // 1. M5-FIX-11: createControlPlaneStoreFromEnv + production stack bootstrap fallbacks & fail-closed requirePostgres
+    assert.throws(
+      () => createControlPlaneStoreFromEnv({ env: {}, requirePostgres: true }),
+      /PostgreSQL runtime is required/i
+    );
+    const memHandle = createControlPlaneStoreFromEnv({ env: {} });
+    assert.equal(memHandle.mode, "memory");
+    assert.equal(memHandle.pool, null);
+    await memHandle.close();
+
+    const coreRt = await createCoreApiRuntime({ env: {} });
+    const gwRt = await createAgentGatewayRuntime({ env: {} });
+    const stackRt = await createControlPlaneStackRuntime({ env: {} });
+    try {
+      assert.equal(coreRt.mode, "memory");
+      assert.equal(gwRt.mode, "memory");
+      assert.equal(stackRt.mode, "memory");
+      const coreHealth = await fetch(`${coreRt.coreApiEndpoint!.baseUrl}/health`);
+      assert.equal(coreHealth.status, 200);
+      const gwHealth = await fetch(`${gwRt.endpoint!.baseUrl}/health`);
+      assert.equal(gwHealth.status, 200);
+      const webHealth = await fetch(`${stackRt.webEndpoint!.baseUrl}/health`);
+      assert.equal(webHealth.status, 200);
+    } finally {
+      await Promise.all([stackRt.close(), gwRt.close(), coreRt.close()]);
+    }
+
+    // 2. M5-FIX-16 + M5-FIX-15 in SoftwareFactoryControlPlaneStore
+    const memStore = new SoftwareFactoryControlPlaneStore();
+    const { pA, pB, tA, lA } = await memStore.withRlsTransaction(
+      { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+      async () => {
+        const projA = memStore.createProject({
+          slug: "fix16-a",
+          name: "Project A",
+          repo_bare_path: "/tmp/a.git",
+          initial_main_commit_hash: "1".repeat(40),
+          initial_main_tree_hash: "2".repeat(40),
+        });
+        const projB = memStore.createProject({
+          slug: "fix16-b",
+          name: "Project B",
+          repo_bare_path: "/tmp/b.git",
+          initial_main_commit_hash: "3".repeat(40),
+          initial_main_tree_hash: "4".repeat(40),
+        });
+        memStore.addProjectMembership({
+          project_id: projA.project_id,
+          principal_id: "op-a",
+          member_role: "DEVELOPER",
+        });
+        return memStore.withRlsTransaction(
+          {
+            currentProjectId: projA.project_id,
+            currentPrincipalId: "op-a",
+            currentRole: "core_api_service",
+          },
+          async () => {
+            const t = memStore.createTask({
+              project_id: projA.project_id,
+              title: "Metric Default Task",
+              task_contract: { allowed_files: ["src/**"] },
+            });
+            const l = await memStore.grantTaskLease({
+              project_id: projA.project_id,
+              task_id: t.task_id,
+              worker_id: "w-m15",
+            });
+            return { pA: projA, pB: projB, tA: t, lA: l };
+          }
+        );
+      }
+    );
+
+    await memStore.withRlsTransaction(
+      { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+      () => {
+        assert.equal(memStore.getMainRefCommitHash(), null);
+        assert.equal(memStore.getMainRefCommitHash(pA.project_id), "1".repeat(40));
+        assert.equal(memStore.getMainRefCommitHash(pB.project_id), "3".repeat(40));
+      }
+    );
+
+    await assert.rejects(
+      () =>
+        memStore.withRlsTransaction(
+          {
+            currentProjectId: pA.project_id,
+            currentPrincipalId: "w-m15",
+            currentRole: "gateway_service",
+          },
+          () =>
+            memStore.recordResourceUsageMetric({
+              project_id: pA.project_id,
+              task_id: tA.task_id,
+              lease_id: lA.lease_id,
+              lease_epoch: lA.lease_epoch,
+              phase: "DEVELOPER",
+              wall_time_ms: -1,
+              cpu_usage_usec: 10,
+              peak_memory_bytes: 10,
+              sandbox_backend_mode: "real-process",
+              metrics_source: "process-rusage",
+            })
+        ),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+    const defaultedMemMetric = await memStore.withRlsTransaction(
+      {
+        currentProjectId: pA.project_id,
+        currentPrincipalId: "w-m15",
+        currentRole: "gateway_service",
+      },
+      () =>
+        memStore.recordResourceUsageMetric({
+          project_id: pA.project_id,
+          task_id: tA.task_id,
+          lease_id: lA.lease_id,
+          lease_epoch: lA.lease_epoch,
+          phase: "DEVELOPER",
+          wall_time_ms: 15,
+          cpu_usage_usec: 25,
+          peak_memory_bytes: 512,
+          sandbox_backend_mode: "real-process",
+          metrics_source: "process-rusage",
+        })
+    );
+    assert.equal(defaultedMemMetric.attempt_no, lA.attempt_no);
+    assert.equal(defaultedMemMetric.rework_cycle, tA.rework_count);
+
+    // 3. M5-FIX-04: buildCandidateBoundLineage rejects FAIL verdict, REJECTED approval, and superseded candidate
+    const nowLineageIso = new Date().toISOString();
+    const baseProcessedEvent: ProcessedWorkerEventRecord = {
+      event_id: "ev-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      lease_id: lA.lease_id,
+      lease_epoch: 1,
+      sequence_no: 1,
+      event_type: "task.completed",
+      event_idempotency_key: "ik-1",
+      payload_sha256: "0".repeat(64),
+      payload_json: {},
+      processed_at: nowLineageIso,
+    };
+    const baseVerifiedImport = {
+      import_id: "imp-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      lease_id: lA.lease_id,
+      lease_epoch: 1,
+      agent_commit_hash: "a".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      staging_ref: "refs/heads/sf/staging/t/1",
+      changed_files_count: 1,
+      deleted_lines_count: 0,
+      recovered_by_reconciler: false,
+      created_at: nowLineageIso,
+    };
+    const baseMergeCandidate = {
+      merge_candidate_id: "mc-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      import_id: "imp-1",
+      agent_commit_hash: "a".repeat(40),
+      base_main_commit_hash: "1".repeat(40),
+      merge_candidate_hash: "5".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      is_superseded: false,
+      snapshot_path: null,
+      snapshot_sha256: null,
+      snapshot_size_bytes: null,
+      snapshot_retention_class: "MERGED_PERMANENT" as const,
+      created_at: nowLineageIso,
+    };
+    const baseVerificationRun: VerificationRunRecord = {
+      verification_run_id: "vr-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      merge_candidate_id: "mc-1",
+      merge_candidate_hash: "5".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      verifier_image_digest: "sha256:x",
+      verdict: "PASS",
+      overall_status: "PASSED",
+      tier1_trusted_acceptance_passed: true,
+      tier2_protected_baseline_passed: true,
+      tier2_baseline_tamper_detected: false,
+      tampered_baseline_paths: [],
+      tier3_agent_tests_passed: true,
+      tier3_assertions: [],
+      exit_code: 0,
+      duration_ms: 10,
+      execution_backend: "docker",
+      hermetic_network_disabled: true,
+      hardlink_cache_forbidden: true,
+      report_sha256: "c".repeat(64),
+      created_at: nowLineageIso,
+    };
+    const baseReviewSession = {
+      review_session_id: "rs-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      merge_candidate_id: "mc-1",
+      verification_run_id: "vr-1",
+      reviewer_principal_id: "r",
+      reviewer_credential_id: "rc",
+      reviewer_agent_profile_id: "rp",
+      reviewer_provider: "google",
+      reviewer_model: "gemini-2.5-pro",
+      role: "ROLE_REVIEWER_READONLY" as const,
+      sandbox_backend_mode: "real-process",
+      sandbox_pid: null,
+      sandbox_cgroup_path: null,
+      cleanup_populated_zero_verified: true,
+      status: "COMPLETED" as const,
+      started_at: nowLineageIso,
+      completed_at: nowLineageIso,
+    };
+    const baseReviewArtifact: ReviewArtifactRecord = {
+      review_artifact_id: "ra-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      merge_candidate_id: "mc-1",
+      verification_run_id: "vr-1",
+      merge_candidate_hash: "5".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      writer_provider: "anthropic",
+      writer_model: "claude-sonnet-4",
+      reviewer_provider: "google",
+      reviewer_model: "gemini-2.5-pro",
+      developer_principal_id: "d",
+      reviewer_principal_id: "r",
+      developer_session_id: "ds",
+      reviewer_session_id: "rs",
+      developer_credential_id: "dc",
+      reviewer_credential_id: "rc",
+      developer_agent_profile_id: "dp",
+      reviewer_agent_profile_id: "rp",
+      review_session_id: "rs-1",
+      verdict: "PASS",
+      status: "VALID",
+      is_invalidated: false,
+      invalidated_reason: null,
+      findings_json: [],
+      created_at: nowLineageIso,
+    };
+    const baseApprovalRequest = {
+      approval_request_id: "ar-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      merge_candidate_id: "mc-1",
+      agent_commit_hash: "a".repeat(40),
+      base_main_commit_hash: "1".repeat(40),
+      merge_candidate_hash: "5".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      verification_run_id: "vr-1",
+      review_artifact_id: "ra-1",
+      status: "APPROVED" as const,
+      expires_at: nowLineageIso,
+      created_at: nowLineageIso,
+      updated_at: nowLineageIso,
+    };
+    const baseApprovalDecision: ApprovalDecisionRecord = {
+      approval_id: "ad-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      merge_candidate_id: "mc-1",
+      approval_request_id: "ar-1",
+      agent_commit_hash: "a".repeat(40),
+      base_main_commit_hash: "1".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      merge_candidate_hash: "5".repeat(40),
+      verification_run_id: "vr-1",
+      review_artifact_id: "ra-1",
+      approver_principal_id: "approver",
+      decision: "APPROVED",
+      status: "CONSUMED",
+      invalidated_reason: null,
+      approved_at: nowLineageIso,
+      expires_at: nowLineageIso,
+      consumed_at: nowLineageIso,
+    };
+    const baseMergeOp = {
+      merge_op_id: "mo-1",
+      project_id: pA.project_id,
+      task_id: tA.task_id,
+      merge_candidate_id: "mc-1",
+      approval_id: "ad-1",
+      merge_idempotency_key: "mk-1",
+      base_main_commit_hash: "1".repeat(40),
+      merge_candidate_hash: "5".repeat(40),
+      verified_tree_hash: "b".repeat(40),
+      status: "MERGED" as const,
+      reconciled_after_lost_response: false,
+      retry_count: 0,
+      last_error: null,
+      created_at: nowLineageIso,
+      completed_at: nowLineageIso,
+    };
+    const validLineageInput = {
+      task: {
+        ...tA,
+        status: "MergedAndCompleted" as const,
+        active_merge_candidate_id: "mc-1",
+        merged_commit_hash: "5".repeat(40),
+      },
+      mainHeadCommitHash: "5".repeat(40),
+      taskLeases: [lA],
+      processedEvents: [baseProcessedEvent],
+      resourceUsageMetrics: [defaultedMemMetric],
+      imports: [baseVerifiedImport],
+      allMergeCandidates: [baseMergeCandidate],
+      verificationRuns: [baseVerificationRun],
+      reviewSessions: [baseReviewSession],
+      reviewArtifacts: [baseReviewArtifact],
+      approvalRequests: [baseApprovalRequest],
+      approvalDecisions: [baseApprovalDecision],
+      mergeOperations: [baseMergeOp],
+    };
+
+    const okLineage = buildCandidateBoundLineage(validLineageInput);
+    assert.equal(okLineage.hashBindingVerified, true);
+    assert.equal(okLineage.lineageComplete, true);
+    assert.equal(okLineage.gitLogHeadMatchesCandidate, true);
+
+    const supersededLineage = buildCandidateBoundLineage({
+      ...validLineageInput,
+      allMergeCandidates: [{ ...baseMergeCandidate, is_superseded: true }],
+    });
+    assert.equal(supersededLineage.hashBindingVerified, false);
+    assert.equal(supersededLineage.lineageComplete, false);
+    assert.equal(supersededLineage.gitLogHeadMatchesCandidate, false);
+
+    const failVerLineage = buildCandidateBoundLineage({
+      ...validLineageInput,
+      verificationRuns: [{ ...baseVerificationRun, verdict: "FAIL", overall_status: "FAILED_ACCEPTANCE" }],
+    });
+    assert.equal(failVerLineage.hashBindingVerified, false);
+    assert.equal(failVerLineage.lineageComplete, false);
+
+    const failRevLineage = buildCandidateBoundLineage({
+      ...validLineageInput,
+      reviewArtifacts: [{ ...baseReviewArtifact, verdict: "FAIL" }],
+    });
+    assert.equal(failRevLineage.hashBindingVerified, false);
+    assert.equal(failRevLineage.lineageComplete, false);
+
+    const rejectedAppLineage = buildCandidateBoundLineage({
+      ...validLineageInput,
+      approvalDecisions: [{ ...baseApprovalDecision, decision: "REJECTED" }],
+    });
+    assert.equal(rejectedAppLineage.hashBindingVerified, false);
+    assert.equal(rejectedAppLineage.lineageComplete, false);
+
+    // 4. cd84dc7 minor #3: CoreApiService.runIndependentReview fails closed if reviewerSessionId is not a UUID
+    const fxMinor3 = await createM5LiveStackFixture();
+    try {
+      const task = await fxMinor3.coreClient.createTask(fxMinor3.projectId, fxMinor3.authOp, {
+        title: "cd84dc7 Minor #3 Non-UUID Session Check",
+        task_contract: fxMinor3.contract,
+      });
+      const lease = await fxMinor3.coreClient.dispatchTaskLease(fxMinor3.projectId, fxMinor3.authOp, task.task_id, {
+        worker_id: "w-minor3",
+      });
+      const wnaRes = await runWorkerDaemonOverHttp({
+        fx: fxMinor3,
+        task,
+        lease,
+        workerId: "w-minor3",
+      });
+      const built = await fxMinor3.coreClient.buildCandidate(fxMinor3.projectId, fxMinor3.authOp, task.task_id, {
+        lease_id: lease.lease_id,
+        lease_epoch: lease.lease_epoch,
+        staging_ref: wnaRes.stagingRef,
+        agent_commit_hash: wnaRes.pushedCommitHash!,
+        repo_path: fxMinor3.bareRepoDir,
+      });
+      assert.equal(built.ok, true);
+      if (!built.ok) throw new Error("Expected candidate");
+      const cmds = buildVerifierCommands(fxMinor3.useDocker);
+      const verified = await fxMinor3.coreClient.verifyCandidate(fxMinor3.projectId, fxMinor3.authOp, task.task_id, {
+        merge_candidate_id: built.mergeCandidate.merge_candidate_id,
+        trusted_acceptance_dir: fxMinor3.trustedAcceptanceDir,
+        repo_path: fxMinor3.bareRepoDir,
+        execution_mode: "auto",
+        ...cmds,
+      });
+      await assert.rejects(
+        () =>
+          fxMinor3.coreApi.runIndependentReview(fxMinor3.projectId, fxMinor3.authOp, {
+            task_id: task.task_id,
+            merge_candidate_id: built.mergeCandidate.merge_candidate_id,
+            verification_run_id: verified.finalRun.verification_run_id,
+            reviewer_principal_id: "rev-minor3",
+            reviewer_session_id: "non-uuid-session-id",
+            reviewer_agent_profile_id: "prof-rev-minor3",
+            reviewer_provider: "google",
+            reviewer_model: "gemini-2.5-pro",
+            developer_principal_id: "dev-minor3",
+            developer_session_id: "dev-sess-minor3",
+            developer_credential_id: "dev-cred-minor3",
+            developer_agent_profile_id: "prof-dev-minor3",
+            writer_provider: "anthropic",
+            writer_model: "claude-sonnet-4",
+            agent_gateway: fxMinor3.gatewayService,
+            repo_path: fxMinor3.bareRepoDir,
+            tier3_test_files: cmds.tier3_test_files,
+          }),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+    } finally {
+      await fxMinor3.closeAndCleanup();
     }
   });
 });
