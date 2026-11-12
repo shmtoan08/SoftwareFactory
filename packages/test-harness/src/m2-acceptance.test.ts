@@ -1378,10 +1378,12 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
         task_contract: M2_CONTRACT,
         base_main_commit_hash: baseMainSha,
       });
-      const leaseBadToken = await coreApi.dispatchTaskLease(projectId, authOp1, {
-        task_id: taskBadToken.task_id,
-        worker_id: "worker-e2e-2",
-      });
+      // M6C-FIX-01: gatekeeper fixtures model overlapping legacy leases.
+      // Seed that privileged precondition directly; public dispatch must reject it.
+      const leaseBadToken = await store.withRlsTransaction(
+        { currentProjectId: projectId, currentRole: "core_api_service" },
+        () => store.grantTaskLease({ project_id: projectId, task_id: taskBadToken.task_id,
+          worker_id: "worker-e2e-2", reject_overlapping_active_files: false }));
       const staticTokenRes = await runGitPush(
         `HEAD:refs/heads/sf/staging/${taskBadToken.task_id}/${leaseBadToken.lease_epoch}`,
         "static-unsigned-token"
@@ -1405,10 +1407,12 @@ describe("Milestone M1 & M2 Review Verification Suite (FIX-01 .. FIX-27)", () =>
         task_contract: M2_CONTRACT,
         base_main_commit_hash: baseMainSha,
       });
-      const leaseEnv = await coreApi.dispatchTaskLease(projectId, authOp1, {
-        task_id: taskEnv.task_id,
-        worker_id: "worker-e2e-env",
-      });
+      // M6C-FIX-01: gatekeeper fixtures model overlapping legacy leases.
+      // Seed that privileged precondition directly; public dispatch must reject it.
+      const leaseEnv = await store.withRlsTransaction(
+        { currentProjectId: projectId, currentRole: "core_api_service" },
+        () => store.grantTaskLease({ project_id: projectId, task_id: taskEnv.task_id,
+          worker_id: "worker-e2e-env", reject_overlapping_active_files: false }));
       const tokenEnv = tokenService.issueLeasePushToken({
         projectId,
         taskId: taskEnv.task_id,

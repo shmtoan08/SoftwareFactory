@@ -17,6 +17,7 @@ Deterministic, lease-coordinated AI Software Factory Control Plane with 4-tier P
 - **M6C-1 validation (2026-11-12):** Earlier full PostgreSQL regression **102/102 passing**, followed by final M6C glob regression **8/8 passing**; details and limits: [M6C-1 validation report](./m6c1-validation-report.md).
 - **Slice `M6C-2` (Second Runtime & Extended Imports):** Codex CLI adapter, WNA runtime selection, Bundle/Patch/Artifact normalization, lease-fenced immutable receipts and candidate-bound provenance implemented. Final M6C-2 **9/9**, native sandbox/WNA **2/2**; full regression **108/111**, with the three M5 failures passing an isolated **3/3** rerun. Validation and limits: [M6C-2 report](./m6c2-validation-report.md).
 - **Slice `M6C-3`:** Pending (external target connectors, kernel-isolated verifier, Lima/WSL2 and production deployment approval). **M6C / G7 is not yet complete.**
+- **M6C review fixes (issue #8):** M6C-FIX-01..05 implemented on `review/m6c-1-2`, awaiting reviewer acceptance. Final local PostgreSQL 17 regression: **115/115 passing, 0 skipped** on Node 24.16.0; lint/TypeScript and secret scan passed. Scope, fixture compatibility and transaction-end retry boundaries: [review-fix report](./m6c-review-fixes-validation.md). Linux PG16/17 CI must still pass after acceptance and merge into `main`.
 
 ## Quick Start
 
@@ -153,7 +154,9 @@ All routes use the existing signed core API authentication and project membershi
 | POST | `/tasks/:taskId/budget` | Approval roles; task limits override project defaults |
 | POST | `/budget/resume`, `/tasks/:taskId/budget/resume` | Approval roles; `reason` plus explicit ceiling above observed spend for the paused scope |
 
-`AUTO_PAUSED` blocks new dispatch and model preflight with `402 ERR_BUDGET_AUTO_PAUSED`. Updating a policy does not resume it. Known in-flight provider calls can still complete; their actual cost is recorded. An autonomous denial transaction persists pause + audit when its parent rows are committed; if the caller itself owns conflicting row locks or uncommitted policy/parent rows, accounting falls back to the outer transaction to avoid self-deadlock.
+`AUTO_PAUSED` blocks new dispatch and model preflight with `402 ERR_BUDGET_AUTO_PAUSED`. Updating a policy does not resume it. Known in-flight provider calls can still complete; their actual cost is recorded. An autonomous denial transaction persists pause + audit when its parent rows are committed. Under NOWAIT contention or uncommitted parents/policies, aggregate-budget denial accounting retries in a fresh tenant transaction after the outer transaction ends and releases its connection. This completion work is awaited on commit and rollback; failures propagate. Committed cost-session parents retain their blocked ledger; rolled-back parents are not fabricated. See [M6C review fixes](./m6c-review-fixes-validation.md).
+
+Both `/scheduler/dispatch` and `/tasks/:taskId/dispatch` enforce project capacity and allowed-file exclusion. Request bodies cannot disable those checks. A glob complexity denial blocks the affected task while the scheduler continues examining other Ready tasks. PostgreSQL `withProjectMergeQueueLock` requires an explicit tenant transaction covering its callback; calling it without one fails before the callback runs.
 
 `CoreApiService.telemetry` supports an in-memory collector; set `OTEL_EXPORTER_OTLP_ENDPOINT` (and optionally `OTEL_SERVICE_NAME`) for OTLP/HTTP JSON trace/metric export. HTTP server/client trace context is propagated; authorization headers, credentials and raw request bodies are not recorded. Export transport failures do not fail task operations.
 

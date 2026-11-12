@@ -987,10 +987,12 @@ describe("Milestone M3 Acceptance Gate Suite (Candidate Builder + 3-Tier Trusted
         task_contract: fx.contract,
         base_main_commit_hash: fx.baseMainSha,
       });
-      const lExhaust = await fx.coreApi.dispatchTaskLease(fx.projectId, fx.authOp1, {
-        task_id: tExhaust.task_id,
-        worker_id: "w-exhaust",
-      });
+      // M6C-FIX-01: seed a legacy overlapping lease to isolate verifier retry
+      // exhaustion from the new public dispatch exclusion rule.
+      const lExhaust = await fx.store.withRlsTransaction(
+        { currentProjectId: fx.projectId, currentRole: "core_api_service" },
+        () => fx.store.grantTaskLease({ project_id: fx.projectId, task_id: tExhaust.task_id,
+          worker_id: "w-exhaust", reject_overlapping_active_files: false }));
       const refC = `refs/factory/Verify/${tExhaust.task_id}/1`;
       fx.gitAt(fx.agentWorkDir, ["push", "origin", `${agentCommitSha}:${refC}`]);
 

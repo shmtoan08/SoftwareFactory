@@ -289,6 +289,7 @@ async function prepareVerifiedCandidate(
     task_contract?: TaskContractSpec;
     max_rework_cycles?: number;
     calculatorSource?: string;
+    legacy_concurrent_fixture?: boolean;
     agentTestPath: string;
     agentTestSource: string;
   }
@@ -329,10 +330,13 @@ async function prepareVerifiedCandidate(
     max_rework_cycles: opts.max_rework_cycles,
   });
 
-  const lease = await fx.coreApi.dispatchTaskLease(fx.projectId, fx.authOp, {
-    task_id: task.task_id,
-    worker_id: `worker-${task.task_id.slice(0, 8)}`,
-  });
+  // Explicit legacy-state setup for cross-candidate review/approval probes.
+  // M6C-FIX-01 now rejects these overlapping tasks through public dispatch.
+  const leaseInput = { task_id: task.task_id, worker_id: `worker-${task.task_id.slice(0, 8)}` };
+  const lease = opts.legacy_concurrent_fixture
+    ? await fx.store.withRlsTransaction({ currentProjectId: fx.projectId, currentRole: "core_api_service" },
+      () => fx.store.grantTaskLease({ project_id: fx.projectId, ...leaseInput, reject_overlapping_active_files: false }))
+    : await fx.coreApi.dispatchTaskLease(fx.projectId, fx.authOp, leaseInput);
 
   const stagingRef = `refs/factory/Verify/${task.task_id}/${lease.lease_epoch}`;
   fx.gitAt(fx.agentWorkDir, ["push", "origin", `${agentCommitSha}:${stagingRef}`]);
@@ -1050,6 +1054,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
 
       // Case A2: Trivial typeof-of-literal assertions (`assert.equal(typeof "x", "string")` & `expect(typeof 123).toBe("number")`)
       const prepTrivialTypeof = await prepareVerifiedCandidate(fx, {
+        legacy_concurrent_fixture: true,
         title: "M4 Gate 3A2 Trivial Typeof Literal Reject",
         agentTestPath: "test/trivial-typeof.agent.test.mjs",
         agentTestSource: [
@@ -1120,6 +1125,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
 
       // Case E (M4-FIX-03): Legitimate runtime symbol `expect(typeof symbol).toBe/toEqual("function")` must PASS
       const prepValidTypeof = await prepareVerifiedCandidate(fx, {
+        legacy_concurrent_fixture: true,
         title: "M4 Gate 3E Valid Runtime Typeof Symbol Accept",
         agentTestPath: "test/valid-typeof.agent.test.mjs",
         agentTestSource: [
@@ -1271,6 +1277,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
 
       // Part B: Stale live Git main check inside Approval Center + submitHumanApproval
       const prepStale = await prepareVerifiedCandidate(fx, {
+        legacy_concurrent_fixture: true,
         title: "M4 Gate 4B Stale Main Check",
         agentTestPath: "test/calc2.agent.test.mjs",
         agentTestSource: [
@@ -1349,6 +1356,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
 
       // Part C (M4-FIX-01): Composite binding rejects swapped approval_request_id across candidates
       const prepBindA = await prepareVerifiedCandidate(fx, {
+        legacy_concurrent_fixture: true,
         title: "M4 Gate 4C Bind A",
         agentTestPath: "test/calc-bind-a.agent.test.mjs",
         agentTestSource: [
@@ -1378,6 +1386,7 @@ describe("Milestone M4 Gate — 3D Independent Reviewer, Approval TTL, Atomic CA
       });
 
       const prepBindB = await prepareVerifiedCandidate(fx, {
+        legacy_concurrent_fixture: true,
         title: "M4 Gate 4C Bind B",
         agentTestPath: "test/calc-bind-b.agent.test.mjs",
         agentTestSource: [

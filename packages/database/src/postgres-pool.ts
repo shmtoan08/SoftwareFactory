@@ -1203,6 +1203,7 @@ class PooledPgConnection {
 interface ActiveTxState {
   readonly conn: PooledPgConnection;
   readonly session: RlsSessionContext;
+  readonly afterEnd: (() => Promise<void>)[];
 }
 
 interface PoolAcquireWaiter {
@@ -1250,6 +1251,26 @@ export class PostgresRuntimePool {
 
   public getActiveTxSession(): RlsSessionContext | null {
     return this.txAsyncStorage.getStore()?.session ?? null;
+  }
+
+  /** Awaited after COMMIT/ROLLBACK and connection release, outside the ended TX. */
+  public afterTransactionEnd(fn: () => Promise<void>): void {
+    const active = this.txAsyncStorage.getStore();
+    if (!active) throw new Error("afterTransactionEnd requires an active transaction");
+    active.afterEnd.push(fn);
+  }
+
+  private async finishTransaction(state: ActiveTxState, originalError: unknown): Promise<void> {
+    const errors: unknown[] = [];
+    await this.txAsyncStorage.exit(async () => {
+      for (const callback of state.afterEnd.splice(0)) {
+        try { await callback(); } catch (error) { errors.push(error); }
+      }
+    });
+    if (errors.length) throw new AggregateError(
+      originalError === undefined ? errors : [originalError, ...errors],
+      "Transaction ended but durable completion work failed"
+    );
   }
 
   private popActiveWaiter(): PoolAcquireWaiter | undefined {
@@ -1391,19 +1412,22 @@ export class PostgresRuntimePool {
     const conn = await this.acquire();
     this.transactionsExecuted += 1;
     let committed = false;
+    let transactionError: unknown;
+    const state: ActiveTxState = { conn, session, afterEnd: [] };
     try {
       await conn.simpleQuery("BEGIN; SET LOCAL ROLE app_runtime;");
       await conn.query(
         "SELECT set_config('app.current_project_id', $1::text, true), set_config('app.current_principal_id', $2::text, true), set_config('app.current_role', $3::text, true);",
         [session.currentProjectId ?? "", session.currentPrincipalId ?? "", session.currentRole]
       );
-      const result = await this.txAsyncStorage.run({ conn, session }, () =>
+      const result = await this.txAsyncStorage.run(state, () =>
         fn(conn, session)
       );
       await conn.simpleQuery("COMMIT;");
       committed = true;
       return result;
     } catch (error) {
+      transactionError = error;
       if (!committed && conn.isAlive()) {
         try {
           await conn.simpleQuery("ROLLBACK;");
@@ -1414,6 +1438,7 @@ export class PostgresRuntimePool {
       throw error;
     } finally {
       await this.release(conn);
+      await this.finishTransaction(state, transactionError);
     }
   }
 
@@ -1454,19 +1479,22 @@ export class PostgresRuntimePool {
     const conn = await PooledPgConnection.connect(this.config);
     this.transactionsExecuted += 1;
     let committed = false;
+    let transactionError: unknown;
+    const state: ActiveTxState = { conn, session, afterEnd: [] };
     try {
       await conn.simpleQuery("BEGIN; SET LOCAL ROLE app_runtime;");
       await conn.query(
         "SELECT set_config('app.current_project_id', $1::text, true), set_config('app.current_principal_id', $2::text, true), set_config('app.current_role', $3::text, true);",
         [session.currentProjectId ?? "", session.currentPrincipalId ?? "", session.currentRole]
       );
-      const result = await this.txAsyncStorage.run({ conn, session }, () =>
+      const result = await this.txAsyncStorage.run(state, () =>
         fn(conn, session)
       );
       await conn.simpleQuery("COMMIT;");
       committed = true;
       return result;
     } catch (error) {
+      transactionError = error;
       if (!committed && conn.isAlive()) {
         try {
           await conn.simpleQuery("ROLLBACK;");
@@ -1477,6 +1505,7 @@ export class PostgresRuntimePool {
       throw error;
     } finally {
       await conn.close();
+      await this.finishTransaction(state, transactionError);
     }
   }
 
@@ -7523,6 +7552,9 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   }
 
   public async withProjectMergeQueueLock<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    if (!this.pool.getActiveTxSession()) {
+      throw new PostgresRlsError("23514", "Merge queue lock requires an explicit tenant transaction covering its callback");
+    }
     await this.lockM6CProject(projectId);
     return fn();
   }
@@ -7848,8 +7880,50 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       });
     } catch (error) {
       if (error !== fallback && !(error instanceof PostgresQueryError && error.sqlState === "55P03")) throw error;
-      await this.persistBudgetViolationSql(input.project_id, violation);
-      await input.onBlockedSql?.(violation.scope, violation.reason);
+      // The outer TX owns a parent/policy lock (or a newly inserted parent).
+      // Wait for its real end before retrying: writing inside it would lose the
+      // pause, event and blocked ledger on rollback. Completion work is awaited,
+      // uses a fresh tenant TX, and runs after releasing the outer connection.
+      const captured = structuredClone(violation);
+      this.pool.afterTransactionEnd(() => this.pool.withRlsTransaction(
+        active ?? { currentProjectId: input.project_id, currentRole: "core_api_service" }, async () => {
+          const project = await this.pool.queryInActiveTx("SELECT 1 FROM projects WHERE project_id = $1::uuid;", [input.project_id]);
+          // A rolled-back project has no durable domain identity to pause.
+          if (!project.rowCount) return;
+          const task = captured.taskId ? await this.pool.queryInActiveTx(
+            "SELECT 1 FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, captured.taskId]) : null;
+          if (task && !task.rowCount) {
+            // The transient task is gone; retain its denial audit on the project
+            // without inventing a task or violating the audit's composite FK.
+            await this.budgetEventSql(input.project_id, null, "AUTO_PAUSED",
+              `${captured.reason}; rolled-back task ${captured.taskId}`, captured.scope, captured.limit, null, captured.usage);
+            return;
+          }
+          // A policy created in the aborted TX is gone. Preserve the observed
+          // denial ceiling so AUTO_PAUSED remains resumable by an approver.
+          const columns: Record<BudgetPauseScope, string> = {
+            PROJECT_TOKENS: "max_project_tokens", PROJECT_COST: "max_project_cost_micro_usd", PROJECT_WALL_TIME: "max_project_wall_time_ms",
+            TASK_TOKENS: "max_task_tokens", TASK_COST: "max_task_cost_micro_usd", TASK_WALL_TIME: "max_task_wall_time_ms",
+          };
+          const table = captured.taskId ? "task_budget_policies" : "project_budget_policies";
+          const field = columns[captured.scope];
+          if (captured.taskId) await this.pool.queryInActiveTx(
+            `INSERT INTO ${table} (project_id, task_id, ${field}) VALUES ($1::uuid, $2::uuid, $3::bigint) ON CONFLICT DO NOTHING;`,
+            [input.project_id, captured.taskId, captured.limit]);
+          else await this.pool.queryInActiveTx(
+            `INSERT INTO ${table} (project_id, ${field}) VALUES ($1::uuid, $2::bigint) ON CONFLICT DO NOTHING;`,
+            [input.project_id, captured.limit]);
+          await this.persistBudgetViolationSql(input.project_id, { ...captured, paused: false });
+          // A cost session/pipeline created in the aborted TX cannot own a ledger.
+          // Its budget denial audit above still survives; committed parents keep
+          // the usual BLOCKED_PREFLIGHT ledger and exact request binding.
+          const ledgerTask = input.task_id ? await this.pool.queryInActiveTx(
+            "SELECT 1 FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, input.task_id]) : null;
+          if ((!ledgerTask || ledgerTask.rowCount) && (!input.verifyParentsCommittedSql || await input.verifyParentsCommittedSql())) {
+            await input.onBlockedSql?.(captured.scope, captured.reason);
+          }
+        }
+      ));
     }
     if (!shouldBlock) return;
     throw new BudgetAutoPausedError({ message: blocked.reason, projectId: input.project_id,

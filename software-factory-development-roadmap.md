@@ -261,6 +261,8 @@ Tiến độ ngày **2026-11-12**, theo [M6C-SPEC-01](./m6c_parallel_execution_a
 | `M6C-2` | Đã triển khai Codex CLI adapter + chọn runtime qua WNA; Bundle/Patch/Artifact dùng chung validator, receipt bất biến có ràng buộc lease/epoch, replay và phục hồi lỗi COMMIT. Acceptance 9/9 trên PG17; native sandbox/WNA 2/2. Chưa gọi provider Codex thật; kết quả hồi quy và giới hạn tại báo cáo M6C-2. |
 | `M6C-3` | Chưa triển khai: connectors Tier 2/3/4, verifier cô lập nhân, Lima/WSL2 và production deployment approval. |
 
+Vòng sửa theo issue #8: đã triển khai M6C-FIX-01..05 trên `review/m6c-1-2`, chờ review lại; regression cục bộ trên PostgreSQL 17 đạt **115/115**, không skip. Xem [báo cáo fix](./m6c-review-fixes-validation.md). Chưa merge vào `main`; CI PG16/17 sau merge vẫn là điều kiện bắt buộc.
+
 Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
 
 - **Triển khai:**

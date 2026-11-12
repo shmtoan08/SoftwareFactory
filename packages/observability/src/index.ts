@@ -56,10 +56,13 @@ export interface TelemetryExporter {
 
 const TRACEPARENT_REGEX = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
 const SENSITIVE_ATTR_KEY_REGEX =
-  /api_?key|secret|password|passwd|token|authorization|cookie|private_?key|credential|bearer|session_?id|auth_?header/i;
+  /api[-_]?key|secret|password|passwd|token|authorization|cookie|private[-_]?key|credential|bearer|session[-_]?id|auth[-_]?header/i;
 const SENSITIVE_VALUE_PATTERNS: readonly RegExp[] = [
+  /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----[\s\S]*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|$)/g,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@]+(?::[^\s/@]*)?@/gi,
+  /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
   /\b(?:sk-[A-Za-z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{12,}|AKIA[0-9A-Z]{16})\b/g,
-  /Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi,
+  /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi,
 ];
 
 function nowUnixNano(): bigint {
@@ -137,7 +140,8 @@ export function redactTelemetryValue(value: TelemetryAttributeValue): TelemetryA
   for (const pat of SENSITIVE_VALUE_PATTERNS) {
     out = out.replace(pat, "[REDACTED]");
   }
-  return out.replace(/((?:api[_-]?key|password|secret|authorization|credential)\s*[=:]\s*)[^\s,;]+/gi, "$1[REDACTED]");
+  out = out.replace(/(\b(?:set[-_]?cookie|cookie)\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\r\n]+)/gi, "$1[REDACTED]");
+  return out.replace(/((?:[\w-]*(?:api[_-]?key|password|passwd|secret|authorization|credential|token|cookie|private[_-]?key|session[_-]?id))\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi, "$1[REDACTED]");
 }
 
 export function redactTelemetryAttributes(

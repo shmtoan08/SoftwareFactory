@@ -165,6 +165,7 @@ async function receiptFailureChecks(store: ControlPlaneStore) {
     const receipt = await submit(f, lease, submission); assert.equal(receipt.source_type, "artifact");
     store.withRlsTransaction = originalTx;
     assert.equal((await submit(f, lease, submission)).submission_id, receipt.submission_id);
+    await f.core.revokeTaskLease(f.projectId, f.auth, { task_id: lease.task_id, lease_id: lease.lease_id, reason: "fixture receipt scenario complete", requeueTask: true });
     // A retry commits immediately after the failed caller's recovery transaction
     // returns. Compensation must already be complete while its lease lock is held.
     const retryRace = await f.taskLease();
@@ -186,12 +187,14 @@ async function receiptFailureChecks(store: ControlPlaneStore) {
     store.withRlsTransaction = originalTx;
     assert.ok(retryWon);
     assert.equal(git(f.repo, ["rev-parse", retryWon.staging_ref]), retryWon.agent_commit_hash);
+    await f.core.revokeTaskLease(f.projectId, f.auth, { task_id: retryRace.lease.task_id, lease_id: retryRace.lease.lease_id, reason: "fixture retry scenario complete", requeueTask: true });
     const concurrent = await f.taskLease();
     const raced = await Promise.allSettled([submit(f, concurrent.lease, submission), submit(f, concurrent.lease,
       { kind: "artifact", files: [{ action: "write", path: "src/other.mjs", content_base64: B64("other\n") }] })]);
     assert.equal(raced.filter((attempt) => attempt.status === "fulfilled").length, 1);
     const accepted = raced.find((attempt) => attempt.status === "fulfilled"); assert.ok(accepted?.status === "fulfilled");
     assert.equal(git(f.repo, ["rev-parse", accepted.value.staging_ref]), accepted.value.agent_commit_hash);
+    await f.core.revokeTaskLease(f.projectId, f.auth, { task_id: concurrent.lease.task_id, lease_id: concurrent.lease.lease_id, reason: "fixture concurrent scenario complete", requeueTask: true });
     const revoked = await f.taskLease();
     await f.core.revokeTaskLease(f.projectId, f.auth, { task_id: revoked.task.task_id, lease_id: revoked.lease.lease_id, reason: "revoked", requeueTask: true });
     await assert.rejects(submit(f, revoked.lease, submission), (error: unknown) => error instanceof CodeImportError && error.code === "ERR_IMPORT_STALE_LEASE");
@@ -239,12 +242,14 @@ async function securityMatrix(store: ControlPlaneStore) {
         assert.equal(git(f.repo, ["rev-parse", "main"]), f.base);
         assert.equal(await store.withRlsTransaction(scope(f.projectId), () => store.getCodeImportSubmission(lease.lease_id)), null);
         assert.throws(() => git(f.repo, ["rev-parse", "--verify", `refs/factory/Verify/${lease.task_id}/${lease.lease_epoch}`]));
+        await f.core.revokeTaskLease(f.projectId, f.auth, { task_id: lease.task_id, lease_id: lease.lease_id, reason: "fixture rejected transport complete", requeueTask: true });
       }
       for (const mode of ["120000", "160000"]) {
         const { lease } = await f.taskLease();
         // A gitlink points to the existing base commit; a symlink stores path text.
         if (kind === "artifact") {
           await assert.rejects(submit(f, lease, { kind, files: [{ action: "write", path: "src/link", content_base64: B64("target"), mode: mode as "100644" }] }));
+          await f.core.revokeTaskLease(f.projectId, f.auth, { task_id: lease.task_id, lease_id: lease.lease_id, reason: "fixture rejected mode complete", requeueTask: true });
         } else {
           const modeEnv = { GIT_INDEX_FILE: join(f.root, `mode-index-${randomUUID()}`) };
           git(f.work, ["read-tree", f.base], undefined, modeEnv);
@@ -256,6 +261,7 @@ async function securityMatrix(store: ControlPlaneStore) {
           if (kind === "patch") submission = { kind, patch: execFileSync("git", ["diff", "--binary", f.base, commit], { cwd: f.work, encoding: "utf8" }) };
           else { const path = join(f.root, `${randomUUID()}.bundle`); git(f.work, ["bundle", "create", path, "submission", `^${f.base}`]); submission = { kind, bundle_base64: B64(readFileSync(path)), agent_commit_hash: commit }; }
           await assert.rejects(submit(f, lease, submission));
+          await f.core.revokeTaskLease(f.projectId, f.auth, { task_id: lease.task_id, lease_id: lease.lease_id, reason: "fixture rejected mode complete", requeueTask: true });
         }
       }
     }
@@ -379,6 +385,8 @@ describe("M6C-2 runtime adapter and extended controlled imports", () => {
       await assert.rejects(submit(f, first.lease, submission), (error: unknown) => error instanceof CodeImportError && error.code === "ERR_IMPORT_STALE_LEASE");
       store.withTaskLeaseLock = lock;
       assert.throws(() => git(f.repo, ["rev-parse", "--verify", `refs/factory/Verify/${first.task.task_id}/1`]));
+      // An expired task remains in-flight until reconciliation releases it.
+      await f.core.runOrphanedPushReconciler(f.projectId, f.auth);
       const second = await f.taskLease(); const receipt = await submit(f, second.lease, submission);
       now += 36_000;
       const recovered = await f.core.runOrphanedPushReconciler(f.projectId, f.auth);

@@ -306,7 +306,8 @@ describe("M6C-1 parallel core, CAS queue, budget and telemetry", () => {
         project_id: f.projectId, max_tokens_per_request: 100, max_cost_micro_usd_per_request: 100,
         session_token_budget: 1000, session_cost_budget_micro_usd: 1000 }));
       // A policy created in an outer transaction is invisible to autonomous TXs.
-      // Denial must fall back without waiting on that transaction's own unique-index/FK locks.
+      // Denial must defer until outer rollback releases its unique-index/FK locks,
+      // then preserve the observed ceiling, pause and audit in a fresh transaction.
       await assert.rejects(repo.withRlsTransaction(scope(f.projectId), async () => {
         await repo.upsertProjectBudgetPolicy({ project_id: f.projectId, max_project_tokens: 1 });
         await repo.preflightCheckCostSession({ project_id: f.projectId, cost_session_id: blockedSession.cost_session_id,
@@ -314,7 +315,9 @@ describe("M6C-1 parallel core, CAS queue, budget and telemetry", () => {
           prompt_sha256: sha256Hex("prompt"), request_sha256: sha256Hex("request"), estimated_input_tokens: 2,
           reserved_output_tokens: 0, estimated_cost_micro_usd: 1 });
       }), BudgetAutoPausedError);
-      assert.equal((await f.core.getBudgetSnapshot(f.projectId, f.auth)).policy, null);
+      const deferred = await f.core.getBudgetSnapshot(f.projectId, f.auth);
+      assert.equal(deferred.policy?.status, "AUTO_PAUSED");
+      assert.equal(deferred.events.filter((event) => event.event_type === "AUTO_PAUSED").length, 1);
       await repo.withRlsTransaction(scope(f.projectId), async () => {
         const rows = await pool.queryInActiveTx("SELECT relname, relforcerowsecurity FROM pg_class WHERE relname IN ('task_dependencies', 'merge_queue_entries', 'project_budget_policies', 'task_budget_policies', 'budget_pause_events');");
         assert.equal(rows.rows.length, 5); assert.ok(rows.rows.every((row) => row.relforcerowsecurity));

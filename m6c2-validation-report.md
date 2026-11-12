@@ -2,6 +2,8 @@
 
 Date: 2026-11-12 (Asia/Tokyo). Changes remain in the working tree alongside M6C-1.
 
+Historical implementation evidence for review baseline `f941d94d`. Subsequent fixes for issue #8 and their current validation are recorded in [the M6C review-fix report](./m6c-review-fixes-validation.md).
+
 ## Delivered
 
 - `CodexCliAdapter` and operator-selected WNA runtime configuration. Explicit model/scoped credential, isolated runtime home, JSONL completion checks, credential redaction, real Git hashes, a clean worktree and the existing one-parent/shared import contract. A native permission profile extends `:workspace`, allowing only detached linked-worktree metadata and shared Git objects to be written; common refs/config remain read-only. WNA owns the controlled push; the agent does not receive its Git push token.

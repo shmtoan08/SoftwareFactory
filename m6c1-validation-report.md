@@ -33,6 +33,6 @@ The full regression completed before the final glob correction; the directly aff
 
 At the time of this M6C-1 validation, `M6C-2` and `M6C-3` remained pending. Subsequent M6C-2 work is recorded separately in [the M6C-2 report](./m6c2-validation-report.md). This report does not declare milestone M6C or release gate G7 complete.
 
-Budget pause prevents new dispatch and model calls; already in-flight calls may finish and are accounted for. When the outer transaction owns conflicting locks or uncommitted policy/parent rows, autonomous denial accounting falls back to the outer transaction and follows its commit/rollback result.
+At this initial validation, budget denial accounting under conflicting locks/uncommitted parents fell back to the outer transaction, and the legacy direct dispatch route did not enforce file exclusion/capacity. These limitations are superseded by M6C-FIX-01/04; current behavior and evidence are recorded in [the review-fix report](./m6c-review-fixes-validation.md).
 
-Parallel execution should enter through `/scheduler/dispatch`; the legacy single-task dispatch API retains its previous behavior for existing consumers and fault-injection workflows. The merge queue is exposed explicitly through `/merge-queue` and `/merge-queue/drain`; existing direct CAS remains available.
+Parallel execution should enter through `/scheduler/dispatch`; direct dispatch now enforces the same capacity/file exclusion guards. The merge queue is exposed explicitly through `/merge-queue` and `/merge-queue/drain`; existing direct CAS remains available.

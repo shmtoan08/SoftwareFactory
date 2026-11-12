@@ -56,6 +56,7 @@ import {
   inspectRealGitCommitForImport,
   type CodeImportSubmission,
   CodeImportError,
+  GlobIntersectionComplexityError,
   validateCodeImportSubmission,
   prepareCodeImport,
   codeImportPayloadSha256,
@@ -691,6 +692,7 @@ export class CoreApiService {
         } catch (error) {
           if (error instanceof BudgetAutoPausedError) this.telemetry.recordCounter("budget.dispatch_blocked");
           if (!(error instanceof BudgetAutoPausedError) && !(error instanceof TaskDependencyBlockedError) &&
+            !(error instanceof GlobIntersectionComplexityError) &&
             !(error instanceof PostgresRlsError && error.sqlState === "23514")) throw error;
           blocked.push({ task_id: task.task_id, reason: error.message });
           this.telemetry.recordCounter("scheduler.blocked");
@@ -767,6 +769,7 @@ export class CoreApiService {
       this.store.grantTaskLease({
         project_id: projectId,
         ...input,
+        reject_overlapping_active_files: true,
       })
     );
   }

@@ -629,6 +629,14 @@ interface ExcludedGlobPattern {
   readonly caseInsensitive: boolean;
 }
 
+export class GlobIntersectionComplexityError extends Error {
+  public readonly code = "ERR_GLOB_INTERSECTION_COMPLEXITY";
+  constructor() {
+    super("ERR_GLOB_INTERSECTION_COMPLEXITY: refusing unsafe dispatch");
+    this.name = "GlobIntersectionComplexityError";
+  }
+}
+
 function findGlobIntersectionWitness(
   patternA: string,
   patternB: string,
@@ -702,7 +710,7 @@ function findGlobIntersectionWitness(
       const key = keyOf(states, segment);
       if (visited.has(key)) continue;
       // An adversarially complex glob must deny dispatch, never be classified disjoint.
-      if (queue.length >= 50_000) throw new Error("ERR_GLOB_INTERSECTION_COMPLEXITY: refusing unsafe dispatch");
+      if (queue.length >= 50_000) throw new GlobIntersectionComplexityError();
       visited.add(key);
       queue.push({ states, segment, parent: head, ch });
     }

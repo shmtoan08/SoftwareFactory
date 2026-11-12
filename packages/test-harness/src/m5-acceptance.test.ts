@@ -580,16 +580,19 @@ function runWorkerDaemonOverHttp(options: {
 async function runFullWorkflowToApproval(
   fx: M5LiveStackFixture,
   title: string,
-  approvalRequestTtlMs?: number
+  approvalRequestTtlMs?: number,
+  legacyConcurrentFixture = false
 ) {
   const task = await fx.coreClient.createTask(fx.projectId, fx.authOp, {
     title,
     task_contract: fx.contract,
   });
   const workerId = `worker-${task.task_id.slice(0, 8)}`;
-  const lease = await fx.coreClient.dispatchTaskLease(fx.projectId, fx.authOp, task.task_id, {
-    worker_id: workerId,
-  });
+  // Explicit legacy-state fixture for security probes with overlapping candidates.
+  const lease = legacyConcurrentFixture
+    ? await fx.store.withRlsTransaction({ currentProjectId: fx.projectId, currentRole: "core_api_service" },
+      () => fx.store.grantTaskLease({ project_id: fx.projectId, task_id: task.task_id, worker_id: workerId, reject_overlapping_active_files: false }))
+    : await fx.coreClient.dispatchTaskLease(fx.projectId, fx.authOp, task.task_id, { worker_id: workerId });
   const workerRes = await runWorkerDaemonOverHttp({ fx, task, lease, workerId });
   assert.equal(workerRes.outcome, "COMPLETED");
   assert.ok(workerRes.pushedCommitHash);
@@ -3225,9 +3228,12 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
         title: "M5-FIX-06 Subprocess & Allowlist Check",
         task_contract: fx.contract,
       });
-      const lease = await fx.coreClient.dispatchTaskLease(fx.projectId, fx.authOp, task.task_id, {
-        worker_id: "w-fix06",
-      });
+      // M6C-FIX-01: seed the legacy overlapping lease needed for this
+      // pre-receive/fault-injection probe; the public dispatch route rejects it.
+      const lease = await fx.store.withRlsTransaction(
+        { currentProjectId: fx.projectId, currentRole: "core_api_service" },
+        () => fx.store.grantTaskLease({ project_id: fx.projectId, task_id: task.task_id,
+          worker_id: "w-fix06", reject_overlapping_active_files: false }));
       const workerRes = await runWorkerDaemonOverHttp({ fx, task, lease, workerId: "w-fix06" });
       assert.equal(workerRes.outcome, "COMPLETED");
       const built = await fx.coreClient.buildCandidate(fx.projectId, fx.authOp, task.task_id, {
@@ -3440,7 +3446,7 @@ describe("Milestone M5 Acceptance Gate Suite — P0-2 Live E2E, Fault Recovery, 
       );
 
       // M5-FIX-14: submitHumanApproval rejects stale caller current_main_commit_hash against moved disk Git HEAD
-      const flowStale = await runFullWorkflowToApproval(fx, "M5-FIX-14 Disk HEAD Check");
+      const flowStale = await runFullWorkflowToApproval(fx, "M5-FIX-14 Disk HEAD Check", undefined, true);
       advanceBareMainExternalCommit({
         rootDir: fx.rootDir,
         bareRepoDir: fx.bareRepoDir,
