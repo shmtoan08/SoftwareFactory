@@ -1076,11 +1076,9 @@ export class WebApprovalConsoleController {
     auth: CoreApiAuthContext;
     projectId: string;
     pipelineSessionId: string;
-    liveMainHeadCommitHash?: string;
   }): Promise<M6BStages5To9Bundle> {
     return this.coreApi.getPipelineM6BBundle(input.projectId, input.auth, {
       pipeline_session_id: input.pipelineSessionId,
-      live_main_head_commit_hash: input.liveMainHeadCommitHash,
     });
   }
 
@@ -1140,11 +1138,9 @@ export class WebApprovalConsoleController {
     auth: CoreApiAuthContext;
     projectId: string;
     pipelineSessionId: string;
-    liveMainHeadCommitHash?: string;
   }): Promise<BidirectionalTraceabilityMatrix> {
     return this.coreApi.getPipelineTraceabilityMatrix(input.projectId, input.auth, {
       pipeline_session_id: input.pipelineSessionId,
-      live_main_head_commit_hash: input.liveMainHeadCommitHash,
     });
   }
 
@@ -1152,12 +1148,10 @@ export class WebApprovalConsoleController {
     auth: CoreApiAuthContext;
     projectId: string;
     pipelineSessionId: string;
-    liveMainHeadCommitHash?: string;
     notes?: string;
   }): Promise<ReleaseAcceptancePackageRecord> {
     return this.coreApi.issuePipelineReleasePackage(input.projectId, input.auth, {
       pipeline_session_id: input.pipelineSessionId,
-      live_main_head_commit_hash: input.liveMainHeadCommitHash,
       notes: input.notes,
     });
   }
@@ -1685,7 +1679,6 @@ export class WebApprovalConsoleController {
         ? `<table><thead><tr><th>Release ID</th><th>Coverage</th><th>Main HEAD</th><th>Package SHA-256</th><th>Accepted By</th><th>Accepted At</th></tr></thead><tbody>${releaseRows}</tbody></table>`
         : "<p>No release acceptance package issued yet.</p>",
       `<form method="POST" action="${baseActionUrl}/release-package">`,
-      '<label>Live Main HEAD Commit (optional) <input type="text" name="live_main_head_commit_hash" placeholder="auto-resolved from git"></label>',
       '<label>Release Notes <input type="text" name="notes" placeholder="Sign-off notes"></label>',
       '<button type="submit">Issue Release Acceptance Package</button>',
       "</form>",
@@ -3264,12 +3257,10 @@ export class WebApprovalConsoleHttpServer {
       if (method === "GET" && webM6BMatch?.[1] && webM6BMatch?.[2]) {
         const projectId = decodeURIComponent(webM6BMatch[1]);
         const pipelineSessionId = decodeURIComponent(webM6BMatch[2]);
-        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
         const bundle = await this.controller.loadM6BBundle({
           auth,
           projectId,
           pipelineSessionId,
-          liveMainHeadCommitHash: liveMain,
         });
         const format = url.searchParams.get("format") ?? "html";
         if (format === "json") {
@@ -3301,12 +3292,10 @@ export class WebApprovalConsoleHttpServer {
       if (method === "GET" && webTraceabilityMatch?.[1] && webTraceabilityMatch?.[2]) {
         const projectId = decodeURIComponent(webTraceabilityMatch[1]);
         const pipelineSessionId = decodeURIComponent(webTraceabilityMatch[2]);
-        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
         const matrix = await this.controller.loadTraceabilityMatrix({
           auth,
           projectId,
           pipelineSessionId,
-          liveMainHeadCommitHash: liveMain,
         });
         const format = url.searchParams.get("format") ?? "html";
         if (format === "json") {
@@ -3628,7 +3617,6 @@ export class WebApprovalConsoleHttpServer {
         const projectId = decodeURIComponent(webReleasePackageMatch[1]);
         const pipelineSessionId = decodeURIComponent(webReleasePackageMatch[2]);
         const { data, isFormUrlEncoded } = await this.readRequestPayload<{
-          live_main_head_commit_hash?: unknown;
           notes?: unknown;
         }>(req);
         const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
@@ -3644,10 +3632,6 @@ export class WebApprovalConsoleHttpServer {
           auth,
           projectId,
           pipelineSessionId,
-          liveMainHeadCommitHash: optionalStringField(
-            data.live_main_head_commit_hash,
-            "live_main_head_commit_hash"
-          ),
           notes: optionalStringField(data.notes, "notes"),
         });
         if (preferHtml) {

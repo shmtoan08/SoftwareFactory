@@ -11,6 +11,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
@@ -38,9 +39,17 @@ import {
 import {
   type ControlPlaneStore,
   PostgresControlPlaneRepository,
+  PostgresRlsError,
   PostgresRuntimePool,
+  REQUIRED_STAGE5_PROTECTED_PATHS,
   SoftwareFactoryControlPlaneStore,
   buildPostgresPoolConfigFromEnv,
+  computeBaselineFreezeBundleSha256,
+  computeProjectBootstrapSha256,
+  extractStage2Requirements,
+  validateCreateChangeRequestAgainstBaseline,
+  validateProjectBootstrapInput,
+  validateStage7PlanAgainstBaseline,
 } from "@software-factory/database";
 import {
   type AgentOrgRole,
@@ -53,6 +62,7 @@ import {
   type Stage3ArchitectureSpec,
   type Stage7PlanningOutput,
   type TargetTrustTier,
+  computeCanonicalPayloadSha256,
   computeDirectorySha256,
 } from "@software-factory/shared-types";
 import {
@@ -1036,9 +1046,26 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         }
       }
 
+      await assert.rejects(
+        () =>
+          client.bootstrapPipelineProject(
+            proj.project_id,
+            authDev,
+            frozen.sessionId,
+            {
+              repo_path: repoBarePath,
+              trusted_acceptance_dir: trustedDir,
+              extra_protected_paths: ["config/locked.json"],
+              scaffold_files: { "src/.gitkeep": "" },
+              acceptance_specs: acceptanceSpecs,
+            }
+          ),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+
       const bootOutcome = await client.bootstrapPipelineProject(
         proj.project_id,
-        authDev,
+        authApprover,
         frozen.sessionId,
         {
           repo_path: repoBarePath,
@@ -1944,9 +1971,24 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         }
       }
 
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(
+            projectId,
+            authDev,
+            frozen.sessionId,
+            {
+              repo_path: bareRepoDir,
+              trusted_acceptance_dir: trustedAcceptanceDir,
+              acceptance_specs: acceptanceSpecs,
+            }
+          ),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+
       const bootOutcome = await coreClient.bootstrapPipelineProject(
         projectId,
-        authDev,
+        authApprover,
         frozen.sessionId,
         {
           repo_path: bareRepoDir,
@@ -2702,7 +2744,7 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         };
       }
 
-      const bootFormRes = await fetch(
+      const devForbiddenBootFormRes = await fetch(
         `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/bootstrap`,
         {
           method: "POST",
@@ -2710,6 +2752,25 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
           headers: {
             "Content-Type": "application/x-www-form-urlencoded",
             [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authDevA),
+          },
+          body: new URLSearchParams({
+            repo_path: bareRepoDir,
+            trusted_acceptance_dir: trustedAcceptanceDir,
+            extra_protected_paths: "docs/immutable.md",
+            acceptance_specs: JSON.stringify(acceptanceSpecs),
+          }).toString(),
+        }
+      );
+      assert.equal(devForbiddenBootFormRes.status, 403);
+
+      const bootFormRes = await fetch(
+        `${webBaseUrl}/projects/${pEnc}/pipeline-sessions/${sEnc}/bootstrap`,
+        {
+          method: "POST",
+          redirect: "manual",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApproverA),
           },
           body: new URLSearchParams({
             repo_path: bareRepoDir,
@@ -3245,9 +3306,24 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         };
       }
 
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(
+            projA.project_id,
+            authDevA,
+            frozen.sessionId,
+            {
+              repo_path: bareRepoDir,
+              trusted_acceptance_dir: trustedAcceptanceDir,
+              acceptance_specs: acceptanceSpecs,
+            }
+          ),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
+      );
+
       const bootOutcome = await coreClient.bootstrapPipelineProject(
         projA.project_id,
-        authDevA,
+        authApproverA,
         frozen.sessionId,
         {
           repo_path: bareRepoDir,
@@ -3903,4 +3979,2216 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
       }
     }
   });
+
+  it("M6B-FIX-01..09 & Minor #1/#2/#5/#7/#9 (In-Memory): fail-closed validation, bootstrap hygiene, TX2 billing, git main verification & bidirectional orphan scans", async () => {
+    // 1. Unit validations: M6B-FIX-04, Minor #5, M6B-FIX-05, M6B-FIX-08, Minor #2
+    assert.throws(
+      () => extractStage2Requirements({}),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+    assert.throws(
+      () => extractStage2Requirements({ srs: { functional_requirements: "not-array" } }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+    assert.throws(
+      () =>
+        extractStage2Requirements({
+          srs: {
+            functional_requirements: [
+              { req_id: "   ", title: "T", description: "D", acceptance_criteria: [] },
+            ],
+            non_functional_requirements: [],
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+    assert.throws(
+      () =>
+        extractStage2Requirements({
+          srs: {
+            functional_requirements: [
+              {
+                req_id: "REQ-DUP",
+                title: "A",
+                description: "D",
+                acceptance_criteria: [{ ac_id: "AC-1", given: "g", when: "w", then: "t" }],
+              },
+            ],
+            non_functional_requirements: [
+              {
+                req_id: "REQ-DUP",
+                title: "B",
+                description: "D",
+                acceptance_criteria: [{ ac_id: "AC-2", given: "g", when: "w", then: "t" }],
+              },
+            ],
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+    assert.throws(
+      () =>
+        extractStage2Requirements({
+          srs: {
+            functional_requirements: [
+              { req_id: "REQ-1", title: "A", description: "D", acceptance_criteria: "bad" },
+            ],
+            non_functional_requirements: [],
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+    assert.throws(
+      () =>
+        extractStage2Requirements({
+          srs: {
+            functional_requirements: [
+              {
+                req_id: "REQ-1",
+                title: "A",
+                description: "D",
+                acceptance_criteria: [
+                  { ac_id: "AC-DUP", given: "g", when: "w", then: "t" },
+                  { ac_id: "AC-DUP", given: "g", when: "w", then: "t" },
+                ],
+              },
+            ],
+            non_functional_requirements: [],
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+
+    const sampleTestSpec = [
+      {
+        ac_id: "AC-1",
+        req_id: "REQ-1",
+        given: "g",
+        when: "w",
+        then: "t",
+        test_file_path: "acceptance.test.mjs",
+        component_ids: ["COMP-1"],
+        expected_deliverables: ["src/a.mjs"],
+      },
+    ];
+    for (const missingIdx of [0, 1]) {
+      const partialProtected = REQUIRED_STAGE5_PROTECTED_PATHS.filter((_, idx) => idx !== missingIdx);
+      assert.throws(
+        () =>
+          validateProjectBootstrapInput({
+            repo_path: "/tmp/repo.git",
+            trusted_acceptance_dir: "/tmp/trusted",
+            base_main_commit_hash: "a".repeat(40),
+            protected_paths: partialProtected,
+            trusted_policy_sha256: "b".repeat(64),
+            acceptance_tests: sampleTestSpec,
+            created_by_principal_id: "bob-approver",
+          }),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+    }
+    validateProjectBootstrapInput({
+      repo_path: "/tmp/repo.git",
+      trusted_acceptance_dir: "/tmp/trusted",
+      base_main_commit_hash: "a".repeat(40),
+      protected_paths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+      trusted_policy_sha256: "b".repeat(64),
+      acceptance_tests: sampleTestSpec,
+      created_by_principal_id: "bob-approver",
+    });
+
+    const unitS2: Record<string, unknown> = {
+      srs: {
+        functional_requirements: [
+          {
+            req_id: "REQ-U1",
+            title: "U1",
+            description: "U1",
+            source_discovery_item_ids: [randomUUID()],
+            acceptance_criteria: [{ ac_id: "AC-U1", given: "g1", when: "w1", then: "t1" }],
+          },
+          {
+            req_id: "REQ-U2",
+            title: "U2",
+            description: "U2",
+            source_discovery_item_ids: [randomUUID()],
+            acceptance_criteria: [{ ac_id: "AC-U2", given: "g2", when: "w2", then: "t2" }],
+          },
+        ],
+        non_functional_requirements: [],
+      },
+    };
+    const unitS3: Record<string, unknown> = {
+      architecture: {
+        components: [{ component_id: "COMP-U", name: "UnitComp", requirement_ids: ["REQ-U1", "REQ-U2"] }],
+      },
+    };
+
+    // Swapped (req_id, ac_id) on Stage 7 story & task MUST reject (23514)
+    assert.throws(
+      () =>
+        validateStage7PlanAgainstBaseline({
+          stage2ContentJson: unitS2,
+          protectedPaths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+          profiles: [],
+          plan: {
+            milestones: [{ milestone_key: "MS-1", title: "M", description: "M" }],
+            epics: [{ epic_key: "EP-1", milestone_key: "MS-1", title: "E", description: "E" }],
+            stories: [
+              {
+                story_key: "ST-1",
+                epic_key: "EP-1",
+                title: "S1",
+                description: "S1",
+                requirement_ids: ["REQ-U1"],
+                ac_ids: ["AC-U2"],
+              },
+              {
+                story_key: "ST-2",
+                epic_key: "EP-1",
+                title: "S2",
+                description: "S2",
+                requirement_ids: ["REQ-U2"],
+                ac_ids: ["AC-U1"],
+              },
+            ],
+            tasks: [
+              {
+                task_key: "T-1",
+                story_key: "ST-1",
+                title: "T1",
+                description: "T1",
+                requirement_ids: ["REQ-U1"],
+                ac_ids: ["AC-U1"],
+                allowed_files: ["src/**"],
+                depends_on_task_keys: [],
+              },
+              {
+                task_key: "T-2",
+                story_key: "ST-2",
+                title: "T2",
+                description: "T2",
+                requirement_ids: ["REQ-U2"],
+                ac_ids: ["AC-U2"],
+                allowed_files: ["src/**"],
+                depends_on_task_keys: [],
+              },
+            ],
+            planning_notes: "swapped pair",
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+
+    // task.requirement_ids not subset of story.requirement_ids MUST reject (23514)
+    assert.throws(
+      () =>
+        validateStage7PlanAgainstBaseline({
+          stage2ContentJson: unitS2,
+          protectedPaths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+          profiles: [],
+          plan: {
+            milestones: [{ milestone_key: "MS-1", title: "M", description: "M" }],
+            epics: [{ epic_key: "EP-1", milestone_key: "MS-1", title: "E", description: "E" }],
+            stories: [
+              {
+                story_key: "ST-1",
+                epic_key: "EP-1",
+                title: "S1",
+                description: "S1",
+                requirement_ids: ["REQ-U1"],
+                ac_ids: ["AC-U1"],
+              },
+            ],
+            tasks: [
+              {
+                task_key: "T-1",
+                story_key: "ST-1",
+                title: "T1",
+                description: "T1",
+                requirement_ids: ["REQ-U1", "REQ-U2"],
+                ac_ids: ["AC-U1", "AC-U2"],
+                allowed_files: ["src/**"],
+                depends_on_task_keys: [],
+              },
+            ],
+            planning_notes: "superset task",
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+
+    // Whitespace-padded dependency cycle (`[" T-B "]` / `[" T-A "]`) MUST reject (23514)
+    assert.throws(
+      () =>
+        validateStage7PlanAgainstBaseline({
+          stage2ContentJson: unitS2,
+          protectedPaths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+          profiles: [],
+          plan: {
+            milestones: [{ milestone_key: "MS-1", title: "M", description: "M" }],
+            epics: [{ epic_key: "EP-1", milestone_key: "MS-1", title: "E", description: "E" }],
+            stories: [
+              {
+                story_key: "ST-1",
+                epic_key: "EP-1",
+                title: "S1",
+                description: "S1",
+                requirement_ids: ["REQ-U1", "REQ-U2"],
+                ac_ids: ["AC-U1", "AC-U2"],
+              },
+            ],
+            tasks: [
+              {
+                task_key: "T-A",
+                story_key: "ST-1",
+                title: "TA",
+                description: "TA",
+                requirement_ids: ["REQ-U1"],
+                ac_ids: ["AC-U1"],
+                allowed_files: ["src/**"],
+                depends_on_task_keys: [" T-B "],
+              },
+              {
+                task_key: "T-B",
+                story_key: "ST-1",
+                title: "TB",
+                description: "TB",
+                requirement_ids: ["REQ-U2"],
+                ac_ids: ["AC-U2"],
+                allowed_files: ["src/**"],
+                depends_on_task_keys: [" T-A "],
+              },
+            ],
+            planning_notes: "padded cycle",
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+
+    // Minor #2: Iterative Kahn topological sort handles 1,600-task chain without RangeError AND catches 1,600-task cycle
+    const chainTasks = Array.from({ length: 1600 }, (_, i) => ({
+      task_key: `TASK-${i}`,
+      story_key: "ST-CHAIN",
+      title: `Task ${i}`,
+      description: "Chain task",
+      requirement_ids: i === 0 ? ["REQ-U1", "REQ-U2"] : ["REQ-U1"],
+      ac_ids: i === 0 ? ["AC-U1", "AC-U2"] : ["AC-U1"],
+      allowed_files: ["src/**"],
+      depends_on_task_keys: i === 0 ? [] : [`TASK-${i - 1}`],
+    }));
+    const valid1600 = validateStage7PlanAgainstBaseline({
+      stage2ContentJson: unitS2,
+      protectedPaths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+      profiles: [],
+      plan: {
+        milestones: [{ milestone_key: "MS-1", title: "M", description: "M" }],
+        epics: [{ epic_key: "EP-1", milestone_key: "MS-1", title: "E", description: "E" }],
+        stories: [
+          {
+            story_key: "ST-CHAIN",
+            epic_key: "EP-1",
+            title: "Chain",
+            description: "1600 chain",
+            requirement_ids: ["REQ-U1", "REQ-U2"],
+            ac_ids: ["AC-U1", "AC-U2"],
+          },
+        ],
+        tasks: chainTasks,
+        planning_notes: "1600 acyclic",
+      },
+    });
+    assert.equal(valid1600.requirements.length, 2);
+
+    const cyclicChainTasks = chainTasks.map((t, i) =>
+      i === 0 ? { ...t, depends_on_task_keys: ["TASK-1599"] } : t
+    );
+    assert.throws(
+      () =>
+        validateStage7PlanAgainstBaseline({
+          stage2ContentJson: unitS2,
+          protectedPaths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+          profiles: [],
+          plan: {
+            milestones: [{ milestone_key: "MS-1", title: "M", description: "M" }],
+            epics: [{ epic_key: "EP-1", milestone_key: "MS-1", title: "E", description: "E" }],
+            stories: [
+              {
+                story_key: "ST-CHAIN",
+                epic_key: "EP-1",
+                title: "Chain",
+                description: "1600 cycle",
+                requirement_ids: ["REQ-U1", "REQ-U2"],
+                ac_ids: ["AC-U1", "AC-U2"],
+              },
+            ],
+            tasks: cyclicChainTasks,
+            planning_notes: "1600 cyclic",
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+
+    // M6B-FIX-05: CR swapped (req_id, ac_id) & uncovered impacted req MUST reject (23514)
+    assert.throws(
+      () =>
+        validateCreateChangeRequestAgainstBaseline({
+          stage2ContentJson: unitS2,
+          stage3ContentJson: unitS3,
+          protectedPaths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+          request: {
+            cr_key: "CR-SWAP",
+            title: "Swap",
+            rationale: "Test",
+            impacted_requirement_ids: ["REQ-U1"],
+            proposed_tasks: [
+              {
+                task_key: "T-SWAP",
+                title: "T",
+                description: "D",
+                requirement_ids: ["REQ-U1"],
+                ac_ids: ["AC-U2"],
+                allowed_files: ["src/**"],
+              },
+            ],
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+    assert.throws(
+      () =>
+        validateCreateChangeRequestAgainstBaseline({
+          stage2ContentJson: unitS2,
+          stage3ContentJson: unitS3,
+          protectedPaths: [...REQUIRED_STAGE5_PROTECTED_PATHS],
+          request: {
+            cr_key: "CR-UNCOV",
+            title: "Uncov",
+            rationale: "Test",
+            impacted_requirement_ids: ["REQ-U1", "REQ-U2"],
+            proposed_tasks: [
+              {
+                task_key: "T-ONE",
+                title: "T",
+                description: "D",
+                requirement_ids: ["REQ-U1"],
+                ac_ids: ["AC-U1"],
+                allowed_files: ["src/**"],
+              },
+            ],
+          },
+        }),
+      (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+    );
+
+    // 2. End-to-end In-Memory Stack for M6B-FIX-01..09
+    const mock = await startMockModelProviderServers();
+    const store = new SoftwareFactoryControlPlaneStore();
+    const rootDir = mkdtempSync(join(tmpdir(), "sf-m6b-fix-mem-"));
+    const snapshotDir = join(rootDir, "snapshots");
+    const worktreeBaseDir = join(rootDir, "worktrees");
+    const outboxDir = join(rootDir, "outbox");
+    const bareRepoDir = join(rootDir, "app.git");
+    const trustedDir = join(rootDir, "trusted-acceptance");
+    const trivialRepoDir = join(rootDir, "trivial.git");
+    const trivialTrustedDir = join(rootDir, "trivial-trusted");
+    mkdirSync(snapshotDir, { recursive: true });
+    mkdirSync(worktreeBaseDir, { recursive: true });
+    mkdirSync(outboxDir, { recursive: true });
+
+    const snapshotStore = new ImmutableSourceSnapshotStore({ storageDir: snapshotDir });
+    const verifier = new Docker3TierVerifier({ snapshotStore });
+    const tokenService = new EphemeralGitPushTokenService();
+    const reviewerCredService = new EphemeralReviewerCredentialService();
+
+    const projSetup = await store.withRlsTransaction(
+      { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+      async () => {
+        const mainProj = await store.createProject({
+          slug: `m6b-fix-main-${randomUUID().slice(0, 8)}`,
+          name: "M6B Fix Main",
+          repo_bare_path: bareRepoDir,
+          initial_main_commit_hash: "1".repeat(40),
+          initial_main_tree_hash: "2".repeat(40),
+        });
+        await store.addProjectMembership({
+          project_id: mainProj.project_id,
+          principal_id: "alice-dev",
+          member_role: "DEVELOPER",
+        });
+        await store.addProjectMembership({
+          project_id: mainProj.project_id,
+          principal_id: "bob-approver",
+          member_role: "PROJECT_APPROVER",
+        });
+
+        const trivProj = await store.createProject({
+          slug: `m6b-fix-triv-${randomUUID().slice(0, 8)}`,
+          name: "M6B Fix Trivial Specs",
+          repo_bare_path: trivialRepoDir,
+          initial_main_commit_hash: "3".repeat(40),
+          initial_main_tree_hash: "4".repeat(40),
+        });
+        await store.addProjectMembership({
+          project_id: trivProj.project_id,
+          principal_id: "alice-dev",
+          member_role: "DEVELOPER",
+        });
+        await store.addProjectMembership({
+          project_id: trivProj.project_id,
+          principal_id: "bob-approver",
+          member_role: "PROJECT_APPROVER",
+        });
+        return { mainProj, trivProj };
+      }
+    );
+    const proj = projSetup.mainProj;
+    const trivProj = projSetup.trivProj;
+
+    const gatewayService = new AgentGatewayService({
+      store,
+      projectId: proj.project_id,
+      reviewerCredentialService: reviewerCredService,
+    });
+    const gatewayHttp = new AgentGatewayHttpServer({ store, tokenService });
+    const coreApi = new CoreApiService(store, {
+      env: {},
+      snapshotStore,
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+    });
+    const coreHttp = new CoreApiHttpServer({
+      coreApi,
+      snapshotStore,
+      defaultVerifier: verifier,
+      defaultAgentGateway: gatewayService,
+    });
+    const webHttp = new WebApprovalConsoleHttpServer({ coreApi });
+
+    try {
+      const gwInfo = await gatewayHttp.start();
+      const coreInfo = await coreHttp.start();
+      const webInfo = await webHttp.start();
+      const coreClient = new HttpCoreApiClient(coreInfo.baseUrl);
+      const dockerProbe = probeDockerVerifierSupport("node:22-alpine");
+      const useDocker = dockerProbe.daemonAvailable && dockerProbe.imageAvailable;
+
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+      const authTrivDev = coreApi.issueAuthContext({
+        projectId: trivProj.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authTrivApprover = coreApi.issueAuthContext({
+        projectId: trivProj.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      // 3. M6B-FIX-02 Execution Proof: trivial assertion_lines `["assert.equal(1, 1)"]` STILL enforces implementedAcIds & non-empty function
+      const trivFrozen = await advanceToFrozenBaseline({
+        client: coreClient,
+        projectId: trivProj.project_id,
+        authDev: authTrivDev,
+        authApprover: authTrivApprover,
+        title: "Trivial Override Test",
+      });
+      const trivS2 = trivFrozen.s2.parsed as unknown as Stage2RequirementsSpec;
+      const trivAcIds = [
+        ...trivS2.srs.functional_requirements,
+        ...trivS2.srs.non_functional_requirements,
+      ].flatMap((r) => r.acceptance_criteria.map((a) => a.ac_id));
+      const trivialSpecs: Record<string, { target_file: string; assertion_lines: string[] }> = {};
+      for (const acId of trivAcIds) {
+        trivialSpecs[acId] = {
+          target_file: "src/ledger.mjs",
+          assertion_lines: ["assert.equal(1, 1)"],
+        };
+      }
+      await coreClient.bootstrapPipelineProject(
+        trivProj.project_id,
+        authTrivApprover,
+        trivFrozen.sessionId,
+        {
+          repo_path: trivialRepoDir,
+          trusted_acceptance_dir: trivialTrustedDir,
+          acceptance_specs: trivialSpecs,
+        }
+      );
+      const trivClone = join(rootDir, "trivial-clone");
+      gitAt(rootDir, ["clone", trivialRepoDir, trivClone]);
+      mkdirSync(join(trivClone, "src"), { recursive: true });
+      const trivChildEnv = { ...process.env };
+      delete trivChildEnv.NODE_TEST_CONTEXT;
+      const runTrivialAcceptance = () =>
+        execFileSync(
+          process.execPath,
+          ["--test", join(trivialTrustedDir, "acceptance.test.mjs")],
+          {
+            cwd: trivClone,
+            env: trivChildEnv,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          }
+        );
+
+      // (a) Missing implementedAcIds/implementedRequirements -> MUST fail
+      writeFileSync(
+        join(trivClone, "src", "ledger.mjs"),
+        "export function createLedgerEntry(x) { return { amountCents: x }; }\n",
+        "utf8"
+      );
+      assert.throws(() => runTrivialAcceptance());
+
+      // (b) implementedAcIds present, empty body function -> MUST fail
+      writeFileSync(
+        join(trivClone, "src", "ledger.mjs"),
+        `export const implementedAcIds = ${JSON.stringify(trivAcIds)};\nexport function createLedgerEntry() {}\n`,
+        "utf8"
+      );
+      assert.throws(() => runTrivialAcceptance());
+
+      // (c) implementedAcIds present + non-empty executable function -> PASS
+      writeFileSync(
+        join(trivClone, "src", "ledger.mjs"),
+        `export const implementedAcIds = ${JSON.stringify(trivAcIds)};\nexport function createLedgerEntry(x) { return { amountCents: x }; }\n`,
+        "utf8"
+      );
+      runTrivialAcceptance();
+
+      // 4. Stage 5 Hygiene & Security Guards (M6B-FIX-02, M6B-FIX-09, Minor #9)
+      const frozen = await advanceToFrozenBaseline({
+        client: coreClient,
+        projectId: proj.project_id,
+        authDev,
+        authApprover,
+        title: "M6B Fixes Pipeline",
+      });
+      const parsedS2 = frozen.s2.parsed as unknown as Stage2RequirementsSpec;
+      const s2Reqs = [
+        ...parsedS2.srs.functional_requirements,
+        ...parsedS2.srs.non_functional_requirements,
+      ];
+      const allReqIds = s2Reqs.map((r) => r.req_id);
+      const allAcIds = s2Reqs.flatMap((r) => r.acceptance_criteria.map((a) => a.ac_id));
+      assert.equal(allReqIds.length, 3);
+
+      const acceptanceSpecs: Record<
+        string,
+        { target_file: string; export_name?: string; assertion_lines?: string[] }
+      > = {};
+      for (const acId of allAcIds) {
+        acceptanceSpecs[acId] = {
+          target_file: "src/ledger.mjs",
+          export_name: "createLedgerEntry",
+          assertion_lines: [
+            'const entry = mod.createLedgerEntry(5000, "USD");',
+            "assert.equal(entry.amountCents, 5000);",
+            `assert.equal(mod.implementedAcIds.includes(${JSON.stringify(acId)}), true);`,
+          ],
+        };
+      }
+
+      // Unsafe assertion_lines MUST fail (422)
+      for (const badLine of [
+        "process.exit(1)",
+        "const fs = require('fs')",
+        "const a = 1; assert.equal(a, 1)",
+      ]) {
+        await assert.rejects(
+          () =>
+            coreClient.bootstrapPipelineProject(proj.project_id, authApprover, frozen.sessionId, {
+              repo_path: bareRepoDir,
+              trusted_acceptance_dir: trustedDir,
+              acceptance_specs: {
+                [allAcIds[0]!]: { target_file: "src/ledger.mjs", assertion_lines: [badLine] },
+              },
+            }),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+        );
+      }
+
+      // Non-empty trusted_acceptance_dir MUST fail (422) and preserve leftover file
+      mkdirSync(trustedDir, { recursive: true });
+      const leftoverPath = join(trustedDir, "leftover.txt");
+      writeFileSync(leftoverPath, "keep-me\n", "utf8");
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(proj.project_id, authApprover, frozen.sessionId, {
+            repo_path: bareRepoDir,
+            trusted_acceptance_dir: trustedDir,
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      assert.equal(readFileSync(leftoverPath, "utf8"), "keep-me\n");
+      rmSync(trustedDir, { recursive: true, force: true });
+
+      // Direct symlink trusted_acceptance_dir (outside empty dir) MUST fail (422)
+      const outsideEmptyDir = join(rootDir, "outside-empty");
+      mkdirSync(outsideEmptyDir, { recursive: true });
+      const symlinkOutsideTrusted = join(rootDir, "symlink-outside-trusted");
+      symlinkSync(outsideEmptyDir, symlinkOutsideTrusted);
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(proj.project_id, authApprover, frozen.sessionId, {
+            repo_path: bareRepoDir,
+            trusted_acceptance_dir: symlinkOutsideTrusted,
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // Symlink pointing inside repo_path MUST fail (422)
+      const symTargetRepo = join(rootDir, "sym-target-repo.git");
+      mkdirSync(symTargetRepo, { recursive: true });
+      const symlinkInsideTrusted = join(rootDir, "symlink-inside-trusted");
+      symlinkSync(symTargetRepo, symlinkInsideTrusted);
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(proj.project_id, authApprover, frozen.sessionId, {
+            repo_path: symTargetRepo,
+            trusted_acceptance_dir: symlinkInsideTrusted,
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // Injected DB TX2 throw during bootstrap MUST leave refs/heads/main unwritten & trustedDir unpublished
+      const origCreateBootstrap = store.createProjectBootstrap.bind(store);
+      store.createProjectBootstrap = async () => {
+        throw new Error("INJECTED_STAGE5_TX2_FAIL");
+      };
+      try {
+        await assert.rejects(
+          () =>
+            coreClient.bootstrapPipelineProject(proj.project_id, authApprover, frozen.sessionId, {
+              repo_path: bareRepoDir,
+              trusted_acceptance_dir: trustedDir,
+              acceptance_specs: acceptanceSpecs,
+            }),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode >= 500
+        );
+      } finally {
+        store.createProjectBootstrap = origCreateBootstrap;
+      }
+      assert.equal(existsSync(trustedDir), false);
+      assert.throws(() => gitAt(bareRepoDir, ["rev-parse", "--verify", "refs/heads/main"]));
+
+      // Clean Stage 5 bootstrap + duplicate 409 check (Minor #9)
+      const bootOutcome = await coreClient.bootstrapPipelineProject(
+        proj.project_id,
+        authApprover,
+        frozen.sessionId,
+        {
+          repo_path: bareRepoDir,
+          trusted_acceptance_dir: trustedDir,
+          acceptance_specs: acceptanceSpecs,
+        }
+      );
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(proj.project_id, authApprover, frozen.sessionId, {
+            repo_path: bareRepoDir,
+            trusted_acceptance_dir: join(rootDir, "trusted-dup"),
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 409
+      );
+      assert.equal(
+        gitAt(bareRepoDir, ["rev-parse", "refs/heads/main"]).toLowerCase(),
+        bootOutcome.bootstrap.base_main_commit_hash
+      );
+
+      const hooksDir = join(bareRepoDir, "hooks");
+      mkdirSync(hooksDir, { recursive: true });
+      const hookDest = join(hooksDir, "pre-receive");
+      copyFileSync(findPreReceiveHookSource(), hookDest);
+      chmodSync(hookDest, 0o755);
+
+      // 5. Stage 6 profiles
+      const devProfile = await coreClient.upsertAgentOrganizationProfile(proj.project_id, authDev, {
+        profile_key: "fix-dev",
+        role: "DEVELOPER",
+        principal_id: "coder-claude",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        execution_target_type: "factory_managed_worker",
+        trust_tier: "TIER_1_FACTORY_MANAGED",
+      });
+      const revProfile = await coreClient.upsertAgentOrganizationProfile(proj.project_id, authDev, {
+        profile_key: "fix-rev",
+        role: "REVIEWER_READONLY",
+        principal_id: "reviewer-gemini",
+        provider: "google",
+        model: "gemini-2.5-pro",
+        execution_target_type: "provider_managed_vm",
+        trust_tier: "TIER_3_PROVIDER_VM",
+      });
+
+      // 6. M6B-FIX-08: Stage 7 BLOCKED_POSTCALL (402 + EXHAUSTED + 0 tasks) & TX2 persistence compensation
+      const postcallCost = await coreClient.createCostSession(proj.project_id, authDev, {
+        pipeline_session_id: frozen.sessionId,
+        max_tokens_per_request: 100_000,
+        max_cost_micro_usd_per_request: 500_000_000,
+        session_token_budget: 20_000,
+        session_cost_budget_micro_usd: 500_000_000,
+      });
+      mock.setResponseOverride("anthropic", { inputTokens: 15_000, outputTokens: 10_000 });
+      try {
+        await assert.rejects(
+          () =>
+            coreClient.runPipelineStage7Plan(proj.project_id, authDev, frozen.sessionId, {
+              cost_session_id: postcallCost.cost_session_id,
+              max_tokens: 1,
+            }),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 402
+        );
+      } finally {
+        mock.setResponseOverride("anthropic", null);
+      }
+      const postcallAfter = await coreClient.getCostSession(
+        proj.project_id,
+        authDev,
+        postcallCost.cost_session_id
+      );
+      assert.equal(postcallAfter.session.status, "EXHAUSTED");
+      assert.equal(postcallAfter.ledgers.some((l) => l.status === "BLOCKED_POSTCALL"), true);
+      const bundleAfterPostcall = await coreClient.getPipelineM6BBundle(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(bundleAfterPostcall.stage7_plan.milestones.length, 0);
+      assert.equal(bundleAfterPostcall.stage7_plan.tasks.length, 0);
+
+      // Injected Stage 7 TX2 persistence failure -> single FAILED_VALIDATION with [PERSISTENCE_FAILURE], 0 ALLOWED, 0 tasks
+      const origCreateStage7 = store.createStage7DevelopmentPlan.bind(store);
+      store.createStage7DevelopmentPlan = async () => {
+        throw new Error("INJECTED_STAGE7_TX2_FAIL");
+      };
+      try {
+        await assert.rejects(
+          () => coreClient.runPipelineStage7Plan(proj.project_id, authDev, frozen.sessionId),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode >= 500
+        );
+      } finally {
+        store.createStage7DevelopmentPlan = origCreateStage7;
+      }
+      const costAfterTx2Fail = await coreClient.getCostSession(
+        proj.project_id,
+        authDev,
+        frozen.costSessionId
+      );
+      const s7Ledgers = costAfterTx2Fail.ledgers.filter((l) => l.stage === "STAGE_7_PLANNING");
+      assert.equal(s7Ledgers.length, 1);
+      assert.equal(s7Ledgers[0]!.status, "FAILED_VALIDATION");
+      assert.ok(s7Ledgers[0]!.error_message?.startsWith("[PERSISTENCE_FAILURE] "));
+      const bundleAfterTx2Fail = await coreClient.getPipelineM6BBundle(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(bundleAfterTx2Fail.stage7_plan.milestones.length, 0);
+      assert.equal(bundleAfterTx2Fail.stage7_plan.tasks.length, 0);
+
+      // 7. Valid 2-task Stage 7 plan -> Partial Coverage (66.66% Minor #1) -> Full Coverage (100%)
+      mock.setStage7Override(() => ({
+        milestones: [{ milestone_key: "MS-1", title: "MS1", description: "MS1" }],
+        epics: [{ epic_key: "EPIC-1", milestone_key: "MS-1", title: "E1", description: "E1" }],
+        stories: [
+          {
+            story_key: "STORY-1",
+            epic_key: "EPIC-1",
+            title: "Story 1",
+            description: "All 3 reqs",
+            requirement_ids: allReqIds,
+            ac_ids: allAcIds,
+          },
+        ],
+        tasks: [
+          {
+            task_key: "TASK-PART-1",
+            story_key: "STORY-1",
+            title: "Implement ledger & 2 reqs",
+            description: "Part 1",
+            requirement_ids: allReqIds.slice(0, 2),
+            ac_ids: allAcIds.slice(0, 2),
+            allowed_files: ["src/**", "test/**"],
+            depends_on_task_keys: [],
+            developer_profile_key: "fix-dev",
+          },
+          {
+            task_key: "TASK-PART-2",
+            story_key: "STORY-1",
+            title: "Implement audit helper & 3rd req",
+            description: "Part 2",
+            requirement_ids: allReqIds.slice(2),
+            ac_ids: allAcIds.slice(2),
+            allowed_files: ["src/**", "test/**"],
+            depends_on_task_keys: [],
+            developer_profile_key: "fix-dev",
+          },
+        ],
+        planning_notes: "2 tasks for 2/3 partial coverage proof",
+      }));
+      const planOut = await coreClient.runPipelineStage7Plan(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      mock.setStage7Override(null);
+      assert.equal(planOut.bundle.tasks.length, 2);
+
+      // Merge ONLY T1 -> 2 / 3 => 66.66% (truncated, not rounded to 66.67)
+      await runFullStage8ToCasMerge({
+        store,
+        coreClient,
+        webBaseUrl: webInfo.baseUrl,
+        tokenService,
+        gatewayBaseUrl: gwInfo.baseUrl,
+        preReceiveUrl: gwInfo.url,
+        bareRepoDir,
+        trustedAcceptanceDir: trustedDir,
+        expectedTrustedPolicySha256: bootOutcome.bootstrap.trusted_policy_sha256,
+        worktreeBaseDir,
+        outboxDir,
+        useDocker,
+        projectId: proj.project_id,
+        taskId: planOut.bundle.tasks[0]!.task_id,
+        authDev,
+        authApprover,
+        developerProfile: devProfile,
+        reviewerProfile: revProfile,
+        edits: [
+          {
+            path: "src/ledger.mjs",
+            content: `export const implementedAcIds = ${JSON.stringify(allAcIds)};\nexport function createLedgerEntry(a, c='USD'){ return { amountCents: a, currency: c }; }\n`,
+          },
+          {
+            path: "test/part1.agent.test.mjs",
+            content:
+              'import assert from "node:assert/strict"; import { createLedgerEntry } from "../src/ledger.mjs"; assert.equal(createLedgerEntry(10).amountCents, 10);\n',
+          },
+        ],
+        agentTestFile: "test/part1.agent.test.mjs",
+      });
+      const partialMatrix = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(partialMatrix.covered_requirements, 2);
+      assert.equal(partialMatrix.total_requirements, 3);
+      assert.equal(partialMatrix.coverage_percent, 66.66);
+      assert.equal(partialMatrix.complete, false);
+
+      // Merge T2 -> 3 / 3 => 100%
+      const stage8T2 = await runFullStage8ToCasMerge({
+        store,
+        coreClient,
+        webBaseUrl: webInfo.baseUrl,
+        tokenService,
+        gatewayBaseUrl: gwInfo.baseUrl,
+        preReceiveUrl: gwInfo.url,
+        bareRepoDir,
+        trustedAcceptanceDir: trustedDir,
+        expectedTrustedPolicySha256: bootOutcome.bootstrap.trusted_policy_sha256,
+        worktreeBaseDir,
+        outboxDir,
+        useDocker,
+        projectId: proj.project_id,
+        taskId: planOut.bundle.tasks[1]!.task_id,
+        authDev,
+        authApprover,
+        developerProfile: devProfile,
+        reviewerProfile: revProfile,
+        edits: [
+          { path: "src/part2.mjs", content: "export const auditReady = true;\n" },
+          {
+            path: "test/part2.agent.test.mjs",
+            content:
+              'import assert from "node:assert/strict"; import { auditReady } from "../src/part2.mjs"; assert.equal(auditReady, true);\n',
+          },
+        ],
+        agentTestFile: "test/part2.agent.test.mjs",
+      });
+      const c2Hash = stage8T2.mergedCommitHash;
+      const cleanMatrix = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(cleanMatrix.coverage_percent, 100);
+      assert.equal(cleanMatrix.complete, true);
+
+      // 8. M6B-FIX-01: Forged ?live_main_head_commit_hash & body ignored when refs/heads/main is behind
+      gitAt(bareRepoDir, ["update-ref", "refs/heads/main", bootOutcome.bootstrap.base_main_commit_hash]);
+      await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          store.updateProjectMainRefCommitHash({
+            project_id: proj.project_id,
+            main_ref_commit_hash: bootOutcome.bootstrap.base_main_commit_hash,
+          })
+      );
+      const forgedTraceResp = await fetch(
+        `${coreInfo.baseUrl}/api/v1/projects/${encodeURIComponent(
+          proj.project_id
+        )}/pipeline-sessions/${encodeURIComponent(
+          frozen.sessionId
+        )}/traceability?live_main_head_commit_hash=${c2Hash}`,
+        { headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover) } }
+      );
+      assert.equal(forgedTraceResp.status, 200);
+      const forgedTrace = (await forgedTraceResp.json()) as BidirectionalTraceabilityMatrix;
+      assert.equal(forgedTrace.coverage_percent, 0);
+      assert.equal(forgedTrace.complete, false);
+      assert.equal(
+        forgedTrace.requirement_rows.every((r) => r.stage8_lineage.every((l) => l.main_reachable === false)),
+        true
+      );
+      const forgedRelResp = await fetch(
+        `${coreInfo.baseUrl}/api/v1/projects/${encodeURIComponent(
+          proj.project_id
+        )}/pipeline-sessions/${encodeURIComponent(
+          frozen.sessionId
+        )}/release-package?live_main_head_commit_hash=${c2Hash}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover),
+          },
+          body: JSON.stringify({ live_main_head_commit_hash: c2Hash }),
+        }
+      );
+      assert.equal(forgedRelResp.status, 422);
+
+      // Restore refs/heads/main & store main_ref_commit_hash -> 100%
+      gitAt(bareRepoDir, ["update-ref", "refs/heads/main", c2Hash]);
+      await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          store.updateProjectMainRefCommitHash({
+            project_id: proj.project_id,
+            main_ref_commit_hash: c2Hash,
+          })
+      );
+
+      // 9. M6B-FIX-06: Bidirectional orphan scans (unlinked task, Stage 3 dangling req, bootstrap dangling ac)
+      const internalStore = store as unknown as {
+        tasks: Map<string, Record<string, unknown>>;
+        stageArtifacts: Map<string, Record<string, unknown>>;
+        baselineSpecFreezes: Map<string, Record<string, unknown>>;
+        projectBootstraps: Map<string, Record<string, unknown>>;
+        stage1DiscoveryItems: Map<string, Record<string, unknown>>;
+        verificationRuns: Map<string, Record<string, unknown>>;
+      };
+
+      // (a) Unlinked project task
+      const unlinkedTask = await coreClient.createTask(proj.project_id, authDev, {
+        title: "Unlinked Rogue Task",
+        task_contract: {
+          allowed_files: ["src/**"],
+          protected_paths: [...bootOutcome.bootstrap.protected_paths],
+        },
+        base_main_commit_hash: c2Hash,
+      });
+      const matrixUnlinked = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(
+        matrixUnlinked.orphan_links.some(
+          (o) => o.entity_type === "task" && o.entity_id === unlinkedTask.task_id
+        ),
+        true
+      );
+      assert.equal(matrixUnlinked.complete, false);
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(proj.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      internalStore.tasks.delete(unlinkedTask.task_id);
+
+      // (b) Stage 3 ADR referencing unknown req_id
+      const origS3Art = structuredClone(internalStore.stageArtifacts.get(frozen.s3.artifact.artifact_id)!);
+      const origFreeze = structuredClone(internalStore.baselineSpecFreezes.get(frozen.baseline.baseline_id)!);
+      const s3ContentMut = structuredClone(origS3Art.content_json) as {
+        adrs: Array<Record<string, unknown>>;
+      };
+      s3ContentMut.adrs.push({
+        adr_id: "ADR-ORPHAN",
+        title: "Orphan ADR",
+        status: "ACCEPTED",
+        context: "C",
+        decision: "D",
+        consequences: "X",
+        requirement_ids: ["REQ-ORPHAN-999"],
+      });
+      const newS3Sha = computeCanonicalPayloadSha256(s3ContentMut);
+      internalStore.stageArtifacts.set(frozen.s3.artifact.artifact_id, {
+        ...origS3Art,
+        content_json: s3ContentMut,
+        artifact_sha256: newS3Sha,
+      });
+      const updatedFreeze: Record<string, unknown> = {
+        ...origFreeze,
+        stage3_artifact_sha256: newS3Sha,
+      };
+      updatedFreeze.freeze_bundle_sha256 = computeBaselineFreezeBundleSha256(
+        updatedFreeze as unknown as Parameters<typeof computeBaselineFreezeBundleSha256>[0]
+      );
+      internalStore.baselineSpecFreezes.set(frozen.baseline.baseline_id, updatedFreeze);
+      const matrixS3Orphan = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(
+        matrixS3Orphan.orphan_links.some(
+          (o) => o.entity_type === "stage3_adr" && o.entity_id === "ADR-ORPHAN"
+        ),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(proj.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      internalStore.stageArtifacts.set(frozen.s3.artifact.artifact_id, origS3Art);
+      internalStore.baselineSpecFreezes.set(frozen.baseline.baseline_id, origFreeze);
+
+      // (c) Bootstrap trusted acceptance test referencing unknown ac_id
+      const origBoot = structuredClone(
+        internalStore.projectBootstraps.get(bootOutcome.bootstrap.bootstrap_id)!
+      );
+      const mutBoot = structuredClone(origBoot) as {
+        acceptance_tests: Array<Record<string, unknown>>;
+        bootstrap_sha256: string;
+      };
+      mutBoot.acceptance_tests.push({
+        ac_id: "AC-ORPHAN-999",
+        req_id: allReqIds[0]!,
+        given: "g",
+        when: "w",
+        then: "t",
+        test_file_path: "acceptance.test.mjs",
+        component_ids: ["COMP-LEDGER-CORE"],
+        expected_deliverables: ["src/ledger.mjs"],
+      });
+      mutBoot.bootstrap_sha256 = computeProjectBootstrapSha256(
+        mutBoot as unknown as Parameters<typeof computeProjectBootstrapSha256>[0]
+      );
+      internalStore.projectBootstraps.set(bootOutcome.bootstrap.bootstrap_id, mutBoot);
+      const matrixBootOrphan = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(
+        matrixBootOrphan.orphan_links.some(
+          (o) => o.entity_type === "bootstrap_acceptance_test" && o.entity_id.includes("AC-ORPHAN-999")
+        ),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(proj.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      internalStore.projectBootstraps.set(bootOutcome.bootstrap.bootstrap_id, origBoot);
+
+      // 10. M6B-FIX-03: Stage 1 provenance item in REJECTED status breaks traceability
+      const verifiedS1 = frozen.s1.discoveryItems.find(
+        (d) => d.confirmation_status === "AUTO_VERIFIED" || d.confirmation_status === "CONFIRMED"
+      )!;
+      const origS1Item = structuredClone(internalStore.stage1DiscoveryItems.get(verifiedS1.item_id)!);
+      internalStore.stage1DiscoveryItems.set(verifiedS1.item_id, {
+        ...origS1Item,
+        confirmation_status: "REJECTED",
+      });
+      const matrixS1Rejected = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(
+        matrixS1Rejected.missing_links.some((m) => m.stage === "STAGE_1_DISCOVERY"),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(proj.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      internalStore.stage1DiscoveryItems.set(verifiedS1.item_id, origS1Item);
+
+      // 11. M6B-FIX-07: Null tier1_trusted_acceptance_passed & mismatched contract trusted_policy_sha256
+      const origVr2 = structuredClone(
+        internalStore.verificationRuns.get(stage8T2.verificationRun.verification_run_id)!
+      );
+      internalStore.verificationRuns.set(stage8T2.verificationRun.verification_run_id, {
+        ...origVr2,
+        tier1_trusted_acceptance_passed: null,
+      });
+      const matrixNullTier1 = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(
+        matrixNullTier1.missing_links.some((m) => m.stage === "STAGE_8_EXECUTION"),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(proj.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      internalStore.verificationRuns.set(stage8T2.verificationRun.verification_run_id, origVr2);
+
+      const origTask2 = structuredClone(internalStore.tasks.get(stage8T2.task.task_id)!);
+      const mutTask2Contract = {
+        ...(origTask2.task_contract_json as Record<string, unknown>),
+        trusted_policy_sha256: "0".repeat(64),
+      };
+      internalStore.tasks.set(stage8T2.task.task_id, {
+        ...origTask2,
+        task_contract_json: mutTask2Contract,
+      });
+      const matrixMismatchPolicy = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(
+        matrixMismatchPolicy.missing_links.some((m) => m.stage === "STAGE_8_EXECUTION"),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(proj.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      internalStore.tasks.set(stage8T2.task.task_id, origTask2);
+
+      // 12. Minor #7 & M6B-FIX-05: invalid decision 23514, HTTP gap CR 422, direct store CR-PARTIAL -> STAGE_9_CHANGE_REQUEST missing & 422
+      await assert.rejects(
+        () =>
+          coreClient.submitPipelineChangeRequest(proj.project_id, authDev, frozen.sessionId, {
+            cr_key: "CR-HTTP-GAP",
+            title: "Gap CR",
+            rationale: "Gap rejected",
+            impacted_requirement_ids: [allReqIds[0]!, allReqIds[1]!],
+            proposed_tasks: [
+              {
+                task_key: "TASK-HTTP-ONLY-ONE",
+                story_id: planOut.bundle.stories[0]!.story_id,
+                title: "Only req 0",
+                description: "D",
+                requirement_ids: [allReqIds[0]!],
+                ac_ids: [allAcIds[0]!],
+                allowed_files: ["src/**", "test/**"],
+              },
+            ],
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      const crPartial = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          store.createChangeRequest({
+            project_id: proj.project_id,
+            pipeline_session_id: frozen.sessionId,
+            baseline_id: frozen.baseline.baseline_id,
+            cr_key: "CR-PARTIAL",
+            title: "Bypassed Partial CR",
+            rationale: "Simulates direct store gap",
+            impacted_requirement_ids: [allReqIds[0]!, allReqIds[1]!],
+            impacted_component_ids: [],
+            proposed_tasks: [
+              {
+                task_key: "TASK-CR-PARTIAL",
+                story_id: planOut.bundle.stories[0]!.story_id,
+                title: "CR Partial Task",
+                description: "Only touches req 0",
+                requirement_ids: [allReqIds[0]!],
+                ac_ids: [allAcIds[0]!],
+                allowed_files: ["src/**", "test/**"],
+              },
+            ],
+            requested_by_principal_id: "alice-dev",
+          })
+      );
+
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "bob-approver",
+              currentRole: "core_api_service",
+            },
+            () =>
+              store.decideChangeRequest({
+                project_id: proj.project_id,
+                cr_id: crPartial.cr_id,
+                decision: "INVALID" as "APPROVED",
+                decided_by_principal_id: "bob-approver",
+              })
+          ),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+
+      await coreClient.decidePipelineChangeRequest(
+        proj.project_id,
+        authApprover,
+        frozen.sessionId,
+        crPartial.cr_id,
+        { decision: "APPROVED" }
+      );
+      const appliedPartial = await coreClient.applyPipelineChangeRequest(
+        proj.project_id,
+        authDev,
+        frozen.sessionId,
+        crPartial.cr_id
+      );
+      await runFullStage8ToCasMerge({
+        store,
+        coreClient,
+        webBaseUrl: webInfo.baseUrl,
+        tokenService,
+        gatewayBaseUrl: gwInfo.baseUrl,
+        preReceiveUrl: gwInfo.url,
+        bareRepoDir,
+        trustedAcceptanceDir: trustedDir,
+        expectedTrustedPolicySha256: bootOutcome.bootstrap.trusted_policy_sha256,
+        worktreeBaseDir,
+        outboxDir,
+        useDocker,
+        projectId: proj.project_id,
+        taskId: appliedPartial.tasks[0]!.task_id,
+        authDev,
+        authApprover,
+        developerProfile: devProfile,
+        reviewerProfile: revProfile,
+        edits: [
+          { path: "src/cr-partial.mjs", content: "export const crPartialDone = true;\n" },
+          {
+            path: "test/cr-partial.agent.test.mjs",
+            content:
+              'import assert from "node:assert/strict"; import { crPartialDone } from "../src/cr-partial.mjs"; assert.equal(crPartialDone, true);\n',
+          },
+        ],
+        agentTestFile: "test/cr-partial.agent.test.mjs",
+      });
+
+      const matrixPartialCr = await coreClient.getPipelineTraceabilityMatrix(
+        proj.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(matrixPartialCr.complete, false);
+      assert.equal(
+        matrixPartialCr.missing_links.some(
+          (m) => m.stage === "STAGE_9_CHANGE_REQUEST" && m.req_id === allReqIds[1]!
+        ),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(proj.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+    } finally {
+      await Promise.allSettled([webHttp.stop(), coreHttp.stop(), gatewayHttp.close(), mock.close()]);
+      restoreWritableRecursive(rootDir);
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("M6B-FIX-PG: Live PostgreSQL 17 M6B-FIX-01/03/05/06/07/08/09, Minor #1/#7/#9 & M6A-FU-04 Stage 7 Rollback", async (t) => {
+    const pgConfig = buildPostgresPoolConfigFromEnv();
+    if (!pgConfig) {
+      t.skip("PostgreSQL connection env (PGHOST/DATABASE_URL) not configured on local workstation");
+      return;
+    }
+
+    const repoRoot = resolve(import.meta.dirname ?? process.cwd(), "../../..");
+    const psqlBin = (() => {
+      for (const candidate of [
+        "psql",
+        "/opt/homebrew/opt/postgresql@17/bin/psql",
+        "/usr/local/opt/postgresql@17/bin/psql",
+        "/opt/homebrew/bin/psql",
+        "/usr/local/bin/psql",
+      ]) {
+        try {
+          execFileSync(candidate, ["--version"], { stdio: "ignore" });
+          return candidate;
+        } catch {
+          // next candidate
+        }
+      }
+      return null;
+    })();
+    if (!psqlBin && process.env.CI) {
+      assert.fail("psql CLI binary is required in CI for M6B-FIX-PG");
+    }
+
+    const runOwnerSql = (sql: string): void => {
+      if (!psqlBin) {
+        throw new Error("psqlBin unavailable for owner SQL");
+      }
+      execFileSync(psqlBin, ["-v", "ON_ERROR_STOP=1"], {
+        cwd: repoRoot,
+        input: sql,
+        env: {
+          ...process.env,
+          PGHOST: pgConfig.host,
+          PGPORT: String(pgConfig.port),
+          PGUSER: pgConfig.user,
+          PGDATABASE: pgConfig.database,
+          ...(pgConfig.password !== undefined ? { PGPASSWORD: pgConfig.password } : {}),
+          ...(pgConfig.sslMode ? { PGSSLMODE: pgConfig.sslMode } : {}),
+          ...(pgConfig.sslRootCertPath ? { PGSSLROOTCERT: pgConfig.sslRootCertPath } : {}),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    };
+
+    const pool = new PostgresRuntimePool({ ...pgConfig, maxConnections: 8 });
+    const repo = new PostgresControlPlaneRepository(pool);
+    const mock = await startMockModelProviderServers();
+    const rootDir = mkdtempSync(join(tmpdir(), "sf-m6b-fix-pg-"));
+    const bareRepoDir = join(rootDir, "pg-fix-a.git");
+    const trustedAcceptanceDir = join(rootDir, "pg-fix-trusted");
+    const worktreeBaseDir = join(rootDir, "worktrees");
+    const outboxDir = join(rootDir, "outbox");
+    const snapshotDir = join(rootDir, "snapshots");
+    mkdirSync(worktreeBaseDir, { recursive: true });
+    mkdirSync(outboxDir, { recursive: true });
+    mkdirSync(snapshotDir, { recursive: true });
+
+    const createdProjIds: string[] = [];
+    const snapshotStore = new ImmutableSourceSnapshotStore({ storageDir: snapshotDir });
+    const verifier = new Docker3TierVerifier({ snapshotStore });
+    const tokenService = new EphemeralGitPushTokenService();
+    const reviewerCredService = new EphemeralReviewerCredentialService();
+
+    const coreApi = new CoreApiService(repo, {
+      env: {},
+      snapshotStore,
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+    });
+    const coreHttp = new CoreApiHttpServer({ coreApi, snapshotStore, defaultVerifier: verifier });
+    const webHttp = new WebApprovalConsoleHttpServer({ coreApi });
+    let gatewayHttp: AgentGatewayHttpServer | null = null;
+    let coreWithGw: CoreApiHttpServer | null = null;
+
+    try {
+      const coreInfo = await coreHttp.start();
+      const webInfo = await webHttp.start();
+      const coreClient = new HttpCoreApiClient(coreInfo.baseUrl);
+      const dockerProbe = probeDockerVerifierSupport("node:22-alpine");
+      const useDocker = dockerProbe.daemonAvailable && dockerProbe.imageAvailable;
+
+      const projA = await repo.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "pg-admin" },
+        async () => {
+          const p = await repo.createProject({
+            slug: `m6b-fix-pg-${randomUUID().slice(0, 8)}`,
+            name: "PG M6B Fix Project",
+            repo_bare_path: bareRepoDir,
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          createdProjIds.push(p.project_id);
+          await repo.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await repo.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          return p;
+        }
+      );
+
+      const authDev = coreApi.issueAuthContext({
+        projectId: projA.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: projA.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      const gatewayService = new AgentGatewayService({
+        store: repo,
+        projectId: projA.project_id,
+        reviewerCredentialService: reviewerCredService,
+      });
+      gatewayHttp = new AgentGatewayHttpServer({ store: repo, tokenService });
+      coreWithGw = new CoreApiHttpServer({
+        coreApi,
+        snapshotStore,
+        defaultVerifier: verifier,
+        defaultAgentGateway: gatewayService,
+      });
+      const gwInfo = await gatewayHttp.start();
+      const coreGwInfo = await coreWithGw.start();
+      const gwClient = new HttpCoreApiClient(coreGwInfo.baseUrl);
+
+      const frozen = await advanceToFrozenBaseline({
+        client: coreClient,
+        projectId: projA.project_id,
+        authDev,
+        authApprover,
+        title: "PG M6B Fixes Pipeline",
+      });
+      const parsedS2 = frozen.s2.parsed as unknown as Stage2RequirementsSpec;
+      const s2Reqs = [
+        ...parsedS2.srs.functional_requirements,
+        ...parsedS2.srs.non_functional_requirements,
+      ];
+      const allReqIds = s2Reqs.map((r) => r.req_id);
+      const allAcIds = s2Reqs.flatMap((r) => r.acceptance_criteria.map((a) => a.ac_id));
+      const acceptanceSpecs: Record<
+        string,
+        { target_file: string; export_name?: string; assertion_lines?: string[] }
+      > = {};
+      for (const acId of allAcIds) {
+        acceptanceSpecs[acId] = {
+          target_file: "src/ledger.mjs",
+          export_name: "createLedgerEntry",
+          assertion_lines: [
+            `assert.equal(mod.implementedAcIds.includes(${JSON.stringify(acId)}), true);`,
+          ],
+        };
+      }
+
+      // 1. M6B-FIX-09 & Minor #9 on PG
+      mkdirSync(trustedAcceptanceDir, { recursive: true });
+      const leftoverPg = join(trustedAcceptanceDir, "leftover-pg.txt");
+      writeFileSync(leftoverPg, "pg-keep\n", "utf8");
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(projA.project_id, authApprover, frozen.sessionId, {
+            repo_path: bareRepoDir,
+            trusted_acceptance_dir: trustedAcceptanceDir,
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      assert.equal(readFileSync(leftoverPg, "utf8"), "pg-keep\n");
+      rmSync(trustedAcceptanceDir, { recursive: true, force: true });
+
+      const pgSymOutside = join(rootDir, "pg-outside-empty");
+      mkdirSync(pgSymOutside, { recursive: true });
+      const pgSymTrusted = join(rootDir, "pg-sym-trusted");
+      symlinkSync(pgSymOutside, pgSymTrusted);
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(projA.project_id, authApprover, frozen.sessionId, {
+            repo_path: bareRepoDir,
+            trusted_acceptance_dir: pgSymTrusted,
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      const pgSymRepoTarget = join(rootDir, "pg-sym-target-repo.git");
+      mkdirSync(pgSymRepoTarget, { recursive: true });
+      const pgSymInsideTrusted = join(rootDir, "pg-sym-inside-trusted");
+      symlinkSync(pgSymRepoTarget, pgSymInsideTrusted);
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(projA.project_id, authApprover, frozen.sessionId, {
+            repo_path: pgSymRepoTarget,
+            trusted_acceptance_dir: pgSymInsideTrusted,
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      const bootOutcome = await coreClient.bootstrapPipelineProject(
+        projA.project_id,
+        authApprover,
+        frozen.sessionId,
+        {
+          repo_path: bareRepoDir,
+          trusted_acceptance_dir: trustedAcceptanceDir,
+          acceptance_specs: acceptanceSpecs,
+        }
+      );
+      await assert.rejects(
+        () =>
+          coreClient.bootstrapPipelineProject(projA.project_id, authApprover, frozen.sessionId, {
+            repo_path: bareRepoDir,
+            trusted_acceptance_dir: join(rootDir, "pg-trusted-dup"),
+            acceptance_specs: acceptanceSpecs,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 409
+      );
+      assert.equal(
+        gitAt(bareRepoDir, ["rev-parse", "refs/heads/main"]).toLowerCase(),
+        bootOutcome.bootstrap.base_main_commit_hash
+      );
+
+      const hooksDir = join(bareRepoDir, "hooks");
+      mkdirSync(hooksDir, { recursive: true });
+      const hookDest = join(hooksDir, "pre-receive");
+      copyFileSync(findPreReceiveHookSource(), hookDest);
+      chmodSync(hookDest, 0o755);
+
+      const devProfile = await coreClient.upsertAgentOrganizationProfile(projA.project_id, authDev, {
+        profile_key: "pg-fix-dev",
+        role: "DEVELOPER",
+        principal_id: "pg-coder",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        execution_target_type: "factory_managed_worker",
+        trust_tier: "TIER_1_FACTORY_MANAGED",
+      });
+      const revProfile = await coreClient.upsertAgentOrganizationProfile(projA.project_id, authDev, {
+        profile_key: "pg-fix-rev",
+        role: "REVIEWER_READONLY",
+        principal_id: "pg-reviewer",
+        provider: "google",
+        model: "gemini-2.5-pro",
+        execution_target_type: "provider_managed_vm",
+        trust_tier: "TIER_3_PROVIDER_VM",
+      });
+
+      // 2. M6A-FU-04 on live PG: bare repo.createStage7DevelopmentPlan rolls back completely on FK violation (23503)
+      await assert.rejects(
+        () =>
+          repo.createStage7DevelopmentPlan({
+            project_id: projA.project_id,
+            pipeline_session_id: frozen.sessionId,
+            baseline_id: frozen.baseline.baseline_id,
+            bootstrap_id: bootOutcome.bootstrap.bootstrap_id,
+            base_main_commit_hash: bootOutcome.bootstrap.base_main_commit_hash,
+            milestones: [
+              { milestone_key: "MS-RB", title: "Rollback", description: "Should rollback", sequence_order: 1 },
+            ],
+            epics: [
+              {
+                epic_key: "EP-RB",
+                milestone_key: "MS-RB",
+                title: "Epic",
+                description: "Should rollback",
+                sequence_order: 1,
+              },
+            ],
+            stories: [
+              {
+                story_key: "ST-RB",
+                epic_key: "EP-RB",
+                title: "Story",
+                description: "Should rollback",
+                requirement_ids: allReqIds,
+                ac_ids: allAcIds,
+                sequence_order: 1,
+              },
+            ],
+            tasks: [
+              {
+                story_key: "ST-RB",
+                title: "FK violation rolls back entire Stage 7 TX",
+                requirement_ids: allReqIds,
+                ac_ids: allAcIds,
+                assigned_profile_id: randomUUID(),
+                task_contract: {
+                  allowed_files: ["src/**"],
+                  protected_paths: [...bootOutcome.bootstrap.protected_paths],
+                  trusted_policy_sha256: bootOutcome.bootstrap.trusted_policy_sha256,
+                },
+              },
+            ],
+          }),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23503"
+      );
+      await pool.withRlsTransaction(
+        {
+          currentProjectId: projA.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        async (conn) => {
+          for (const check of [
+            {
+              sql: "SELECT count(*)::text AS cnt FROM dev_milestones WHERE pipeline_session_id = $1::uuid;",
+              params: [frozen.sessionId],
+            },
+            {
+              sql: "SELECT count(*)::text AS cnt FROM dev_epics e JOIN dev_milestones m ON m.milestone_id = e.milestone_id WHERE m.pipeline_session_id = $1::uuid;",
+              params: [frozen.sessionId],
+            },
+            {
+              sql: "SELECT count(*)::text AS cnt FROM dev_user_stories s JOIN dev_epics e ON e.epic_id = s.epic_id JOIN dev_milestones m ON m.milestone_id = e.milestone_id WHERE m.pipeline_session_id = $1::uuid;",
+              params: [frozen.sessionId],
+            },
+            {
+              sql: "SELECT count(*)::text AS cnt FROM tasks WHERE project_id = $1::uuid;",
+              params: [projA.project_id],
+            },
+            {
+              sql: "SELECT count(*)::text AS cnt FROM task_plan_links WHERE pipeline_session_id = $1::uuid;",
+              params: [frozen.sessionId],
+            },
+          ]) {
+            const res = await conn.query<{ cnt: string }>(check.sql, check.params);
+            assert.equal(res.rows[0]!.cnt, "0", `Expected 0 rows after Stage 7 rollback for ${check.sql}`);
+          }
+        }
+      );
+
+      // 3. M6B-FIX-08 on live PG: Stage 7 BLOCKED_POSTCALL (402 + EXHAUSTED + 0 rows)
+      const pgPostcallCost = await coreClient.createCostSession(projA.project_id, authDev, {
+        pipeline_session_id: frozen.sessionId,
+        max_tokens_per_request: 100_000,
+        max_cost_micro_usd_per_request: 500_000_000,
+        session_token_budget: 20_000,
+        session_cost_budget_micro_usd: 500_000_000,
+      });
+      mock.setResponseOverride("anthropic", { inputTokens: 15_000, outputTokens: 10_000 });
+      try {
+        await assert.rejects(
+          () =>
+            coreClient.runPipelineStage7Plan(projA.project_id, authDev, frozen.sessionId, {
+              cost_session_id: pgPostcallCost.cost_session_id,
+              max_tokens: 1,
+            }),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 402
+        );
+      } finally {
+        mock.setResponseOverride("anthropic", null);
+      }
+      const pgPostcallAfter = await coreClient.getCostSession(
+        projA.project_id,
+        authDev,
+        pgPostcallCost.cost_session_id
+      );
+      assert.equal(pgPostcallAfter.session.status, "EXHAUSTED");
+      assert.equal(pgPostcallAfter.ledgers.some((l) => l.status === "BLOCKED_POSTCALL"), true);
+
+      // 4. Minor #1 on PG: 2-task Stage 7 -> 66.66% after T1 -> 100% after T2
+      mock.setStage7Override(() => ({
+        milestones: [{ milestone_key: "MS-PG", title: "PG MS", description: "PG MS" }],
+        epics: [{ epic_key: "EPIC-PG", milestone_key: "MS-PG", title: "PG E", description: "PG E" }],
+        stories: [
+          {
+            story_key: "STORY-PG",
+            epic_key: "EPIC-PG",
+            title: "PG Story",
+            description: "All 3 reqs",
+            requirement_ids: allReqIds,
+            ac_ids: allAcIds,
+          },
+        ],
+        tasks: [
+          {
+            task_key: "TASK-PG-1",
+            story_key: "STORY-PG",
+            title: "PG Part 1",
+            description: "2 reqs",
+            requirement_ids: allReqIds.slice(0, 2),
+            ac_ids: allAcIds.slice(0, 2),
+            allowed_files: ["src/**", "test/**"],
+            depends_on_task_keys: [],
+            developer_profile_key: "pg-fix-dev",
+          },
+          {
+            task_key: "TASK-PG-2",
+            story_key: "STORY-PG",
+            title: "PG Part 2",
+            description: "1 req",
+            requirement_ids: allReqIds.slice(2),
+            ac_ids: allAcIds.slice(2),
+            allowed_files: ["src/**", "test/**"],
+            depends_on_task_keys: [],
+            developer_profile_key: "pg-fix-dev",
+          },
+        ],
+        planning_notes: "PG 2/3 partial proof",
+      }));
+      const planOut = await coreClient.runPipelineStage7Plan(projA.project_id, authDev, frozen.sessionId);
+      mock.setStage7Override(null);
+      assert.equal(planOut.bundle.tasks.length, 2);
+
+      const stage8T1 = await runFullStage8ToCasMerge({
+        store: repo,
+        coreClient: gwClient,
+        webBaseUrl: webInfo.baseUrl,
+        tokenService,
+        gatewayBaseUrl: gwInfo.baseUrl,
+        preReceiveUrl: gwInfo.url,
+        bareRepoDir,
+        trustedAcceptanceDir,
+        expectedTrustedPolicySha256: bootOutcome.bootstrap.trusted_policy_sha256,
+        worktreeBaseDir,
+        outboxDir,
+        useDocker,
+        projectId: projA.project_id,
+        taskId: planOut.bundle.tasks[0]!.task_id,
+        authDev,
+        authApprover,
+        developerProfile: devProfile,
+        reviewerProfile: revProfile,
+        edits: [
+          {
+            path: "src/ledger.mjs",
+            content: `export const implementedAcIds = ${JSON.stringify(allAcIds)};\nexport function createLedgerEntry(a, c='USD'){ return { amountCents: a, currency: c }; }\n`,
+          },
+          {
+            path: "test/pg1.agent.test.mjs",
+            content:
+              'import assert from "node:assert/strict"; import { createLedgerEntry } from "../src/ledger.mjs"; assert.equal(createLedgerEntry(7).amountCents, 7);\n',
+          },
+        ],
+        agentTestFile: "test/pg1.agent.test.mjs",
+      });
+      const partialPgTrace = await coreClient.getPipelineTraceabilityMatrix(
+        projA.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(partialPgTrace.coverage_percent, 66.66);
+      assert.equal(partialPgTrace.complete, false);
+
+      const stage8T2 = await runFullStage8ToCasMerge({
+        store: repo,
+        coreClient: gwClient,
+        webBaseUrl: webInfo.baseUrl,
+        tokenService,
+        gatewayBaseUrl: gwInfo.baseUrl,
+        preReceiveUrl: gwInfo.url,
+        bareRepoDir,
+        trustedAcceptanceDir,
+        expectedTrustedPolicySha256: bootOutcome.bootstrap.trusted_policy_sha256,
+        worktreeBaseDir,
+        outboxDir,
+        useDocker,
+        projectId: projA.project_id,
+        taskId: planOut.bundle.tasks[1]!.task_id,
+        authDev,
+        authApprover,
+        developerProfile: devProfile,
+        reviewerProfile: revProfile,
+        edits: [
+          { path: "src/pg2.mjs", content: "export const pgPart2 = true;\n" },
+          {
+            path: "test/pg2.agent.test.mjs",
+            content:
+              'import assert from "node:assert/strict"; import { pgPart2 } from "../src/pg2.mjs"; assert.equal(pgPart2, true);\n',
+          },
+        ],
+        agentTestFile: "test/pg2.agent.test.mjs",
+      });
+      const c2Hash = stage8T2.mergedCommitHash;
+
+      // 5. M6B-FIX-01 on PG: forged live_main_head_commit_hash rejected when real main ref is behind
+      gitAt(bareRepoDir, ["update-ref", "refs/heads/main", bootOutcome.bootstrap.base_main_commit_hash]);
+      await repo.updateProjectMainRefCommitHash({
+        project_id: projA.project_id,
+        main_ref_commit_hash: bootOutcome.bootstrap.base_main_commit_hash,
+      });
+      const pgForgedResp = await fetch(
+        `${coreInfo.baseUrl}/api/v1/projects/${encodeURIComponent(
+          projA.project_id
+        )}/pipeline-sessions/${encodeURIComponent(
+          frozen.sessionId
+        )}/traceability?live_main_head_commit_hash=${c2Hash}`,
+        { headers: { [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover) } }
+      );
+      assert.equal(pgForgedResp.status, 200);
+      const pgForgedTrace = (await pgForgedResp.json()) as BidirectionalTraceabilityMatrix;
+      assert.equal(pgForgedTrace.coverage_percent, 0);
+      assert.equal(pgForgedTrace.complete, false);
+      const pgForgedRel = await fetch(
+        `${coreInfo.baseUrl}/api/v1/projects/${encodeURIComponent(
+          projA.project_id
+        )}/pipeline-sessions/${encodeURIComponent(
+          frozen.sessionId
+        )}/release-package?live_main_head_commit_hash=${c2Hash}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(authApprover),
+          },
+          body: JSON.stringify({ live_main_head_commit_hash: c2Hash }),
+        }
+      );
+      assert.equal(pgForgedRel.status, 422);
+
+      gitAt(bareRepoDir, ["update-ref", "refs/heads/main", c2Hash]);
+      await repo.updateProjectMainRefCommitHash({
+        project_id: projA.project_id,
+        main_ref_commit_hash: c2Hash,
+      });
+
+      // 6. M6B-FIX-07 on PG via owner SQL probes (null tier1 + mismatched contract policy SHA)
+      if (psqlBin) {
+        const vr1Id = stage8T1.verificationRun.verification_run_id;
+        const t1Id = stage8T1.task.task_id;
+        runOwnerSql(
+          `UPDATE verification_runs SET tier1_trusted_acceptance_passed = NULL WHERE verification_run_id = '${vr1Id}';`
+        );
+        const pgNullTier1 = await coreClient.getPipelineTraceabilityMatrix(
+          projA.project_id,
+          authDev,
+          frozen.sessionId
+        );
+        assert.equal(
+          pgNullTier1.missing_links.some((m) => m.stage === "STAGE_8_EXECUTION"),
+          true
+        );
+        await assert.rejects(
+          () => coreClient.issuePipelineReleasePackage(projA.project_id, authApprover, frozen.sessionId),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+        );
+        runOwnerSql(
+          `UPDATE verification_runs SET tier1_trusted_acceptance_passed = TRUE WHERE verification_run_id = '${vr1Id}';`
+        );
+
+        runOwnerSql(
+          `UPDATE tasks SET task_contract_json = jsonb_set(task_contract_json, '{trusted_policy_sha256}', '"0000000000000000000000000000000000000000000000000000000000000000"') WHERE task_id = '${t1Id}';`
+        );
+        const pgBadContractSha = await coreClient.getPipelineTraceabilityMatrix(
+          projA.project_id,
+          authDev,
+          frozen.sessionId
+        );
+        assert.equal(
+          pgBadContractSha.missing_links.some((m) => m.stage === "STAGE_8_EXECUTION"),
+          true
+        );
+        await assert.rejects(
+          () => coreClient.issuePipelineReleasePackage(projA.project_id, authApprover, frozen.sessionId),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+        );
+        runOwnerSql(
+          `UPDATE tasks SET task_contract_json = jsonb_set(task_contract_json, '{trusted_policy_sha256}', '"${bootOutcome.bootstrap.trusted_policy_sha256}"') WHERE task_id = '${t1Id}';`
+        );
+      }
+
+      // 7. M6B-FIX-05 on PG: direct repo.createChangeRequest gap CR -> apply & merge -> STAGE_9_CHANGE_REQUEST missing & 422
+      const crPgPartial = await repo.withRlsTransaction(
+        {
+          currentProjectId: projA.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          repo.createChangeRequest({
+            project_id: projA.project_id,
+            pipeline_session_id: frozen.sessionId,
+            baseline_id: frozen.baseline.baseline_id,
+            cr_key: "CR-PG-PARTIAL",
+            title: "PG Partial CR",
+            rationale: "Direct store gap",
+            impacted_requirement_ids: [allReqIds[0]!, allReqIds[1]!],
+            impacted_component_ids: [],
+            proposed_tasks: [
+              {
+                task_key: "TASK-PG-CR-PARTIAL",
+                story_id: planOut.bundle.stories[0]!.story_id,
+                title: "PG CR task",
+                description: "Covers req 0 only",
+                requirement_ids: [allReqIds[0]!],
+                ac_ids: [allAcIds[0]!],
+                allowed_files: ["src/**", "test/**"],
+              },
+            ],
+            requested_by_principal_id: "alice-dev",
+          })
+      );
+      await coreClient.decidePipelineChangeRequest(
+        projA.project_id,
+        authApprover,
+        frozen.sessionId,
+        crPgPartial.cr_id,
+        { decision: "APPROVED" }
+      );
+      const appliedPgPartial = await coreClient.applyPipelineChangeRequest(
+        projA.project_id,
+        authDev,
+        frozen.sessionId,
+        crPgPartial.cr_id
+      );
+      await runFullStage8ToCasMerge({
+        store: repo,
+        coreClient: gwClient,
+        webBaseUrl: webInfo.baseUrl,
+        tokenService,
+        gatewayBaseUrl: gwInfo.baseUrl,
+        preReceiveUrl: gwInfo.url,
+        bareRepoDir,
+        trustedAcceptanceDir,
+        expectedTrustedPolicySha256: bootOutcome.bootstrap.trusted_policy_sha256,
+        worktreeBaseDir,
+        outboxDir,
+        useDocker,
+        projectId: projA.project_id,
+        taskId: appliedPgPartial.tasks[0]!.task_id,
+        authDev,
+        authApprover,
+        developerProfile: devProfile,
+        reviewerProfile: revProfile,
+        edits: [
+          { path: "src/pg-cr.mjs", content: "export const pgCr = true;\n" },
+          {
+            path: "test/pg-cr.agent.test.mjs",
+            content:
+              'import assert from "node:assert/strict"; import { pgCr } from "../src/pg-cr.mjs"; assert.equal(pgCr, true);\n',
+          },
+        ],
+        agentTestFile: "test/pg-cr.agent.test.mjs",
+      });
+      const pgPartialCrTrace = await coreClient.getPipelineTraceabilityMatrix(
+        projA.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(pgPartialCrTrace.complete, false);
+      assert.equal(
+        pgPartialCrTrace.missing_links.some(
+          (m) => m.stage === "STAGE_9_CHANGE_REQUEST" && m.req_id === allReqIds[1]!
+        ),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(projA.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // 8. Minor #7 on PG: invalid decision 23514 & concurrent decideChangeRequest FOR UPDATE serialization
+      await assert.rejects(
+        () =>
+          repo.withRlsTransaction(
+            {
+              currentProjectId: projA.project_id,
+              currentPrincipalId: "bob-approver",
+              currentRole: "core_api_service",
+            },
+            () =>
+              repo.decideChangeRequest({
+                project_id: projA.project_id,
+                cr_id: crPgPartial.cr_id,
+                decision: "INVALID" as "APPROVED",
+                decided_by_principal_id: "bob-approver",
+              })
+          ),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+
+      const crRace = await coreClient.submitPipelineChangeRequest(
+        projA.project_id,
+        authDev,
+        frozen.sessionId,
+        {
+          cr_key: "CR-PG-RACE",
+          title: "PG Concurrent Decision Race",
+          rationale: "Ensure single winner and single decided outbox event",
+          impacted_requirement_ids: [allReqIds[0]!],
+          proposed_tasks: [
+            {
+              task_key: "TASK-PG-RACE",
+              story_id: planOut.bundle.stories[0]!.story_id,
+              title: "Race Task",
+              description: "Test",
+              requirement_ids: [allReqIds[0]!],
+              ac_ids: [allAcIds[0]!],
+              allowed_files: ["src/**", "test/**"],
+            },
+          ],
+        }
+      );
+      const raceResults = await Promise.allSettled([
+        coreClient.decidePipelineChangeRequest(
+          projA.project_id,
+          authApprover,
+          frozen.sessionId,
+          crRace.cr_id,
+          { decision: "APPROVED", decision_rationale: "race-approve" }
+        ),
+        coreClient.decidePipelineChangeRequest(
+          projA.project_id,
+          authApprover,
+          frozen.sessionId,
+          crRace.cr_id,
+          { decision: "REJECTED", decision_rationale: "race-reject" }
+        ),
+      ]);
+      const fulfilledRace = raceResults.filter((r) => r.status === "fulfilled");
+      const rejectedRace = raceResults.filter(
+        (r): r is PromiseRejectedResult => r.status === "rejected"
+      );
+      assert.equal(fulfilledRace.length, 1);
+      assert.equal(rejectedRace.length, 1);
+      assert.ok(
+        rejectedRace[0]!.reason instanceof HttpCoreApiError &&
+          (rejectedRace[0]!.reason.statusCode === 422 || rejectedRace[0]!.reason.statusCode === 409)
+      );
+      await pool.withRlsTransaction(
+        {
+          currentProjectId: projA.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        async (conn) => {
+          const outRes = await conn.query<{ cnt: string }>(
+            `SELECT count(*)::text AS cnt
+             FROM outbox_events
+             WHERE project_id = $1::uuid
+               AND aggregate_id = $2::uuid
+               AND event_type IN ('change_request.approved', 'change_request.rejected');`,
+            [projA.project_id, crRace.cr_id]
+          );
+          assert.equal(outRes.rows[0]!.cnt, "1");
+        }
+      );
+
+      // 9. M6B-FIX-06 on PG: unlinked task detected in orphan_links & blocks Release Acceptance (422)
+      const unlinkedPgTask = await gwClient.createTask(projA.project_id, authDev, {
+        title: "PG Unlinked Task",
+        task_contract: {
+          allowed_files: ["src/**"],
+          protected_paths: [...bootOutcome.bootstrap.protected_paths],
+        },
+        base_main_commit_hash: c2Hash,
+      });
+      const pgOrphanTrace = await coreClient.getPipelineTraceabilityMatrix(
+        projA.project_id,
+        authDev,
+        frozen.sessionId
+      );
+      assert.equal(
+        pgOrphanTrace.orphan_links.some(
+          (o) => o.entity_type === "task" && o.entity_id === unlinkedPgTask.task_id
+        ),
+        true
+      );
+      await assert.rejects(
+        () => coreClient.issuePipelineReleasePackage(projA.project_id, authApprover, frozen.sessionId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+
+      // 10. M6B-FIX-03 on PG: missing Stage 1 provenance item triggers STAGE_1_DISCOVERY gap & 422
+      if (psqlBin) {
+        const verifiedS1Pg = frozen.s1.discoveryItems.find(
+          (d) => d.confirmation_status === "AUTO_VERIFIED"
+        )!;
+        runOwnerSql(`DELETE FROM stage1_discovery_items WHERE item_id = '${verifiedS1Pg.item_id}';`);
+        const pgMissingS1Trace = await coreClient.getPipelineTraceabilityMatrix(
+          projA.project_id,
+          authDev,
+          frozen.sessionId
+        );
+        assert.equal(
+          pgMissingS1Trace.missing_links.some((m) => m.stage === "STAGE_1_DISCOVERY"),
+          true
+        );
+        await assert.rejects(
+          () =>
+            coreClient.issuePipelineReleasePackage(projA.project_id, authApprover, frozen.sessionId),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+        );
+      }
+
+      assert.ok(pool.getStats().discardAllExecuted > 0);
+    } finally {
+      await Promise.allSettled([
+        coreWithGw?.stop(),
+        gatewayHttp?.close(),
+        webHttp.stop(),
+        coreHttp.stop(),
+        mock.close(),
+      ]);
+      if (psqlBin) {
+        for (const pid of createdProjIds) {
+          try {
+            runOwnerSql(`
+              BEGIN;
+              UPDATE product_pipeline_sessions SET frozen_baseline_id = NULL WHERE project_id = '${pid}';
+              DELETE FROM release_acceptance_packages WHERE project_id = '${pid}';
+              DELETE FROM task_plan_links WHERE project_id = '${pid}';
+              DELETE FROM change_requests WHERE project_id = '${pid}';
+              DELETE FROM dev_user_stories WHERE project_id = '${pid}';
+              DELETE FROM dev_epics WHERE project_id = '${pid}';
+              DELETE FROM dev_milestones WHERE project_id = '${pid}';
+              DELETE FROM project_bootstraps WHERE project_id = '${pid}';
+              DELETE FROM agent_organization_profiles WHERE project_id = '${pid}';
+              DELETE FROM baseline_spec_freezes WHERE project_id = '${pid}';
+              DELETE FROM stage_approval_gates WHERE project_id = '${pid}';
+              DELETE FROM stage_artifacts WHERE project_id = '${pid}';
+              DELETE FROM stage1_discovery_items WHERE project_id = '${pid}';
+              DELETE FROM model_call_ledgers WHERE project_id = '${pid}';
+              DELETE FROM product_pipeline_sessions WHERE project_id = '${pid}';
+              DELETE FROM model_cost_sessions WHERE project_id = '${pid}';
+              DELETE FROM resource_usage_metrics WHERE project_id = '${pid}';
+              DELETE FROM merge_operations WHERE project_id = '${pid}';
+              DELETE FROM approval_decisions WHERE project_id = '${pid}';
+              DELETE FROM approval_requests WHERE project_id = '${pid}';
+              DELETE FROM review_artifacts WHERE project_id = '${pid}';
+              DELETE FROM review_sessions WHERE project_id = '${pid}';
+              DELETE FROM verification_runs WHERE project_id = '${pid}';
+              DELETE FROM merge_candidates WHERE project_id = '${pid}';
+              DELETE FROM verified_code_imports WHERE project_id = '${pid}';
+              DELETE FROM processed_worker_events WHERE project_id = '${pid}';
+              DELETE FROM task_leases WHERE project_id = '${pid}';
+              DELETE FROM tasks WHERE project_id = '${pid}';
+              DELETE FROM outbox_events WHERE project_id = '${pid}';
+              DELETE FROM audit_logs WHERE project_id = '${pid}';
+              DELETE FROM project_memberships WHERE project_id = '${pid}';
+              DELETE FROM projects WHERE project_id = '${pid}';
+              COMMIT;
+            `);
+          } catch {
+            // best-effort cleanup
+          }
+        }
+      }
+      await pool.close();
+      restoreWritableRecursive(rootDir);
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
 });
+

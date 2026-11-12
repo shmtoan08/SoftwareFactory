@@ -288,6 +288,15 @@ export function validateFreezeBaselineSpecInvariants(input: {
         `BaselineSpecFreeze ${label} stage is ${artifact.stage}, expected ${expectedStage}`
       );
     }
+    const canonicalSha = computeCanonicalPayloadSha256(
+      artifact.content_json as Record<string, unknown>
+    );
+    if (canonicalSha !== artifact.artifact_sha256) {
+      throw new PostgresRlsError(
+        "23514",
+        `BaselineSpecFreeze ${label} artifact (${expectedId}) content_json canonical sha256 (${canonicalSha}) does not match stored artifact_sha256 (${artifact.artifact_sha256})`
+      );
+    }
   };
 
   verifyStageRef(

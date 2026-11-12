@@ -49,6 +49,53 @@ export const EXPECTED_TRUST_TIER_BY_TARGET: Readonly<Record<ExecutionTargetType,
   remote_agent_session: "TIER_4_REMOTE_SESSION",
 };
 
+export const REQUIRED_STAGE5_PROTECTED_PATHS: readonly string[] = [
+  "policy/trusted-verification-policy.json",
+  "tests/protected/**",
+];
+
+export function validateProjectBootstrapInput(
+  input: Pick<
+    CreateProjectBootstrapInput,
+    | "repo_path"
+    | "trusted_acceptance_dir"
+    | "base_main_commit_hash"
+    | "protected_paths"
+    | "trusted_policy_sha256"
+    | "acceptance_tests"
+    | "created_by_principal_id"
+  >
+): void {
+  if (
+    !input.repo_path.trim() ||
+    !input.trusted_acceptance_dir.trim() ||
+    !input.created_by_principal_id.trim()
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      "repo_path, trusted_acceptance_dir, and created_by_principal_id must be non-empty"
+    );
+  }
+  if (
+    !/^[0-9a-f]{40}$/i.test(input.base_main_commit_hash) ||
+    !/^[0-9a-f]{64}$/i.test(input.trusted_policy_sha256) ||
+    input.acceptance_tests.length === 0
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      "Invalid project bootstrap hashes or empty acceptance_tests"
+    );
+  }
+  for (const requiredPath of REQUIRED_STAGE5_PROTECTED_PATHS) {
+    if (!input.protected_paths.includes(requiredPath)) {
+      throw new PostgresRlsError(
+        "23514",
+        `Project bootstrap protected_paths must include '${requiredPath}'`
+      );
+    }
+  }
+}
+
 export interface ExtractedStage2Requirement {
   readonly req_id: string;
   readonly category: "FR" | "NFR";
@@ -95,43 +142,90 @@ export function extractStage2Requirements(
     throw new PostgresRlsError("23514", "Frozen Stage 2 artifact is missing object srs");
   }
   const srsObj = srs as Record<string, unknown>;
-  const frs = Array.isArray(srsObj.functional_requirements) ? srsObj.functional_requirements : [];
-  const nfrs = Array.isArray(srsObj.non_functional_requirements)
-    ? srsObj.non_functional_requirements
-    : [];
+  if (!Array.isArray(srsObj.functional_requirements)) {
+    throw new PostgresRlsError(
+      "23514",
+      "Frozen Stage 2 artifact srs.functional_requirements must be an array"
+    );
+  }
+  if (
+    srsObj.non_functional_requirements !== undefined &&
+    !Array.isArray(srsObj.non_functional_requirements)
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      "Frozen Stage 2 artifact srs.non_functional_requirements must be an array"
+    );
+  }
+  const frs = srsObj.functional_requirements;
+  const nfrs = srsObj.non_functional_requirements ?? [];
 
   const result: ExtractedStage2Requirement[] = [];
   const seenReqIds = new Set<string>();
+  const seenAcIds = new Set<string>();
   const pushList = (list: unknown[], category: "FR" | "NFR") => {
-    for (const rawReq of list) {
+    for (let idx = 0; idx < list.length; idx += 1) {
+      const rawReq = list[idx];
       if (!rawReq || typeof rawReq !== "object" || Array.isArray(rawReq)) {
-        continue;
+        throw new PostgresRlsError(
+          "23514",
+          `Frozen Stage 2 ${category} requirement at index ${idx} must be an object`
+        );
       }
       const req = rawReq as Record<string, unknown>;
       const req_id = typeof req.req_id === "string" ? req.req_id.trim() : "";
-      if (!req_id || seenReqIds.has(req_id)) {
-        continue;
+      if (!req_id) {
+        throw new PostgresRlsError(
+          "23514",
+          `Frozen Stage 2 ${category} requirement at index ${idx} is missing non-empty req_id`
+        );
+      }
+      if (seenReqIds.has(req_id)) {
+        throw new PostgresRlsError(
+          "23514",
+          `Frozen Stage 2 artifact contains duplicate req_id '${req_id}'`
+        );
       }
       seenReqIds.add(req_id);
-      const rawAcs = Array.isArray(req.acceptance_criteria) ? req.acceptance_criteria : [];
+      if (!Array.isArray(req.acceptance_criteria)) {
+        throw new PostgresRlsError(
+          "23514",
+          `Frozen Stage 2 requirement '${req_id}' must have an acceptance_criteria array`
+        );
+      }
       const acceptance_criteria: Array<{
         ac_id: string;
         given: string;
         when: string;
         then: string;
       }> = [];
-      for (const rawAc of rawAcs) {
+      for (let acIdx = 0; acIdx < req.acceptance_criteria.length; acIdx += 1) {
+        const rawAc = req.acceptance_criteria[acIdx];
         if (!rawAc || typeof rawAc !== "object" || Array.isArray(rawAc)) {
-          continue;
+          throw new PostgresRlsError(
+            "23514",
+            `Frozen Stage 2 requirement '${req_id}' acceptance criterion at index ${acIdx} must be an object`
+          );
         }
         const ac = rawAc as Record<string, unknown>;
         const ac_id = typeof ac.ac_id === "string" ? ac.ac_id.trim() : "";
+        if (!ac_id) {
+          throw new PostgresRlsError(
+            "23514",
+            `Frozen Stage 2 requirement '${req_id}' acceptance criterion at index ${acIdx} is missing non-empty ac_id`
+          );
+        }
+        if (seenAcIds.has(ac_id)) {
+          throw new PostgresRlsError(
+            "23514",
+            `Frozen Stage 2 artifact contains duplicate ac_id '${ac_id}'`
+          );
+        }
+        seenAcIds.add(ac_id);
         const given = typeof ac.given === "string" ? ac.given.trim() : "";
         const when = typeof ac.when === "string" ? ac.when.trim() : "";
         const thenText = typeof ac.then === "string" ? ac.then.trim() : "";
-        if (ac_id) {
-          acceptance_criteria.push({ ac_id, given, when, then: thenText });
-        }
+        acceptance_criteria.push({ ac_id, given, when, then: thenText });
       }
       result.push({
         req_id,
@@ -464,13 +558,44 @@ export function validateStage7PlanAgainstBaseline(input: {
   const validReqIds = new Set(requirements.map((r) => r.req_id));
   const validAcIds = new Set<string>();
   const acsByReqId = new Map<string, Set<string>>();
+  const acToReq = new Map<string, string>();
   for (const r of requirements) {
     const acSet = new Set(r.ac_ids);
     acsByReqId.set(r.req_id, acSet);
     for (const ac of r.ac_ids) {
       validAcIds.add(ac);
+      acToReq.set(ac, r.req_id);
     }
   }
+
+  const assertReqAcConsistent = (
+    entityLabel: string,
+    reqIds: readonly string[],
+    acIds: readonly string[]
+  ): { reqSet: Set<string>; acSet: Set<string> } => {
+    const reqSet = new Set(reqIds);
+    const acSet = new Set(acIds);
+    for (const ac of acSet) {
+      const owningReq = acToReq.get(ac);
+      if (!owningReq || !reqSet.has(owningReq)) {
+        throw new PostgresRlsError(
+          "23514",
+          `${entityLabel}: ac_id '${ac}' belongs to req_id '${owningReq ?? "unknown"}', which is not listed in requirement_ids`
+        );
+      }
+    }
+    for (const r of reqSet) {
+      const expectedAcs = acsByReqId.get(r) ?? new Set<string>();
+      const hasMatchingAc = [...acSet].some((ac) => expectedAcs.has(ac));
+      if (!hasMatchingAc) {
+        throw new PostgresRlsError(
+          "23514",
+          `${entityLabel}: requirement_id '${r}' has no corresponding ac_id in ac_ids`
+        );
+      }
+    }
+    return { reqSet, acSet };
+  };
 
   const milestoneKeys = new Set<string>();
   for (const m of plan.milestones) {
@@ -497,6 +622,7 @@ export function validateStage7PlanAgainstBaseline(input: {
   }
 
   const storyKeys = new Set<string>();
+  const storyScopes = new Map<string, { readonly reqSet: Set<string>; readonly acSet: Set<string> }>();
   const storyCoveredReqs = new Set<string>();
   const storyCoveredAcs = new Set<string>();
   for (const s of plan.stories) {
@@ -525,7 +651,9 @@ export function validateStage7PlanAgainstBaseline(input: {
       }
       storyCoveredAcs.add(ac);
     }
+    const scope = assertReqAcConsistent(`Story '${key}'`, s.requirement_ids, s.ac_ids);
     storyKeys.add(key);
+    storyScopes.set(key, scope);
   }
 
   const profileByKey = new Map<string, AgentOrganizationProfileRecord>();
@@ -540,10 +668,12 @@ export function validateStage7PlanAgainstBaseline(input: {
 
   for (const t of plan.tasks) {
     const key = t.task_key.trim();
+    const storyKey = t.story_key.trim();
     if (!key || !t.title.trim() || taskKeys.has(key)) {
       throw new PostgresRlsError("23514", `Invalid or duplicate task_key '${t.task_key}'`);
     }
-    if (!storyKeys.has(t.story_key.trim())) {
+    const parentScope = storyScopes.get(storyKey);
+    if (!parentScope) {
       throw new PostgresRlsError("23514", `Task '${key}' references unknown story_key '${t.story_key}'`);
     }
     if (t.requirement_ids.length === 0 || t.ac_ids.length === 0) {
@@ -556,14 +686,27 @@ export function validateStage7PlanAgainstBaseline(input: {
       if (!validReqIds.has(r)) {
         throw new PostgresRlsError("23514", `Task '${key}' references unknown Stage 2 req_id '${r}'`);
       }
+      if (!parentScope.reqSet.has(r)) {
+        throw new PostgresRlsError(
+          "23514",
+          `Task '${key}' references req_id '${r}' outside parent Story '${storyKey}' scope`
+        );
+      }
       taskCoveredReqs.add(r);
     }
     for (const ac of t.ac_ids) {
       if (!validAcIds.has(ac)) {
         throw new PostgresRlsError("23514", `Task '${key}' references unknown Stage 2 ac_id '${ac}'`);
       }
+      if (!parentScope.acSet.has(ac)) {
+        throw new PostgresRlsError(
+          "23514",
+          `Task '${key}' references ac_id '${ac}' outside parent Story '${storyKey}' scope`
+        );
+      }
       taskCoveredAcs.add(ac);
     }
+    assertReqAcConsistent(`Task '${key}'`, t.requirement_ids, t.ac_ids);
     validateAllowedFilesAgainstProtectedAndForbidden({
       allowedFiles: t.allowed_files,
       protectedPaths: input.protectedPaths,
@@ -579,34 +722,73 @@ export function validateStage7PlanAgainstBaseline(input: {
       }
     }
     taskKeys.add(key);
-    depsByTask.set(key, t.depends_on_task_keys);
+    const trimmedDeps: string[] = [];
+    for (const rawDep of t.depends_on_task_keys) {
+      const dep = rawDep.trim();
+      if (!dep) {
+        throw new PostgresRlsError(
+          "23514",
+          `Stage 7 task '${key}' contains blank dependency key`
+        );
+      }
+      if (dep === key) {
+        throw new PostgresRlsError(
+          "23514",
+          `Stage 7 task '${key}' cannot depend on itself`
+        );
+      }
+      if (!trimmedDeps.includes(dep)) {
+        trimmedDeps.push(dep);
+      }
+    }
+    depsByTask.set(key, trimmedDeps);
   }
 
-  // Check dependency resolution & acyclicity
-  const visitState = new Map<string, "visiting" | "visited">();
-  const dfsCycle = (taskKey: string) => {
-    const state = visitState.get(taskKey);
-    if (state === "visiting") {
-      throw new PostgresRlsError(
-        "23514",
-        `Stage 7 task dependency cycle detected involving '${taskKey}'`
-      );
-    }
-    if (state === "visited") return;
-    visitState.set(taskKey, "visiting");
-    for (const dep of depsByTask.get(taskKey) ?? []) {
+  // Iterative Kahn topological sort for dependency resolution & acyclicity (Minor #2)
+  const inDegree = new Map<string, number>();
+  const dependents = new Map<string, string[]>();
+  for (const key of taskKeys) {
+    inDegree.set(key, 0);
+    dependents.set(key, []);
+  }
+  for (const [taskKey, deps] of depsByTask.entries()) {
+    for (const dep of deps) {
       if (!taskKeys.has(dep)) {
         throw new PostgresRlsError(
           "23514",
           `Stage 7 task '${taskKey}' depends on unknown task_key '${dep}'`
         );
       }
-      dfsCycle(dep);
+      dependents.get(dep)!.push(taskKey);
+      inDegree.set(taskKey, (inDegree.get(taskKey) ?? 0) + 1);
     }
-    visitState.set(taskKey, "visited");
-  };
-  for (const key of taskKeys) {
-    dfsCycle(key);
+  }
+  const queue: string[] = [];
+  for (const [key, deg] of inDegree.entries()) {
+    if (deg === 0) {
+      queue.push(key);
+    }
+  }
+  let visitedCount = 0;
+  while (queue.length > 0) {
+    const cur = queue.shift()!;
+    visitedCount += 1;
+    for (const next of dependents.get(cur) ?? []) {
+      const rem = (inDegree.get(next) ?? 0) - 1;
+      inDegree.set(next, rem);
+      if (rem === 0) {
+        queue.push(next);
+      }
+    }
+  }
+  if (visitedCount !== taskKeys.size) {
+    const cycleNodes = [...inDegree.entries()]
+      .filter(([, deg]) => deg > 0)
+      .map(([k]) => k);
+    throw new PostgresRlsError(
+      "23514",
+      `Stage 7 task dependency cycle detected involving '${cycleNodes[0] ?? "unknown"}'`
+    );
   }
 
   // Enforce 100% Stage 2 requirement & AC coverage across stories and tasks
@@ -679,6 +861,14 @@ export function validateCreateChangeRequestAgainstBaseline(input: {
   const reqs = extractStage2Requirements(input.stage2ContentJson);
   const validReqIds = new Set(reqs.map((r) => r.req_id));
   const validAcIds = new Set(reqs.flatMap((r) => r.ac_ids));
+  const acsByReqId = new Map<string, Set<string>>();
+  const acToReq = new Map<string, string>();
+  for (const r of reqs) {
+    acsByReqId.set(r.req_id, new Set(r.ac_ids));
+    for (const a of r.ac_ids) {
+      acToReq.set(a, r.req_id);
+    }
+  }
   const designIndex = extractStage3DesignIndex(input.stage3ContentJson);
   const validComponentIds = new Set(designIndex.componentIds);
 
@@ -700,6 +890,7 @@ export function validateCreateChangeRequestAgainstBaseline(input: {
   }
 
   const seenKeys = new Set<string>();
+  const proposedTaskCoveredReqs = new Set<string>();
   for (const pt of request.proposed_tasks) {
     const key = pt.task_key.trim();
     if (!key || !pt.title.trim() || seenKeys.has(key)) {
@@ -715,6 +906,7 @@ export function validateCreateChangeRequestAgainstBaseline(input: {
         `Proposed CR task '${key}' must reference >= 1 requirement_id and >= 1 ac_id`
       );
     }
+    const ptReqSet = new Set<string>();
     for (const r of pt.requirement_ids) {
       if (!validReqIds.has(r)) {
         throw new PostgresRlsError(
@@ -722,12 +914,32 @@ export function validateCreateChangeRequestAgainstBaseline(input: {
           `Proposed CR task '${key}' references unknown req_id '${r}'`
         );
       }
+      ptReqSet.add(r);
+      proposedTaskCoveredReqs.add(r);
     }
+    const ptAcSet = new Set<string>();
     for (const a of pt.ac_ids) {
       if (!validAcIds.has(a)) {
         throw new PostgresRlsError(
           "23514",
           `Proposed CR task '${key}' references unknown ac_id '${a}'`
+        );
+      }
+      const owningReq = acToReq.get(a);
+      if (!owningReq || !ptReqSet.has(owningReq)) {
+        throw new PostgresRlsError(
+          "23514",
+          `Proposed CR task '${key}': ac_id '${a}' belongs to req_id '${owningReq ?? "unknown"}', which is not listed in requirement_ids`
+        );
+      }
+      ptAcSet.add(a);
+    }
+    for (const r of ptReqSet) {
+      const expectedAcs = acsByReqId.get(r) ?? new Set<string>();
+      if (![...ptAcSet].some((a) => expectedAcs.has(a))) {
+        throw new PostgresRlsError(
+          "23514",
+          `Proposed CR task '${key}': requirement_id '${r}' has no corresponding ac_id in ac_ids`
         );
       }
     }
@@ -736,6 +948,16 @@ export function validateCreateChangeRequestAgainstBaseline(input: {
       protectedPaths: input.protectedPaths,
       contextLabel: `Change Request task '${key}'`,
     });
+  }
+
+  const uncoveredImpacted = request.impacted_requirement_ids.filter(
+    (r) => !proposedTaskCoveredReqs.has(r)
+  );
+  if (uncoveredImpacted.length > 0) {
+    throw new PostgresRlsError(
+      "23514",
+      `Change Request proposed_tasks do not cover impacted_requirement_ids: missing ${uncoveredImpacted.join(", ")}`
+    );
   }
 }
 
@@ -761,9 +983,9 @@ export function computeProjectBootstrapSha256(
       baseline_id: input.baseline_id,
       repo_path: input.repo_path,
       trusted_acceptance_dir: input.trusted_acceptance_dir,
-      base_main_commit_hash: input.base_main_commit_hash,
+      base_main_commit_hash: input.base_main_commit_hash.toLowerCase(),
       protected_paths: input.protected_paths,
-      trusted_policy_sha256: input.trusted_policy_sha256,
+      trusted_policy_sha256: input.trusted_policy_sha256.toLowerCase(),
       generated_files: input.generated_files,
       acceptance_tests: input.acceptance_tests,
     })
@@ -790,9 +1012,9 @@ export function computeChangeRequestSha256(
       project_id: input.project_id,
       pipeline_session_id: input.pipeline_session_id,
       baseline_id: input.baseline_id,
-      cr_key: input.cr_key,
-      title: input.title,
-      rationale: input.rationale,
+      cr_key: input.cr_key.trim(),
+      title: input.title.trim(),
+      rationale: input.rationale.trim(),
       impacted_requirement_ids: input.impacted_requirement_ids,
       impacted_component_ids: input.impacted_component_ids ?? [],
       proposed_tasks: input.proposed_tasks,
@@ -824,13 +1046,13 @@ export function computeReleasePackageSha256(
       project_id: input.project_id,
       pipeline_session_id: input.pipeline_session_id,
       baseline_id: input.baseline_id,
-      traceability_sha256: input.traceability_sha256,
+      traceability_sha256: input.traceability_sha256.toLowerCase(),
       coverage_percent: input.coverage_percent,
       complete: input.complete,
       total_requirements: input.total_requirements,
       merged_task_ids: input.merged_task_ids,
       applied_cr_ids: input.applied_cr_ids,
-      main_head_commit_hash: input.main_head_commit_hash,
+      main_head_commit_hash: input.main_head_commit_hash.toLowerCase(),
       summary_markdown: input.summary_markdown,
       package_json: input.package_json,
       accepted_by_principal_id: input.accepted_by_principal_id,

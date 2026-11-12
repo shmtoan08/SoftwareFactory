@@ -1,4 +1,5 @@
 import {
+  CostBudgetExceededError,
   type ManagedModelProviderExecutor,
 } from "@software-factory/adapter-sdk";
 import {
@@ -245,8 +246,8 @@ export async function runStage7DevelopmentPlan(
     }
   );
 
-  // Outside DB transaction: AC-12b preflight + LLM call + structured schema validation + postcall ledger
-  const execRes = await executor.executeStructuredPrompt<Stage7PlanningOutput>({
+  // Outside DB transaction: AC-12b preflight + LLM call + structured schema validation (ledger deferred to TX2)
+  const deferredExec = await executor.executeStructuredPromptDeferred<Stage7PlanningOutput>({
     projectId: input.project_id,
     costSessionId: pre.costSessionId,
     pipelineSessionId: pre.session.pipeline_session_id,
@@ -277,83 +278,119 @@ export async function runStage7DevelopmentPlan(
   });
 
   // Deterministic fail-closed baseline verification (100% req/AC coverage, zero protected overlap, acyclic DAG)
-  const validated = validateStage7PlanAgainstBaseline({
-    plan: execRes.parsed,
-    stage2ContentJson: pre.stage2.content_json,
-    protectedPaths: pre.bootstrap.protected_paths,
-    profiles: pre.profiles,
-  });
+  let validated: ReturnType<typeof validateStage7PlanAgainstBaseline>;
+  try {
+    validated = validateStage7PlanAgainstBaseline({
+      plan: deferredExec.parsed,
+      stage2ContentJson: pre.stage2.content_json,
+      protectedPaths: pre.bootstrap.protected_paths,
+      profiles: pre.profiles,
+    });
+  } catch (domainErr: unknown) {
+    await deferredExec.finalizeDomainFailure(
+      domainErr instanceof Error ? domainErr.message : String(domainErr)
+    );
+    throw domainErr;
+  }
 
-  // Short TX2: materialize Milestones -> Epics -> Stories -> Stage 8 Tasks + task_plan_links
-  const bundle = await store.withRlsTransaction(
-    {
-      currentProjectId: input.project_id,
-      currentPrincipalId: input.actor_principal_id,
-      currentRole: "core_api_service",
-    },
-    async () => {
-      const liveMainHead =
-        (await store.getMainRefCommitHash(input.project_id)) ??
-        pre.project.main_ref_commit_hash ??
-        pre.bootstrap.base_main_commit_hash;
+  // Short TX2: materialize Milestones -> Epics -> Stories -> Stage 8 Tasks + task_plan_links + ALLOWED ledger atomically
+  let persisted: {
+    readonly bundle: Stage7DevelopmentPlanBundle;
+    readonly ledger: ModelCallLedgerRecord;
+    readonly costSession: CostSessionRecord;
+  };
+  try {
+    persisted = await store.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.actor_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        const liveMainHead =
+          (await store.getMainRefCommitHash(input.project_id)) ??
+          pre.project.main_ref_commit_hash ??
+          pre.bootstrap.base_main_commit_hash;
 
-      return store.createStage7DevelopmentPlan({
-        project_id: input.project_id,
-        pipeline_session_id: pre.session.pipeline_session_id,
-        baseline_id: pre.baseline.baseline_id,
-        bootstrap_id: pre.bootstrap.bootstrap_id,
-        base_main_commit_hash: liveMainHead,
-        milestones: execRes.parsed.milestones.map((m, idx) => ({
-          milestone_key: m.milestone_key,
-          title: m.title,
-          description: m.description,
-          sequence_order: idx + 1,
-        })),
-        epics: execRes.parsed.epics.map((e, idx) => ({
-          milestone_key: e.milestone_key,
-          epic_key: e.epic_key,
-          title: e.title,
-          description: e.description,
-          sequence_order: idx + 1,
-        })),
-        stories: execRes.parsed.stories.map((s, idx) => ({
-          epic_key: s.epic_key,
-          story_key: s.story_key,
-          title: s.title,
-          description: s.description,
-          requirement_ids: s.requirement_ids,
-          ac_ids: s.ac_ids,
-          sequence_order: idx + 1,
-        })),
-        tasks: execRes.parsed.tasks.map((t) => {
-          const prof = t.developer_profile_key
-            ? validated.profileByKey.get(t.developer_profile_key)
-            : undefined;
-          return {
-            story_key: t.story_key,
-            title: t.title,
-            task_contract: {
-              allowed_files: [...t.allowed_files],
-              protected_paths: [...pre.bootstrap.protected_paths],
-              trusted_policy_sha256: pre.bootstrap.trusted_policy_sha256,
-            },
-            requirement_ids: t.requirement_ids,
-            ac_ids: t.ac_ids,
-            assigned_profile_id: prof?.profile_id ?? null,
-            max_rework_cycles: input.max_rework_cycles,
-          };
-        }),
-      });
+        const bundle = await store.createStage7DevelopmentPlan({
+          project_id: input.project_id,
+          pipeline_session_id: pre.session.pipeline_session_id,
+          baseline_id: pre.baseline.baseline_id,
+          bootstrap_id: pre.bootstrap.bootstrap_id,
+          base_main_commit_hash: liveMainHead,
+          milestones: deferredExec.parsed.milestones.map((m, idx) => ({
+            milestone_key: m.milestone_key,
+            title: m.title,
+            description: m.description,
+            sequence_order: idx + 1,
+          })),
+          epics: deferredExec.parsed.epics.map((e, idx) => ({
+            milestone_key: e.milestone_key,
+            epic_key: e.epic_key,
+            title: e.title,
+            description: e.description,
+            sequence_order: idx + 1,
+          })),
+          stories: deferredExec.parsed.stories.map((s, idx) => ({
+            epic_key: s.epic_key,
+            story_key: s.story_key,
+            title: s.title,
+            description: s.description,
+            requirement_ids: s.requirement_ids,
+            ac_ids: s.ac_ids,
+            sequence_order: idx + 1,
+          })),
+          tasks: deferredExec.parsed.tasks.map((t) => {
+            const prof = t.developer_profile_key
+              ? validated.profileByKey.get(t.developer_profile_key)
+              : undefined;
+            return {
+              story_key: t.story_key,
+              title: t.title,
+              task_contract: {
+                allowed_files: [...t.allowed_files],
+                protected_paths: [...pre.bootstrap.protected_paths],
+                trusted_policy_sha256: pre.bootstrap.trusted_policy_sha256,
+              },
+              requirement_ids: t.requirement_ids,
+              ac_ids: t.ac_ids,
+              assigned_profile_id: prof?.profile_id ?? null,
+              max_rework_cycles: input.max_rework_cycles,
+            };
+          }),
+        });
+        const committed = await deferredExec.commitAllowedLedger();
+        return {
+          bundle,
+          ledger: committed.ledger,
+          costSession: committed.costSession,
+        };
+      }
+    );
+  } catch (persistErr: unknown) {
+    if (persistErr instanceof CostBudgetExceededError) {
+      throw persistErr;
     }
-  );
+    const isValidation =
+      persistErr instanceof PostgresRlsError &&
+      (persistErr.sqlState === "23514" ||
+        persistErr.sqlState === "23505" ||
+        persistErr.sqlState === "23503");
+    const rawMsg = persistErr instanceof Error ? persistErr.message : String(persistErr);
+    await deferredExec.finalizeDomainFailure(
+      isValidation ? rawMsg : `[PERSISTENCE_FAILURE] ${rawMsg}`,
+      "FAILED_VALIDATION"
+    );
+    throw persistErr;
+  }
 
   return {
     session: pre.session,
     baseline: pre.baseline,
     bootstrap: pre.bootstrap,
-    plan: execRes.parsed,
-    bundle,
-    ledger: execRes.ledger,
-    costSession: execRes.costSession,
+    plan: deferredExec.parsed,
+    bundle: persisted.bundle,
+    ledger: persisted.ledger,
+    costSession: persisted.costSession,
   };
 }

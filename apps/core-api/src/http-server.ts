@@ -934,10 +934,8 @@ export class CoreApiHttpServer {
       if (method === "GET" && m6bBundleMatch?.[1] && m6bBundleMatch?.[2]) {
         const projectId = decodeURIComponent(m6bBundleMatch[1]);
         const pipelineSessionId = decodeURIComponent(m6bBundleMatch[2]);
-        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
         const bundle = await this.coreApi.getPipelineM6BBundle(projectId, auth, {
           pipeline_session_id: pipelineSessionId,
-          live_main_head_commit_hash: liveMain,
         });
         this.sendJson(res, 200, bundle);
         return;
@@ -1039,10 +1037,8 @@ export class CoreApiHttpServer {
       if (method === "GET" && traceabilityMatch?.[1] && traceabilityMatch?.[2]) {
         const projectId = decodeURIComponent(traceabilityMatch[1]);
         const pipelineSessionId = decodeURIComponent(traceabilityMatch[2]);
-        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
         const matrix = await this.coreApi.getPipelineTraceabilityMatrix(projectId, auth, {
           pipeline_session_id: pipelineSessionId,
-          live_main_head_commit_hash: liveMain,
         });
         this.sendJson(res, 200, matrix);
         return;
@@ -1065,12 +1061,10 @@ export class CoreApiHttpServer {
         }
         if (method === "POST") {
           const body = await this.readJsonBody<{
-            live_main_head_commit_hash?: string;
             notes?: string;
           }>(req);
           const pkg = await this.coreApi.issuePipelineReleasePackage(projectId, auth, {
             pipeline_session_id: pipelineSessionId,
-            live_main_head_commit_hash: body.live_main_head_commit_hash,
             notes: body.notes,
           });
           this.sendJson(res, 201, pkg);
@@ -2270,19 +2264,13 @@ export class HttpCoreApiClient {
   public async getPipelineM6BBundle(
     projectId: string,
     auth: CoreApiAuthContext,
-    pipelineSessionId: string,
-    query?: { readonly live_main_head_commit_hash?: string }
+    pipelineSessionId: string
   ): Promise<M6BStages5To9Bundle> {
-    const qs = new URLSearchParams();
-    if (query?.live_main_head_commit_hash) {
-      qs.set("live_main_head_commit_hash", query.live_main_head_commit_hash);
-    }
-    const suffix = qs.toString() ? `?${qs.toString()}` : "";
     const res = await this.requestJson<M6BStages5To9Bundle>(
       "GET",
       `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
         pipelineSessionId
-      )}/m6b-bundle${suffix}`,
+      )}/m6b-bundle`,
       auth,
       undefined,
       [200]
@@ -2384,19 +2372,13 @@ export class HttpCoreApiClient {
   public async getPipelineTraceabilityMatrix(
     projectId: string,
     auth: CoreApiAuthContext,
-    pipelineSessionId: string,
-    query?: { readonly live_main_head_commit_hash?: string }
+    pipelineSessionId: string
   ): Promise<BidirectionalTraceabilityMatrix> {
-    const qs = new URLSearchParams();
-    if (query?.live_main_head_commit_hash) {
-      qs.set("live_main_head_commit_hash", query.live_main_head_commit_hash);
-    }
-    const suffix = qs.toString() ? `?${qs.toString()}` : "";
     const res = await this.requestJson<BidirectionalTraceabilityMatrix>(
       "GET",
       `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
         pipelineSessionId
-      )}/traceability${suffix}`,
+      )}/traceability`,
       auth,
       undefined,
       [200]
@@ -2409,7 +2391,6 @@ export class HttpCoreApiClient {
     auth: CoreApiAuthContext,
     pipelineSessionId: string,
     input: {
-      readonly live_main_head_commit_hash?: string;
       readonly notes?: string;
     } = {}
   ): Promise<ReleaseAcceptancePackageRecord> {

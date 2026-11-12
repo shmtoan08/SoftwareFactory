@@ -858,7 +858,7 @@ export class CoreApiService {
     const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
     const snapshotStore = input.snapshot_store ?? this.snapshotStore ?? undefined;
 
-    const { verifiedImport, clockIso } = await this.store.withRlsTransaction(
+    const { taskBaseMainCommitHash, verifiedImport, clockIso } = await this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
@@ -899,6 +899,7 @@ export class CoreApiService {
         }
 
         return {
+          taskBaseMainCommitHash: task.base_main_commit_hash,
           verifiedImport: foundImport,
           clockIso: await this.store.clockTimestampIso(),
         };
@@ -978,6 +979,7 @@ export class CoreApiService {
             base_main_commit_hash: buildResult.baseMainCommitHash,
             merge_candidate_hash: buildResult.mergeCandidateHash,
             verified_tree_hash: buildResult.verifiedTreeHash,
+            allow_rebased_tree_hash: buildResult.baseMainCommitHash !== taskBaseMainCommitHash,
             snapshot_path: buildResult.snapshotPath ?? null,
             snapshot_sha256: buildResult.snapshotSha256 ?? null,
             snapshot_size_bytes: buildResult.snapshotSizeBytes ?? null,
@@ -2420,7 +2422,13 @@ export class CoreApiService {
       readonly acceptance_specs?: Readonly<Record<string, Stage5AcceptanceSpecOverride>>;
     }
   ): Promise<Stage5BootstrapOutcome> {
-    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    const hasCustomSpecs =
+      input.acceptance_specs !== undefined && Object.keys(input.acceptance_specs).length > 0;
+    const verified = await this.authorize(
+      auth,
+      projectId,
+      hasCustomSpecs ? APPROVAL_ROLES : MUTATION_ROLES
+    );
     return this.pipelineService.bootstrapProject({
       ...input,
       project_id: projectId,
@@ -2586,7 +2594,6 @@ export class CoreApiService {
     auth: CoreApiAuthContext,
     input: {
       readonly pipeline_session_id: string;
-      readonly live_main_head_commit_hash?: string;
     }
   ): Promise<BidirectionalTraceabilityMatrix> {
     const verified = await this.authorize(auth, projectId, READ_ROLES);
@@ -2602,7 +2609,6 @@ export class CoreApiService {
     auth: CoreApiAuthContext,
     input: {
       readonly pipeline_session_id: string;
-      readonly live_main_head_commit_hash?: string;
       readonly notes?: string;
     }
   ): Promise<ReleaseAcceptancePackageRecord> {
@@ -2632,7 +2638,6 @@ export class CoreApiService {
     auth: CoreApiAuthContext,
     input: {
       readonly pipeline_session_id: string;
-      readonly live_main_head_commit_hash?: string;
     }
   ): Promise<M6BStages5To9Bundle> {
     const verified = await this.authorize(auth, projectId, READ_ROLES);

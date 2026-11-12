@@ -115,6 +115,7 @@ import {
   computeReleasePackageSha256,
   serializeTrustedAcceptanceTestSpecs,
   validateAgentOrganizationProfileInput,
+  validateProjectBootstrapInput,
 } from "./m6b-validation.ts";
 
 export type PostgresSslMode = "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
@@ -1407,6 +1408,55 @@ export class PostgresRuntimePool {
     );
   }
 
+  /**
+   * Executes an independent transient PostgreSQL RLS transaction outside any active outer
+   * transaction so durable audit ledgers (`BLOCKED_*` / `FAILED_*`) survive outer rollback
+   * without self-deadlocking even when `maxConnections === 1`.
+   */
+  public async runAutonomousRlsTransaction<T>(
+    ctx: Partial<RlsSessionContext>,
+    fn: (conn: PooledPgConnection, effectiveSession: RlsSessionContext) => Promise<T> | T
+  ): Promise<T> {
+    if (!this.txAsyncStorage.getStore()) {
+      return this.withRlsTransaction(ctx, fn);
+    }
+    if (this.closed) {
+      throw new Error("PostgresRuntimePool is closed");
+    }
+    const session: RlsSessionContext = {
+      currentProjectId: ctx.currentProjectId ?? null,
+      currentPrincipalId: ctx.currentPrincipalId ?? null,
+      currentRole: ctx.currentRole ?? "anonymous",
+    };
+    const conn = await PooledPgConnection.connect(this.config);
+    this.transactionsExecuted += 1;
+    let committed = false;
+    try {
+      await conn.simpleQuery("BEGIN; SET LOCAL ROLE app_runtime;");
+      await conn.query(
+        "SELECT set_config('app.current_project_id', $1::text, true), set_config('app.current_principal_id', $2::text, true), set_config('app.current_role', $3::text, true);",
+        [session.currentProjectId ?? "", session.currentPrincipalId ?? "", session.currentRole]
+      );
+      const result = await this.txAsyncStorage.run({ conn, session }, () =>
+        fn(conn, session)
+      );
+      await conn.simpleQuery("COMMIT;");
+      committed = true;
+      return result;
+    } catch (error) {
+      if (!committed && conn.isAlive()) {
+        try {
+          await conn.simpleQuery("ROLLBACK;");
+        } catch {
+          // ignore rollback error on broken connection
+        }
+      }
+      throw error;
+    } finally {
+      await conn.close();
+    }
+  }
+
   public async close(): Promise<void> {
     this.closed = true;
     while (this.waiters.length > 0) {
@@ -1891,7 +1941,9 @@ function mapStage1DiscoveryItemRow(row: Record<string, unknown>): Stage1Discover
 }
 
 function mapStageArtifactRow(row: Record<string, unknown>): StageArtifactRecord {
-  return {
+  const contentJson = (row.content_json as Record<string, unknown>) ?? {};
+  const artifactSha256 = String(row.artifact_sha256).trimEnd();
+  const record: StageArtifactRecord = {
     artifact_id: String(row.artifact_id),
     project_id: String(row.project_id),
     pipeline_session_id: String(row.pipeline_session_id),
@@ -1903,11 +1955,19 @@ function mapStageArtifactRow(row: Record<string, unknown>): StageArtifactRecord 
     prompt_id: String(row.prompt_id),
     prompt_version: String(row.prompt_version),
     prompt_sha256: String(row.prompt_sha256).trimEnd(),
-    content_json: (row.content_json as Record<string, unknown>) ?? {},
-    artifact_sha256: String(row.artifact_sha256).trimEnd(),
+    content_json: contentJson,
+    artifact_sha256: artifactSha256,
     created_by_principal_id: String(row.created_by_principal_id),
     created_at: String(row.created_at),
   };
+  const computed = computeCanonicalPayloadSha256(contentJson);
+  if (computed !== artifactSha256.toLowerCase()) {
+    throw new PostgresRlsError(
+      "23514",
+      `Integrity check failed for StageArtifact ${record.artifact_id}: content_json canonical sha256 (${computed}) !== artifact_sha256 (${artifactSha256})`
+    );
+  }
+  return record;
 }
 
 function mapStageApprovalGateRow(row: Record<string, unknown>): StageApprovalGateRecord {
@@ -1926,7 +1986,7 @@ function mapStageApprovalGateRow(row: Record<string, unknown>): StageApprovalGat
 }
 
 function mapBaselineSpecFreezeRow(row: Record<string, unknown>): BaselineSpecFreezeRecord {
-  return {
+  const record: BaselineSpecFreezeRecord = {
     baseline_id: String(row.baseline_id),
     project_id: String(row.project_id),
     pipeline_session_id: String(row.pipeline_session_id),
@@ -1944,6 +2004,14 @@ function mapBaselineSpecFreezeRow(row: Record<string, unknown>): BaselineSpecFre
     status: "FROZEN",
     frozen_at: String(row.frozen_at),
   };
+  const computed = computeBaselineFreezeBundleSha256(record);
+  if (computed !== record.freeze_bundle_sha256.toLowerCase()) {
+    throw new PostgresRlsError(
+      "23514",
+      `Integrity check failed for BaselineSpecFreeze ${record.baseline_id}: computed sha256 (${computed}) !== stored (${record.freeze_bundle_sha256})`
+    );
+  }
+  return record;
 }
 
 function asStringArrayCell(val: unknown): string[] {
@@ -1951,7 +2019,7 @@ function asStringArrayCell(val: unknown): string[] {
 }
 
 function mapProjectBootstrapRow(row: Record<string, unknown>): ProjectBootstrapRecord {
-  return {
+  const record: ProjectBootstrapRecord = {
     bootstrap_id: String(row.bootstrap_id),
     project_id: String(row.project_id),
     pipeline_session_id: String(row.pipeline_session_id),
@@ -1969,6 +2037,14 @@ function mapProjectBootstrapRow(row: Record<string, unknown>): ProjectBootstrapR
     created_by_principal_id: String(row.created_by_principal_id),
     created_at: String(row.created_at),
   };
+  const computed = computeProjectBootstrapSha256(record);
+  if (computed !== record.bootstrap_sha256.toLowerCase()) {
+    throw new PostgresRlsError(
+      "23514",
+      `Integrity check failed for ProjectBootstrap ${record.bootstrap_id}: computed sha256 (${computed}) !== stored (${record.bootstrap_sha256})`
+    );
+  }
+  return record;
 }
 
 function mapAgentOrganizationProfileRow(
@@ -2053,7 +2129,7 @@ function mapTaskPlanLinkRow(row: Record<string, unknown>): TaskPlanLinkRecord {
 }
 
 function mapChangeRequestRow(row: Record<string, unknown>): ChangeRequestRecord {
-  return {
+  const record: ChangeRequestRecord = {
     cr_id: String(row.cr_id),
     project_id: String(row.project_id),
     pipeline_session_id: String(row.pipeline_session_id),
@@ -2081,12 +2157,20 @@ function mapChangeRequestRow(row: Record<string, unknown>): ChangeRequestRecord 
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
   };
+  const computed = computeChangeRequestSha256(record);
+  if (computed !== record.cr_sha256.toLowerCase()) {
+    throw new PostgresRlsError(
+      "23514",
+      `Integrity check failed for ChangeRequest ${record.cr_id}: computed sha256 (${computed}) !== stored (${record.cr_sha256})`
+    );
+  }
+  return record;
 }
 
 function mapReleaseAcceptancePackageRow(
   row: Record<string, unknown>
 ): ReleaseAcceptancePackageRecord {
-  return {
+  const record: ReleaseAcceptancePackageRecord = {
     release_id: String(row.release_id),
     project_id: String(row.project_id),
     pipeline_session_id: String(row.pipeline_session_id),
@@ -2104,6 +2188,14 @@ function mapReleaseAcceptancePackageRow(
     accepted_by_principal_id: String(row.accepted_by_principal_id),
     accepted_at: String(row.accepted_at),
   };
+  const computed = computeReleasePackageSha256(record);
+  if (computed !== record.package_sha256.toLowerCase()) {
+    throw new PostgresRlsError(
+      "23514",
+      `Integrity check failed for ReleaseAcceptancePackage ${record.release_id}: computed sha256 (${computed}) !== stored (${record.package_sha256})`
+    );
+  }
+  return record;
 }
 
 /**
@@ -2136,6 +2228,16 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     fn: () => Promise<T> | T
   ): Promise<T> {
     return this.pool.withRlsTransaction(ctx, () => fn());
+  }
+
+  private withExistingOrRlsTransaction<T>(
+    ctx: Partial<RlsSessionContext>,
+    fn: () => Promise<T> | T
+  ): Promise<T> {
+    if (this.pool.getActiveTxSession()) {
+      return Promise.resolve(fn());
+    }
+    return this.withRlsTransaction(ctx, fn);
   }
 
   private async insertOutboxEventSql(
@@ -2384,86 +2486,95 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     heartbeat_interval_ms?: number;
     lease_ttl_ms?: number;
   }): Promise<TaskLeaseRecord> {
-    try {
-      const taskRes = await this.pool.queryInActiveTx(
-        "SELECT * FROM tasks WHERE task_id = $1::uuid AND project_id = $2::uuid FOR UPDATE;",
-        [input.task_id, input.project_id]
-      );
-      const taskRow = taskRes.rows[0];
-      if (!taskRow) {
-        throw new PostgresRlsError(
-          "23503",
-          `Task ${input.task_id} not found in project ${input.project_id}`
-        );
-      }
-      const task = mapTaskRow(taskRow);
-      if (task.status !== "Ready" && task.status !== "ReworkRequired") {
-        throw new Error(`Cannot grant lease when task is in status ${task.status}`);
-      }
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const taskRes = await this.pool.queryInActiveTx(
+            "SELECT * FROM tasks WHERE task_id = $1::uuid AND project_id = $2::uuid FOR UPDATE;",
+            [input.task_id, input.project_id]
+          );
+          const taskRow = taskRes.rows[0];
+          if (!taskRow) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task ${input.task_id} not found in project ${input.project_id}`
+            );
+          }
+          const task = mapTaskRow(taskRow);
+          if (task.status !== "Ready" && task.status !== "ReworkRequired") {
+            throw new Error(`Cannot grant lease when task is in status ${task.status}`);
+          }
 
-      let nextReworkCount = task.rework_count;
-      if (task.status === "ReworkRequired") {
-        if (task.rework_count >= task.max_rework_cycles) {
+          let nextReworkCount = task.rework_count;
+          if (task.status === "ReworkRequired") {
+            if (task.rework_count >= task.max_rework_cycles) {
+              await this.pool.queryInActiveTx(
+                "UPDATE tasks SET status = 'ManualIntervention', updated_at = clock_timestamp() WHERE task_id = $1::uuid;",
+                [task.task_id]
+              );
+              throw new PostgresRlsError(
+                "23514",
+                `Max rework cycles (${task.max_rework_cycles}) exceeded for task ${task.task_id}; moved to ManualIntervention`
+              );
+            }
+            nextReworkCount += 1;
+          }
+
+          const hbMs = input.heartbeat_interval_ms ?? 10_000;
+          const ttlMs = input.lease_ttl_ms ?? 35_000;
+          const nextAttemptNo = task.current_attempt_no + 1;
+          const nextEpoch = task.active_lease_epoch + 1;
+          const leaseId = randomUUID();
+          const idempotencyKey = computeTaskExecutionIdempotencyKey(
+            input.project_id,
+            input.task_id,
+            nextAttemptNo
+          );
+
+          const leaseRes = await this.pool.queryInActiveTx(
+            `INSERT INTO task_leases (
+              lease_id, project_id, task_id, attempt_no, lease_epoch, worker_id, status,
+              task_execution_idempotency_key, last_processed_seq, heartbeat_interval_ms,
+              lease_ttl_ms, leased_at, last_heartbeat_at, expires_at
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::integer, $5::bigint, $6::text, 'ACTIVE',
+              $7::text, 0, $8::integer, $9::integer, clock_timestamp(), clock_timestamp(),
+              clock_timestamp() + ($9::bigint * interval '1 millisecond')
+            ) RETURNING *;`,
+            [leaseId, input.project_id, input.task_id, nextAttemptNo, nextEpoch, input.worker_id, idempotencyKey, hbMs, ttlMs]
+          );
+          const lease = mapLeaseRow(leaseRes.rows[0]!);
+
           await this.pool.queryInActiveTx(
-            "UPDATE tasks SET status = 'ManualIntervention', updated_at = clock_timestamp() WHERE task_id = $1::uuid;",
-            [task.task_id]
+            `UPDATE tasks SET
+              status = 'Leased',
+              current_attempt_no = $1::integer,
+              rework_count = $2::integer,
+              active_lease_id = $3::uuid,
+              active_lease_epoch = $4::bigint,
+              updated_at = clock_timestamp()
+            WHERE task_id = $5::uuid;`,
+            [nextAttemptNo, nextReworkCount, leaseId, nextEpoch, task.task_id]
           );
-          throw new PostgresRlsError(
-            "23514",
-            `Max rework cycles (${task.max_rework_cycles}) exceeded for task ${task.task_id}; moved to ManualIntervention`
-          );
+
+          await this.insertOutboxEventSql(input.project_id, "task_lease", leaseId, "lease.granted", {
+            task_id: task.task_id,
+            lease_id: leaseId,
+            lease_epoch: nextEpoch,
+            worker_id: input.worker_id,
+          });
+
+          return lease;
+        } catch (error) {
+          mapPgError(error);
         }
-        nextReworkCount += 1;
       }
-
-      const hbMs = input.heartbeat_interval_ms ?? 10_000;
-      const ttlMs = input.lease_ttl_ms ?? 35_000;
-      const nextAttemptNo = task.current_attempt_no + 1;
-      const nextEpoch = task.active_lease_epoch + 1;
-      const leaseId = randomUUID();
-      const idempotencyKey = computeTaskExecutionIdempotencyKey(
-        input.project_id,
-        input.task_id,
-        nextAttemptNo
-      );
-
-      const leaseRes = await this.pool.queryInActiveTx(
-        `INSERT INTO task_leases (
-          lease_id, project_id, task_id, attempt_no, lease_epoch, worker_id, status,
-          task_execution_idempotency_key, last_processed_seq, heartbeat_interval_ms,
-          lease_ttl_ms, leased_at, last_heartbeat_at, expires_at
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::integer, $5::bigint, $6::text, 'ACTIVE',
-          $7::text, 0, $8::integer, $9::integer, clock_timestamp(), clock_timestamp(),
-          clock_timestamp() + ($9::bigint * interval '1 millisecond')
-        ) RETURNING *;`,
-        [leaseId, input.project_id, input.task_id, nextAttemptNo, nextEpoch, input.worker_id, idempotencyKey, hbMs, ttlMs]
-      );
-      const lease = mapLeaseRow(leaseRes.rows[0]!);
-
-      await this.pool.queryInActiveTx(
-        `UPDATE tasks SET
-          status = 'Leased',
-          current_attempt_no = $1::integer,
-          rework_count = $2::integer,
-          active_lease_id = $3::uuid,
-          active_lease_epoch = $4::bigint,
-          updated_at = clock_timestamp()
-        WHERE task_id = $5::uuid;`,
-        [nextAttemptNo, nextReworkCount, leaseId, nextEpoch, task.task_id]
-      );
-
-      await this.insertOutboxEventSql(input.project_id, "task_lease", leaseId, "lease.granted", {
-        task_id: task.task_id,
-        lease_id: leaseId,
-        lease_epoch: nextEpoch,
-        worker_id: input.worker_id,
-      });
-
-      return lease;
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async getLeaseById(leaseId: string): Promise<TaskLeaseRecord | null> {
@@ -2517,362 +2628,371 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     envelope: WorkerEventEnvelope,
     inTransactionDelayMs = 0
   ): Promise<ServerEventAckContract> {
-    try {
-      const lockRes = await this.pool.queryInActiveTx(
-        `SELECT l.lease_id, l.project_id, l.task_id, l.attempt_no, l.lease_epoch,
-                l.worker_id, l.status AS lease_status, l.last_processed_seq,
-                l.lease_ttl_ms, l.expires_at, l.revoked_at,
-                t.status AS task_status, t.active_lease_id, t.active_lease_epoch,
-                clock_timestamp() AS server_now,
-                (l.expires_at <= clock_timestamp()) AS is_expired_now
-         FROM task_leases l
-         INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
-         WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
-         FOR UPDATE OF l, t;`,
-        [envelope.lease_id, envelope.task_id, envelope.project_id]
-      );
-
-      if (inTransactionDelayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, inTransactionDelayMs));
-      }
-
-      const nowIso = await this.clockTimestampIso();
-      const row = lockRes.rows[0];
-      if (!row) {
-        const tRes = await this.pool.queryInActiveTx(
-          "SELECT status FROM tasks WHERE task_id = $1::uuid LIMIT 1;",
-          [envelope.task_id]
-        );
-        return {
-          http_status: 409,
-          ack_status: "REJECTED_STALE_LEASE",
-          lease_id: envelope.lease_id,
-          lease_epoch: envelope.lease_epoch,
-          lease_status: "REVOKED",
-          acked_sequence_no: 0,
-          expected_next_seq: 0,
-          task_status: (tRes.rows[0]?.status as TaskStatus) ?? "ManualIntervention",
-          lease_expires_at: null,
-          server_clock_timestamp: nowIso,
-          error_code: "ERR_STALE_LEASE",
-        };
-      }
-
-      const expiresCheck = await this.pool.queryInActiveTx<{
-        is_expired_now: boolean;
-        server_now: string;
-      }>(
-        "SELECT ($1::timestamptz <= clock_timestamp()) AS is_expired_now, clock_timestamp() AS server_now;",
-        [row.expires_at]
-      );
-      const isExpiredNow = Boolean(expiresCheck.rows[0]?.is_expired_now);
-      const evalNowIso = String(expiresCheck.rows[0]?.server_now ?? nowIso);
-      let leaseStatus = String(row.lease_status) as TaskLeaseRecord["status"];
-      let taskStatus = String(row.task_status) as TaskStatus;
-      const leaseEpoch = Number(row.lease_epoch);
-      const lastProcessedSeq = Number(row.last_processed_seq);
-
-      if (isExpiredNow && leaseStatus === "ACTIVE") {
-        leaseStatus = "EXPIRED";
-        await this.pool.queryInActiveTx(
-          "UPDATE task_leases SET status = 'EXPIRED' WHERE lease_id = $1::uuid;",
-          [envelope.lease_id]
-        );
-        if (String(row.active_lease_id ?? "") === envelope.lease_id) {
-          if (taskStatus === "Leased" || taskStatus === "ExecutingInTarget") {
-            taskStatus = "Ready";
-          }
-          await this.pool.queryInActiveTx(
-            `UPDATE tasks SET active_lease_id = NULL, status = $1::text, updated_at = clock_timestamp()
-             WHERE task_id = $2::uuid;`,
-            [taskStatus, envelope.task_id]
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: envelope.project_id,
+        currentPrincipalId: envelope.worker_id,
+        currentRole: "gateway_service",
+      },
+      async () => {
+        try {
+          const lockRes = await this.pool.queryInActiveTx(
+            `SELECT l.lease_id, l.project_id, l.task_id, l.attempt_no, l.lease_epoch,
+                    l.worker_id, l.status AS lease_status, l.last_processed_seq,
+                    l.lease_ttl_ms, l.expires_at, l.revoked_at,
+                    t.status AS task_status, t.active_lease_id, t.active_lease_epoch,
+                    clock_timestamp() AS server_now,
+                    (l.expires_at <= clock_timestamp()) AS is_expired_now
+             FROM task_leases l
+             INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
+             WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
+             FOR UPDATE OF l, t;`,
+            [envelope.lease_id, envelope.task_id, envelope.project_id]
           );
-        }
-      }
 
-      if (
-        String(row.worker_id) !== envelope.worker_id ||
-        leaseStatus !== "ACTIVE" ||
-        row.revoked_at !== null ||
-        isExpiredNow ||
-        leaseEpoch !== envelope.lease_epoch ||
-        String(row.active_lease_id ?? "") !== envelope.lease_id ||
-        Number(row.active_lease_epoch) !== envelope.lease_epoch
-      ) {
-        return {
-          http_status: 409,
-          ack_status: "REJECTED_STALE_LEASE",
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          lease_status: leaseStatus,
-          acked_sequence_no: lastProcessedSeq,
-          expected_next_seq: 0,
-          task_status: taskStatus,
-          lease_expires_at: null,
-          server_clock_timestamp: evalNowIso,
-          error_code: "ERR_STALE_LEASE",
-        };
-      }
+          if (inTransactionDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, inTransactionDelayMs));
+          }
 
-      const existingRes = await this.pool.queryInActiveTx(
-        `SELECT * FROM processed_worker_events
-         WHERE (project_id = $1::uuid AND event_idempotency_key = $2::text)
-            OR (lease_id = $3::uuid AND sequence_no = $4::bigint)
-         LIMIT 1;`,
-        [envelope.project_id, envelope.event_idempotency_key, envelope.lease_id, envelope.sequence_no]
-      );
-      const existingRow = existingRes.rows[0];
-      if (existingRow) {
-        const existing = mapProcessedEventRow(existingRow);
-        const computedSha = computeCanonicalPayloadSha256(envelope.payload);
-        if (
-          existing.event_idempotency_key === envelope.event_idempotency_key &&
-          existing.payload_sha256 === envelope.payload_sha256 &&
-          existing.payload_sha256 === computedSha &&
-          existing.sequence_no === envelope.sequence_no &&
-          existing.event_type === envelope.event_type
-        ) {
+          const nowIso = await this.clockTimestampIso();
+          const row = lockRes.rows[0];
+          if (!row) {
+            const tRes = await this.pool.queryInActiveTx(
+              "SELECT status FROM tasks WHERE task_id = $1::uuid LIMIT 1;",
+              [envelope.task_id]
+            );
+            return {
+              http_status: 409,
+              ack_status: "REJECTED_STALE_LEASE",
+              lease_id: envelope.lease_id,
+              lease_epoch: envelope.lease_epoch,
+              lease_status: "REVOKED",
+              acked_sequence_no: 0,
+              expected_next_seq: 0,
+              task_status: (tRes.rows[0]?.status as TaskStatus) ?? "ManualIntervention",
+              lease_expires_at: null,
+              server_clock_timestamp: nowIso,
+              error_code: "ERR_STALE_LEASE",
+            };
+          }
+
+          const expiresCheck = await this.pool.queryInActiveTx<{
+            is_expired_now: boolean;
+            server_now: string;
+          }>(
+            "SELECT ($1::timestamptz <= clock_timestamp()) AS is_expired_now, clock_timestamp() AS server_now;",
+            [row.expires_at]
+          );
+          const isExpiredNow = Boolean(expiresCheck.rows[0]?.is_expired_now);
+          const evalNowIso = String(expiresCheck.rows[0]?.server_now ?? nowIso);
+          let leaseStatus = String(row.lease_status) as TaskLeaseRecord["status"];
+          let taskStatus = String(row.task_status) as TaskStatus;
+          const leaseEpoch = Number(row.lease_epoch);
+          const lastProcessedSeq = Number(row.last_processed_seq);
+
+          if (isExpiredNow && leaseStatus === "ACTIVE") {
+            leaseStatus = "EXPIRED";
+            await this.pool.queryInActiveTx(
+              "UPDATE task_leases SET status = 'EXPIRED' WHERE lease_id = $1::uuid;",
+              [envelope.lease_id]
+            );
+            if (String(row.active_lease_id ?? "") === envelope.lease_id) {
+              if (taskStatus === "Leased" || taskStatus === "ExecutingInTarget") {
+                taskStatus = "Ready";
+              }
+              await this.pool.queryInActiveTx(
+                `UPDATE tasks SET active_lease_id = NULL, status = $1::text, updated_at = clock_timestamp()
+                 WHERE task_id = $2::uuid;`,
+                [taskStatus, envelope.task_id]
+              );
+            }
+          }
+
+          if (
+            String(row.worker_id) !== envelope.worker_id ||
+            leaseStatus !== "ACTIVE" ||
+            row.revoked_at !== null ||
+            isExpiredNow ||
+            leaseEpoch !== envelope.lease_epoch ||
+            String(row.active_lease_id ?? "") !== envelope.lease_id ||
+            Number(row.active_lease_epoch) !== envelope.lease_epoch
+          ) {
+            return {
+              http_status: 409,
+              ack_status: "REJECTED_STALE_LEASE",
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              lease_status: leaseStatus,
+              acked_sequence_no: lastProcessedSeq,
+              expected_next_seq: 0,
+              task_status: taskStatus,
+              lease_expires_at: null,
+              server_clock_timestamp: evalNowIso,
+              error_code: "ERR_STALE_LEASE",
+            };
+          }
+
+          const existingRes = await this.pool.queryInActiveTx(
+            `SELECT * FROM processed_worker_events
+             WHERE (project_id = $1::uuid AND event_idempotency_key = $2::text)
+                OR (lease_id = $3::uuid AND sequence_no = $4::bigint)
+             LIMIT 1;`,
+            [envelope.project_id, envelope.event_idempotency_key, envelope.lease_id, envelope.sequence_no]
+          );
+          const existingRow = existingRes.rows[0];
+          if (existingRow) {
+            const existing = mapProcessedEventRow(existingRow);
+            const computedSha = computeCanonicalPayloadSha256(envelope.payload);
+            if (
+              existing.event_idempotency_key === envelope.event_idempotency_key &&
+              existing.payload_sha256 === envelope.payload_sha256 &&
+              existing.payload_sha256 === computedSha &&
+              existing.sequence_no === envelope.sequence_no &&
+              existing.event_type === envelope.event_type
+            ) {
+              return {
+                http_status: 200,
+                ack_status: "DUPLICATE_RETRY_NOP",
+                lease_id: envelope.lease_id,
+                lease_epoch: leaseEpoch,
+                lease_status: leaseStatus,
+                acked_sequence_no: existing.sequence_no,
+                expected_next_seq: lastProcessedSeq + 1,
+                task_status: taskStatus,
+                lease_expires_at: String(row.expires_at),
+                server_clock_timestamp: evalNowIso,
+              };
+            }
+
+            return {
+              http_status: 409,
+              ack_status: "REJECTED_CONFLICT_PAYLOAD",
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              lease_status: leaseStatus,
+              acked_sequence_no: lastProcessedSeq,
+              expected_next_seq: lastProcessedSeq + 1,
+              task_status: taskStatus,
+              lease_expires_at: String(row.expires_at),
+              server_clock_timestamp: evalNowIso,
+              error_code: "ERR_IDEMPOTENCY_PAYLOAD_MISMATCH",
+            };
+          }
+
+          const expectedNextSeq = lastProcessedSeq + 1;
+          if (envelope.sequence_no !== expectedNextSeq) {
+            return {
+              http_status: 409,
+              ack_status: "REJECTED_OUT_OF_ORDER",
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              lease_status: leaseStatus,
+              acked_sequence_no: lastProcessedSeq,
+              expected_next_seq: expectedNextSeq,
+              task_status: taskStatus,
+              lease_expires_at: String(row.expires_at),
+              server_clock_timestamp: evalNowIso,
+              error_code:
+                envelope.sequence_no < expectedNextSeq ? "ERR_SEQ_ALREADY_ADVANCED" : "ERR_SEQ_GAP",
+            };
+          }
+
+          const actualPayloadSha = computeCanonicalPayloadSha256(envelope.payload);
+          if (actualPayloadSha !== envelope.payload_sha256) {
+            return {
+              http_status: 409,
+              ack_status: "REJECTED_CONFLICT_PAYLOAD",
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              lease_status: leaseStatus,
+              acked_sequence_no: lastProcessedSeq,
+              expected_next_seq: expectedNextSeq,
+              task_status: taskStatus,
+              lease_expires_at: String(row.expires_at),
+              server_clock_timestamp: evalNowIso,
+              error_code: "ERR_IDEMPOTENCY_PAYLOAD_MISMATCH",
+            };
+          }
+
+          const transitionRule = WORKER_EVENT_STATE_TRANSITIONS[envelope.event_type];
+          if (!transitionRule.allowedFrom.includes(taskStatus)) {
+            return {
+              http_status: 422,
+              ack_status: "REJECTED_INVALID_TRANSITION",
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              lease_status: leaseStatus,
+              acked_sequence_no: lastProcessedSeq,
+              expected_next_seq: expectedNextSeq,
+              task_status: taskStatus,
+              lease_expires_at: String(row.expires_at),
+              server_clock_timestamp: evalNowIso,
+              error_code: "ERR_INVALID_STATE_TRANSITION",
+            };
+          }
+
+          await this.pool.queryInActiveTx(
+            `INSERT INTO processed_worker_events (
+              project_id, task_id, lease_id, lease_epoch, sequence_no,
+              event_type, event_idempotency_key, payload_sha256, payload_json
+            ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::bigint, $6::text, $7::text, $8::text, $9::jsonb);`,
+            [
+              envelope.project_id,
+              envelope.task_id,
+              envelope.lease_id,
+              envelope.lease_epoch,
+              envelope.sequence_no,
+              envelope.event_type,
+              envelope.event_idempotency_key,
+              envelope.payload_sha256,
+              envelope.payload,
+            ]
+          );
+
+          let nextLeaseStatus: TaskLeaseRecord["status"] = "ACTIVE";
+          let nextTaskStatus: TaskStatus =
+            transitionRule.targetStatus === "UNCHANGED" ? taskStatus : transitionRule.targetStatus;
+          const leaseTtlMs = Number(row.lease_ttl_ms);
+
+          if (transitionRule.closesLeaseAs === "COMPLETED") {
+            nextLeaseStatus = "COMPLETED";
+            const updL = await this.pool.queryInActiveTx(
+              `UPDATE task_leases SET
+                last_processed_seq = $1::bigint,
+                last_heartbeat_at = clock_timestamp(),
+                expires_at = clock_timestamp() + ($2::bigint * interval '1 millisecond'),
+                status = 'COMPLETED',
+                completed_at = clock_timestamp()
+              WHERE lease_id = $3::uuid
+              RETURNING expires_at, clock_timestamp() AS server_now;`,
+              [envelope.sequence_no, leaseTtlMs, envelope.lease_id]
+            );
+            await this.pool.queryInActiveTx(
+              `UPDATE tasks SET status = $1::text, active_lease_id = NULL, updated_at = clock_timestamp()
+               WHERE task_id = $2::uuid;`,
+              [nextTaskStatus, envelope.task_id]
+            );
+            await this.insertOutboxEventSql(
+              envelope.project_id,
+              "task",
+              envelope.task_id,
+              envelope.event_type,
+              {
+                task_id: envelope.task_id,
+                lease_id: envelope.lease_id,
+                lease_epoch: leaseEpoch,
+                sequence_no: envelope.sequence_no,
+                new_task_status: nextTaskStatus,
+                payload: envelope.payload,
+              }
+            );
+            return {
+              http_status: 200,
+              ack_status: "ACCEPTED",
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              lease_status: nextLeaseStatus,
+              acked_sequence_no: envelope.sequence_no,
+              expected_next_seq: envelope.sequence_no + 1,
+              task_status: nextTaskStatus,
+              lease_expires_at: null,
+              server_clock_timestamp: String(updL.rows[0]?.server_now ?? evalNowIso),
+            };
+          }
+
+          if (transitionRule.closesLeaseAs === "REVOKED") {
+            nextLeaseStatus = "REVOKED";
+            const updL = await this.pool.queryInActiveTx(
+              `UPDATE task_leases SET
+                last_processed_seq = $1::bigint,
+                last_heartbeat_at = clock_timestamp(),
+                status = 'REVOKED',
+                revoked_at = clock_timestamp(),
+                revoke_reason = 'WORKER_REPORTED_FAILURE'
+              WHERE lease_id = $2::uuid
+              RETURNING clock_timestamp() AS server_now;`,
+              [envelope.sequence_no, envelope.lease_id]
+            );
+            await this.pool.queryInActiveTx(
+              `UPDATE tasks SET status = $1::text, active_lease_id = NULL, updated_at = clock_timestamp()
+               WHERE task_id = $2::uuid;`,
+              [nextTaskStatus, envelope.task_id]
+            );
+            await this.insertOutboxEventSql(
+              envelope.project_id,
+              "task",
+              envelope.task_id,
+              envelope.event_type,
+              {
+                task_id: envelope.task_id,
+                lease_id: envelope.lease_id,
+                lease_epoch: leaseEpoch,
+                sequence_no: envelope.sequence_no,
+                new_task_status: nextTaskStatus,
+                payload: envelope.payload,
+              }
+            );
+            return {
+              http_status: 200,
+              ack_status: "ACCEPTED",
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              lease_status: nextLeaseStatus,
+              acked_sequence_no: envelope.sequence_no,
+              expected_next_seq: envelope.sequence_no + 1,
+              task_status: nextTaskStatus,
+              lease_expires_at: null,
+              server_clock_timestamp: String(updL.rows[0]?.server_now ?? evalNowIso),
+            };
+          }
+
+          const updL = await this.pool.queryInActiveTx(
+            `UPDATE task_leases SET
+              last_processed_seq = $1::bigint,
+              last_heartbeat_at = clock_timestamp(),
+              expires_at = clock_timestamp() + ($2::bigint * interval '1 millisecond')
+            WHERE lease_id = $3::uuid
+            RETURNING expires_at, clock_timestamp() AS server_now;`,
+            [envelope.sequence_no, leaseTtlMs, envelope.lease_id]
+          );
+          if (transitionRule.targetStatus !== "UNCHANGED") {
+            await this.pool.queryInActiveTx(
+              "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
+              [nextTaskStatus, envelope.task_id]
+            );
+          }
+          await this.insertOutboxEventSql(
+            envelope.project_id,
+            "task",
+            envelope.task_id,
+            envelope.event_type,
+            {
+              task_id: envelope.task_id,
+              lease_id: envelope.lease_id,
+              lease_epoch: leaseEpoch,
+              sequence_no: envelope.sequence_no,
+              new_task_status: nextTaskStatus,
+              payload: envelope.payload,
+            }
+          );
+
           return {
             http_status: 200,
-            ack_status: "DUPLICATE_RETRY_NOP",
+            ack_status: "ACCEPTED",
             lease_id: envelope.lease_id,
             lease_epoch: leaseEpoch,
-            lease_status: leaseStatus,
-            acked_sequence_no: existing.sequence_no,
-            expected_next_seq: lastProcessedSeq + 1,
-            task_status: taskStatus,
-            lease_expires_at: String(row.expires_at),
-            server_clock_timestamp: evalNowIso,
+            lease_status: "ACTIVE",
+            acked_sequence_no: envelope.sequence_no,
+            expected_next_seq: envelope.sequence_no + 1,
+            task_status: nextTaskStatus,
+            lease_expires_at: String(updL.rows[0]?.expires_at ?? row.expires_at),
+            server_clock_timestamp: String(updL.rows[0]?.server_now ?? evalNowIso),
           };
+        } catch (error) {
+          mapPgError(error);
         }
-
-        return {
-          http_status: 409,
-          ack_status: "REJECTED_CONFLICT_PAYLOAD",
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          lease_status: leaseStatus,
-          acked_sequence_no: lastProcessedSeq,
-          expected_next_seq: lastProcessedSeq + 1,
-          task_status: taskStatus,
-          lease_expires_at: String(row.expires_at),
-          server_clock_timestamp: evalNowIso,
-          error_code: "ERR_IDEMPOTENCY_PAYLOAD_MISMATCH",
-        };
       }
-
-      const expectedNextSeq = lastProcessedSeq + 1;
-      if (envelope.sequence_no !== expectedNextSeq) {
-        return {
-          http_status: 409,
-          ack_status: "REJECTED_OUT_OF_ORDER",
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          lease_status: leaseStatus,
-          acked_sequence_no: lastProcessedSeq,
-          expected_next_seq: expectedNextSeq,
-          task_status: taskStatus,
-          lease_expires_at: String(row.expires_at),
-          server_clock_timestamp: evalNowIso,
-          error_code:
-            envelope.sequence_no < expectedNextSeq ? "ERR_SEQ_ALREADY_ADVANCED" : "ERR_SEQ_GAP",
-        };
-      }
-
-      const actualPayloadSha = computeCanonicalPayloadSha256(envelope.payload);
-      if (actualPayloadSha !== envelope.payload_sha256) {
-        return {
-          http_status: 409,
-          ack_status: "REJECTED_CONFLICT_PAYLOAD",
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          lease_status: leaseStatus,
-          acked_sequence_no: lastProcessedSeq,
-          expected_next_seq: expectedNextSeq,
-          task_status: taskStatus,
-          lease_expires_at: String(row.expires_at),
-          server_clock_timestamp: evalNowIso,
-          error_code: "ERR_IDEMPOTENCY_PAYLOAD_MISMATCH",
-        };
-      }
-
-      const transitionRule = WORKER_EVENT_STATE_TRANSITIONS[envelope.event_type];
-      if (!transitionRule.allowedFrom.includes(taskStatus)) {
-        return {
-          http_status: 422,
-          ack_status: "REJECTED_INVALID_TRANSITION",
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          lease_status: leaseStatus,
-          acked_sequence_no: lastProcessedSeq,
-          expected_next_seq: expectedNextSeq,
-          task_status: taskStatus,
-          lease_expires_at: String(row.expires_at),
-          server_clock_timestamp: evalNowIso,
-          error_code: "ERR_INVALID_STATE_TRANSITION",
-        };
-      }
-
-      await this.pool.queryInActiveTx(
-        `INSERT INTO processed_worker_events (
-          project_id, task_id, lease_id, lease_epoch, sequence_no,
-          event_type, event_idempotency_key, payload_sha256, payload_json
-        ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::bigint, $6::text, $7::text, $8::text, $9::jsonb);`,
-        [
-          envelope.project_id,
-          envelope.task_id,
-          envelope.lease_id,
-          envelope.lease_epoch,
-          envelope.sequence_no,
-          envelope.event_type,
-          envelope.event_idempotency_key,
-          envelope.payload_sha256,
-          envelope.payload,
-        ]
-      );
-
-      let nextLeaseStatus: TaskLeaseRecord["status"] = "ACTIVE";
-      let nextTaskStatus: TaskStatus =
-        transitionRule.targetStatus === "UNCHANGED" ? taskStatus : transitionRule.targetStatus;
-      const leaseTtlMs = Number(row.lease_ttl_ms);
-
-      if (transitionRule.closesLeaseAs === "COMPLETED") {
-        nextLeaseStatus = "COMPLETED";
-        const updL = await this.pool.queryInActiveTx(
-          `UPDATE task_leases SET
-            last_processed_seq = $1::bigint,
-            last_heartbeat_at = clock_timestamp(),
-            expires_at = clock_timestamp() + ($2::bigint * interval '1 millisecond'),
-            status = 'COMPLETED',
-            completed_at = clock_timestamp()
-          WHERE lease_id = $3::uuid
-          RETURNING expires_at, clock_timestamp() AS server_now;`,
-          [envelope.sequence_no, leaseTtlMs, envelope.lease_id]
-        );
-        await this.pool.queryInActiveTx(
-          `UPDATE tasks SET status = $1::text, active_lease_id = NULL, updated_at = clock_timestamp()
-           WHERE task_id = $2::uuid;`,
-          [nextTaskStatus, envelope.task_id]
-        );
-        await this.insertOutboxEventSql(
-          envelope.project_id,
-          "task",
-          envelope.task_id,
-          envelope.event_type,
-          {
-            task_id: envelope.task_id,
-            lease_id: envelope.lease_id,
-            lease_epoch: leaseEpoch,
-            sequence_no: envelope.sequence_no,
-            new_task_status: nextTaskStatus,
-            payload: envelope.payload,
-          }
-        );
-        return {
-          http_status: 200,
-          ack_status: "ACCEPTED",
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          lease_status: nextLeaseStatus,
-          acked_sequence_no: envelope.sequence_no,
-          expected_next_seq: envelope.sequence_no + 1,
-          task_status: nextTaskStatus,
-          lease_expires_at: null,
-          server_clock_timestamp: String(updL.rows[0]?.server_now ?? evalNowIso),
-        };
-      }
-
-      if (transitionRule.closesLeaseAs === "REVOKED") {
-        nextLeaseStatus = "REVOKED";
-        const updL = await this.pool.queryInActiveTx(
-          `UPDATE task_leases SET
-            last_processed_seq = $1::bigint,
-            last_heartbeat_at = clock_timestamp(),
-            status = 'REVOKED',
-            revoked_at = clock_timestamp(),
-            revoke_reason = 'WORKER_REPORTED_FAILURE'
-          WHERE lease_id = $2::uuid
-          RETURNING clock_timestamp() AS server_now;`,
-          [envelope.sequence_no, envelope.lease_id]
-        );
-        await this.pool.queryInActiveTx(
-          `UPDATE tasks SET status = $1::text, active_lease_id = NULL, updated_at = clock_timestamp()
-           WHERE task_id = $2::uuid;`,
-          [nextTaskStatus, envelope.task_id]
-        );
-        await this.insertOutboxEventSql(
-          envelope.project_id,
-          "task",
-          envelope.task_id,
-          envelope.event_type,
-          {
-            task_id: envelope.task_id,
-            lease_id: envelope.lease_id,
-            lease_epoch: leaseEpoch,
-            sequence_no: envelope.sequence_no,
-            new_task_status: nextTaskStatus,
-            payload: envelope.payload,
-          }
-        );
-        return {
-          http_status: 200,
-          ack_status: "ACCEPTED",
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          lease_status: nextLeaseStatus,
-          acked_sequence_no: envelope.sequence_no,
-          expected_next_seq: envelope.sequence_no + 1,
-          task_status: nextTaskStatus,
-          lease_expires_at: null,
-          server_clock_timestamp: String(updL.rows[0]?.server_now ?? evalNowIso),
-        };
-      }
-
-      const updL = await this.pool.queryInActiveTx(
-        `UPDATE task_leases SET
-          last_processed_seq = $1::bigint,
-          last_heartbeat_at = clock_timestamp(),
-          expires_at = clock_timestamp() + ($2::bigint * interval '1 millisecond')
-        WHERE lease_id = $3::uuid
-        RETURNING expires_at, clock_timestamp() AS server_now;`,
-        [envelope.sequence_no, leaseTtlMs, envelope.lease_id]
-      );
-      if (transitionRule.targetStatus !== "UNCHANGED") {
-        await this.pool.queryInActiveTx(
-          "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
-          [nextTaskStatus, envelope.task_id]
-        );
-      }
-      await this.insertOutboxEventSql(
-        envelope.project_id,
-        "task",
-        envelope.task_id,
-        envelope.event_type,
-        {
-          task_id: envelope.task_id,
-          lease_id: envelope.lease_id,
-          lease_epoch: leaseEpoch,
-          sequence_no: envelope.sequence_no,
-          new_task_status: nextTaskStatus,
-          payload: envelope.payload,
-        }
-      );
-
-      return {
-        http_status: 200,
-        ack_status: "ACCEPTED",
-        lease_id: envelope.lease_id,
-        lease_epoch: leaseEpoch,
-        lease_status: "ACTIVE",
-        acked_sequence_no: envelope.sequence_no,
-        expected_next_seq: envelope.sequence_no + 1,
-        task_status: nextTaskStatus,
-        lease_expires_at: String(updL.rows[0]?.expires_at ?? row.expires_at),
-        server_clock_timestamp: String(updL.rows[0]?.server_now ?? evalNowIso),
-      };
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async revokeTaskLease(input: {
@@ -2882,56 +3002,65 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     reason: string;
     requeueTask?: boolean;
   }): Promise<TaskLeaseRecord> {
-    try {
-      const lockRes = await this.pool.queryInActiveTx(
-        `SELECT l.*, t.active_lease_id, t.status AS task_status
-         FROM task_leases l
-         INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
-         WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
-         FOR UPDATE OF l, t;`,
-        [input.lease_id, input.task_id, input.project_id]
-      );
-      const row = lockRes.rows[0];
-      if (!row) {
-        throw new Error(`Lease ${input.lease_id} not found`);
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const lockRes = await this.pool.queryInActiveTx(
+            `SELECT l.*, t.active_lease_id, t.status AS task_status
+             FROM task_leases l
+             INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
+             WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
+             FOR UPDATE OF l, t;`,
+            [input.lease_id, input.task_id, input.project_id]
+          );
+          const row = lockRes.rows[0];
+          if (!row) {
+            throw new Error(`Lease ${input.lease_id} not found`);
+          }
+
+          let updatedLease = mapLeaseRow(row);
+          if (updatedLease.status === "ACTIVE") {
+            const res = await this.pool.queryInActiveTx(
+              `UPDATE task_leases SET status = 'REVOKED', revoked_at = clock_timestamp(), revoke_reason = $1::text
+               WHERE lease_id = $2::uuid RETURNING *;`,
+              [input.reason, input.lease_id]
+            );
+            updatedLease = mapLeaseRow(res.rows[0]!);
+          }
+
+          if (String(row.active_lease_id ?? "") === input.lease_id) {
+            const curTaskStatus = String(row.task_status) as TaskStatus;
+            const nextTaskStatus: TaskStatus =
+              curTaskStatus === "Leased" || curTaskStatus === "ExecutingInTarget"
+                ? input.requeueTask
+                  ? "Ready"
+                  : "ManualIntervention"
+                : curTaskStatus;
+            await this.pool.queryInActiveTx(
+              `UPDATE tasks SET active_lease_id = NULL, status = $1::text, updated_at = clock_timestamp()
+               WHERE task_id = $2::uuid;`,
+              [nextTaskStatus, input.task_id]
+            );
+          }
+
+          await this.insertOutboxEventSql(input.project_id, "task_lease", input.lease_id, "lease.revoked", {
+            task_id: input.task_id,
+            lease_id: input.lease_id,
+            lease_epoch: updatedLease.lease_epoch,
+            reason: input.reason,
+          });
+
+          return updatedLease;
+        } catch (error) {
+          mapPgError(error);
+        }
       }
-
-      let updatedLease = mapLeaseRow(row);
-      if (updatedLease.status === "ACTIVE") {
-        const res = await this.pool.queryInActiveTx(
-          `UPDATE task_leases SET status = 'REVOKED', revoked_at = clock_timestamp(), revoke_reason = $1::text
-           WHERE lease_id = $2::uuid RETURNING *;`,
-          [input.reason, input.lease_id]
-        );
-        updatedLease = mapLeaseRow(res.rows[0]!);
-      }
-
-      if (String(row.active_lease_id ?? "") === input.lease_id) {
-        const curTaskStatus = String(row.task_status) as TaskStatus;
-        const nextTaskStatus: TaskStatus =
-          curTaskStatus === "Leased" || curTaskStatus === "ExecutingInTarget"
-            ? input.requeueTask
-              ? "Ready"
-              : "ManualIntervention"
-            : curTaskStatus;
-        await this.pool.queryInActiveTx(
-          `UPDATE tasks SET active_lease_id = NULL, status = $1::text, updated_at = clock_timestamp()
-           WHERE task_id = $2::uuid;`,
-          [nextTaskStatus, input.task_id]
-        );
-      }
-
-      await this.insertOutboxEventSql(input.project_id, "task_lease", input.lease_id, "lease.revoked", {
-        task_id: input.task_id,
-        lease_id: input.lease_id,
-        lease_epoch: updatedLease.lease_epoch,
-        reason: input.reason,
-      });
-
-      return updatedLease;
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async pushStagingGitRefWithGatekeeper(input: {
@@ -3454,115 +3583,120 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     staging_ref: string;
     candidate_input: GitTreeImportCandidateInput;
   }): Promise<VerifiedCodeImportRecord> {
-    try {
-      const rowRes = await this.pool.queryInActiveTx(
-        `SELECT l.*, t.status AS task_status, t.base_main_commit_hash,
-                (l.expires_at <= clock_timestamp()) AS is_expired_now
-         FROM task_leases l
-         INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
-         WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
-         FOR UPDATE OF l, t;`,
-        [input.lease_id, input.task_id, input.project_id]
-      );
-      const row = rowRes.rows[0];
-      if (!row) {
-        throw new PostgresRlsError(
-          "23503",
-          `Task ${input.task_id} or Lease ${input.lease_id} not found for project ${input.project_id}`
-        );
-      }
-      if (Number(row.lease_epoch) !== input.lease_epoch) {
-        throw new PostgresRlsError(
-          "23514",
-          `Lease epoch mismatch: expected ${String(row.lease_epoch)}, got ${input.lease_epoch}`
-        );
-      }
-      const expectedStagingRef = `refs/heads/sf/staging/${input.task_id}/${input.lease_epoch}`;
-      const expectedVerifyAlias = `refs/factory/Verify/${input.task_id}/${input.lease_epoch}`;
-      if (input.staging_ref !== expectedStagingRef && input.staging_ref !== expectedVerifyAlias) {
-        throw new PostgresRlsError(
-          "23514",
-          `Invalid staging_ref ${input.staging_ref}`
-        );
-      }
-      const leaseStatus = String(row.status);
-      if (
-        leaseStatus === "REVOKED" ||
-        leaseStatus === "EXPIRED" ||
-        row.revoked_at !== null ||
-        (leaseStatus === "ACTIVE" && Boolean(row.is_expired_now))
-      ) {
-        throw new PostgresRlsError(
-          "23514",
-          `Lease ${input.lease_id} (status=${leaseStatus}) is revoked or expired`
-        );
-      }
-      if (input.candidate_input.expected_base_main_commit_hash !== String(row.base_main_commit_hash)) {
-        throw new PostgresRlsError(
-          "23514",
-          `Candidate expected_base_main_commit_hash does not match task base_main_commit_hash`
-        );
-      }
-
-      const validation = validateGitTreeImport(input.candidate_input);
-      if (!validation.valid) {
-        throw new PostgresRlsError(
-          "23514",
-          `TrustedImportValidator rejected import: [${validation.error_code}] ${validation.message}`
-        );
-      }
-
-      const existingRes = await this.pool.queryInActiveTx(
-        `SELECT * FROM verified_code_imports
-         WHERE lease_id = $1::uuid AND agent_commit_hash = $2::text LIMIT 1;`,
-        [input.lease_id, validation.agent_commit_hash]
-      );
-      if (existingRes.rows[0]) {
-        const existing = mapVerifiedImportRow(existingRes.rows[0]);
-        if (
-          existing.project_id !== input.project_id ||
-          existing.task_id !== input.task_id ||
-          existing.lease_epoch !== input.lease_epoch ||
-          existing.staging_ref !== input.staging_ref ||
-          existing.verified_tree_hash !== validation.verified_tree_hash
-        ) {
-          throw new PostgresRlsError(
-            "23514",
-            `Conflicting VerifiedCodeImport already exists for lease ${input.lease_id}`
+    return this.withExistingOrRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "core_api_service" },
+      async () => {
+        try {
+          const rowRes = await this.pool.queryInActiveTx(
+            `SELECT l.*, t.status AS task_status, t.base_main_commit_hash,
+                    (l.expires_at <= clock_timestamp()) AS is_expired_now
+             FROM task_leases l
+             INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
+             WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
+             FOR UPDATE OF l, t;`,
+            [input.lease_id, input.task_id, input.project_id]
           );
+          const row = rowRes.rows[0];
+          if (!row) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task ${input.task_id} or Lease ${input.lease_id} not found for project ${input.project_id}`
+            );
+          }
+          if (Number(row.lease_epoch) !== input.lease_epoch) {
+            throw new PostgresRlsError(
+              "23514",
+              `Lease epoch mismatch: expected ${String(row.lease_epoch)}, got ${input.lease_epoch}`
+            );
+          }
+          const expectedStagingRef = `refs/heads/sf/staging/${input.task_id}/${input.lease_epoch}`;
+          const expectedVerifyAlias = `refs/factory/Verify/${input.task_id}/${input.lease_epoch}`;
+          if (input.staging_ref !== expectedStagingRef && input.staging_ref !== expectedVerifyAlias) {
+            throw new PostgresRlsError(
+              "23514",
+              `Invalid staging_ref ${input.staging_ref}`
+            );
+          }
+          const leaseStatus = String(row.status);
+          if (
+            leaseStatus === "REVOKED" ||
+            leaseStatus === "EXPIRED" ||
+            row.revoked_at !== null ||
+            (leaseStatus === "ACTIVE" && Boolean(row.is_expired_now))
+          ) {
+            throw new PostgresRlsError(
+              "23514",
+              `Lease ${input.lease_id} (status=${leaseStatus}) is revoked or expired`
+            );
+          }
+          if (input.candidate_input.expected_base_main_commit_hash !== String(row.base_main_commit_hash)) {
+            throw new PostgresRlsError(
+              "23514",
+              `Candidate expected_base_main_commit_hash does not match task base_main_commit_hash`
+            );
+          }
+
+          const validation = validateGitTreeImport(input.candidate_input);
+          if (!validation.valid) {
+            throw new PostgresRlsError(
+              "23514",
+              `TrustedImportValidator rejected import: [${validation.error_code}] ${validation.message}`
+            );
+          }
+
+          const existingRes = await this.pool.queryInActiveTx(
+            `SELECT * FROM verified_code_imports
+             WHERE lease_id = $1::uuid AND agent_commit_hash = $2::text LIMIT 1;`,
+            [input.lease_id, validation.agent_commit_hash]
+          );
+          if (existingRes.rows[0]) {
+            const existing = mapVerifiedImportRow(existingRes.rows[0]);
+            if (
+              existing.project_id !== input.project_id ||
+              existing.task_id !== input.task_id ||
+              existing.lease_epoch !== input.lease_epoch ||
+              existing.staging_ref !== input.staging_ref ||
+              existing.verified_tree_hash !== validation.verified_tree_hash
+            ) {
+              throw new PostgresRlsError(
+                "23514",
+                `Conflicting VerifiedCodeImport already exists for lease ${input.lease_id}`
+              );
+            }
+            return existing;
+          }
+
+          if (leaseStatus !== "ACTIVE") {
+            throw new PostgresRlsError(
+              "23514",
+              `Cannot record new VerifiedCodeImport on non-ACTIVE lease (status=${leaseStatus})`
+            );
+          }
+
+          const ins = await this.pool.queryInActiveTx(
+            `INSERT INTO verified_code_imports (
+              project_id, task_id, lease_id, lease_epoch, agent_commit_hash,
+              verified_tree_hash, staging_ref, changed_files_count, deleted_lines_count
+            ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::text, $6::text, $7::text, $8::integer, $9::integer)
+            RETURNING *;`,
+            [
+              input.project_id,
+              input.task_id,
+              input.lease_id,
+              input.lease_epoch,
+              validation.agent_commit_hash,
+              validation.verified_tree_hash,
+              input.staging_ref,
+              validation.changed_files_count,
+              validation.deleted_lines_count,
+            ]
+          );
+          return mapVerifiedImportRow(ins.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
         }
-        return existing;
       }
-
-      if (leaseStatus !== "ACTIVE") {
-        throw new PostgresRlsError(
-          "23514",
-          `Cannot record new VerifiedCodeImport on non-ACTIVE lease (status=${leaseStatus})`
-        );
-      }
-
-      const ins = await this.pool.queryInActiveTx(
-        `INSERT INTO verified_code_imports (
-          project_id, task_id, lease_id, lease_epoch, agent_commit_hash,
-          verified_tree_hash, staging_ref, changed_files_count, deleted_lines_count
-        ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::text, $6::text, $7::text, $8::integer, $9::integer)
-        RETURNING *;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.lease_id,
-          input.lease_epoch,
-          validation.agent_commit_hash,
-          validation.verified_tree_hash,
-          input.staging_ref,
-          validation.changed_files_count,
-          validation.deleted_lines_count,
-        ]
-      );
-      return mapVerifiedImportRow(ins.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async createMergeCandidate(input: {
@@ -3578,97 +3712,102 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     snapshot_size_bytes?: number | null;
     snapshot_retention_class?: SnapshotRetentionClass;
   }): Promise<MergeCandidateRecord> {
-    try {
-      const impRes = await this.pool.queryInActiveTx(
-        `SELECT i.*, p.main_ref_commit_hash
-         FROM verified_code_imports i
-         INNER JOIN projects p ON p.project_id = i.project_id
-         WHERE i.import_id = $1::uuid AND i.task_id = $2::uuid AND i.project_id = $3::uuid
-         LIMIT 1;`,
-        [input.import_id, input.task_id, input.project_id]
-      );
-      const impRow = impRes.rows[0];
-      if (!impRow) {
-        throw new PostgresRlsError("23503", "Task or VerifiedCodeImport not found for project");
+    return this.withExistingOrRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "core_api_service" },
+      async () => {
+        try {
+          const impRes = await this.pool.queryInActiveTx(
+            `SELECT i.*, p.main_ref_commit_hash
+             FROM verified_code_imports i
+             INNER JOIN projects p ON p.project_id = i.project_id
+             WHERE i.import_id = $1::uuid AND i.task_id = $2::uuid AND i.project_id = $3::uuid
+             LIMIT 1;`,
+            [input.import_id, input.task_id, input.project_id]
+          );
+          const impRow = impRes.rows[0];
+          if (!impRow) {
+            throw new PostgresRlsError("23503", "Task or VerifiedCodeImport not found for project");
+          }
+          if (!input.allow_rebased_tree_hash && input.verified_tree_hash !== String(impRow.verified_tree_hash)) {
+            throw new PostgresRlsError(
+              "23514",
+              `Candidate verified_tree_hash ${input.verified_tree_hash} does not match import ${String(impRow.verified_tree_hash)}`
+            );
+          }
+          const currentMainSha = impRow.main_ref_commit_hash
+            ? String(impRow.main_ref_commit_hash)
+            : "";
+          if (currentMainSha && input.base_main_commit_hash !== currentMainSha) {
+            throw new PostgresRlsError(
+              "23514",
+              `Candidate base_main_commit_hash ${input.base_main_commit_hash} does not match current main ${currentMainSha}`
+            );
+          }
+
+          // Supersede older candidates and invalidate stale reviews/requests/approvals on this task
+          await this.pool.queryInActiveTx(
+            `UPDATE merge_candidates SET is_superseded = TRUE
+             WHERE project_id = $1::uuid AND task_id = $2::uuid AND is_superseded = FALSE;`,
+            [input.project_id, input.task_id]
+          );
+          await this.pool.queryInActiveTx(
+            `UPDATE review_artifacts
+             SET status = 'INVALIDATED_STALE_CANDIDATE', is_invalidated = TRUE,
+                 invalidated_reason = COALESCE(invalidated_reason, 'SUPERSEDED_BY_NEW_MERGE_CANDIDATE')
+             WHERE project_id = $1::uuid AND task_id = $2::uuid
+               AND merge_candidate_hash <> $3::text AND (status = 'VALID' OR is_invalidated = FALSE);`,
+            [input.project_id, input.task_id, input.merge_candidate_hash]
+          );
+          await this.pool.queryInActiveTx(
+            `UPDATE approval_requests SET status = 'INVALIDATED_STALE_CANDIDATE', updated_at = clock_timestamp()
+             WHERE project_id = $1::uuid AND task_id = $2::uuid AND status = 'PENDING';`,
+            [input.project_id, input.task_id]
+          );
+          await this.pool.queryInActiveTx(
+            `UPDATE approval_decisions SET status = 'INVALIDATED',
+                 invalidated_reason = COALESCE(invalidated_reason, 'SUPERSEDED_BY_NEW_MERGE_CANDIDATE')
+             WHERE project_id = $1::uuid AND task_id = $2::uuid AND status = 'ACTIVE';`,
+            [input.project_id, input.task_id]
+          );
+
+          const ins = await this.pool.queryInActiveTx(
+            `INSERT INTO merge_candidates (
+              project_id, task_id, import_id, agent_commit_hash, base_main_commit_hash,
+              merge_candidate_hash, verified_tree_hash, is_superseded,
+              snapshot_path, snapshot_sha256, snapshot_size_bytes, snapshot_retention_class
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text,
+              $6::text, $7::text, FALSE, $8::text, $9::text, $10::bigint, $11::text
+            ) RETURNING *;`,
+            [
+              input.project_id,
+              input.task_id,
+              input.import_id,
+              String(impRow.agent_commit_hash),
+              input.base_main_commit_hash,
+              input.merge_candidate_hash,
+              input.verified_tree_hash,
+              input.snapshot_path ?? null,
+              input.snapshot_sha256 ?? null,
+              input.snapshot_size_bytes ?? null,
+              input.snapshot_retention_class ?? "EPHEMERAL_14D",
+            ]
+          );
+          const mc = mapMergeCandidateRow(ins.rows[0]!);
+
+          await this.pool.queryInActiveTx(
+            `UPDATE tasks SET status = 'VerifyingInDocker', active_merge_candidate_id = $1::uuid,
+                 updated_at = clock_timestamp()
+             WHERE task_id = $2::uuid;`,
+            [mc.merge_candidate_id, input.task_id]
+          );
+
+          return mc;
+        } catch (error) {
+          mapPgError(error);
+        }
       }
-      if (!input.allow_rebased_tree_hash && input.verified_tree_hash !== String(impRow.verified_tree_hash)) {
-        throw new PostgresRlsError(
-          "23514",
-          `Candidate verified_tree_hash ${input.verified_tree_hash} does not match import ${String(impRow.verified_tree_hash)}`
-        );
-      }
-      const currentMainSha = impRow.main_ref_commit_hash
-        ? String(impRow.main_ref_commit_hash)
-        : "";
-      if (currentMainSha && input.base_main_commit_hash !== currentMainSha) {
-        throw new PostgresRlsError(
-          "23514",
-          `Candidate base_main_commit_hash ${input.base_main_commit_hash} does not match current main ${currentMainSha}`
-        );
-      }
-
-      // Supersede older candidates and invalidate stale reviews/requests/approvals on this task
-      await this.pool.queryInActiveTx(
-        `UPDATE merge_candidates SET is_superseded = TRUE
-         WHERE project_id = $1::uuid AND task_id = $2::uuid AND is_superseded = FALSE;`,
-        [input.project_id, input.task_id]
-      );
-      await this.pool.queryInActiveTx(
-        `UPDATE review_artifacts
-         SET status = 'INVALIDATED_STALE_CANDIDATE', is_invalidated = TRUE,
-             invalidated_reason = COALESCE(invalidated_reason, 'SUPERSEDED_BY_NEW_MERGE_CANDIDATE')
-         WHERE project_id = $1::uuid AND task_id = $2::uuid
-           AND merge_candidate_hash <> $3::text AND (status = 'VALID' OR is_invalidated = FALSE);`,
-        [input.project_id, input.task_id, input.merge_candidate_hash]
-      );
-      await this.pool.queryInActiveTx(
-        `UPDATE approval_requests SET status = 'INVALIDATED_STALE_CANDIDATE', updated_at = clock_timestamp()
-         WHERE project_id = $1::uuid AND task_id = $2::uuid AND status = 'PENDING';`,
-        [input.project_id, input.task_id]
-      );
-      await this.pool.queryInActiveTx(
-        `UPDATE approval_decisions SET status = 'INVALIDATED',
-             invalidated_reason = COALESCE(invalidated_reason, 'SUPERSEDED_BY_NEW_MERGE_CANDIDATE')
-         WHERE project_id = $1::uuid AND task_id = $2::uuid AND status = 'ACTIVE';`,
-        [input.project_id, input.task_id]
-      );
-
-      const ins = await this.pool.queryInActiveTx(
-        `INSERT INTO merge_candidates (
-          project_id, task_id, import_id, agent_commit_hash, base_main_commit_hash,
-          merge_candidate_hash, verified_tree_hash, is_superseded,
-          snapshot_path, snapshot_sha256, snapshot_size_bytes, snapshot_retention_class
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text,
-          $6::text, $7::text, FALSE, $8::text, $9::text, $10::bigint, $11::text
-        ) RETURNING *;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.import_id,
-          String(impRow.agent_commit_hash),
-          input.base_main_commit_hash,
-          input.merge_candidate_hash,
-          input.verified_tree_hash,
-          input.snapshot_path ?? null,
-          input.snapshot_sha256 ?? null,
-          input.snapshot_size_bytes ?? null,
-          input.snapshot_retention_class ?? "EPHEMERAL_14D",
-        ]
-      );
-      const mc = mapMergeCandidateRow(ins.rows[0]!);
-
-      await this.pool.queryInActiveTx(
-        `UPDATE tasks SET status = 'VerifyingInDocker', active_merge_candidate_id = $1::uuid,
-             updated_at = clock_timestamp()
-         WHERE task_id = $2::uuid;`,
-        [mc.merge_candidate_id, input.task_id]
-      );
-
-      return mc;
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   private async closeActiveLeasesForTaskSql(
@@ -3705,44 +3844,49 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     import_id?: string;
     conflict_summary?: string;
   }): Promise<{ readonly task_status: TaskStatus; readonly conflicted_files: readonly string[] }> {
-    try {
-      const taskRes = await this.pool.queryInActiveTx(
-        "SELECT * FROM tasks WHERE task_id = $1::uuid AND project_id = $2::uuid FOR UPDATE;",
-        [input.task_id, input.project_id]
-      );
-      if (!taskRes.rows[0]) {
-        throw new PostgresRlsError("23503", `Task ${input.task_id} not found for project`);
-      }
-      const task = mapTaskRow(taskRes.rows[0]);
-      const nextStatus: TaskStatus =
-        task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
-      await this.closeActiveLeasesForTaskSql(task.task_id, "COMPLETED");
-      await this.pool.queryInActiveTx(
-        "UPDATE tasks SET status = $1::text, active_lease_id = NULL, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
-        [nextStatus, task.task_id]
-      );
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "task",
-        task.task_id,
-        "merge_candidate.conflict",
-        {
-          task_id: task.task_id,
-          import_id: input.import_id ?? null,
-          agent_commit_hash: input.agent_commit_hash,
-          base_main_commit_hash: input.base_main_commit_hash,
-          conflicted_files: [...input.conflicted_files],
-          conflict_summary: input.conflict_summary ?? null,
-          resulting_task_status: nextStatus,
+    return this.withExistingOrRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "core_api_service" },
+      async () => {
+        try {
+          const taskRes = await this.pool.queryInActiveTx(
+            "SELECT * FROM tasks WHERE task_id = $1::uuid AND project_id = $2::uuid FOR UPDATE;",
+            [input.task_id, input.project_id]
+          );
+          if (!taskRes.rows[0]) {
+            throw new PostgresRlsError("23503", `Task ${input.task_id} not found for project`);
+          }
+          const task = mapTaskRow(taskRes.rows[0]);
+          const nextStatus: TaskStatus =
+            task.rework_count < task.max_rework_cycles ? "ReworkRequired" : "ManualIntervention";
+          await this.closeActiveLeasesForTaskSql(task.task_id, "COMPLETED");
+          await this.pool.queryInActiveTx(
+            "UPDATE tasks SET status = $1::text, active_lease_id = NULL, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
+            [nextStatus, task.task_id]
+          );
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "task",
+            task.task_id,
+            "merge_candidate.conflict",
+            {
+              task_id: task.task_id,
+              import_id: input.import_id ?? null,
+              agent_commit_hash: input.agent_commit_hash,
+              base_main_commit_hash: input.base_main_commit_hash,
+              conflicted_files: [...input.conflicted_files],
+              conflict_summary: input.conflict_summary ?? null,
+              resulting_task_status: nextStatus,
+            }
+          );
+          return {
+            task_status: nextStatus,
+            conflicted_files: [...input.conflicted_files],
+          };
+        } catch (error) {
+          mapPgError(error);
         }
-      );
-      return {
-        task_status: nextStatus,
-        conflicted_files: [...input.conflicted_files],
-      };
-    } catch (error) {
-      mapPgError(error);
-    }
+      }
+    );
   }
 
   public async recordVerificationRun(input: {
@@ -3771,161 +3915,166 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     duration_ms: number;
     report_sha256: string;
   }): Promise<VerificationRunRecord> {
-    try {
-      const checkRes = await this.pool.queryInActiveTx(
-        `SELECT mc.*, t.rework_count, t.max_rework_cycles
-         FROM merge_candidates mc
-         INNER JOIN tasks t ON t.task_id = mc.task_id AND t.project_id = mc.project_id
-         WHERE mc.merge_candidate_id = $1::uuid AND mc.project_id = $2::uuid AND mc.task_id = $3::uuid
-         FOR UPDATE OF mc, t;`,
-        [input.merge_candidate_id, input.project_id, input.task_id]
-      );
-      const mcRow = checkRes.rows[0];
-      if (
-        !mcRow ||
-        Boolean(mcRow.is_superseded) ||
-        String(mcRow.merge_candidate_hash) !== input.merge_candidate_hash ||
-        String(mcRow.verified_tree_hash) !== input.verified_tree_hash
-      ) {
-        throw new PostgresRlsError(
-          "23503",
-          "VerificationRun composite foreign key binding mismatch against active MergeCandidate"
-        );
-      }
+    return this.withExistingOrRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "core_api_service" },
+      async () => {
+        try {
+          const checkRes = await this.pool.queryInActiveTx(
+            `SELECT mc.*, t.rework_count, t.max_rework_cycles
+             FROM merge_candidates mc
+             INNER JOIN tasks t ON t.task_id = mc.task_id AND t.project_id = mc.project_id
+             WHERE mc.merge_candidate_id = $1::uuid AND mc.project_id = $2::uuid AND mc.task_id = $3::uuid
+             FOR UPDATE OF mc, t;`,
+            [input.merge_candidate_id, input.project_id, input.task_id]
+          );
+          const mcRow = checkRes.rows[0];
+          if (
+            !mcRow ||
+            Boolean(mcRow.is_superseded) ||
+            String(mcRow.merge_candidate_hash) !== input.merge_candidate_hash ||
+            String(mcRow.verified_tree_hash) !== input.verified_tree_hash
+          ) {
+            throw new PostgresRlsError(
+              "23503",
+              "VerificationRun composite foreign key binding mismatch against active MergeCandidate"
+            );
+          }
 
-      const overallStatus: VerificationOverallStatus =
-        input.overall_status ?? (input.verdict === "PASS" ? "PASSED" : "FAILED_ACCEPTANCE");
-      const tamperDetected = input.tier2_baseline_tamper_detected ?? false;
-      const infraRetryCount = input.infra_retry_count ?? 0;
-      const t1 =
-        input.tier1_trusted_acceptance_passed !== undefined
-          ? input.tier1_trusted_acceptance_passed
-          : input.verdict === "PASS"
-          ? true
-          : null;
-      const t2 =
-        input.tier2_protected_baseline_passed !== undefined
-          ? input.tier2_protected_baseline_passed
-          : input.verdict === "PASS"
-          ? true
-          : null;
-      const t3 =
-        input.tier3_agent_tests_passed !== undefined
-          ? input.tier3_agent_tests_passed
-          : input.verdict === "PASS"
-          ? true
-          : null;
+          const overallStatus: VerificationOverallStatus =
+            input.overall_status ?? (input.verdict === "PASS" ? "PASSED" : "FAILED_ACCEPTANCE");
+          const tamperDetected = input.tier2_baseline_tamper_detected ?? false;
+          const infraRetryCount = input.infra_retry_count ?? 0;
+          const t1 =
+            input.tier1_trusted_acceptance_passed !== undefined
+              ? input.tier1_trusted_acceptance_passed
+              : input.verdict === "PASS"
+              ? true
+              : null;
+          const t2 =
+            input.tier2_protected_baseline_passed !== undefined
+              ? input.tier2_protected_baseline_passed
+              : input.verdict === "PASS"
+              ? true
+              : null;
+          const t3 =
+            input.tier3_agent_tests_passed !== undefined
+              ? input.tier3_agent_tests_passed
+              : input.verdict === "PASS"
+              ? true
+              : null;
 
-      await this.pool.queryInActiveTx(
-        `UPDATE review_artifacts SET status = 'INVALIDATED_STALE_CANDIDATE', is_invalidated = TRUE,
-             invalidated_reason = 'VERIFICATION_RUN_RERUN'
-         WHERE merge_candidate_id = $1::uuid AND (status = 'VALID' OR is_invalidated = FALSE);`,
-        [input.merge_candidate_id]
-      );
-      await this.pool.queryInActiveTx(
-        `UPDATE approval_requests SET status = 'INVALIDATED_STALE_CANDIDATE', updated_at = clock_timestamp()
-         WHERE merge_candidate_id = $1::uuid AND status = 'PENDING';`,
-        [input.merge_candidate_id]
-      );
-      await this.pool.queryInActiveTx(
-        `UPDATE approval_decisions SET status = 'INVALIDATED', invalidated_reason = 'VERIFICATION_RUN_RERUN'
-         WHERE merge_candidate_id = $1::uuid AND status = 'ACTIVE';`,
-        [input.merge_candidate_id]
-      );
+          await this.pool.queryInActiveTx(
+            `UPDATE review_artifacts SET status = 'INVALIDATED_STALE_CANDIDATE', is_invalidated = TRUE,
+                 invalidated_reason = 'VERIFICATION_RUN_RERUN'
+             WHERE merge_candidate_id = $1::uuid AND (status = 'VALID' OR is_invalidated = FALSE);`,
+            [input.merge_candidate_id]
+          );
+          await this.pool.queryInActiveTx(
+            `UPDATE approval_requests SET status = 'INVALIDATED_STALE_CANDIDATE', updated_at = clock_timestamp()
+             WHERE merge_candidate_id = $1::uuid AND status = 'PENDING';`,
+            [input.merge_candidate_id]
+          );
+          await this.pool.queryInActiveTx(
+            `UPDATE approval_decisions SET status = 'INVALIDATED', invalidated_reason = 'VERIFICATION_RUN_RERUN'
+             WHERE merge_candidate_id = $1::uuid AND status = 'ACTIVE';`,
+            [input.merge_candidate_id]
+          );
 
-      const ins = await this.pool.queryInActiveTx(
-        `INSERT INTO verification_runs (
-          project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash,
-          verifier_image_digest, verdict, overall_status,
-          tier1_trusted_acceptance_passed, tier2_protected_baseline_passed,
-          tier2_baseline_tamper_detected, tampered_baseline_paths,
-          tier3_agent_tests_passed, tier3_assertions_json,
-          infra_retry_count, execution_backend, hermetic_network_disabled,
-          hardlink_cache_forbidden, is_docker_isolated, trusted_policy_sha256,
-          exit_code, duration_ms, report_sha256
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text,
-          $6::text, $7::text, $8::text,
-          $9::boolean, $10::boolean,
-          $11::boolean, $12::jsonb,
-          $13::boolean, $14::jsonb,
-          $15::integer, $16::text, $17::boolean,
-          $18::boolean, $19::boolean, $20::text,
-          $21::integer, $22::integer, $23::text
-        ) RETURNING *;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.merge_candidate_id,
-          input.merge_candidate_hash,
-          input.verified_tree_hash,
-          input.verifier_image_digest,
-          input.verdict,
-          overallStatus,
-          t1,
-          t2,
-          tamperDetected,
-          input.tampered_baseline_paths ?? [],
-          t3,
-          input.tier3_assertions ?? [],
-          infraRetryCount,
-          input.execution_backend ?? "docker",
-          input.hermetic_network_disabled ?? true,
-          input.hardlink_cache_forbidden ?? true,
-          input.is_docker_isolated ?? false,
-          input.trusted_policy_sha256 ?? null,
-          input.exit_code,
-          input.duration_ms,
-          input.report_sha256,
-        ]
-      );
-      const record = mapVerificationRunRow(ins.rows[0]!);
+          const ins = await this.pool.queryInActiveTx(
+            `INSERT INTO verification_runs (
+              project_id, task_id, merge_candidate_id, merge_candidate_hash, verified_tree_hash,
+              verifier_image_digest, verdict, overall_status,
+              tier1_trusted_acceptance_passed, tier2_protected_baseline_passed,
+              tier2_baseline_tamper_detected, tampered_baseline_paths,
+              tier3_agent_tests_passed, tier3_assertions_json,
+              infra_retry_count, execution_backend, hermetic_network_disabled,
+              hardlink_cache_forbidden, is_docker_isolated, trusted_policy_sha256,
+              exit_code, duration_ms, report_sha256
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text,
+              $6::text, $7::text, $8::text,
+              $9::boolean, $10::boolean,
+              $11::boolean, $12::jsonb,
+              $13::boolean, $14::jsonb,
+              $15::integer, $16::text, $17::boolean,
+              $18::boolean, $19::boolean, $20::text,
+              $21::integer, $22::integer, $23::text
+            ) RETURNING *;`,
+            [
+              input.project_id,
+              input.task_id,
+              input.merge_candidate_id,
+              input.merge_candidate_hash,
+              input.verified_tree_hash,
+              input.verifier_image_digest,
+              input.verdict,
+              overallStatus,
+              t1,
+              t2,
+              tamperDetected,
+              input.tampered_baseline_paths ?? [],
+              t3,
+              input.tier3_assertions ?? [],
+              infraRetryCount,
+              input.execution_backend ?? "docker",
+              input.hermetic_network_disabled ?? true,
+              input.hardlink_cache_forbidden ?? true,
+              input.is_docker_isolated ?? false,
+              input.trusted_policy_sha256 ?? null,
+              input.exit_code,
+              input.duration_ms,
+              input.report_sha256,
+            ]
+          );
+          const record = mapVerificationRunRow(ins.rows[0]!);
 
-      let nextTaskStatus: TaskStatus;
-      if (input.verdict === "PASS") {
-        nextTaskStatus = "UnderIndependentReview";
-      } else if (overallStatus === "INFRA_ERROR") {
-        nextTaskStatus = input.keep_verifying_on_infra_retry
-          ? "VerifyingInDocker"
-          : "ManualIntervention";
-        if (nextTaskStatus === "ManualIntervention") {
-          await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
+          let nextTaskStatus: TaskStatus;
+          if (input.verdict === "PASS") {
+            nextTaskStatus = "UnderIndependentReview";
+          } else if (overallStatus === "INFRA_ERROR") {
+            nextTaskStatus = input.keep_verifying_on_infra_retry
+              ? "VerifyingInDocker"
+              : "ManualIntervention";
+            if (nextTaskStatus === "ManualIntervention") {
+              await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
+            }
+          } else {
+            const reworkCount = Number(mcRow.rework_count);
+            const maxRework = Number(mcRow.max_rework_cycles);
+            nextTaskStatus = reworkCount < maxRework ? "ReworkRequired" : "ManualIntervention";
+            await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
+          }
+
+          await this.pool.queryInActiveTx(
+            "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
+            [nextTaskStatus, input.task_id]
+          );
+
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "verification_run",
+            record.verification_run_id,
+            "verification.completed",
+            {
+              task_id: input.task_id,
+              merge_candidate_id: input.merge_candidate_id,
+              merge_candidate_hash: input.merge_candidate_hash,
+              verdict: record.verdict,
+              overall_status: record.overall_status,
+              tier2_baseline_tamper_detected: record.tier2_baseline_tamper_detected,
+              infra_retry_count: record.infra_retry_count,
+              execution_backend: record.execution_backend,
+              is_docker_isolated: record.is_docker_isolated,
+              resulting_task_status: nextTaskStatus,
+            }
+          );
+
+          return record;
+        } catch (error) {
+          mapPgError(error);
         }
-      } else {
-        const reworkCount = Number(mcRow.rework_count);
-        const maxRework = Number(mcRow.max_rework_cycles);
-        nextTaskStatus = reworkCount < maxRework ? "ReworkRequired" : "ManualIntervention";
-        await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
       }
-
-      await this.pool.queryInActiveTx(
-        "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
-        [nextTaskStatus, input.task_id]
-      );
-
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "verification_run",
-        record.verification_run_id,
-        "verification.completed",
-        {
-          task_id: input.task_id,
-          merge_candidate_id: input.merge_candidate_id,
-          merge_candidate_hash: input.merge_candidate_hash,
-          verdict: record.verdict,
-          overall_status: record.overall_status,
-          tier2_baseline_tamper_detected: record.tier2_baseline_tamper_detected,
-          infra_retry_count: record.infra_retry_count,
-          execution_backend: record.execution_backend,
-          is_docker_isolated: record.is_docker_isolated,
-          resulting_task_status: nextTaskStatus,
-        }
-      );
-
-      return record;
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async recordReviewSession(input: {
@@ -4054,141 +4203,146 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     verdict: "PASS" | "FAIL";
     findings_json?: ReadonlyArray<Record<string, unknown>>;
   }): Promise<ReviewArtifactRecord> {
-    try {
-      const preRes = await this.pool.queryInActiveTx(
-        `SELECT vr.verification_run_id, vr.verdict AS vr_verdict,
-                mc.agent_commit_hash, mc.base_main_commit_hash, mc.is_superseded,
-                t.rework_count, t.max_rework_cycles, p.approval_ttl_seconds,
-                (SELECT v2.verification_run_id FROM verification_runs v2
-                 WHERE v2.project_id = $1::uuid AND v2.merge_candidate_id = $3::uuid
-                 ORDER BY v2.created_at DESC LIMIT 1) AS latest_vr_id
-         FROM verification_runs vr
-         INNER JOIN merge_candidates mc ON mc.merge_candidate_id = vr.merge_candidate_id AND mc.project_id = vr.project_id
-         INNER JOIN tasks t ON t.task_id = mc.task_id AND t.project_id = mc.project_id
-         INNER JOIN projects p ON p.project_id = t.project_id
-         WHERE vr.verification_run_id = $2::uuid AND vr.project_id = $1::uuid
-           AND vr.merge_candidate_id = $3::uuid AND vr.task_id = $4::uuid
-         LIMIT 1;`,
-        [input.project_id, input.verification_run_id, input.merge_candidate_id, input.task_id]
-      );
-      const row = preRes.rows[0];
-      if (!row || String(row.vr_verdict) !== "PASS" || Boolean(row.is_superseded)) {
-        throw new PostgresRlsError(
-          "23503",
-          "ReviewArtifact composite foreign key binding mismatch against PASS VerificationRun"
-        );
-      }
-      if (row.latest_vr_id && String(row.latest_vr_id) !== input.verification_run_id) {
-        throw new PostgresRlsError(
-          "23503",
-          `VerificationRun ${input.verification_run_id} was superseded by newer run ${String(row.latest_vr_id)}`
-        );
-      }
+    return this.withExistingOrRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "core_api_service" },
+      async () => {
+        try {
+          const preRes = await this.pool.queryInActiveTx(
+            `SELECT vr.verification_run_id, vr.verdict AS vr_verdict,
+                    mc.agent_commit_hash, mc.base_main_commit_hash, mc.is_superseded,
+                    t.rework_count, t.max_rework_cycles, p.approval_ttl_seconds,
+                    (SELECT v2.verification_run_id FROM verification_runs v2
+                     WHERE v2.project_id = $1::uuid AND v2.merge_candidate_id = $3::uuid
+                     ORDER BY v2.created_at DESC LIMIT 1) AS latest_vr_id
+             FROM verification_runs vr
+             INNER JOIN merge_candidates mc ON mc.merge_candidate_id = vr.merge_candidate_id AND mc.project_id = vr.project_id
+             INNER JOIN tasks t ON t.task_id = mc.task_id AND t.project_id = mc.project_id
+             INNER JOIN projects p ON p.project_id = t.project_id
+             WHERE vr.verification_run_id = $2::uuid AND vr.project_id = $1::uuid
+               AND vr.merge_candidate_id = $3::uuid AND vr.task_id = $4::uuid
+             LIMIT 1;`,
+            [input.project_id, input.verification_run_id, input.merge_candidate_id, input.task_id]
+          );
+          const row = preRes.rows[0];
+          if (!row || String(row.vr_verdict) !== "PASS" || Boolean(row.is_superseded)) {
+            throw new PostgresRlsError(
+              "23503",
+              "ReviewArtifact composite foreign key binding mismatch against PASS VerificationRun"
+            );
+          }
+          if (row.latest_vr_id && String(row.latest_vr_id) !== input.verification_run_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `VerificationRun ${input.verification_run_id} was superseded by newer run ${String(row.latest_vr_id)}`
+            );
+          }
 
-      const ins = await this.pool.queryInActiveTx(
-        `INSERT INTO review_artifacts (
-          project_id, task_id, merge_candidate_id, verification_run_id,
-          merge_candidate_hash, verified_tree_hash,
-          writer_provider, writer_model, reviewer_provider, reviewer_model,
-          developer_principal_id, reviewer_principal_id,
-          developer_session_id, reviewer_session_id,
-          developer_credential_id, reviewer_credential_id,
-          developer_agent_profile_id, reviewer_agent_profile_id,
-          review_session_id, verdict, status, is_invalidated,
-          summary_markdown, report_sha256, findings_json
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-          $5::text, $6::text,
-          $7::text, $8::text, $9::text, $10::text,
-          $11::text, $12::text,
-          $13::text, $14::text,
-          $15::text, $16::text,
-          $17::text, $18::text,
-          $19::uuid, $20::text, 'VALID', FALSE,
-          $21::text, $22::text, $23::jsonb
-        ) RETURNING *;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.merge_candidate_id,
-          input.verification_run_id,
-          input.merge_candidate_hash,
-          input.verified_tree_hash,
-          input.writer_provider.trim(),
-          input.writer_model.trim(),
-          input.reviewer_provider.trim(),
-          input.reviewer_model.trim(),
-          input.developer_principal_id.trim(),
-          input.reviewer_principal_id.trim(),
-          input.developer_session_id.trim(),
-          input.reviewer_session_id.trim(),
-          input.developer_credential_id ?? null,
-          input.reviewer_credential_id ?? null,
-          input.developer_agent_profile_id ?? null,
-          input.reviewer_agent_profile_id ?? null,
-          input.review_session_id ?? null,
-          input.verdict,
-          input.summary_markdown ?? null,
-          input.report_sha256 ?? null,
-          input.findings_json ?? [],
-        ]
-      );
-      const artifact = mapReviewArtifactRow(ins.rows[0]!);
+          const ins = await this.pool.queryInActiveTx(
+            `INSERT INTO review_artifacts (
+              project_id, task_id, merge_candidate_id, verification_run_id,
+              merge_candidate_hash, verified_tree_hash,
+              writer_provider, writer_model, reviewer_provider, reviewer_model,
+              developer_principal_id, reviewer_principal_id,
+              developer_session_id, reviewer_session_id,
+              developer_credential_id, reviewer_credential_id,
+              developer_agent_profile_id, reviewer_agent_profile_id,
+              review_session_id, verdict, status, is_invalidated,
+              summary_markdown, report_sha256, findings_json
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+              $5::text, $6::text,
+              $7::text, $8::text, $9::text, $10::text,
+              $11::text, $12::text,
+              $13::text, $14::text,
+              $15::text, $16::text,
+              $17::text, $18::text,
+              $19::uuid, $20::text, 'VALID', FALSE,
+              $21::text, $22::text, $23::jsonb
+            ) RETURNING *;`,
+            [
+              input.project_id,
+              input.task_id,
+              input.merge_candidate_id,
+              input.verification_run_id,
+              input.merge_candidate_hash,
+              input.verified_tree_hash,
+              input.writer_provider.trim(),
+              input.writer_model.trim(),
+              input.reviewer_provider.trim(),
+              input.reviewer_model.trim(),
+              input.developer_principal_id.trim(),
+              input.reviewer_principal_id.trim(),
+              input.developer_session_id.trim(),
+              input.reviewer_session_id.trim(),
+              input.developer_credential_id ?? null,
+              input.reviewer_credential_id ?? null,
+              input.developer_agent_profile_id ?? null,
+              input.reviewer_agent_profile_id ?? null,
+              input.review_session_id ?? null,
+              input.verdict,
+              input.summary_markdown ?? null,
+              input.report_sha256 ?? null,
+              input.findings_json ?? [],
+            ]
+          );
+          const artifact = mapReviewArtifactRow(ins.rows[0]!);
 
-      if (input.verdict === "PASS") {
-        await this.pool.queryInActiveTx(
-          "UPDATE tasks SET status = 'AwaitingHumanApproval', updated_at = clock_timestamp() WHERE task_id = $1::uuid;",
-          [input.task_id]
-        );
-        await this.pool.queryInActiveTx(
-          `UPDATE approval_requests SET status = 'INVALIDATED_STALE_CANDIDATE', updated_at = clock_timestamp()
-           WHERE merge_candidate_id = $1::uuid AND status = 'PENDING';`,
-          [input.merge_candidate_id]
-        );
-        const reqTtlMs =
-          input.approval_request_ttl_ms ?? Number(row.approval_ttl_seconds) * 1000;
-        if (reqTtlMs <= 0) {
-          throw new PostgresRlsError("23514", "chk_ar_ttl_window: expires_at must be > created_at");
+          if (input.verdict === "PASS") {
+            await this.pool.queryInActiveTx(
+              "UPDATE tasks SET status = 'AwaitingHumanApproval', updated_at = clock_timestamp() WHERE task_id = $1::uuid;",
+              [input.task_id]
+            );
+            await this.pool.queryInActiveTx(
+              `UPDATE approval_requests SET status = 'INVALIDATED_STALE_CANDIDATE', updated_at = clock_timestamp()
+               WHERE merge_candidate_id = $1::uuid AND status = 'PENDING';`,
+              [input.merge_candidate_id]
+            );
+            const reqTtlMs =
+              input.approval_request_ttl_ms ?? Number(row.approval_ttl_seconds) * 1000;
+            if (reqTtlMs <= 0) {
+              throw new PostgresRlsError("23514", "chk_ar_ttl_window: expires_at must be > created_at");
+            }
+            await this.pool.queryInActiveTx(
+              `INSERT INTO approval_requests (
+                project_id, task_id, merge_candidate_id,
+                agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash,
+                verification_run_id, review_artifact_id, status, expires_at
+              ) VALUES (
+                $1::uuid, $2::uuid, $3::uuid,
+                $4::text, $5::text, $6::text, $7::text,
+                $8::uuid, $9::uuid, 'PENDING',
+                clock_timestamp() + ($10::bigint * interval '1 millisecond')
+              );`,
+              [
+                input.project_id,
+                input.task_id,
+                input.merge_candidate_id,
+                String(row.agent_commit_hash),
+                String(row.base_main_commit_hash),
+                input.merge_candidate_hash,
+                input.verified_tree_hash,
+                input.verification_run_id,
+                artifact.review_artifact_id,
+                reqTtlMs,
+              ]
+            );
+          } else {
+            const nextStatus: TaskStatus =
+              Number(row.rework_count) < Number(row.max_rework_cycles)
+                ? "ReworkRequired"
+                : "ManualIntervention";
+            await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
+            await this.pool.queryInActiveTx(
+              "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
+              [nextStatus, input.task_id]
+            );
+          }
+          return artifact;
+        } catch (error) {
+          mapPgError(error);
         }
-        await this.pool.queryInActiveTx(
-          `INSERT INTO approval_requests (
-            project_id, task_id, merge_candidate_id,
-            agent_commit_hash, base_main_commit_hash, merge_candidate_hash, verified_tree_hash,
-            verification_run_id, review_artifact_id, status, expires_at
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid,
-            $4::text, $5::text, $6::text, $7::text,
-            $8::uuid, $9::uuid, 'PENDING',
-            clock_timestamp() + ($10::bigint * interval '1 millisecond')
-          );`,
-          [
-            input.project_id,
-            input.task_id,
-            input.merge_candidate_id,
-            String(row.agent_commit_hash),
-            String(row.base_main_commit_hash),
-            input.merge_candidate_hash,
-            input.verified_tree_hash,
-            input.verification_run_id,
-            artifact.review_artifact_id,
-            reqTtlMs,
-          ]
-        );
-      } else {
-        const nextStatus: TaskStatus =
-          Number(row.rework_count) < Number(row.max_rework_cycles)
-            ? "ReworkRequired"
-            : "ManualIntervention";
-        await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
-        await this.pool.queryInActiveTx(
-          "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
-          [nextStatus, input.task_id]
-        );
       }
-      return artifact;
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async submitHumanApproval(input: {
@@ -4208,269 +4362,278 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     ttl_ms?: number;
     current_main_commit_hash?: string;
   }): Promise<ApprovalDecisionRecord> {
-    try {
-      const membership = await this.getProjectMembership(input.project_id, input.approver_principal_id);
-      if (
-        !membership ||
-        (membership.member_role !== "PROJECT_APPROVER" && membership.member_role !== "ORG_ADMIN")
-      ) {
-        throw new PostgresRlsError(
-          "42501",
-          `Principal ${input.approver_principal_id} (${
-            membership ? `role=${membership.member_role}` : "no project membership"
-          }) is not authorized to approve in project ${input.project_id}`
-        );
-      }
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.approver_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const membership = await this.getProjectMembership(input.project_id, input.approver_principal_id);
+          if (
+            !membership ||
+            (membership.member_role !== "PROJECT_APPROVER" && membership.member_role !== "ORG_ADMIN")
+          ) {
+            throw new PostgresRlsError(
+              "42501",
+              `Principal ${input.approver_principal_id} (${
+                membership ? `role=${membership.member_role}` : "no project membership"
+              }) is not authorized to approve in project ${input.project_id}`
+            );
+          }
 
-      const stateRes = await this.pool.queryInActiveTx(
-        `SELECT p.approval_ttl_seconds, p.main_ref_commit_hash,
-                t.status AS task_status, t.rework_count, t.max_rework_cycles,
-                mc.task_id AS mc_task_id, mc.is_superseded,
-                mc.agent_commit_hash AS mc_agent, mc.base_main_commit_hash AS mc_base,
-                mc.merge_candidate_hash AS mc_cand, mc.verified_tree_hash AS mc_tree,
-                ra.task_id AS ra_task_id, ra.merge_candidate_id AS ra_mc_id,
-                ra.verification_run_id AS ra_vr_id, ra.merge_candidate_hash AS ra_cand,
-                ra.verified_tree_hash AS ra_tree,
-                ra.is_invalidated AS ra_invalidated, ra.status AS ra_status, ra.verdict AS ra_verdict,
-                vr.task_id AS vr_task_id, vr.merge_candidate_id AS vr_mc_id,
-                vr.verdict AS vr_verdict
-         FROM projects p
-         INNER JOIN tasks t ON t.project_id = p.project_id AND t.task_id = $2::uuid
-         INNER JOIN merge_candidates mc ON mc.project_id = p.project_id AND mc.merge_candidate_id = $3::uuid
-         INNER JOIN review_artifacts ra ON ra.project_id = p.project_id AND ra.review_artifact_id = $4::uuid
-         INNER JOIN verification_runs vr ON vr.project_id = p.project_id AND vr.verification_run_id = $5::uuid
-         WHERE p.project_id = $1::uuid
-         FOR UPDATE OF t, mc;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.merge_candidate_id,
-          input.review_artifact_id,
-          input.verification_run_id,
-        ]
-      );
-      const row = stateRes.rows[0];
-      if (!row) {
-        throw new PostgresRlsError(
-          "23503",
-          'insert or update on table "approval_decisions" violates composite 8-field foreign key constraint'
-        );
-      }
-      if (String(row.task_status) !== "AwaitingHumanApproval") {
-        throw new PostgresRlsError(
-          "23514",
-          `Task must be in AwaitingHumanApproval status to receive human approval, got ${String(row.task_status)}`
-        );
-      }
-      if (
-        String(row.mc_task_id) !== input.task_id ||
-        String(row.mc_agent) !== input.agent_commit_hash ||
-        String(row.mc_base) !== input.base_main_commit_hash ||
-        String(row.mc_cand) !== input.merge_candidate_hash ||
-        String(row.mc_tree) !== input.verified_tree_hash ||
-        String(row.ra_task_id) !== input.task_id ||
-        String(row.ra_mc_id) !== input.merge_candidate_id ||
-        String(row.ra_vr_id) !== input.verification_run_id ||
-        String(row.ra_cand) !== input.merge_candidate_hash ||
-        String(row.ra_tree) !== input.verified_tree_hash ||
-        String(row.vr_task_id) !== input.task_id ||
-        String(row.vr_mc_id) !== input.merge_candidate_id ||
-        Boolean(row.is_superseded) ||
-        Boolean(row.ra_invalidated) ||
-        String(row.ra_status) !== "VALID" ||
-        String(row.ra_verdict) !== "PASS" ||
-        String(row.vr_verdict) !== "PASS"
-      ) {
-        throw new PostgresRlsError(
-          "23503",
-          'insert or update on table "approval_decisions" violates composite 8-field foreign key constraint'
-        );
-      }
-
-      const arRes = input.approval_request_id
-        ? await this.pool.queryInActiveTx(
-            `SELECT *, (expires_at <= clock_timestamp()) AS is_expired_now
-             FROM approval_requests WHERE approval_request_id = $1::uuid LIMIT 1;`,
-            [input.approval_request_id]
-          )
-        : await this.pool.queryInActiveTx(
-            `SELECT *, (expires_at <= clock_timestamp()) AS is_expired_now
-             FROM approval_requests
-             WHERE merge_candidate_id = $1::uuid AND review_artifact_id = $2::uuid
-             ORDER BY (status = 'PENDING') DESC, created_at DESC LIMIT 1;`,
-            [input.merge_candidate_id, input.review_artifact_id]
-          );
-      const arRow = arRes.rows[0];
-      if (
-        input.approval_request_id &&
-        (!arRow ||
-          String(arRow.project_id) !== input.project_id ||
-          String(arRow.task_id) !== input.task_id ||
-          String(arRow.merge_candidate_id) !== input.merge_candidate_id ||
-          String(arRow.review_artifact_id) !== input.review_artifact_id ||
-          String(arRow.verification_run_id) !== input.verification_run_id ||
-          String(arRow.agent_commit_hash) !== String(row.mc_agent) ||
-          String(arRow.base_main_commit_hash) !== String(row.mc_base) ||
-          String(arRow.merge_candidate_hash) !== String(row.mc_cand) ||
-          String(arRow.verified_tree_hash) !== String(row.mc_tree))
-      ) {
-        throw new PostgresRlsError(
-          "23503",
-          `ApprovalRequest ${input.approval_request_id} violates composite binding to candidate ${input.merge_candidate_id} / review ${input.review_artifact_id}`
-        );
-      }
-      const approvalRequestId = arRow ? String(arRow.approval_request_id) : null;
-
-      if (input.decision === "APPROVED") {
-        const liveMainSha =
-          input.current_main_commit_hash ??
-          (row.main_ref_commit_hash ? String(row.main_ref_commit_hash) : "");
-        if (!liveMainSha || liveMainSha !== String(row.mc_base)) {
-          await this.pool.queryInActiveTx(
-            "UPDATE merge_candidates SET is_superseded = TRUE WHERE merge_candidate_id = $1::uuid;",
-            [input.merge_candidate_id]
-          );
-          await this.pool.queryInActiveTx(
-            `UPDATE review_artifacts SET status = 'INVALIDATED_STALE_BASE', is_invalidated = TRUE,
-                 invalidated_reason = $1::text
-             WHERE merge_candidate_id = $2::uuid;`,
+          const stateRes = await this.pool.queryInActiveTx(
+            `SELECT p.approval_ttl_seconds, p.main_ref_commit_hash,
+                    t.status AS task_status, t.rework_count, t.max_rework_cycles,
+                    mc.task_id AS mc_task_id, mc.is_superseded,
+                    mc.agent_commit_hash AS mc_agent, mc.base_main_commit_hash AS mc_base,
+                    mc.merge_candidate_hash AS mc_cand, mc.verified_tree_hash AS mc_tree,
+                    ra.task_id AS ra_task_id, ra.merge_candidate_id AS ra_mc_id,
+                    ra.verification_run_id AS ra_vr_id, ra.merge_candidate_hash AS ra_cand,
+                    ra.verified_tree_hash AS ra_tree,
+                    ra.is_invalidated AS ra_invalidated, ra.status AS ra_status, ra.verdict AS ra_verdict,
+                    vr.task_id AS vr_task_id, vr.merge_candidate_id AS vr_mc_id,
+                    vr.verdict AS vr_verdict
+             FROM projects p
+             INNER JOIN tasks t ON t.project_id = p.project_id AND t.task_id = $2::uuid
+             INNER JOIN merge_candidates mc ON mc.project_id = p.project_id AND mc.merge_candidate_id = $3::uuid
+             INNER JOIN review_artifacts ra ON ra.project_id = p.project_id AND ra.review_artifact_id = $4::uuid
+             INNER JOIN verification_runs vr ON vr.project_id = p.project_id AND vr.verification_run_id = $5::uuid
+             WHERE p.project_id = $1::uuid
+             FOR UPDATE OF t, mc;`,
             [
-              `APPROVAL_REJECTED_STALE_BASE_${String(row.mc_base)}_VS_${liveMainSha}`,
+              input.project_id,
+              input.task_id,
               input.merge_candidate_id,
+              input.review_artifact_id,
+              input.verification_run_id,
             ]
           );
-          if (approvalRequestId) {
-            await this.pool.queryInActiveTx(
-              "UPDATE approval_requests SET status = 'INVALIDATED_STALE_BASE', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
-              [approvalRequestId]
+          const row = stateRes.rows[0];
+          if (!row) {
+            throw new PostgresRlsError(
+              "23503",
+              'insert or update on table "approval_decisions" violates composite 8-field foreign key constraint'
             );
           }
-          await this.pool.queryInActiveTx(
-            `UPDATE tasks SET status = 'BuildingMergeCandidate',
-                 base_main_commit_hash = COALESCE(NULLIF($1::text, ''), base_main_commit_hash),
-                 active_merge_candidate_id = NULL, updated_at = clock_timestamp()
-             WHERE task_id = $2::uuid;`,
-            [liveMainSha, input.task_id]
-          );
-          throw new ApprovalExpiredOrStaleError(
-            `ERR_APPROVAL_EXPIRED_OR_STALE: candidate base_main_commit_hash ${String(row.mc_base)} is stale against live main ${liveMainSha}`,
-            "INVALIDATED_STALE_BASE"
-          );
-        }
-
-        if (
-          !arRow ||
-          String(arRow.status) !== "PENDING" ||
-          Boolean(arRow.is_expired_now)
-        ) {
-          if (approvalRequestId) {
-            await this.pool.queryInActiveTx(
-              "UPDATE approval_requests SET status = 'INVALIDATED_EXPIRED', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
-              [approvalRequestId]
+          if (String(row.task_status) !== "AwaitingHumanApproval") {
+            throw new PostgresRlsError(
+              "23514",
+              `Task must be in AwaitingHumanApproval status to receive human approval, got ${String(row.task_status)}`
             );
           }
+          if (
+            String(row.mc_task_id) !== input.task_id ||
+            String(row.mc_agent) !== input.agent_commit_hash ||
+            String(row.mc_base) !== input.base_main_commit_hash ||
+            String(row.mc_cand) !== input.merge_candidate_hash ||
+            String(row.mc_tree) !== input.verified_tree_hash ||
+            String(row.ra_task_id) !== input.task_id ||
+            String(row.ra_mc_id) !== input.merge_candidate_id ||
+            String(row.ra_vr_id) !== input.verification_run_id ||
+            String(row.ra_cand) !== input.merge_candidate_hash ||
+            String(row.ra_tree) !== input.verified_tree_hash ||
+            String(row.vr_task_id) !== input.task_id ||
+            String(row.vr_mc_id) !== input.merge_candidate_id ||
+            Boolean(row.is_superseded) ||
+            Boolean(row.ra_invalidated) ||
+            String(row.ra_status) !== "VALID" ||
+            String(row.ra_verdict) !== "PASS" ||
+            String(row.vr_verdict) !== "PASS"
+          ) {
+            throw new PostgresRlsError(
+              "23503",
+              'insert or update on table "approval_decisions" violates composite 8-field foreign key constraint'
+            );
+          }
+
+          const arRes = input.approval_request_id
+            ? await this.pool.queryInActiveTx(
+                `SELECT *, (expires_at <= clock_timestamp()) AS is_expired_now
+                 FROM approval_requests WHERE approval_request_id = $1::uuid LIMIT 1;`,
+                [input.approval_request_id]
+              )
+            : await this.pool.queryInActiveTx(
+                `SELECT *, (expires_at <= clock_timestamp()) AS is_expired_now
+                 FROM approval_requests
+                 WHERE merge_candidate_id = $1::uuid AND review_artifact_id = $2::uuid
+                 ORDER BY (status = 'PENDING') DESC, created_at DESC LIMIT 1;`,
+                [input.merge_candidate_id, input.review_artifact_id]
+              );
+          const arRow = arRes.rows[0];
+          if (
+            input.approval_request_id &&
+            (!arRow ||
+              String(arRow.project_id) !== input.project_id ||
+              String(arRow.task_id) !== input.task_id ||
+              String(arRow.merge_candidate_id) !== input.merge_candidate_id ||
+              String(arRow.review_artifact_id) !== input.review_artifact_id ||
+              String(arRow.verification_run_id) !== input.verification_run_id ||
+              String(arRow.agent_commit_hash) !== String(row.mc_agent) ||
+              String(arRow.base_main_commit_hash) !== String(row.mc_base) ||
+              String(arRow.merge_candidate_hash) !== String(row.mc_cand) ||
+              String(arRow.verified_tree_hash) !== String(row.mc_tree))
+          ) {
+            throw new PostgresRlsError(
+              "23503",
+              `ApprovalRequest ${input.approval_request_id} violates composite binding to candidate ${input.merge_candidate_id} / review ${input.review_artifact_id}`
+            );
+          }
+          const approvalRequestId = arRow ? String(arRow.approval_request_id) : null;
+
+          if (input.decision === "APPROVED") {
+            const liveMainSha =
+              input.current_main_commit_hash ??
+              (row.main_ref_commit_hash ? String(row.main_ref_commit_hash) : "");
+            if (!liveMainSha || liveMainSha !== String(row.mc_base)) {
+              await this.pool.queryInActiveTx(
+                "UPDATE merge_candidates SET is_superseded = TRUE WHERE merge_candidate_id = $1::uuid;",
+                [input.merge_candidate_id]
+              );
+              await this.pool.queryInActiveTx(
+                `UPDATE review_artifacts SET status = 'INVALIDATED_STALE_BASE', is_invalidated = TRUE,
+                     invalidated_reason = $1::text
+                 WHERE merge_candidate_id = $2::uuid;`,
+                [
+                  `APPROVAL_REJECTED_STALE_BASE_${String(row.mc_base)}_VS_${liveMainSha}`,
+                  input.merge_candidate_id,
+                ]
+              );
+              if (approvalRequestId) {
+                await this.pool.queryInActiveTx(
+                  "UPDATE approval_requests SET status = 'INVALIDATED_STALE_BASE', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
+                  [approvalRequestId]
+                );
+              }
+              await this.pool.queryInActiveTx(
+                `UPDATE tasks SET status = 'BuildingMergeCandidate',
+                     base_main_commit_hash = COALESCE(NULLIF($1::text, ''), base_main_commit_hash),
+                     active_merge_candidate_id = NULL, updated_at = clock_timestamp()
+                 WHERE task_id = $2::uuid;`,
+                [liveMainSha, input.task_id]
+              );
+              throw new ApprovalExpiredOrStaleError(
+                `ERR_APPROVAL_EXPIRED_OR_STALE: candidate base_main_commit_hash ${String(row.mc_base)} is stale against live main ${liveMainSha}`,
+                "INVALIDATED_STALE_BASE"
+              );
+            }
+
+            if (
+              !arRow ||
+              String(arRow.status) !== "PENDING" ||
+              Boolean(arRow.is_expired_now)
+            ) {
+              if (approvalRequestId) {
+                await this.pool.queryInActiveTx(
+                  "UPDATE approval_requests SET status = 'INVALIDATED_EXPIRED', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
+                  [approvalRequestId]
+                );
+              }
+              await this.pool.queryInActiveTx(
+                "UPDATE merge_candidates SET is_superseded = TRUE WHERE merge_candidate_id = $1::uuid;",
+                [input.merge_candidate_id]
+              );
+              await this.pool.queryInActiveTx(
+                `UPDATE tasks SET status = 'BuildingMergeCandidate', active_merge_candidate_id = NULL,
+                     updated_at = clock_timestamp()
+                 WHERE task_id = $1::uuid;`,
+                [input.task_id]
+              );
+              throw new ApprovalExpiredOrStaleError(
+                "ERR_APPROVAL_EXPIRED_OR_STALE: ApprovalRequest expired or missing",
+                "INVALIDATED_EXPIRED"
+              );
+            }
+          }
+
+          const ttlMs = input.ttl_ms ?? Number(row.approval_ttl_seconds) * 1000;
+          if (ttlMs <= 0) {
+            throw new PostgresRlsError("23514", "chk_approval_ttl_window: expires_at must be > approved_at");
+          }
+
+          const initialStatus = input.decision === "APPROVED" ? "ACTIVE" : "CONSUMED";
+          const ins = await this.pool.queryInActiveTx(
+            `INSERT INTO approval_decisions (
+              project_id, task_id, merge_candidate_id, approval_request_id,
+              agent_commit_hash, base_main_commit_hash, verified_tree_hash, merge_candidate_hash,
+              verification_run_id, review_artifact_id, approver_principal_id,
+              decision, status, approved_at, expires_at, consumed_at
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+              $5::text, $6::text, $7::text, $8::text,
+              $9::uuid, $10::uuid, $11::text,
+              $12::text, $13::text, clock_timestamp(),
+              clock_timestamp() + ($14::bigint * interval '1 millisecond'),
+              CASE WHEN $13::text = 'CONSUMED' THEN clock_timestamp() ELSE NULL END
+            ) RETURNING *;`,
+            [
+              input.project_id,
+              input.task_id,
+              input.merge_candidate_id,
+              approvalRequestId,
+              input.agent_commit_hash,
+              input.base_main_commit_hash,
+              input.verified_tree_hash,
+              input.merge_candidate_hash,
+              input.verification_run_id,
+              input.review_artifact_id,
+              input.approver_principal_id,
+              input.decision,
+              initialStatus,
+              ttlMs,
+            ]
+          );
+          const record = mapApprovalDecisionRow(ins.rows[0]!);
+
+          if (approvalRequestId) {
+            await this.pool.queryInActiveTx(
+              "UPDATE approval_requests SET status = $1::text, updated_at = clock_timestamp() WHERE approval_request_id = $2::uuid;",
+              [input.decision === "APPROVED" ? "APPROVED" : "REJECTED", approvalRequestId]
+            );
+          }
+
+          let nextTaskStatus: TaskStatus;
+          if (input.decision === "APPROVED") {
+            nextTaskStatus = "AtomicCasMerge";
+          } else if (input.decision === "REQUEST_CHANGES") {
+            nextTaskStatus =
+              Number(row.rework_count) < Number(row.max_rework_cycles)
+                ? "ReworkRequired"
+                : "ManualIntervention";
+            await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
+          } else {
+            nextTaskStatus = "ManualIntervention";
+            await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
+          }
+
           await this.pool.queryInActiveTx(
-            "UPDATE merge_candidates SET is_superseded = TRUE WHERE merge_candidate_id = $1::uuid;",
-            [input.merge_candidate_id]
+            "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
+            [nextTaskStatus, input.task_id]
           );
-          await this.pool.queryInActiveTx(
-            `UPDATE tasks SET status = 'BuildingMergeCandidate', active_merge_candidate_id = NULL,
-                 updated_at = clock_timestamp()
-             WHERE task_id = $1::uuid;`,
-            [input.task_id]
+
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "approval_decision",
+            record.approval_id,
+            "human.approval_decided",
+            {
+              task_id: input.task_id,
+              merge_candidate_id: input.merge_candidate_id,
+              approval_request_id: approvalRequestId,
+              decision: input.decision,
+              approver_principal_id: input.approver_principal_id,
+              resulting_task_status: nextTaskStatus,
+              ...(input.feedback ? { feedback: input.feedback } : {}),
+            }
           );
-          throw new ApprovalExpiredOrStaleError(
-            "ERR_APPROVAL_EXPIRED_OR_STALE: ApprovalRequest expired or missing",
-            "INVALIDATED_EXPIRED"
-          );
+
+          return record;
+        } catch (error) {
+          mapPgError(error);
         }
       }
-
-      const ttlMs = input.ttl_ms ?? Number(row.approval_ttl_seconds) * 1000;
-      if (ttlMs <= 0) {
-        throw new PostgresRlsError("23514", "chk_approval_ttl_window: expires_at must be > approved_at");
-      }
-
-      const initialStatus = input.decision === "APPROVED" ? "ACTIVE" : "CONSUMED";
-      const ins = await this.pool.queryInActiveTx(
-        `INSERT INTO approval_decisions (
-          project_id, task_id, merge_candidate_id, approval_request_id,
-          agent_commit_hash, base_main_commit_hash, verified_tree_hash, merge_candidate_hash,
-          verification_run_id, review_artifact_id, approver_principal_id,
-          decision, status, approved_at, expires_at, consumed_at
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-          $5::text, $6::text, $7::text, $8::text,
-          $9::uuid, $10::uuid, $11::text,
-          $12::text, $13::text, clock_timestamp(),
-          clock_timestamp() + ($14::bigint * interval '1 millisecond'),
-          CASE WHEN $13::text = 'CONSUMED' THEN clock_timestamp() ELSE NULL END
-        ) RETURNING *;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.merge_candidate_id,
-          approvalRequestId,
-          input.agent_commit_hash,
-          input.base_main_commit_hash,
-          input.verified_tree_hash,
-          input.merge_candidate_hash,
-          input.verification_run_id,
-          input.review_artifact_id,
-          input.approver_principal_id,
-          input.decision,
-          initialStatus,
-          ttlMs,
-        ]
-      );
-      const record = mapApprovalDecisionRow(ins.rows[0]!);
-
-      if (approvalRequestId) {
-        await this.pool.queryInActiveTx(
-          "UPDATE approval_requests SET status = $1::text, updated_at = clock_timestamp() WHERE approval_request_id = $2::uuid;",
-          [input.decision === "APPROVED" ? "APPROVED" : "REJECTED", approvalRequestId]
-        );
-      }
-
-      let nextTaskStatus: TaskStatus;
-      if (input.decision === "APPROVED") {
-        nextTaskStatus = "AtomicCasMerge";
-      } else if (input.decision === "REQUEST_CHANGES") {
-        nextTaskStatus =
-          Number(row.rework_count) < Number(row.max_rework_cycles)
-            ? "ReworkRequired"
-            : "ManualIntervention";
-        await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
-      } else {
-        nextTaskStatus = "ManualIntervention";
-        await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
-      }
-
-      await this.pool.queryInActiveTx(
-        "UPDATE tasks SET status = $1::text, updated_at = clock_timestamp() WHERE task_id = $2::uuid;",
-        [nextTaskStatus, input.task_id]
-      );
-
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "approval_decision",
-        record.approval_id,
-        "human.approval_decided",
-        {
-          task_id: input.task_id,
-          merge_candidate_id: input.merge_candidate_id,
-          approval_request_id: approvalRequestId,
-          decision: input.decision,
-          approver_principal_id: input.approver_principal_id,
-          resulting_task_status: nextTaskStatus,
-          ...(input.feedback ? { feedback: input.feedback } : {}),
-        }
-      );
-
-      return record;
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async executeAtomicCasMergeOrReconcile(input: {
@@ -4487,264 +4650,269 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     };
     simulateCrashAfterGitUpdateRef?: boolean;
   }): Promise<CasMergeResult> {
-    try {
-      const res = await this.pool.queryInActiveTx(
-        `SELECT p.main_ref_commit_hash,
-                t.status AS task_status, t.merged_commit_hash,
-                mc.base_main_commit_hash, mc.merge_candidate_hash, mc.verified_tree_hash,
-                ad.decision, ad.status AS approval_status, ad.approval_request_id,
-                (ad.expires_at <= clock_timestamp()) AS approval_expired_now
-         FROM projects p
-         INNER JOIN tasks t ON t.project_id = p.project_id AND t.task_id = $2::uuid
-         INNER JOIN merge_candidates mc ON mc.project_id = p.project_id AND mc.merge_candidate_id = $3::uuid
-         INNER JOIN approval_decisions ad ON ad.project_id = p.project_id AND ad.approval_id = $4::uuid
-         WHERE p.project_id = $1::uuid
-         FOR UPDATE OF t, mc, ad;`,
-        [input.project_id, input.task_id, input.merge_candidate_id, input.approval_id]
-      );
-      const row = res.rows[0];
-      if (!row) {
-        throw new Error("Missing project, task, merge_candidate, or approval_decision for CAS merge");
-      }
-      if (String(row.decision) !== "APPROVED") {
-        throw new Error(`Cannot merge candidate with decision ${String(row.decision)}`);
-      }
-      const taskStatus = String(row.task_status) as TaskStatus;
-      if (taskStatus !== "AtomicCasMerge" && taskStatus !== "MergedAndCompleted") {
-        throw new Error(
-          `Task must be in AtomicCasMerge status for CAS merge, current status is ${taskStatus}`
-        );
-      }
-
-      const currentMainSha = input.gitBridge
-        ? input.gitBridge.getCurrentMainHead()
-        : String(row.main_ref_commit_hash ?? "");
-      if (!currentMainSha) {
-        throw new PostgresRlsError(
-          "23503",
-          `Project ${input.project_id} is missing required refs/heads/main pointer`
-        );
-      }
-
-      if (taskStatus === "MergedAndCompleted" && row.merged_commit_hash) {
-        const opRes = await this.pool.queryInActiveTx(
-          `SELECT * FROM merge_operations
-           WHERE project_id = $1::uuid AND task_id = $2::uuid AND approval_id = $3::uuid
-           LIMIT 1;`,
-          [input.project_id, input.task_id, input.approval_id]
-        );
-        const op = opRes.rows[0] ? mapMergeOperationRow(opRes.rows[0]) : undefined;
-        return {
-          status: "RECONCILED_ALREADY_MERGED",
-          task_status: "MergedAndCompleted",
-          merged_commit_hash: String(row.merged_commit_hash),
-          main_ref_commit_hash: currentMainSha,
-          ...(op ? { merge_op_id: op.merge_op_id } : {}),
-          reconciled_after_lost_response: op?.reconciled_after_lost_response ?? false,
-        };
-      }
-
-      const mergeIdempKey = `merge:${input.project_id}:${input.task_id}:${String(row.merge_candidate_hash)}:${input.approval_id}`;
-      let opRes = await this.pool.queryInActiveTx(
-        "SELECT * FROM merge_operations WHERE project_id = $1::uuid AND merge_idempotency_key = $2::text LIMIT 1;",
-        [input.project_id, mergeIdempKey]
-      );
-      let mergeOp: MergeOperationRecord;
-      if (opRes.rows[0]) {
-        mergeOp = mapMergeOperationRow(opRes.rows[0]);
-        if (mergeOp.status === "IN_PROGRESS") {
-          const upd = await this.pool.queryInActiveTx(
-            "UPDATE merge_operations SET retry_count = retry_count + 1 WHERE merge_op_id = $1::uuid RETURNING *;",
-            [mergeOp.merge_op_id]
+    return this.withExistingOrRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "core_api_service" },
+      async () => {
+        try {
+          const res = await this.pool.queryInActiveTx(
+            `SELECT p.main_ref_commit_hash,
+                    t.status AS task_status, t.merged_commit_hash,
+                    mc.base_main_commit_hash, mc.merge_candidate_hash, mc.verified_tree_hash,
+                    ad.decision, ad.status AS approval_status, ad.approval_request_id,
+                    (ad.expires_at <= clock_timestamp()) AS approval_expired_now
+             FROM projects p
+             INNER JOIN tasks t ON t.project_id = p.project_id AND t.task_id = $2::uuid
+             INNER JOIN merge_candidates mc ON mc.project_id = p.project_id AND mc.merge_candidate_id = $3::uuid
+             INNER JOIN approval_decisions ad ON ad.project_id = p.project_id AND ad.approval_id = $4::uuid
+             WHERE p.project_id = $1::uuid
+             FOR UPDATE OF t, mc, ad;`,
+            [input.project_id, input.task_id, input.merge_candidate_id, input.approval_id]
           );
-          mergeOp = mapMergeOperationRow(upd.rows[0]!);
-        }
-      } else {
-        const insOp = await this.pool.queryInActiveTx(
-          `INSERT INTO merge_operations (
-            project_id, task_id, merge_candidate_id, approval_id, merge_idempotency_key,
-            base_main_commit_hash, merge_candidate_hash, verified_tree_hash, status
-          ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::text, $6::text, $7::text, $8::text, 'IN_PROGRESS')
-          RETURNING *;`,
-          [
-            input.project_id,
-            input.task_id,
-            input.merge_candidate_id,
-            input.approval_id,
-            mergeIdempKey,
-            String(row.base_main_commit_hash),
-            String(row.merge_candidate_hash),
-            String(row.verified_tree_hash),
-          ]
-        );
-        mergeOp = mapMergeOperationRow(insOp.rows[0]!);
-      }
-
-      const mcHash = String(row.merge_candidate_hash);
-      const baseHash = String(row.base_main_commit_hash);
-      const approvalReqId = row.approval_request_id ? String(row.approval_request_id) : null;
-
-      const commitReconciledMerge = async (reconciled: boolean, eventName: string): Promise<CasMergeResult> => {
-        await this.pool.queryInActiveTx(
-          "UPDATE projects SET main_ref_commit_hash = $1::text, updated_at = clock_timestamp() WHERE project_id = $2::uuid;",
-          [mcHash, input.project_id]
-        );
-        await this.pool.queryInActiveTx(
-          "UPDATE approval_decisions SET status = 'CONSUMED', consumed_at = COALESCE(consumed_at, clock_timestamp()) WHERE approval_id = $1::uuid;",
-          [input.approval_id]
-        );
-        if (approvalReqId) {
-          await this.pool.queryInActiveTx(
-            "UPDATE approval_requests SET status = 'APPROVED', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
-            [approvalReqId]
-          );
-        }
-        await this.pool.queryInActiveTx(
-          "UPDATE merge_candidates SET snapshot_retention_class = 'MERGED_PERMANENT' WHERE merge_candidate_id = $1::uuid;",
-          [input.merge_candidate_id]
-        );
-        await this.pool.queryInActiveTx(
-          `UPDATE merge_operations SET status = 'MERGED', reconciled_after_lost_response = $1::boolean,
-               last_error = NULL, completed_at = clock_timestamp()
-           WHERE merge_op_id = $2::uuid;`,
-          [reconciled, mergeOp.merge_op_id]
-        );
-        await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
-        await this.pool.queryInActiveTx(
-          `UPDATE tasks SET status = 'MergedAndCompleted', merged_commit_hash = $1::text,
-               merged_at = clock_timestamp(), updated_at = clock_timestamp()
-           WHERE task_id = $2::uuid;`,
-          [mcHash, input.task_id]
-        );
-        await this.insertOutboxEventSql(input.project_id, "task", input.task_id, eventName, {
-          task_id: input.task_id,
-          merge_candidate_id: input.merge_candidate_id,
-          merged_commit_hash: mcHash,
-          approval_id: input.approval_id,
-          merge_op_id: mergeOp.merge_op_id,
-        });
-        return {
-          status: reconciled ? "RECONCILED_ALREADY_MERGED" : "MERGED_BY_CAS",
-          task_status: "MergedAndCompleted",
-          merged_commit_hash: mcHash,
-          main_ref_commit_hash: mcHash,
-          merge_op_id: mergeOp.merge_op_id,
-          reconciled_after_lost_response: reconciled,
-        };
-      };
-
-      if (currentMainSha === mcHash) {
-        return await commitReconciledMerge(true, "task.merged_reconciled");
-      }
-
-      if (String(row.approval_status) !== "ACTIVE" || Boolean(row.approval_expired_now)) {
-        if (String(row.approval_status) === "ACTIVE") {
-          await this.pool.queryInActiveTx(
-            "UPDATE approval_decisions SET status = 'EXPIRED', invalidated_reason = 'APPROVAL_TTL_EXPIRED' WHERE approval_id = $1::uuid;",
-            [input.approval_id]
-          );
-        }
-        await this.pool.queryInActiveTx(
-          "UPDATE merge_operations SET last_error = 'APPROVAL_TTL_EXPIRED' WHERE merge_op_id = $1::uuid;",
-          [mergeOp.merge_op_id]
-        );
-        await this.pool.queryInActiveTx(
-          "UPDATE tasks SET status = 'AwaitingHumanApproval', updated_at = clock_timestamp() WHERE task_id = $1::uuid;",
-          [input.task_id]
-        );
-        return {
-          status: "APPROVAL_EXPIRED",
-          task_status: "AwaitingHumanApproval",
-          merged_commit_hash: null,
-          main_ref_commit_hash: currentMainSha,
-          invalidated_approval_id: input.approval_id,
-          merge_op_id: mergeOp.merge_op_id,
-        };
-      }
-
-      const abortForConflict = async (observedSha: string): Promise<CasMergeResult> => {
-        const errMsg = `CAS_MAIN_MOVED_FROM_${baseHash}_TO_${observedSha}`;
-        await this.pool.queryInActiveTx(
-          "UPDATE projects SET main_ref_commit_hash = $1::text, updated_at = clock_timestamp() WHERE project_id = $2::uuid;",
-          [observedSha, input.project_id]
-        );
-        await this.pool.queryInActiveTx(
-          `UPDATE merge_operations SET status = 'CAS_CONFLICT_ABORTED', last_error = $1::text, completed_at = clock_timestamp()
-           WHERE merge_op_id = $2::uuid;`,
-          [errMsg, mergeOp.merge_op_id]
-        );
-        await this.pool.queryInActiveTx(
-          "UPDATE merge_candidates SET is_superseded = TRUE WHERE merge_candidate_id = $1::uuid;",
-          [input.merge_candidate_id]
-        );
-        await this.pool.queryInActiveTx(
-          "UPDATE review_artifacts SET status = 'INVALIDATED_STALE_BASE', is_invalidated = TRUE, invalidated_reason = $1::text WHERE merge_candidate_id = $2::uuid;",
-          [errMsg, input.merge_candidate_id]
-        );
-        await this.pool.queryInActiveTx(
-          "UPDATE approval_decisions SET status = 'INVALIDATED', invalidated_reason = $1::text WHERE approval_id = $2::uuid;",
-          [errMsg, input.approval_id]
-        );
-        if (approvalReqId) {
-          await this.pool.queryInActiveTx(
-            "UPDATE approval_requests SET status = 'INVALIDATED_STALE_BASE', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
-            [approvalReqId]
-          );
-        }
-        await this.pool.queryInActiveTx(
-          `UPDATE tasks SET status = 'BuildingMergeCandidate', base_main_commit_hash = $1::text,
-               active_merge_candidate_id = NULL, updated_at = clock_timestamp()
-           WHERE task_id = $2::uuid;`,
-          [observedSha, input.task_id]
-        );
-        await this.insertOutboxEventSql(
-          input.project_id,
-          "merge_operation",
-          mergeOp.merge_op_id,
-          "merge.cas_conflict_detected",
-          {
-            task_id: input.task_id,
-            merge_candidate_id: input.merge_candidate_id,
-            stale_base_main_commit_hash: baseHash,
-            observed_main_commit_hash: observedSha,
+          const row = res.rows[0];
+          if (!row) {
+            throw new Error("Missing project, task, merge_candidate, or approval_decision for CAS merge");
           }
-        );
-        return {
-          status: "CAS_CONFLICT_NEEDS_REBASE",
-          task_status: "BuildingMergeCandidate",
-          merged_commit_hash: null,
-          main_ref_commit_hash: observedSha,
-          invalidated_approval_id: input.approval_id,
-          merge_op_id: mergeOp.merge_op_id,
-        };
-      };
+          if (String(row.decision) !== "APPROVED") {
+            throw new Error(`Cannot merge candidate with decision ${String(row.decision)}`);
+          }
+          const taskStatus = String(row.task_status) as TaskStatus;
+          if (taskStatus !== "AtomicCasMerge" && taskStatus !== "MergedAndCompleted") {
+            throw new Error(
+              `Task must be in AtomicCasMerge status for CAS merge, current status is ${taskStatus}`
+            );
+          }
 
-      if (currentMainSha !== baseHash) {
-        return await abortForConflict(currentMainSha);
-      }
+          const currentMainSha = input.gitBridge
+            ? input.gitBridge.getCurrentMainHead()
+            : String(row.main_ref_commit_hash ?? "");
+          if (!currentMainSha) {
+            throw new PostgresRlsError(
+              "23503",
+              `Project ${input.project_id} is missing required refs/heads/main pointer`
+            );
+          }
 
-      if (input.gitBridge) {
-        const casOk = input.gitBridge.atomicCompareAndSwapMainRef(baseHash, mcHash);
-        if (!casOk) {
-          const racedSha = input.gitBridge.getCurrentMainHead();
-          if (racedSha === mcHash) {
+          if (taskStatus === "MergedAndCompleted" && row.merged_commit_hash) {
+            const opRes = await this.pool.queryInActiveTx(
+              `SELECT * FROM merge_operations
+               WHERE project_id = $1::uuid AND task_id = $2::uuid AND approval_id = $3::uuid
+               LIMIT 1;`,
+              [input.project_id, input.task_id, input.approval_id]
+            );
+            const op = opRes.rows[0] ? mapMergeOperationRow(opRes.rows[0]) : undefined;
+            return {
+              status: "RECONCILED_ALREADY_MERGED",
+              task_status: "MergedAndCompleted",
+              merged_commit_hash: String(row.merged_commit_hash),
+              main_ref_commit_hash: currentMainSha,
+              ...(op ? { merge_op_id: op.merge_op_id } : {}),
+              reconciled_after_lost_response: op?.reconciled_after_lost_response ?? false,
+            };
+          }
+
+          const mergeIdempKey = `merge:${input.project_id}:${input.task_id}:${String(row.merge_candidate_hash)}:${input.approval_id}`;
+          let opRes = await this.pool.queryInActiveTx(
+            "SELECT * FROM merge_operations WHERE project_id = $1::uuid AND merge_idempotency_key = $2::text LIMIT 1;",
+            [input.project_id, mergeIdempKey]
+          );
+          let mergeOp: MergeOperationRecord;
+          if (opRes.rows[0]) {
+            mergeOp = mapMergeOperationRow(opRes.rows[0]);
+            if (mergeOp.status === "IN_PROGRESS") {
+              const upd = await this.pool.queryInActiveTx(
+                "UPDATE merge_operations SET retry_count = retry_count + 1 WHERE merge_op_id = $1::uuid RETURNING *;",
+                [mergeOp.merge_op_id]
+              );
+              mergeOp = mapMergeOperationRow(upd.rows[0]!);
+            }
+          } else {
+            const insOp = await this.pool.queryInActiveTx(
+              `INSERT INTO merge_operations (
+                project_id, task_id, merge_candidate_id, approval_id, merge_idempotency_key,
+                base_main_commit_hash, merge_candidate_hash, verified_tree_hash, status
+              ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::text, $6::text, $7::text, $8::text, 'IN_PROGRESS')
+              RETURNING *;`,
+              [
+                input.project_id,
+                input.task_id,
+                input.merge_candidate_id,
+                input.approval_id,
+                mergeIdempKey,
+                String(row.base_main_commit_hash),
+                String(row.merge_candidate_hash),
+                String(row.verified_tree_hash),
+              ]
+            );
+            mergeOp = mapMergeOperationRow(insOp.rows[0]!);
+          }
+
+          const mcHash = String(row.merge_candidate_hash);
+          const baseHash = String(row.base_main_commit_hash);
+          const approvalReqId = row.approval_request_id ? String(row.approval_request_id) : null;
+
+          const commitReconciledMerge = async (reconciled: boolean, eventName: string): Promise<CasMergeResult> => {
+            await this.pool.queryInActiveTx(
+              "UPDATE projects SET main_ref_commit_hash = $1::text, updated_at = clock_timestamp() WHERE project_id = $2::uuid;",
+              [mcHash, input.project_id]
+            );
+            await this.pool.queryInActiveTx(
+              "UPDATE approval_decisions SET status = 'CONSUMED', consumed_at = COALESCE(consumed_at, clock_timestamp()) WHERE approval_id = $1::uuid;",
+              [input.approval_id]
+            );
+            if (approvalReqId) {
+              await this.pool.queryInActiveTx(
+                "UPDATE approval_requests SET status = 'APPROVED', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
+                [approvalReqId]
+              );
+            }
+            await this.pool.queryInActiveTx(
+              "UPDATE merge_candidates SET snapshot_retention_class = 'MERGED_PERMANENT' WHERE merge_candidate_id = $1::uuid;",
+              [input.merge_candidate_id]
+            );
+            await this.pool.queryInActiveTx(
+              `UPDATE merge_operations SET status = 'MERGED', reconciled_after_lost_response = $1::boolean,
+                   last_error = NULL, completed_at = clock_timestamp()
+               WHERE merge_op_id = $2::uuid;`,
+              [reconciled, mergeOp.merge_op_id]
+            );
+            await this.closeActiveLeasesForTaskSql(input.task_id, "COMPLETED");
+            await this.pool.queryInActiveTx(
+              `UPDATE tasks SET status = 'MergedAndCompleted', merged_commit_hash = $1::text,
+                   merged_at = clock_timestamp(), updated_at = clock_timestamp()
+               WHERE task_id = $2::uuid;`,
+              [mcHash, input.task_id]
+            );
+            await this.insertOutboxEventSql(input.project_id, "task", input.task_id, eventName, {
+              task_id: input.task_id,
+              merge_candidate_id: input.merge_candidate_id,
+              merged_commit_hash: mcHash,
+              approval_id: input.approval_id,
+              merge_op_id: mergeOp.merge_op_id,
+            });
+            return {
+              status: reconciled ? "RECONCILED_ALREADY_MERGED" : "MERGED_BY_CAS",
+              task_status: "MergedAndCompleted",
+              merged_commit_hash: mcHash,
+              main_ref_commit_hash: mcHash,
+              merge_op_id: mergeOp.merge_op_id,
+              reconciled_after_lost_response: reconciled,
+            };
+          };
+
+          if (currentMainSha === mcHash) {
             return await commitReconciledMerge(true, "task.merged_reconciled");
           }
-          return await abortForConflict(racedSha);
+
+          if (String(row.approval_status) !== "ACTIVE" || Boolean(row.approval_expired_now)) {
+            if (String(row.approval_status) === "ACTIVE") {
+              await this.pool.queryInActiveTx(
+                "UPDATE approval_decisions SET status = 'EXPIRED', invalidated_reason = 'APPROVAL_TTL_EXPIRED' WHERE approval_id = $1::uuid;",
+                [input.approval_id]
+              );
+            }
+            await this.pool.queryInActiveTx(
+              "UPDATE merge_operations SET last_error = 'APPROVAL_TTL_EXPIRED' WHERE merge_op_id = $1::uuid;",
+              [mergeOp.merge_op_id]
+            );
+            await this.pool.queryInActiveTx(
+              "UPDATE tasks SET status = 'AwaitingHumanApproval', updated_at = clock_timestamp() WHERE task_id = $1::uuid;",
+              [input.task_id]
+            );
+            return {
+              status: "APPROVAL_EXPIRED",
+              task_status: "AwaitingHumanApproval",
+              merged_commit_hash: null,
+              main_ref_commit_hash: currentMainSha,
+              invalidated_approval_id: input.approval_id,
+              merge_op_id: mergeOp.merge_op_id,
+            };
+          }
+
+          const abortForConflict = async (observedSha: string): Promise<CasMergeResult> => {
+            const errMsg = `CAS_MAIN_MOVED_FROM_${baseHash}_TO_${observedSha}`;
+            await this.pool.queryInActiveTx(
+              "UPDATE projects SET main_ref_commit_hash = $1::text, updated_at = clock_timestamp() WHERE project_id = $2::uuid;",
+              [observedSha, input.project_id]
+            );
+            await this.pool.queryInActiveTx(
+              `UPDATE merge_operations SET status = 'CAS_CONFLICT_ABORTED', last_error = $1::text, completed_at = clock_timestamp()
+               WHERE merge_op_id = $2::uuid;`,
+              [errMsg, mergeOp.merge_op_id]
+            );
+            await this.pool.queryInActiveTx(
+              "UPDATE merge_candidates SET is_superseded = TRUE WHERE merge_candidate_id = $1::uuid;",
+              [input.merge_candidate_id]
+            );
+            await this.pool.queryInActiveTx(
+              "UPDATE review_artifacts SET status = 'INVALIDATED_STALE_BASE', is_invalidated = TRUE, invalidated_reason = $1::text WHERE merge_candidate_id = $2::uuid;",
+              [errMsg, input.merge_candidate_id]
+            );
+            await this.pool.queryInActiveTx(
+              "UPDATE approval_decisions SET status = 'INVALIDATED', invalidated_reason = $1::text WHERE approval_id = $2::uuid;",
+              [errMsg, input.approval_id]
+            );
+            if (approvalReqId) {
+              await this.pool.queryInActiveTx(
+                "UPDATE approval_requests SET status = 'INVALIDATED_STALE_BASE', updated_at = clock_timestamp() WHERE approval_request_id = $1::uuid;",
+                [approvalReqId]
+              );
+            }
+            await this.pool.queryInActiveTx(
+              `UPDATE tasks SET status = 'BuildingMergeCandidate', base_main_commit_hash = $1::text,
+                   active_merge_candidate_id = NULL, updated_at = clock_timestamp()
+               WHERE task_id = $2::uuid;`,
+              [observedSha, input.task_id]
+            );
+            await this.insertOutboxEventSql(
+              input.project_id,
+              "merge_operation",
+              mergeOp.merge_op_id,
+              "merge.cas_conflict_detected",
+              {
+                task_id: input.task_id,
+                merge_candidate_id: input.merge_candidate_id,
+                stale_base_main_commit_hash: baseHash,
+                observed_main_commit_hash: observedSha,
+              }
+            );
+            return {
+              status: "CAS_CONFLICT_NEEDS_REBASE",
+              task_status: "BuildingMergeCandidate",
+              merged_commit_hash: null,
+              main_ref_commit_hash: observedSha,
+              invalidated_approval_id: input.approval_id,
+              merge_op_id: mergeOp.merge_op_id,
+            };
+          };
+
+          if (currentMainSha !== baseHash) {
+            return await abortForConflict(currentMainSha);
+          }
+
+          if (input.gitBridge) {
+            const casOk = input.gitBridge.atomicCompareAndSwapMainRef(baseHash, mcHash);
+            if (!casOk) {
+              const racedSha = input.gitBridge.getCurrentMainHead();
+              if (racedSha === mcHash) {
+                return await commitReconciledMerge(true, "task.merged_reconciled");
+              }
+              return await abortForConflict(racedSha);
+            }
+          }
+
+          if (input.simulateCrashAfterGitUpdateRef) {
+            throw new SimulatedPostMergeCrashError(
+              `Simulated crash right after git update-ref moved refs/heads/main to ${mcHash}`,
+              mergeOp.merge_op_id
+            );
+          }
+
+          return await commitReconciledMerge(false, "task.merged");
+        } catch (error) {
+          mapPgError(error);
         }
       }
-
-      if (input.simulateCrashAfterGitUpdateRef) {
-        throw new SimulatedPostMergeCrashError(
-          `Simulated crash right after git update-ref moved refs/heads/main to ${mcHash}`,
-          mergeOp.merge_op_id
-        );
-      }
-
-      return await commitReconciledMerge(false, "task.merged");
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async getMainRefCommitHash(projectId?: string): Promise<string | null> {
@@ -4845,52 +5013,57 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async recordResourceUsageMetric(
     input: RecordResourceUsageMetricInput
   ): Promise<ResourceUsageMetricRecord> {
-    try {
-      validateAndNormalizeResourceUsageMetricInput(input);
-      let taskDefaults: { current_attempt_no: number; rework_count: number } | undefined;
-      if (input.attempt_no === undefined || input.rework_cycle === undefined) {
-        const taskRes = await this.pool.queryInActiveTx(
-          "SELECT current_attempt_no, rework_count FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid LIMIT 1;",
-          [input.project_id, input.task_id]
-        );
-        const taskRow = taskRes.rows[0];
-        if (taskRow) {
-          taskDefaults = {
-            current_attempt_no: Number(taskRow.current_attempt_no ?? 1),
-            rework_count: Number(taskRow.rework_count ?? 0),
-          };
+    return this.withExistingOrRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "gateway_service" },
+      async () => {
+        try {
+          validateAndNormalizeResourceUsageMetricInput(input);
+          let taskDefaults: { current_attempt_no: number; rework_count: number } | undefined;
+          if (input.attempt_no === undefined || input.rework_cycle === undefined) {
+            const taskRes = await this.pool.queryInActiveTx(
+              "SELECT current_attempt_no, rework_count FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid LIMIT 1;",
+              [input.project_id, input.task_id]
+            );
+            const taskRow = taskRes.rows[0];
+            if (taskRow) {
+              taskDefaults = {
+                current_attempt_no: Number(taskRow.current_attempt_no ?? 1),
+                rework_count: Number(taskRow.rework_count ?? 0),
+              };
+            }
+          }
+          const normalized = validateAndNormalizeResourceUsageMetricInput(input, taskDefaults);
+
+          const res = await this.pool.queryInActiveTx(
+            `INSERT INTO resource_usage_metrics (
+              project_id, task_id, lease_id, lease_epoch, attempt_no, rework_cycle,
+              phase, wall_time_ms, cpu_usage_usec, peak_memory_bytes,
+              sandbox_backend_mode, metrics_source
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::integer, $6::integer,
+              $7::text, $8::integer, $9::bigint, $10::bigint, $11::text, $12::text
+            ) RETURNING *;`,
+            [
+              input.project_id,
+              input.task_id,
+              input.lease_id ?? null,
+              normalized.lease_epoch,
+              normalized.attempt_no,
+              normalized.rework_cycle,
+              input.phase,
+              normalized.wall_time_ms,
+              normalized.cpu_usage_usec,
+              normalized.peak_memory_bytes,
+              normalized.sandbox_backend_mode,
+              input.metrics_source,
+            ]
+          );
+          return mapResourceMetricRow(res.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
         }
       }
-      const normalized = validateAndNormalizeResourceUsageMetricInput(input, taskDefaults);
-
-      const res = await this.pool.queryInActiveTx(
-        `INSERT INTO resource_usage_metrics (
-          project_id, task_id, lease_id, lease_epoch, attempt_no, rework_cycle,
-          phase, wall_time_ms, cpu_usage_usec, peak_memory_bytes,
-          sandbox_backend_mode, metrics_source
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::integer, $6::integer,
-          $7::text, $8::integer, $9::bigint, $10::bigint, $11::text, $12::text
-        ) RETURNING *;`,
-        [
-          input.project_id,
-          input.task_id,
-          input.lease_id ?? null,
-          normalized.lease_epoch,
-          normalized.attempt_no,
-          normalized.rework_cycle,
-          input.phase,
-          normalized.wall_time_ms,
-          normalized.cpu_usage_usec,
-          normalized.peak_memory_bytes,
-          normalized.sandbox_backend_mode,
-          input.metrics_source,
-        ]
-      );
-      return mapResourceMetricRow(res.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async listResourceUsageMetricsForTask(
@@ -5020,7 +5193,58 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async preflightCheckCostSession(
     input: CostPreflightCheckInput
   ): Promise<CostPreflightCheckResult> {
-    const run = async (): Promise<CostPreflightCheckResult> => {
+    const insertBlockedPreflight = async (
+      session: CostSessionRecord,
+      violation: NonNullable<ReturnType<typeof evaluatePreflightLimits>>
+    ): Promise<CostPreflightCheckResult> => {
+      const callId = randomUUID();
+      const blockReason = `${violation.limitScope}: ${violation.reason}`;
+      const ledgerRes = await this.pool.queryInActiveTx(
+        `INSERT INTO model_call_ledgers (
+          call_id, project_id, cost_session_id, pipeline_session_id, task_id,
+          stage, provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
+          estimated_input_tokens, reserved_output_tokens,
+          actual_input_tokens, actual_output_tokens, actual_total_tokens,
+          estimated_cost_micro_usd, actual_cost_micro_usd,
+          status, usage_estimated, block_reason, error_message, latency_ms
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+          $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
+          $13::integer, $14::integer,
+          0, 0, 0,
+          $15::bigint, 0,
+          'BLOCKED_PREFLIGHT', FALSE, $16::text, $17::text, 0
+        ) RETURNING *;`,
+        [
+          callId,
+          input.project_id,
+          input.cost_session_id,
+          input.pipeline_session_id ?? session.pipeline_session_id,
+          input.task_id ?? session.task_id,
+          input.stage,
+          input.provider,
+          input.model,
+          input.prompt_id,
+          input.prompt_version,
+          input.prompt_sha256,
+          input.request_sha256,
+          input.estimated_input_tokens,
+          input.reserved_output_tokens,
+          input.estimated_cost_micro_usd,
+          blockReason,
+          violation.reason,
+        ]
+      );
+      return {
+        allowed: false,
+        limitScope: violation.limitScope,
+        reason: violation.reason,
+        session,
+        blockedLedger: mapModelCallLedgerRow(ledgerRes.rows[0]!),
+      };
+    };
+
+    const runLockedInCurrentTx = async (): Promise<CostPreflightCheckResult> => {
       try {
         const sessRes = await this.pool.queryInActiveTx(
           `SELECT * FROM model_cost_sessions
@@ -5040,68 +5264,107 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         if (!violation) {
           return { allowed: true, session };
         }
-
-        const callId = randomUUID();
-        const blockReason = `${violation.limitScope}: ${violation.reason}`;
-        const ledgerRes = await this.pool.queryInActiveTx(
-          `INSERT INTO model_call_ledgers (
-            call_id, project_id, cost_session_id, pipeline_session_id, task_id,
-            stage, provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
-            estimated_input_tokens, reserved_output_tokens,
-            actual_input_tokens, actual_output_tokens, actual_total_tokens,
-            estimated_cost_micro_usd, actual_cost_micro_usd,
-            status, usage_estimated, block_reason, error_message, latency_ms
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-            $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
-            $13::integer, $14::integer,
-            0, 0, 0,
-            $15::bigint, 0,
-            'BLOCKED_PREFLIGHT', FALSE, $16::text, $17::text, 0
-          ) RETURNING *;`,
-          [
-            callId,
-            input.project_id,
-            input.cost_session_id,
-            input.pipeline_session_id ?? session.pipeline_session_id,
-            input.task_id ?? session.task_id,
-            input.stage,
-            input.provider,
-            input.model,
-            input.prompt_id,
-            input.prompt_version,
-            input.prompt_sha256,
-            input.request_sha256,
-            input.estimated_input_tokens,
-            input.reserved_output_tokens,
-            input.estimated_cost_micro_usd,
-            blockReason,
-            violation.reason,
-          ]
-        );
-        return {
-          allowed: false,
-          limitScope: violation.limitScope,
-          reason: violation.reason,
-          session,
-          blockedLedger: mapModelCallLedgerRow(ledgerRes.rows[0]!),
-        };
+        return await insertBlockedPreflight(session, violation);
       } catch (error) {
         mapPgError(error);
       }
     };
 
-    if (this.pool.getActiveTxSession()) {
-      return run();
+    const active = this.pool.getActiveTxSession();
+    if (!active) {
+      return this.withRlsTransaction(
+        {
+          currentProjectId: input.project_id,
+          currentPrincipalId: "core_api_service",
+          currentRole: "core_api_service",
+        },
+        runLockedInCurrentTx
+      );
     }
-    return this.withRlsTransaction(
-      {
-        currentProjectId: input.project_id,
-        currentPrincipalId: "core_api_service",
-        currentRole: "core_api_service",
-      },
-      run
-    );
+
+    // M6A-FU-03: Probe without FOR UPDATE first when called inside an outer transaction.
+    // On preflight denials, persist BLOCKED_PREFLIGHT in an autonomous transaction unless
+    // FOR UPDATE NOWAIT hits outer lock contention (55P03) or parent FKs are uncommitted.
+    const fallbackSentinel = new Error("AUTONOMOUS_TX_FALLBACK");
+    try {
+      const probeRes = await this.pool.queryInActiveTx(
+        `SELECT * FROM model_cost_sessions
+         WHERE cost_session_id = $1::uuid AND project_id = $2::uuid;`,
+        [input.cost_session_id, input.project_id]
+      );
+      const probeRow = probeRes.rows[0];
+      if (!probeRow) {
+        throw new PostgresRlsError(
+          "23503",
+          `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+        );
+      }
+      const probeSession = mapCostSessionRow(probeRow);
+      const probeViolation = evaluatePreflightLimits(probeSession, input);
+      if (!probeViolation) {
+        return { allowed: true, session: probeSession };
+      }
+
+      try {
+        return await this.pool.runAutonomousRlsTransaction(active, async () => {
+          let sessRes2;
+          try {
+            sessRes2 = await this.pool.queryInActiveTx(
+              `SELECT * FROM model_cost_sessions
+               WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
+               FOR UPDATE NOWAIT;`,
+              [input.cost_session_id, input.project_id]
+            );
+          } catch (lockErr) {
+            if (lockErr instanceof PostgresQueryError && lockErr.sqlState === "55P03") {
+              throw fallbackSentinel;
+            }
+            throw lockErr;
+          }
+          const sessRow2 = sessRes2.rows[0];
+          if (!sessRow2) {
+            throw fallbackSentinel;
+          }
+          const session2 = mapCostSessionRow(sessRow2);
+          const targetPipelineId = input.pipeline_session_id ?? session2.pipeline_session_id;
+          if (targetPipelineId) {
+            const psCheck = await this.pool.queryInActiveTx(
+              `SELECT 1 FROM product_pipeline_sessions
+               WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+               LIMIT 1;`,
+              [targetPipelineId, input.project_id]
+            );
+            if (psCheck.rowCount === 0) {
+              throw fallbackSentinel;
+            }
+          }
+          const targetTaskId = input.task_id ?? session2.task_id;
+          if (targetTaskId) {
+            const taskCheck = await this.pool.queryInActiveTx(
+              `SELECT 1 FROM tasks
+               WHERE task_id = $1::uuid AND project_id = $2::uuid
+               LIMIT 1;`,
+              [targetTaskId, input.project_id]
+            );
+            if (taskCheck.rowCount === 0) {
+              throw fallbackSentinel;
+            }
+          }
+          const violation2 = evaluatePreflightLimits(session2, input);
+          if (!violation2) {
+            return { allowed: true, session: session2 };
+          }
+          return await insertBlockedPreflight(session2, violation2);
+        });
+      } catch (autoErr) {
+        if (autoErr === fallbackSentinel) {
+          return await runLockedInCurrentTx();
+        }
+        throw autoErr;
+      }
+    } catch (error) {
+      mapPgError(error);
+    }
   }
 
   public async finalizeModelCallLedger(
@@ -5131,128 +5394,216 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       throw new RangeError("actual_total_tokens exceeds JavaScript safe integer range");
     }
 
-    const run = async (): Promise<FinalizeModelCallResult> => {
-      try {
-        const sessRes = await this.pool.queryInActiveTx(
-          `SELECT * FROM model_cost_sessions
-           WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
-           FOR UPDATE;`,
-          [input.cost_session_id, input.project_id]
+    const executeLockedFinalize = async (useNoWait: boolean): Promise<FinalizeModelCallResult> => {
+      const sessRes = await this.pool.queryInActiveTx(
+        `SELECT * FROM model_cost_sessions
+         WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
+         ${useNoWait ? "FOR UPDATE NOWAIT" : "FOR UPDATE"};`,
+        [input.cost_session_id, input.project_id]
+      );
+      const sessRow = sessRes.rows[0];
+      if (!sessRow) {
+        throw new PostgresRlsError(
+          "23503",
+          `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
         );
-        const sessRow = sessRes.rows[0];
-        if (!sessRow) {
-          throw new PostgresRlsError(
-            "23503",
-            `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
-          );
-        }
-        const session = mapCostSessionRow(sessRow);
-        const evalRes = evaluatePostcallLimits(
-          session,
-          actualTotalTokens,
-          input.actual_cost_micro_usd
-        );
+      }
+      const session = mapCostSessionRow(sessRow);
+      const evalRes = evaluatePostcallLimits(
+        session,
+        actualTotalTokens,
+        input.actual_cost_micro_usd
+      );
 
-        let updatedSession = session;
-        if (session.status === "ACTIVE") {
-          const updRes = await this.pool.queryInActiveTx(
-            `UPDATE model_cost_sessions
-             SET tokens_used_total = $1::bigint,
-                 cost_used_micro_usd = $2::bigint,
-                 status = $3::text,
-                 updated_at = clock_timestamp()
-             WHERE cost_session_id = $4::uuid AND project_id = $5::uuid
-             RETURNING *;`,
-            [
-              evalRes.nextTokensUsedTotal,
-              evalRes.nextCostUsedMicroUsd,
-              evalRes.nextStatus,
-              input.cost_session_id,
-              input.project_id,
-            ]
-          );
-          updatedSession = mapCostSessionRow(updRes.rows[0]!);
-        }
-
-        const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
-        const blockReason = evalRes.exceeded
-          ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
-          : null;
-        const errorMessage = evalRes.exceeded
-          ? input.error_message && input.outcome !== "ALLOWED"
-            ? `${evalRes.exceeded.reason}; upstream error: ${input.error_message}`
-            : evalRes.exceeded.reason
-          : input.error_message ?? null;
-        const callId = randomUUID();
-
-        const ledgerRes = await this.pool.queryInActiveTx(
-          `INSERT INTO model_call_ledgers (
-            call_id, project_id, cost_session_id, pipeline_session_id, task_id,
-            stage, provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
-            estimated_input_tokens, reserved_output_tokens,
-            actual_input_tokens, actual_output_tokens, actual_total_tokens,
-            estimated_cost_micro_usd, actual_cost_micro_usd,
-            status, usage_estimated, block_reason, error_message, latency_ms
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
-            $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
-            $13::integer, $14::integer,
-            $15::integer, $16::integer, $17::integer,
-            $18::bigint, $19::bigint,
-            $20::text, $21::boolean, $22::text, $23::text, $24::integer
-          ) RETURNING *;`,
+      let updatedSession = session;
+      if (session.status === "ACTIVE") {
+        const updRes = await this.pool.queryInActiveTx(
+          `UPDATE model_cost_sessions
+           SET tokens_used_total = $1::bigint,
+               cost_used_micro_usd = $2::bigint,
+               status = $3::text,
+               updated_at = clock_timestamp()
+           WHERE cost_session_id = $4::uuid AND project_id = $5::uuid
+           RETURNING *;`,
           [
-            callId,
-            input.project_id,
+            evalRes.nextTokensUsedTotal,
+            evalRes.nextCostUsedMicroUsd,
+            evalRes.nextStatus,
             input.cost_session_id,
-            input.pipeline_session_id ?? session.pipeline_session_id,
-            input.task_id ?? session.task_id,
-            input.stage,
-            input.provider,
-            input.model,
-            input.prompt_id,
-            input.prompt_version,
-            input.prompt_sha256,
-            input.request_sha256,
-            input.estimated_input_tokens,
-            input.reserved_output_tokens,
-            input.actual_input_tokens,
-            input.actual_output_tokens,
-            actualTotalTokens,
-            input.estimated_cost_micro_usd,
-            input.actual_cost_micro_usd,
-            status,
-            Boolean(input.usage_estimated),
-            blockReason,
-            errorMessage,
-            Math.max(0, Math.trunc(input.latency_ms)),
+            input.project_id,
           ]
         );
-        const ledger = mapModelCallLedgerRow(ledgerRes.rows[0]!);
-        return {
-          allowed: !evalRes.exceeded,
-          ...(evalRes.exceeded
-            ? { limitScope: evalRes.exceeded.limitScope, reason: evalRes.exceeded.reason }
-            : {}),
-          session: updatedSession,
-          ledger,
-        };
+        updatedSession = mapCostSessionRow(updRes.rows[0]!);
+      }
+
+      const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
+      const blockReason = evalRes.exceeded
+        ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
+        : null;
+      const errorMessage = evalRes.exceeded
+        ? input.error_message && input.outcome !== "ALLOWED"
+          ? `${evalRes.exceeded.reason}; upstream error: ${input.error_message}`
+          : evalRes.exceeded.reason
+        : input.error_message ?? null;
+      const callId = randomUUID();
+
+      const ledgerRes = await this.pool.queryInActiveTx(
+        `INSERT INTO model_call_ledgers (
+          call_id, project_id, cost_session_id, pipeline_session_id, task_id,
+          stage, provider, model, prompt_id, prompt_version, prompt_sha256, request_sha256,
+          estimated_input_tokens, reserved_output_tokens,
+          actual_input_tokens, actual_output_tokens, actual_total_tokens,
+          estimated_cost_micro_usd, actual_cost_micro_usd,
+          status, usage_estimated, block_reason, error_message, latency_ms
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid,
+          $6::text, $7::text, $8::text, $9::text, $10::text, $11::char(64), $12::char(64),
+          $13::integer, $14::integer,
+          $15::integer, $16::integer, $17::integer,
+          $18::bigint, $19::bigint,
+          $20::text, $21::boolean, $22::text, $23::text, $24::integer
+        ) RETURNING *;`,
+        [
+          callId,
+          input.project_id,
+          input.cost_session_id,
+          input.pipeline_session_id ?? session.pipeline_session_id,
+          input.task_id ?? session.task_id,
+          input.stage,
+          input.provider,
+          input.model,
+          input.prompt_id,
+          input.prompt_version,
+          input.prompt_sha256,
+          input.request_sha256,
+          input.estimated_input_tokens,
+          input.reserved_output_tokens,
+          input.actual_input_tokens,
+          input.actual_output_tokens,
+          actualTotalTokens,
+          input.estimated_cost_micro_usd,
+          input.actual_cost_micro_usd,
+          status,
+          Boolean(input.usage_estimated),
+          blockReason,
+          errorMessage,
+          Math.max(0, Math.trunc(input.latency_ms)),
+        ]
+      );
+      const ledger = mapModelCallLedgerRow(ledgerRes.rows[0]!);
+      return {
+        allowed: !evalRes.exceeded,
+        ...(evalRes.exceeded
+          ? { limitScope: evalRes.exceeded.limitScope, reason: evalRes.exceeded.reason }
+          : {}),
+        session: updatedSession,
+        ledger,
+      };
+    };
+
+    const runInCurrentTx = async (): Promise<FinalizeModelCallResult> => {
+      try {
+        return await executeLockedFinalize(false);
       } catch (error) {
         mapPgError(error);
       }
     };
 
-    if (this.pool.getActiveTxSession()) {
-      return run();
+    const active = this.pool.getActiveTxSession();
+    if (!active) {
+      return this.withRlsTransaction(
+        {
+          currentProjectId: input.project_id,
+          currentPrincipalId: "core_api_service",
+          currentRole: "core_api_service",
+        },
+        runInCurrentTx
+      );
     }
-    return this.withRlsTransaction(
-      {
-        currentProjectId: input.project_id,
-        currentPrincipalId: "core_api_service",
-        currentRole: "core_api_service",
-      },
-      run
-    );
+
+    // M6A-FU-03: Probe without FOR UPDATE first inside outer TX. ALLOWED calls run in TX_outer
+    // so they commit/rollback atomically with domain state (M6A-FU-02), whereas BLOCKED_POSTCALL /
+    // FAILED_* / EXHAUSTED writes use an autonomous TX with FOR UPDATE NOWAIT and parent FK checks.
+    const fallbackSentinel = new Error("AUTONOMOUS_TX_FALLBACK");
+    try {
+      const probeRes = await this.pool.queryInActiveTx(
+        `SELECT * FROM model_cost_sessions
+         WHERE cost_session_id = $1::uuid AND project_id = $2::uuid;`,
+        [input.cost_session_id, input.project_id]
+      );
+      const probeRow = probeRes.rows[0];
+      if (!probeRow) {
+        throw new PostgresRlsError(
+          "23503",
+          `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+        );
+      }
+      const probeSession = mapCostSessionRow(probeRow);
+      const probeEval = evaluatePostcallLimits(
+        probeSession,
+        actualTotalTokens,
+        input.actual_cost_micro_usd
+      );
+      if (!probeEval.exceeded && input.outcome === "ALLOWED") {
+        return await runInCurrentTx();
+      }
+
+      try {
+        return await this.pool.runAutonomousRlsTransaction(active, async () => {
+          let sessRes2;
+          try {
+            sessRes2 = await this.pool.queryInActiveTx(
+              `SELECT * FROM model_cost_sessions
+               WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
+               FOR UPDATE NOWAIT;`,
+              [input.cost_session_id, input.project_id]
+            );
+          } catch (lockErr) {
+            if (lockErr instanceof PostgresQueryError && lockErr.sqlState === "55P03") {
+              throw fallbackSentinel;
+            }
+            throw lockErr;
+          }
+          const sessRow2 = sessRes2.rows[0];
+          if (!sessRow2) {
+            throw fallbackSentinel;
+          }
+          const session2 = mapCostSessionRow(sessRow2);
+          const targetPipelineId = input.pipeline_session_id ?? session2.pipeline_session_id;
+          if (targetPipelineId) {
+            const psCheck = await this.pool.queryInActiveTx(
+              `SELECT 1 FROM product_pipeline_sessions
+               WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+               LIMIT 1;`,
+              [targetPipelineId, input.project_id]
+            );
+            if (psCheck.rowCount === 0) {
+              throw fallbackSentinel;
+            }
+          }
+          const targetTaskId = input.task_id ?? session2.task_id;
+          if (targetTaskId) {
+            const taskCheck = await this.pool.queryInActiveTx(
+              `SELECT 1 FROM tasks
+               WHERE task_id = $1::uuid AND project_id = $2::uuid
+               LIMIT 1;`,
+              [targetTaskId, input.project_id]
+            );
+            if (taskCheck.rowCount === 0) {
+              throw fallbackSentinel;
+            }
+          }
+          return await executeLockedFinalize(false);
+        });
+      } catch (autoErr) {
+        if (autoErr === fallbackSentinel) {
+          return await runInCurrentTx();
+        }
+        throw autoErr;
+      }
+    } catch (error) {
+      mapPgError(error);
+    }
   }
 
   public async createProductPipelineSession(
@@ -5329,61 +5680,70 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async createStage1DiscoveryItems(
     input: CreateStage1DiscoveryItemsInput
   ): Promise<Stage1DiscoveryItemRecord[]> {
-    try {
-      const sessRes = await this.pool.queryInActiveTx(
-        `SELECT status FROM product_pipeline_sessions
-         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
-         FOR UPDATE;`,
-        [input.pipeline_session_id, input.project_id]
-      );
-      const sessRow = sessRes.rows[0];
-      if (!sessRow) {
-        throw new PostgresRlsError(
-          "23503",
-          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
-        );
-      }
-      if (String(sessRow.status) !== "ACTIVE") {
-        throw new PostgresRlsError(
-          "23514",
-          `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; stage1_discovery_items cannot be added or modified after baseline freeze`
-        );
-      }
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const sessRes = await this.pool.queryInActiveTx(
+            `SELECT status FROM product_pipeline_sessions
+             WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+             FOR UPDATE;`,
+            [input.pipeline_session_id, input.project_id]
+          );
+          const sessRow = sessRes.rows[0];
+          if (!sessRow) {
+            throw new PostgresRlsError(
+              "23503",
+              `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+            );
+          }
+          if (String(sessRow.status) !== "ACTIVE") {
+            throw new PostgresRlsError(
+              "23514",
+              `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; stage1_discovery_items cannot be added or modified after baseline freeze`
+            );
+          }
 
-      const normalizedItems = input.items.map((raw) => ({
-        raw,
-        normalized: normalizeCreateStage1DiscoveryItem(raw),
-      }));
+          const normalizedItems = input.items.map((raw) => ({
+            raw,
+            normalized: normalizeCreateStage1DiscoveryItem(raw),
+          }));
 
-      const inserted: Stage1DiscoveryItemRecord[] = [];
-      for (const { raw, normalized } of normalizedItems) {
-        const itemId = raw.item_id ?? randomUUID();
-        const res = await this.pool.queryInActiveTx(
-          `INSERT INTO stage1_discovery_items (
-            item_id, project_id, pipeline_session_id, kind,
-            title, statement, rationale, clarification_question, confirmation_status
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid, $4::text,
-            $5::text, $6::text, $7::text, $8::text, $9::text
-          ) RETURNING *;`,
-          [
-            itemId,
-            input.project_id,
-            input.pipeline_session_id,
-            raw.kind,
-            normalized.title,
-            normalized.statement,
-            raw.rationale,
-            normalized.clarification_question,
-            normalized.confirmation_status,
-          ]
-        );
-        inserted.push(mapStage1DiscoveryItemRow(res.rows[0]!));
+          const inserted: Stage1DiscoveryItemRecord[] = [];
+          for (const { raw, normalized } of normalizedItems) {
+            const itemId = raw.item_id ?? randomUUID();
+            const res = await this.pool.queryInActiveTx(
+              `INSERT INTO stage1_discovery_items (
+                item_id, project_id, pipeline_session_id, kind,
+                title, statement, rationale, clarification_question, confirmation_status
+              ) VALUES (
+                $1::uuid, $2::uuid, $3::uuid, $4::text,
+                $5::text, $6::text, $7::text, $8::text, $9::text
+              ) RETURNING *;`,
+              [
+                itemId,
+                input.project_id,
+                input.pipeline_session_id,
+                raw.kind,
+                normalized.title,
+                normalized.statement,
+                raw.rationale,
+                normalized.clarification_question,
+                normalized.confirmation_status,
+              ]
+            );
+            inserted.push(mapStage1DiscoveryItemRow(res.rows[0]!));
+          }
+          return inserted;
+        } catch (error) {
+          mapPgError(error);
+        }
       }
-      return inserted;
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async resolveStage1DiscoveryItem(
@@ -5392,73 +5752,82 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     if (!input.actor_principal_id.trim()) {
       throw new PostgresRlsError("23514", "actor_principal_id is required to resolve Stage 1 item");
     }
-    try {
-      const existingRes = await this.pool.queryInActiveTx(
-        `SELECT s.confirmation_status, p.status AS session_status
-         FROM stage1_discovery_items s
-         JOIN product_pipeline_sessions p
-           ON p.pipeline_session_id = s.pipeline_session_id
-          AND p.project_id = s.project_id
-         WHERE s.item_id = $1::uuid
-           AND s.pipeline_session_id = $2::uuid
-           AND s.project_id = $3::uuid
-         FOR UPDATE OF s;`,
-        [input.item_id, input.pipeline_session_id, input.project_id]
-      );
-      const existingRow = existingRes.rows[0];
-      if (!existingRow) {
-        throw new PostgresRlsError(
-          "23503",
-          `Stage 1 discovery item ${input.item_id} not found in pipeline session ${input.pipeline_session_id}`
-        );
-      }
-      const sessionStatus = String(existingRow.session_status);
-      if (sessionStatus !== "ACTIVE") {
-        throw new PostgresRlsError(
-          "23514",
-          `Session ${input.pipeline_session_id} is ${sessionStatus}; stage1_discovery_items cannot be modified after baseline freeze`
-        );
-      }
-      const existingStatus = String(existingRow.confirmation_status);
-      if (existingStatus !== "UNCONFIRMED") {
-        throw new PostgresRlsError(
-          "23514",
-          `Stage 1 discovery item ${input.item_id} is already ${existingStatus} and cannot be re-resolved`
-        );
-      }
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.actor_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const existingRes = await this.pool.queryInActiveTx(
+            `SELECT s.confirmation_status, p.status AS session_status
+             FROM stage1_discovery_items s
+             JOIN product_pipeline_sessions p
+               ON p.pipeline_session_id = s.pipeline_session_id
+              AND p.project_id = s.project_id
+             WHERE s.item_id = $1::uuid
+               AND s.pipeline_session_id = $2::uuid
+               AND s.project_id = $3::uuid
+             FOR UPDATE OF s;`,
+            [input.item_id, input.pipeline_session_id, input.project_id]
+          );
+          const existingRow = existingRes.rows[0];
+          if (!existingRow) {
+            throw new PostgresRlsError(
+              "23503",
+              `Stage 1 discovery item ${input.item_id} not found in pipeline session ${input.pipeline_session_id}`
+            );
+          }
+          const sessionStatus = String(existingRow.session_status);
+          if (sessionStatus !== "ACTIVE") {
+            throw new PostgresRlsError(
+              "23514",
+              `Session ${input.pipeline_session_id} is ${sessionStatus}; stage1_discovery_items cannot be modified after baseline freeze`
+            );
+          }
+          const existingStatus = String(existingRow.confirmation_status);
+          if (existingStatus !== "UNCONFIRMED") {
+            throw new PostgresRlsError(
+              "23514",
+              `Stage 1 discovery item ${input.item_id} is already ${existingStatus} and cannot be re-resolved`
+            );
+          }
 
-      const nextStatus = input.decision === "CONFIRM" ? "CONFIRMED" : "REJECTED";
-      const res = await this.pool.queryInActiveTx(
-        `UPDATE stage1_discovery_items
-         SET confirmation_status = $1::text,
-             confirmed_by_principal_id = $2::text,
-             confirmed_at = clock_timestamp(),
-             resolution_note = COALESCE($3::text, resolution_note),
-             updated_at = clock_timestamp()
-         WHERE item_id = $4::uuid
-           AND pipeline_session_id = $5::uuid
-           AND project_id = $6::uuid
-           AND confirmation_status = 'UNCONFIRMED'
-         RETURNING *;`,
-        [
-          nextStatus,
-          input.actor_principal_id,
-          input.resolution_note ?? null,
-          input.item_id,
-          input.pipeline_session_id,
-          input.project_id,
-        ]
-      );
-      if (!res.rows[0]) {
-        throw new PostgresRlsError(
-          "23514",
-          `Stage 1 discovery item ${input.item_id} is no longer UNCONFIRMED and cannot be re-resolved`
-        );
+          const nextStatus = input.decision === "CONFIRM" ? "CONFIRMED" : "REJECTED";
+          const res = await this.pool.queryInActiveTx(
+            `UPDATE stage1_discovery_items
+             SET confirmation_status = $1::text,
+                 confirmed_by_principal_id = $2::text,
+                 confirmed_at = clock_timestamp(),
+                 resolution_note = COALESCE($3::text, resolution_note),
+                 updated_at = clock_timestamp()
+             WHERE item_id = $4::uuid
+               AND pipeline_session_id = $5::uuid
+               AND project_id = $6::uuid
+               AND confirmation_status = 'UNCONFIRMED'
+             RETURNING *;`,
+            [
+              nextStatus,
+              input.actor_principal_id,
+              input.resolution_note ?? null,
+              input.item_id,
+              input.pipeline_session_id,
+              input.project_id,
+            ]
+          );
+          if (!res.rows[0]) {
+            throw new PostgresRlsError(
+              "23514",
+              `Stage 1 discovery item ${input.item_id} is no longer UNCONFIRMED and cannot be re-resolved`
+            );
+          }
+          return mapStage1DiscoveryItemRow(res.rows[0]);
+        } catch (error) {
+          mapPgError(error);
+        }
       }
-      return mapStage1DiscoveryItemRow(res.rows[0]);
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async listStage1DiscoveryItems(
@@ -5474,89 +5843,98 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async recordStageArtifact(
     input: RecordStageArtifactInput
   ): Promise<StageArtifactRecord> {
-    try {
-      const sessRes = await this.pool.queryInActiveTx(
-        `SELECT status FROM product_pipeline_sessions
-         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
-         FOR UPDATE;`,
-        [input.pipeline_session_id, input.project_id]
-      );
-      const sessRow = sessRes.rows[0];
-      if (!sessRow) {
-        throw new PostgresRlsError(
-          "23503",
-          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
-        );
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.created_by_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const sessRes = await this.pool.queryInActiveTx(
+            `SELECT status FROM product_pipeline_sessions
+             WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+             FOR UPDATE;`,
+            [input.pipeline_session_id, input.project_id]
+          );
+          const sessRow = sessRes.rows[0];
+          if (!sessRow) {
+            throw new PostgresRlsError(
+              "23503",
+              `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+            );
+          }
+          if (String(sessRow.status) !== "ACTIVE") {
+            throw new PostgresRlsError(
+              "23514",
+              `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; new stage artifacts are forbidden after baseline freeze`
+            );
+          }
+
+          const artifactSha = validateStageArtifactKindAndHash({
+            stage: input.stage,
+            artifact_kind: input.artifact_kind,
+            content_json: input.content_json,
+            artifact_sha256: input.artifact_sha256,
+          });
+
+          if (input.stage === "STAGE_2_REQUIREMENTS") {
+            const items = await this.listStage1DiscoveryItems(input.pipeline_session_id);
+            validateStage2Ac10References(input.content_json, items, input.pipeline_session_id);
+          }
+
+          const verRes = await this.pool.queryInActiveTx<{ next_version: number }>(
+            `SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+             FROM stage_artifacts
+             WHERE pipeline_session_id = $1::uuid AND stage = $2::text;`,
+            [input.pipeline_session_id, input.stage]
+          );
+          const nextVersion = Number(verRes.rows[0]?.next_version ?? 1);
+          const artifactId = input.artifact_id ?? randomUUID();
+
+          const insRes = await this.pool.queryInActiveTx(
+            `INSERT INTO stage_artifacts (
+              artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+              provider, model, prompt_id, prompt_version, prompt_sha256,
+              content_json, artifact_sha256, created_by_principal_id
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::integer,
+              $7::text, $8::text, $9::text, $10::text, $11::char(64),
+              $12::jsonb, $13::char(64), $14::text
+            ) RETURNING *;`,
+            [
+              artifactId,
+              input.project_id,
+              input.pipeline_session_id,
+              input.stage,
+              input.artifact_kind,
+              nextVersion,
+              input.provider,
+              input.model,
+              input.prompt_id,
+              input.prompt_version,
+              input.prompt_sha256,
+              input.content_json,
+              artifactSha,
+              input.created_by_principal_id,
+            ]
+          );
+
+          if (input.advance_session_stage) {
+            await this.pool.queryInActiveTx(
+              `UPDATE product_pipeline_sessions
+               SET current_stage = $1::text, updated_at = clock_timestamp()
+               WHERE pipeline_session_id = $2::uuid AND project_id = $3::uuid;`,
+              [input.advance_session_stage, input.pipeline_session_id, input.project_id]
+            );
+          }
+
+          return mapStageArtifactRow(insRes.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
+        }
       }
-      if (String(sessRow.status) !== "ACTIVE") {
-        throw new PostgresRlsError(
-          "23514",
-          `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; new stage artifacts are forbidden after baseline freeze`
-        );
-      }
-
-      const artifactSha = validateStageArtifactKindAndHash({
-        stage: input.stage,
-        artifact_kind: input.artifact_kind,
-        content_json: input.content_json,
-        artifact_sha256: input.artifact_sha256,
-      });
-
-      if (input.stage === "STAGE_2_REQUIREMENTS") {
-        const items = await this.listStage1DiscoveryItems(input.pipeline_session_id);
-        validateStage2Ac10References(input.content_json, items, input.pipeline_session_id);
-      }
-
-      const verRes = await this.pool.queryInActiveTx<{ next_version: number }>(
-        `SELECT COALESCE(MAX(version), 0) + 1 AS next_version
-         FROM stage_artifacts
-         WHERE pipeline_session_id = $1::uuid AND stage = $2::text;`,
-        [input.pipeline_session_id, input.stage]
-      );
-      const nextVersion = Number(verRes.rows[0]?.next_version ?? 1);
-      const artifactId = input.artifact_id ?? randomUUID();
-
-      const insRes = await this.pool.queryInActiveTx(
-        `INSERT INTO stage_artifacts (
-          artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
-          provider, model, prompt_id, prompt_version, prompt_sha256,
-          content_json, artifact_sha256, created_by_principal_id
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::integer,
-          $7::text, $8::text, $9::text, $10::text, $11::char(64),
-          $12::jsonb, $13::char(64), $14::text
-        ) RETURNING *;`,
-        [
-          artifactId,
-          input.project_id,
-          input.pipeline_session_id,
-          input.stage,
-          input.artifact_kind,
-          nextVersion,
-          input.provider,
-          input.model,
-          input.prompt_id,
-          input.prompt_version,
-          input.prompt_sha256,
-          input.content_json,
-          artifactSha,
-          input.created_by_principal_id,
-        ]
-      );
-
-      if (input.advance_session_stage) {
-        await this.pool.queryInActiveTx(
-          `UPDATE product_pipeline_sessions
-           SET current_stage = $1::text, updated_at = clock_timestamp()
-           WHERE pipeline_session_id = $2::uuid AND project_id = $3::uuid;`,
-          [input.advance_session_stage, input.pipeline_session_id, input.project_id]
-        );
-      }
-
-      return mapStageArtifactRow(insRes.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async listStageArtifacts(pipelineSessionId: string): Promise<StageArtifactRecord[]> {
@@ -5581,53 +5959,62 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     if (!input.approver_principal_id.trim()) {
       throw new PostgresRlsError("23514", "approver_principal_id must be non-empty");
     }
-    try {
-      const sessRes = await this.pool.queryInActiveTx(
-        `SELECT status FROM product_pipeline_sessions
-         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
-         FOR UPDATE;`,
-        [input.pipeline_session_id, input.project_id]
-      );
-      const sessRow = sessRes.rows[0];
-      if (!sessRow) {
-        throw new PostgresRlsError(
-          "23503",
-          `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
-        );
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.approver_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const sessRes = await this.pool.queryInActiveTx(
+            `SELECT status FROM product_pipeline_sessions
+             WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+             FOR UPDATE;`,
+            [input.pipeline_session_id, input.project_id]
+          );
+          const sessRow = sessRes.rows[0];
+          if (!sessRow) {
+            throw new PostgresRlsError(
+              "23503",
+              `Product pipeline session ${input.pipeline_session_id} not found for project ${input.project_id}`
+            );
+          }
+          if (String(sessRow.status) !== "ACTIVE") {
+            throw new PostgresRlsError(
+              "23514",
+              `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; new stage approval gates are forbidden after baseline freeze`
+            );
+          }
+          const gateId = input.gate_id ?? randomUUID();
+          const res = await this.pool.queryInActiveTx(
+            `INSERT INTO stage_approval_gates (
+              gate_id, project_id, pipeline_session_id, gate_stage,
+              target_artifact_id, target_artifact_sha256,
+              approver_principal_id, decision, rationale
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::text,
+              $5::uuid, $6::char(64),
+              $7::text, $8::text, $9::text
+            ) RETURNING *;`,
+            [
+              gateId,
+              input.project_id,
+              input.pipeline_session_id,
+              input.gate_stage,
+              input.target_artifact_id,
+              input.target_artifact_sha256,
+              input.approver_principal_id,
+              input.decision,
+              input.rationale ?? null,
+            ]
+          );
+          return mapStageApprovalGateRow(res.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
+        }
       }
-      if (String(sessRow.status) !== "ACTIVE") {
-        throw new PostgresRlsError(
-          "23514",
-          `Session ${input.pipeline_session_id} is ${String(sessRow.status)}; new stage approval gates are forbidden after baseline freeze`
-        );
-      }
-      const gateId = input.gate_id ?? randomUUID();
-      const res = await this.pool.queryInActiveTx(
-        `INSERT INTO stage_approval_gates (
-          gate_id, project_id, pipeline_session_id, gate_stage,
-          target_artifact_id, target_artifact_sha256,
-          approver_principal_id, decision, rationale
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::text,
-          $5::uuid, $6::char(64),
-          $7::text, $8::text, $9::text
-        ) RETURNING *;`,
-        [
-          gateId,
-          input.project_id,
-          input.pipeline_session_id,
-          input.gate_stage,
-          input.target_artifact_id,
-          input.target_artifact_sha256,
-          input.approver_principal_id,
-          input.decision,
-          input.rationale ?? null,
-        ]
-      );
-      return mapStageApprovalGateRow(res.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async listStageApprovalGates(
@@ -5646,129 +6033,138 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     if (!input.frozen_by_principal_id.trim()) {
       throw new PostgresRlsError("23514", "frozen_by_principal_id must be non-empty");
     }
-    try {
-      const sessRes = await this.pool.queryInActiveTx(
-        `SELECT * FROM product_pipeline_sessions
-         WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
-         FOR UPDATE;`,
-        [input.pipeline_session_id, input.project_id]
-      );
-      const session = sessRes.rows[0] ? mapProductPipelineSessionRow(sessRes.rows[0]) : null;
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.frozen_by_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const sessRes = await this.pool.queryInActiveTx(
+            `SELECT * FROM product_pipeline_sessions
+             WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+             FOR UPDATE;`,
+            [input.pipeline_session_id, input.project_id]
+          );
+          const session = sessRes.rows[0] ? mapProductPipelineSessionRow(sessRes.rows[0]) : null;
 
-      const s1Res = await this.pool.queryInActiveTx(
-        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
-        [input.stage1_artifact_id]
-      );
-      const s2Res = await this.pool.queryInActiveTx(
-        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
-        [input.stage2_artifact_id]
-      );
-      const s3Res = await this.pool.queryInActiveTx(
-        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
-        [input.stage3_artifact_id]
-      );
-      const s4Res = await this.pool.queryInActiveTx(
-        "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
-        [input.validation_report_artifact_id]
-      );
-      const latestS4Res = await this.pool.queryInActiveTx(
-        `SELECT * FROM stage_artifacts
-         WHERE project_id = $1::uuid
-           AND pipeline_session_id = $2::uuid
-           AND stage = 'STAGE_4_SPEC_FREEZE'
-         ORDER BY version DESC
-         LIMIT 1;`,
-        [input.project_id, input.pipeline_session_id]
-      );
-      const stage1Items = await this.listStage1DiscoveryItems(input.pipeline_session_id);
-      const gateRes = await this.pool.queryInActiveTx(
-        "SELECT * FROM stage_approval_gates WHERE gate_id = $1::uuid LIMIT 1;",
-        [input.approval_gate_id]
-      );
-      const existingRes = await this.pool.queryInActiveTx(
-        "SELECT * FROM baseline_spec_freezes WHERE pipeline_session_id = $1::uuid LIMIT 1;",
-        [input.pipeline_session_id]
-      );
+          const s1Res = await this.pool.queryInActiveTx(
+            "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+            [input.stage1_artifact_id]
+          );
+          const s2Res = await this.pool.queryInActiveTx(
+            "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+            [input.stage2_artifact_id]
+          );
+          const s3Res = await this.pool.queryInActiveTx(
+            "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+            [input.stage3_artifact_id]
+          );
+          const s4Res = await this.pool.queryInActiveTx(
+            "SELECT * FROM stage_artifacts WHERE artifact_id = $1::uuid LIMIT 1;",
+            [input.validation_report_artifact_id]
+          );
+          const latestS4Res = await this.pool.queryInActiveTx(
+            `SELECT * FROM stage_artifacts
+             WHERE project_id = $1::uuid
+               AND pipeline_session_id = $2::uuid
+               AND stage = 'STAGE_4_SPEC_FREEZE'
+             ORDER BY version DESC
+             LIMIT 1;`,
+            [input.project_id, input.pipeline_session_id]
+          );
+          const stage1Items = await this.listStage1DiscoveryItems(input.pipeline_session_id);
+          const gateRes = await this.pool.queryInActiveTx(
+            "SELECT * FROM stage_approval_gates WHERE gate_id = $1::uuid LIMIT 1;",
+            [input.approval_gate_id]
+          );
+          const existingRes = await this.pool.queryInActiveTx(
+            "SELECT * FROM baseline_spec_freezes WHERE pipeline_session_id = $1::uuid LIMIT 1;",
+            [input.pipeline_session_id]
+          );
 
-      validateFreezeBaselineSpecInvariants({
-        request: input,
-        session,
-        stage1Artifact: s1Res.rows[0] ? mapStageArtifactRow(s1Res.rows[0]) : null,
-        stage2Artifact: s2Res.rows[0] ? mapStageArtifactRow(s2Res.rows[0]) : null,
-        stage3Artifact: s3Res.rows[0] ? mapStageArtifactRow(s3Res.rows[0]) : null,
-        validationReportArtifact: s4Res.rows[0] ? mapStageArtifactRow(s4Res.rows[0]) : null,
-        latestStage4Artifact: latestS4Res.rows[0]
-          ? mapStageArtifactRow(latestS4Res.rows[0])
-          : null,
-        stage1Items,
-        approvalGate: gateRes.rows[0] ? mapStageApprovalGateRow(gateRes.rows[0]) : null,
-        existingFreeze: existingRes.rows[0] ? mapBaselineSpecFreezeRow(existingRes.rows[0]) : null,
-      });
+          validateFreezeBaselineSpecInvariants({
+            request: input,
+            session,
+            stage1Artifact: s1Res.rows[0] ? mapStageArtifactRow(s1Res.rows[0]) : null,
+            stage2Artifact: s2Res.rows[0] ? mapStageArtifactRow(s2Res.rows[0]) : null,
+            stage3Artifact: s3Res.rows[0] ? mapStageArtifactRow(s3Res.rows[0]) : null,
+            validationReportArtifact: s4Res.rows[0] ? mapStageArtifactRow(s4Res.rows[0]) : null,
+            latestStage4Artifact: latestS4Res.rows[0]
+              ? mapStageArtifactRow(latestS4Res.rows[0])
+              : null,
+            stage1Items,
+            approvalGate: gateRes.rows[0] ? mapStageApprovalGateRow(gateRes.rows[0]) : null,
+            existingFreeze: existingRes.rows[0] ? mapBaselineSpecFreezeRow(existingRes.rows[0]) : null,
+          });
 
-      const baselineId = input.baseline_id ?? randomUUID();
-      const freezeBundleSha = computeBaselineFreezeBundleSha256(input);
+          const baselineId = input.baseline_id ?? randomUUID();
+          const freezeBundleSha = computeBaselineFreezeBundleSha256(input);
 
-      const insRes = await this.pool.queryInActiveTx(
-        `INSERT INTO baseline_spec_freezes (
-          baseline_id, project_id, pipeline_session_id,
-          stage1_artifact_id, stage1_artifact_sha256,
-          stage2_artifact_id, stage2_artifact_sha256,
-          stage3_artifact_id, stage3_artifact_sha256,
-          validation_report_artifact_id, validation_report_sha256,
-          approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256, status
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid,
-          $4::uuid, $5::char(64),
-          $6::uuid, $7::char(64),
-          $8::uuid, $9::char(64),
-          $10::uuid, $11::char(64),
-          $12::uuid, $13::text, $14::char(64), 'FROZEN'
-        ) RETURNING *;`,
-        [
-          baselineId,
-          input.project_id,
-          input.pipeline_session_id,
-          input.stage1_artifact_id,
-          input.stage1_artifact_sha256,
-          input.stage2_artifact_id,
-          input.stage2_artifact_sha256,
-          input.stage3_artifact_id,
-          input.stage3_artifact_sha256,
-          input.validation_report_artifact_id,
-          input.validation_report_sha256,
-          input.approval_gate_id,
-          input.frozen_by_principal_id,
-          freezeBundleSha,
-        ]
-      );
+          const insRes = await this.pool.queryInActiveTx(
+            `INSERT INTO baseline_spec_freezes (
+              baseline_id, project_id, pipeline_session_id,
+              stage1_artifact_id, stage1_artifact_sha256,
+              stage2_artifact_id, stage2_artifact_sha256,
+              stage3_artifact_id, stage3_artifact_sha256,
+              validation_report_artifact_id, validation_report_sha256,
+              approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256, status
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid,
+              $4::uuid, $5::char(64),
+              $6::uuid, $7::char(64),
+              $8::uuid, $9::char(64),
+              $10::uuid, $11::char(64),
+              $12::uuid, $13::text, $14::char(64), 'FROZEN'
+            ) RETURNING *;`,
+            [
+              baselineId,
+              input.project_id,
+              input.pipeline_session_id,
+              input.stage1_artifact_id,
+              input.stage1_artifact_sha256,
+              input.stage2_artifact_id,
+              input.stage2_artifact_sha256,
+              input.stage3_artifact_id,
+              input.stage3_artifact_sha256,
+              input.validation_report_artifact_id,
+              input.validation_report_sha256,
+              input.approval_gate_id,
+              input.frozen_by_principal_id,
+              freezeBundleSha,
+            ]
+          );
 
-      await this.pool.queryInActiveTx(
-        `UPDATE product_pipeline_sessions
-         SET status = 'FROZEN',
-             frozen_baseline_id = $1::uuid,
-             current_stage = 'STAGE_4_SPEC_FREEZE',
-             updated_at = clock_timestamp()
-         WHERE pipeline_session_id = $2::uuid AND project_id = $3::uuid;`,
-        [baselineId, input.pipeline_session_id, input.project_id]
-      );
+          await this.pool.queryInActiveTx(
+            `UPDATE product_pipeline_sessions
+             SET status = 'FROZEN',
+                 frozen_baseline_id = $1::uuid,
+                 current_stage = 'STAGE_4_SPEC_FREEZE',
+                 updated_at = clock_timestamp()
+             WHERE pipeline_session_id = $2::uuid AND project_id = $3::uuid;`,
+            [baselineId, input.pipeline_session_id, input.project_id]
+          );
 
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "product_pipeline",
-        input.pipeline_session_id,
-        "pipeline.baseline_frozen",
-        {
-          pipeline_session_id: input.pipeline_session_id,
-          baseline_id: baselineId,
-          freeze_bundle_sha256: freezeBundleSha,
-          frozen_by_principal_id: input.frozen_by_principal_id,
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "product_pipeline",
+            input.pipeline_session_id,
+            "pipeline.baseline_frozen",
+            {
+              pipeline_session_id: input.pipeline_session_id,
+              baseline_id: baselineId,
+              freeze_bundle_sha256: freezeBundleSha,
+              frozen_by_principal_id: input.frozen_by_principal_id,
+            }
+          );
+
+          return mapBaselineSpecFreezeRow(insRes.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
         }
-      );
-
-      return mapBaselineSpecFreezeRow(insRes.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+      }
+    );
   }
 
   public async getBaselineSpecFreeze(
@@ -5825,58 +6221,58 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       );
     }
     const normalizedHash = input.main_ref_commit_hash.trim().toLowerCase();
-    try {
-      const res = await this.pool.queryInActiveTx(
-        `UPDATE projects
-         SET main_ref_commit_hash = $1::char(40),
-             updated_at = clock_timestamp()
-         WHERE project_id = $2::uuid
-         RETURNING *;`,
-        [normalizedHash, input.project_id]
-      );
-      if (res.rowCount === 0 || !res.rows[0]) {
-        throw new PostgresRlsError(
-          "23503",
-          `Project ${input.project_id} not found or inaccessible under current RLS context`
-        );
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const res = await this.pool.queryInActiveTx(
+            `UPDATE projects
+             SET main_ref_commit_hash = $1::char(40),
+                 updated_at = clock_timestamp()
+             WHERE project_id = $2::uuid
+             RETURNING *;`,
+            [normalizedHash, input.project_id]
+          );
+          if (res.rowCount === 0 || !res.rows[0]) {
+            throw new PostgresRlsError(
+              "23503",
+              `Project ${input.project_id} not found or inaccessible under current RLS context`
+            );
+          }
+          let refs = this.fallbackGitRefsByProject.get(input.project_id);
+          if (!refs) {
+            refs = new Map();
+            this.fallbackGitRefsByProject.set(input.project_id, refs);
+          }
+          refs.set("refs/heads/main", normalizedHash);
+          let commits = this.fallbackGitCommitsByProject.get(input.project_id);
+          if (!commits) {
+            commits = new Map();
+            this.fallbackGitCommitsByProject.set(input.project_id, commits);
+          }
+          if (!commits.has(normalizedHash)) {
+            commits.set(normalizedHash, {
+              commitHash: normalizedHash,
+              treeHash: normalizedHash,
+              parents: [],
+            });
+          }
+          return mapProjectRow(res.rows[0]);
+        } catch (error) {
+          mapPgError(error);
+        }
       }
-      let refs = this.fallbackGitRefsByProject.get(input.project_id);
-      if (!refs) {
-        refs = new Map();
-        this.fallbackGitRefsByProject.set(input.project_id, refs);
-      }
-      refs.set("refs/heads/main", normalizedHash);
-      let commits = this.fallbackGitCommitsByProject.get(input.project_id);
-      if (!commits) {
-        commits = new Map();
-        this.fallbackGitCommitsByProject.set(input.project_id, commits);
-      }
-      if (!commits.has(normalizedHash)) {
-        commits.set(normalizedHash, {
-          commitHash: normalizedHash,
-          treeHash: normalizedHash,
-          parents: [],
-        });
-      }
-      return mapProjectRow(res.rows[0]);
-    } catch (error) {
-      mapPgError(error);
-    }
+    );
   }
 
   public async createProjectBootstrap(
     input: CreateProjectBootstrapInput
   ): Promise<ProjectBootstrapRecord> {
-    if (
-      !/^[0-9a-f]{40}$/i.test(input.base_main_commit_hash) ||
-      !/^[0-9a-f]{64}$/i.test(input.trusted_policy_sha256) ||
-      input.acceptance_tests.length === 0
-    ) {
-      throw new PostgresRlsError(
-        "23514",
-        "Invalid project bootstrap hashes or empty acceptance_tests"
-      );
-    }
+    validateProjectBootstrapInput(input);
     const bootstrapId = input.bootstrap_id ?? randomUUID();
     const normalizedHash = input.base_main_commit_hash.toLowerCase();
     const normalizedPolicySha = input.trusted_policy_sha256.toLowerCase();
@@ -5887,54 +6283,75 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       trusted_policy_sha256: normalizedPolicySha,
       acceptance_tests: normalizedSpecs,
     });
-    try {
-      const insRes = await this.pool.queryInActiveTx(
-        `INSERT INTO project_bootstraps (
-          bootstrap_id, project_id, pipeline_session_id, baseline_id,
-          repo_path, trusted_acceptance_dir, base_main_commit_hash,
-          protected_paths_json, trusted_policy_sha256,
-          generated_files_json, acceptance_tests_json,
-          bootstrap_sha256, created_by_principal_id
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-          $5::text, $6::text, $7::char(40),
-          $8::jsonb, $9::char(64),
-          $10::jsonb, $11::jsonb,
-          $12::char(64), $13::text
-        ) RETURNING *;`,
-        [
-          bootstrapId,
-          input.project_id,
-          input.pipeline_session_id,
-          input.baseline_id,
-          input.repo_path,
-          input.trusted_acceptance_dir,
-          normalizedHash,
-          [...input.protected_paths],
-          normalizedPolicySha,
-          [...input.generated_files],
-          normalizedSpecs,
-          bootstrapSha,
-          input.created_by_principal_id,
-        ]
-      );
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "project_bootstrap",
-        bootstrapId,
-        "pipeline.project_bootstrapped",
-        {
-          pipeline_session_id: input.pipeline_session_id,
-          baseline_id: input.baseline_id,
-          bootstrap_id: bootstrapId,
-          base_main_commit_hash: normalizedHash,
-          trusted_policy_sha256: normalizedPolicySha,
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.created_by_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const dupBaseline = await this.pool.queryInActiveTx(
+            `SELECT 1 FROM project_bootstraps
+             WHERE project_id = $1::uuid AND baseline_id = $2::uuid
+             LIMIT 1;`,
+            [input.project_id, input.baseline_id]
+          );
+          if (dupBaseline.rowCount > 0) {
+            throw new PostgresRlsError(
+              "23505",
+              `Project bootstrap already exists for project ${input.project_id} and baseline ${input.baseline_id}`
+            );
+          }
+          const insRes = await this.pool.queryInActiveTx(
+            `INSERT INTO project_bootstraps (
+              bootstrap_id, project_id, pipeline_session_id, baseline_id,
+              repo_path, trusted_acceptance_dir, base_main_commit_hash,
+              protected_paths_json, trusted_policy_sha256,
+              generated_files_json, acceptance_tests_json,
+              bootstrap_sha256, created_by_principal_id
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+              $5::text, $6::text, $7::char(40),
+              $8::jsonb, $9::char(64),
+              $10::jsonb, $11::jsonb,
+              $12::char(64), $13::text
+            ) RETURNING *;`,
+            [
+              bootstrapId,
+              input.project_id,
+              input.pipeline_session_id,
+              input.baseline_id,
+              input.repo_path,
+              input.trusted_acceptance_dir,
+              normalizedHash,
+              [...input.protected_paths],
+              normalizedPolicySha,
+              [...input.generated_files],
+              normalizedSpecs,
+              bootstrapSha,
+              input.created_by_principal_id,
+            ]
+          );
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "project_bootstrap",
+            bootstrapId,
+            "pipeline.project_bootstrapped",
+            {
+              pipeline_session_id: input.pipeline_session_id,
+              baseline_id: input.baseline_id,
+              bootstrap_id: bootstrapId,
+              base_main_commit_hash: normalizedHash,
+              trusted_policy_sha256: normalizedPolicySha,
+            }
+          );
+          return mapProjectBootstrapRow(insRes.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
         }
-      );
-      return mapProjectBootstrapRow(insRes.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+      }
+    );
   }
 
   public async getProjectBootstrapBySession(
@@ -5963,49 +6380,58 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     validateAgentOrganizationProfileInput(input);
     const profileId = input.profile_id ?? randomUUID();
     const keyTrimmed = input.profile_key.trim();
-    try {
-      const res = await this.pool.queryInActiveTx(
-        `INSERT INTO agent_organization_profiles (
-          profile_id, project_id, profile_key, role, principal_id,
-          provider, model, execution_target_type, trust_tier,
-          target_locator, capabilities_json, is_active, created_by_principal_id
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::text, $4::text, $5::text,
-          $6::text, $7::text, $8::text, $9::text,
-          $10::text, $11::jsonb, $12::boolean, $13::text
-        )
-        ON CONFLICT (project_id, profile_key) DO UPDATE SET
-          role = EXCLUDED.role,
-          principal_id = EXCLUDED.principal_id,
-          provider = EXCLUDED.provider,
-          model = EXCLUDED.model,
-          execution_target_type = EXCLUDED.execution_target_type,
-          trust_tier = EXCLUDED.trust_tier,
-          target_locator = EXCLUDED.target_locator,
-          capabilities_json = EXCLUDED.capabilities_json,
-          is_active = EXCLUDED.is_active,
-          updated_at = clock_timestamp()
-        RETURNING *;`,
-        [
-          profileId,
-          input.project_id,
-          keyTrimmed,
-          input.role,
-          input.principal_id.trim(),
-          input.provider.trim(),
-          input.model.trim(),
-          input.execution_target_type,
-          input.trust_tier,
-          input.target_locator ?? null,
-          input.capabilities_json ?? {},
-          input.is_active ?? true,
-          input.created_by_principal_id.trim(),
-        ]
-      );
-      return mapAgentOrganizationProfileRow(res.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.created_by_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const res = await this.pool.queryInActiveTx(
+            `INSERT INTO agent_organization_profiles (
+              profile_id, project_id, profile_key, role, principal_id,
+              provider, model, execution_target_type, trust_tier,
+              target_locator, capabilities_json, is_active, created_by_principal_id
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::text, $4::text, $5::text,
+              $6::text, $7::text, $8::text, $9::text,
+              $10::text, $11::jsonb, $12::boolean, $13::text
+            )
+            ON CONFLICT (project_id, profile_key) DO UPDATE SET
+              role = EXCLUDED.role,
+              principal_id = EXCLUDED.principal_id,
+              provider = EXCLUDED.provider,
+              model = EXCLUDED.model,
+              execution_target_type = EXCLUDED.execution_target_type,
+              trust_tier = EXCLUDED.trust_tier,
+              target_locator = EXCLUDED.target_locator,
+              capabilities_json = EXCLUDED.capabilities_json,
+              is_active = EXCLUDED.is_active,
+              updated_at = clock_timestamp()
+            RETURNING *;`,
+            [
+              profileId,
+              input.project_id,
+              keyTrimmed,
+              input.role,
+              input.principal_id.trim(),
+              input.provider.trim(),
+              input.model.trim(),
+              input.execution_target_type,
+              input.trust_tier,
+              input.target_locator ?? null,
+              input.capabilities_json ?? {},
+              input.is_active ?? true,
+              input.created_by_principal_id.trim(),
+            ]
+          );
+          return mapAgentOrganizationProfileRow(res.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
+        }
+      }
+    );
   }
 
   public async listAgentOrganizationProfiles(
@@ -6043,184 +6469,211 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async createStage7DevelopmentPlan(
     input: CreateStage7DevelopmentPlanInput
   ): Promise<Stage7DevelopmentPlanBundle> {
-    try {
-      const existingPlan = await this.pool.queryInActiveTx(
-        "SELECT 1 FROM dev_milestones WHERE project_id = $1::uuid AND baseline_id = $2::uuid LIMIT 1;",
-        [input.project_id, input.baseline_id]
+    if (!/^[0-9a-f]{40}$/i.test(input.base_main_commit_hash)) {
+      throw new PostgresRlsError(
+        "23514",
+        `base_main_commit_hash '${input.base_main_commit_hash}' must be a 40-hex commit hash`
       );
-      if (existingPlan.rowCount > 0) {
-        throw new PostgresRlsError(
-          "23514",
-          `Stage 7 development plan already exists for frozen baseline ${input.baseline_id}; submit a Stage 9 Change Request to add or modify tasks`
-        );
-      }
-
-      const bootRes = await this.pool.queryInActiveTx(
-        `SELECT bootstrap_id, baseline_id FROM project_bootstraps
-         WHERE bootstrap_id = $1::uuid AND project_id = $2::uuid LIMIT 1;`,
-        [input.bootstrap_id, input.project_id]
-      );
-      if (
-        !bootRes.rows[0] ||
-        String(bootRes.rows[0].baseline_id) !== input.baseline_id
-      ) {
-        throw new PostgresRlsError(
-          "23514",
-          `Bootstrap ${input.bootstrap_id} does not match baseline ${input.baseline_id}`
-        );
-      }
-
-      const milestones: DevMilestoneRecord[] = [];
-      const milestoneIdByKey = new Map<string, string>();
-      for (const m of input.milestones) {
-        const milestoneId = m.milestone_id ?? randomUUID();
-        const res = await this.pool.queryInActiveTx(
-          `INSERT INTO dev_milestones (
-            milestone_id, project_id, pipeline_session_id, baseline_id,
-            milestone_key, title, description, sequence_order
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-            $5::text, $6::text, $7::text, $8::integer
-          ) RETURNING *;`,
-          [
-            milestoneId,
-            input.project_id,
-            input.pipeline_session_id,
-            input.baseline_id,
-            m.milestone_key,
-            m.title,
-            m.description,
-            m.sequence_order,
-          ]
-        );
-        const mapped = mapDevMilestoneRow(res.rows[0]!);
-        milestoneIdByKey.set(m.milestone_key, mapped.milestone_id);
-        milestones.push(mapped);
-      }
-
-      const epics: DevEpicRecord[] = [];
-      const epicIdByKey = new Map<string, string>();
-      for (const e of input.epics) {
-        const milestoneId = milestoneIdByKey.get(e.milestone_key);
-        if (!milestoneId) {
-          throw new PostgresRlsError("23503", `Milestone key '${e.milestone_key}' not found`);
-        }
-        const epicId = e.epic_id ?? randomUUID();
-        const res = await this.pool.queryInActiveTx(
-          `INSERT INTO dev_epics (
-            epic_id, project_id, milestone_id,
-            epic_key, title, description, sequence_order
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid,
-            $4::text, $5::text, $6::text, $7::integer
-          ) RETURNING *;`,
-          [
-            epicId,
-            input.project_id,
-            milestoneId,
-            e.epic_key,
-            e.title,
-            e.description,
-            e.sequence_order,
-          ]
-        );
-        const mapped = mapDevEpicRow(res.rows[0]!);
-        epicIdByKey.set(e.epic_key, mapped.epic_id);
-        epics.push(mapped);
-      }
-
-      const stories: DevUserStoryRecord[] = [];
-      const storyIdByKey = new Map<string, string>();
-      for (const s of input.stories) {
-        const epicId = epicIdByKey.get(s.epic_key);
-        if (!epicId) {
-          throw new PostgresRlsError("23503", `Epic key '${s.epic_key}' not found`);
-        }
-        const storyId = s.story_id ?? randomUUID();
-        const res = await this.pool.queryInActiveTx(
-          `INSERT INTO dev_user_stories (
-            story_id, project_id, epic_id, story_key, title, description,
-            requirement_ids_json, ac_ids_json, sequence_order
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text,
-            $7::jsonb, $8::jsonb, $9::integer
-          ) RETURNING *;`,
-          [
-            storyId,
-            input.project_id,
-            epicId,
-            s.story_key,
-            s.title,
-            s.description,
-            [...s.requirement_ids],
-            [...s.ac_ids],
-            s.sequence_order,
-          ]
-        );
-        const mapped = mapDevUserStoryRow(res.rows[0]!);
-        storyIdByKey.set(s.story_key, mapped.story_id);
-        stories.push(mapped);
-      }
-
-      const tasks: TaskRecord[] = [];
-      const taskLinks: TaskPlanLinkRecord[] = [];
-      for (const t of input.tasks) {
-        const storyId = storyIdByKey.get(t.story_key);
-        if (!storyId) {
-          throw new PostgresRlsError("23503", `Story key '${t.story_key}' not found`);
-        }
-        const taskRec = await this.createTask({
-          task_id: t.task_id,
-          project_id: input.project_id,
-          title: t.title,
-          task_contract: t.task_contract,
-          base_main_commit_hash: input.base_main_commit_hash,
-          max_rework_cycles: t.max_rework_cycles,
-        });
-        tasks.push(taskRec);
-        const linkId = randomUUID();
-        const linkRes = await this.pool.queryInActiveTx(
-          `INSERT INTO task_plan_links (
-            link_id, project_id, pipeline_session_id, baseline_id,
-            bootstrap_id, story_id, task_id, cr_id,
-            requirement_ids_json, ac_ids_json, assigned_profile_id
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-            $5::uuid, $6::uuid, $7::uuid, NULL,
-            $8::jsonb, $9::jsonb, $10::uuid
-          ) RETURNING *;`,
-          [
-            linkId,
-            input.project_id,
-            input.pipeline_session_id,
-            input.baseline_id,
-            input.bootstrap_id,
-            storyId,
-            taskRec.task_id,
-            [...t.requirement_ids],
-            [...t.ac_ids],
-            t.assigned_profile_id ?? null,
-          ]
-        );
-        taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
-      }
-
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "product_pipeline",
-        input.pipeline_session_id,
-        "pipeline.stage7_plan_materialized",
-        {
-          pipeline_session_id: input.pipeline_session_id,
-          baseline_id: input.baseline_id,
-          task_ids: tasks.map((t) => t.task_id),
-        }
-      );
-
-      return { milestones, epics, stories, taskLinks, tasks };
-    } catch (error) {
-      mapPgError(error);
     }
+    if (
+      input.milestones.length === 0 ||
+      input.epics.length === 0 ||
+      input.stories.length === 0 ||
+      input.tasks.length === 0
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "Stage 7 development plan requires >= 1 milestone, epic, story, and task"
+      );
+    }
+    const normalizedBaseMain = input.base_main_commit_hash.toLowerCase();
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: "core_api_service",
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const existingPlan = await this.pool.queryInActiveTx(
+            "SELECT 1 FROM dev_milestones WHERE project_id = $1::uuid AND baseline_id = $2::uuid LIMIT 1;",
+            [input.project_id, input.baseline_id]
+          );
+          if (existingPlan.rowCount > 0) {
+            throw new PostgresRlsError(
+              "23514",
+              `Stage 7 development plan already exists for frozen baseline ${input.baseline_id}; submit a Stage 9 Change Request to add or modify tasks`
+            );
+          }
+
+          const bootRes = await this.pool.queryInActiveTx(
+            `SELECT bootstrap_id, baseline_id FROM project_bootstraps
+             WHERE bootstrap_id = $1::uuid AND project_id = $2::uuid LIMIT 1;`,
+            [input.bootstrap_id, input.project_id]
+          );
+          if (
+            !bootRes.rows[0] ||
+            String(bootRes.rows[0].baseline_id) !== input.baseline_id
+          ) {
+            throw new PostgresRlsError(
+              "23514",
+              `Bootstrap ${input.bootstrap_id} does not match baseline ${input.baseline_id}`
+            );
+          }
+
+          const milestones: DevMilestoneRecord[] = [];
+          const milestoneIdByKey = new Map<string, string>();
+          for (const m of input.milestones) {
+            const milestoneId = m.milestone_id ?? randomUUID();
+            const res = await this.pool.queryInActiveTx(
+              `INSERT INTO dev_milestones (
+                milestone_id, project_id, pipeline_session_id, baseline_id,
+                milestone_key, title, description, sequence_order
+              ) VALUES (
+                $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+                $5::text, $6::text, $7::text, $8::integer
+              ) RETURNING *;`,
+              [
+                milestoneId,
+                input.project_id,
+                input.pipeline_session_id,
+                input.baseline_id,
+                m.milestone_key,
+                m.title,
+                m.description,
+                m.sequence_order,
+              ]
+            );
+            const mapped = mapDevMilestoneRow(res.rows[0]!);
+            milestoneIdByKey.set(m.milestone_key, mapped.milestone_id);
+            milestones.push(mapped);
+          }
+
+          const epics: DevEpicRecord[] = [];
+          const epicIdByKey = new Map<string, string>();
+          for (const e of input.epics) {
+            const milestoneId = milestoneIdByKey.get(e.milestone_key);
+            if (!milestoneId) {
+              throw new PostgresRlsError("23503", `Milestone key '${e.milestone_key}' not found`);
+            }
+            const epicId = e.epic_id ?? randomUUID();
+            const res = await this.pool.queryInActiveTx(
+              `INSERT INTO dev_epics (
+                epic_id, project_id, milestone_id,
+                epic_key, title, description, sequence_order
+              ) VALUES (
+                $1::uuid, $2::uuid, $3::uuid,
+                $4::text, $5::text, $6::text, $7::integer
+              ) RETURNING *;`,
+              [
+                epicId,
+                input.project_id,
+                milestoneId,
+                e.epic_key,
+                e.title,
+                e.description,
+                e.sequence_order,
+              ]
+            );
+            const mapped = mapDevEpicRow(res.rows[0]!);
+            epicIdByKey.set(e.epic_key, mapped.epic_id);
+            epics.push(mapped);
+          }
+
+          const stories: DevUserStoryRecord[] = [];
+          const storyIdByKey = new Map<string, string>();
+          for (const s of input.stories) {
+            const epicId = epicIdByKey.get(s.epic_key);
+            if (!epicId) {
+              throw new PostgresRlsError("23503", `Epic key '${s.epic_key}' not found`);
+            }
+            const storyId = s.story_id ?? randomUUID();
+            const res = await this.pool.queryInActiveTx(
+              `INSERT INTO dev_user_stories (
+                story_id, project_id, epic_id, story_key, title, description,
+                requirement_ids_json, ac_ids_json, sequence_order
+              ) VALUES (
+                $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text,
+                $7::jsonb, $8::jsonb, $9::integer
+              ) RETURNING *;`,
+              [
+                storyId,
+                input.project_id,
+                epicId,
+                s.story_key,
+                s.title,
+                s.description,
+                [...s.requirement_ids],
+                [...s.ac_ids],
+                s.sequence_order,
+              ]
+            );
+            const mapped = mapDevUserStoryRow(res.rows[0]!);
+            storyIdByKey.set(s.story_key, mapped.story_id);
+            stories.push(mapped);
+          }
+
+          const tasks: TaskRecord[] = [];
+          const taskLinks: TaskPlanLinkRecord[] = [];
+          for (const t of input.tasks) {
+            const storyId = storyIdByKey.get(t.story_key);
+            if (!storyId) {
+              throw new PostgresRlsError("23503", `Story key '${t.story_key}' not found`);
+            }
+            const taskRec = await this.createTask({
+              task_id: t.task_id,
+              project_id: input.project_id,
+              title: t.title,
+              task_contract: t.task_contract,
+              base_main_commit_hash: normalizedBaseMain,
+              max_rework_cycles: t.max_rework_cycles,
+            });
+            tasks.push(taskRec);
+            const linkId = randomUUID();
+            const linkRes = await this.pool.queryInActiveTx(
+              `INSERT INTO task_plan_links (
+                link_id, project_id, pipeline_session_id, baseline_id,
+                bootstrap_id, story_id, task_id, cr_id,
+                requirement_ids_json, ac_ids_json, assigned_profile_id
+              ) VALUES (
+                $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+                $5::uuid, $6::uuid, $7::uuid, NULL,
+                $8::jsonb, $9::jsonb, $10::uuid
+              ) RETURNING *;`,
+              [
+                linkId,
+                input.project_id,
+                input.pipeline_session_id,
+                input.baseline_id,
+                input.bootstrap_id,
+                storyId,
+                taskRec.task_id,
+                [...t.requirement_ids],
+                [...t.ac_ids],
+                t.assigned_profile_id ?? null,
+              ]
+            );
+            taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
+          }
+
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "product_pipeline",
+            input.pipeline_session_id,
+            "pipeline.stage7_plan_materialized",
+            {
+              pipeline_session_id: input.pipeline_session_id,
+              baseline_id: input.baseline_id,
+              task_ids: tasks.map((t) => t.task_id),
+            }
+          );
+
+          return { milestones, epics, stories, taskLinks, tasks };
+        } catch (error) {
+          mapPgError(error);
+        }
+      }
+    );
   }
 
   public async listDevMilestones(pipelineSessionId: string): Promise<DevMilestoneRecord[]> {
@@ -6266,56 +6719,76 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     return res.rows.map(mapTaskPlanLinkRow);
   }
 
+  public async listProjectTaskPlanLinks(): Promise<TaskPlanLinkRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      `SELECT * FROM task_plan_links
+       ORDER BY created_at ASC;`
+    );
+    return res.rows.map(mapTaskPlanLinkRow);
+  }
+
   public async createChangeRequest(
     input: CreateChangeRequestStoreInput
   ): Promise<ChangeRequestRecord> {
+    if (!input.cr_key.trim() || !input.title.trim() || !input.rationale.trim()) {
+      throw new PostgresRlsError("23514", "cr_key, title, and rationale must be non-empty");
+    }
     const crId = input.cr_id ?? randomUUID();
     const crSha = computeChangeRequestSha256(input);
-    try {
-      const res = await this.pool.queryInActiveTx(
-        `INSERT INTO change_requests (
-          cr_id, project_id, pipeline_session_id, baseline_id,
-          cr_key, title, rationale,
-          impacted_requirement_ids_json, impacted_component_ids_json, proposed_tasks_json,
-          status, requested_by_principal_id, cr_sha256
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-          $5::text, $6::text, $7::text,
-          $8::jsonb, $9::jsonb, $10::jsonb,
-          'PENDING_APPROVAL', $11::text, $12::char(64)
-        ) RETURNING *;`,
-        [
-          crId,
-          input.project_id,
-          input.pipeline_session_id,
-          input.baseline_id,
-          input.cr_key.trim(),
-          input.title.trim(),
-          input.rationale.trim(),
-          [...input.impacted_requirement_ids],
-          [...(input.impacted_component_ids ?? [])],
-          [...input.proposed_tasks],
-          input.requested_by_principal_id,
-          crSha,
-        ]
-      );
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "change_request",
-        crId,
-        "change_request.submitted",
-        {
-          cr_id: crId,
-          cr_key: input.cr_key.trim(),
-          pipeline_session_id: input.pipeline_session_id,
-          baseline_id: input.baseline_id,
-          cr_sha256: crSha,
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.requested_by_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const res = await this.pool.queryInActiveTx(
+            `INSERT INTO change_requests (
+              cr_id, project_id, pipeline_session_id, baseline_id,
+              cr_key, title, rationale,
+              impacted_requirement_ids_json, impacted_component_ids_json, proposed_tasks_json,
+              status, requested_by_principal_id, cr_sha256
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+              $5::text, $6::text, $7::text,
+              $8::jsonb, $9::jsonb, $10::jsonb,
+              'PENDING_APPROVAL', $11::text, $12::char(64)
+            ) RETURNING *;`,
+            [
+              crId,
+              input.project_id,
+              input.pipeline_session_id,
+              input.baseline_id,
+              input.cr_key.trim(),
+              input.title.trim(),
+              input.rationale.trim(),
+              [...input.impacted_requirement_ids],
+              [...(input.impacted_component_ids ?? [])],
+              [...input.proposed_tasks],
+              input.requested_by_principal_id,
+              crSha,
+            ]
+          );
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "change_request",
+            crId,
+            "change_request.submitted",
+            {
+              cr_id: crId,
+              cr_key: input.cr_key.trim(),
+              pipeline_session_id: input.pipeline_session_id,
+              baseline_id: input.baseline_id,
+              cr_sha256: crSha,
+            }
+          );
+          return mapChangeRequestRow(res.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
         }
-      );
-      return mapChangeRequestRow(res.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+      }
+    );
   }
 
   public async getChangeRequestById(crId: string): Promise<ChangeRequestRecord | null> {
@@ -6339,63 +6812,79 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async decideChangeRequest(
     input: DecideChangeRequestStoreInput
   ): Promise<ChangeRequestRecord> {
+    if ((input.decision as string) !== "APPROVED" && (input.decision as string) !== "REJECTED") {
+      throw new PostgresRlsError(
+        "23514",
+        `Change Request decision must be APPROVED or REJECTED, got '${String(input.decision)}'`
+      );
+    }
     if (!input.decided_by_principal_id.trim()) {
       throw new PostgresRlsError("23514", "decided_by_principal_id is required");
     }
-    try {
-      const existingRes = await this.pool.queryInActiveTx(
-        `SELECT * FROM change_requests
-         WHERE cr_id = $1::uuid AND project_id = $2::uuid
-         FOR UPDATE;`,
-        [input.cr_id, input.project_id]
-      );
-      const row = existingRes.rows[0];
-      if (!row) {
-        throw new PostgresRlsError(
-          "23503",
-          `Change Request ${input.cr_id} not found for project ${input.project_id}`
-        );
-      }
-      if (String(row.status) !== "PENDING_APPROVAL") {
-        throw new PostgresRlsError(
-          "23514",
-          `Change Request ${input.cr_id} is in status ${String(row.status)}; only PENDING_APPROVAL can be decided`
-        );
-      }
-      const updRes = await this.pool.queryInActiveTx(
-        `UPDATE change_requests
-         SET status = $1::text,
-             decided_by_principal_id = $2::text,
-             decision_rationale = $3::text,
-             decided_at = clock_timestamp(),
-             updated_at = clock_timestamp()
-         WHERE cr_id = $4::uuid AND project_id = $5::uuid
-         RETURNING *;`,
-        [
-          input.decision,
-          input.decided_by_principal_id.trim(),
-          input.decision_rationale ?? null,
-          input.cr_id,
-          input.project_id,
-        ]
-      );
-      const mapped = mapChangeRequestRow(updRes.rows[0]!);
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "change_request",
-        mapped.cr_id,
-        `change_request.${input.decision.toLowerCase()}`,
-        {
-          cr_id: mapped.cr_id,
-          cr_key: mapped.cr_key,
-          decision: input.decision,
-          decided_by_principal_id: mapped.decided_by_principal_id,
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.decided_by_principal_id.trim(),
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const existingRes = await this.pool.queryInActiveTx(
+            `SELECT * FROM change_requests
+             WHERE cr_id = $1::uuid AND project_id = $2::uuid
+             FOR UPDATE;`,
+            [input.cr_id, input.project_id]
+          );
+          const row = existingRes.rows[0];
+          if (!row) {
+            throw new PostgresRlsError(
+              "23503",
+              `Change Request ${input.cr_id} not found for project ${input.project_id}`
+            );
+          }
+          const existing = mapChangeRequestRow(row);
+          if (existing.status !== "PENDING_APPROVAL") {
+            throw new PostgresRlsError(
+              "23514",
+              `Change Request ${input.cr_id} is in status ${existing.status}; only PENDING_APPROVAL can be decided`
+            );
+          }
+          const updRes = await this.pool.queryInActiveTx(
+            `UPDATE change_requests
+             SET status = $1::text,
+                 decided_by_principal_id = $2::text,
+                 decision_rationale = $3::text,
+                 decided_at = clock_timestamp(),
+                 updated_at = clock_timestamp()
+             WHERE cr_id = $4::uuid AND project_id = $5::uuid
+             RETURNING *;`,
+            [
+              input.decision,
+              input.decided_by_principal_id.trim(),
+              input.decision_rationale ?? null,
+              input.cr_id,
+              input.project_id,
+            ]
+          );
+          const mapped = mapChangeRequestRow(updRes.rows[0]!);
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "change_request",
+            mapped.cr_id,
+            `change_request.${input.decision.toLowerCase()}`,
+            {
+              cr_id: mapped.cr_id,
+              cr_key: mapped.cr_key,
+              decision: input.decision,
+              decided_by_principal_id: mapped.decided_by_principal_id,
+            }
+          );
+          return mapped;
+        } catch (error) {
+          mapPgError(error);
         }
-      );
-      return mapped;
-    } catch (error) {
-      mapPgError(error);
-    }
+      }
+    );
   }
 
   public async applyChangeRequestAndMaterializeTasks(
@@ -6408,97 +6897,126 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     if (!input.applied_by_principal_id.trim()) {
       throw new PostgresRlsError("23514", "applied_by_principal_id is required");
     }
-    try {
-      const crRes = await this.pool.queryInActiveTx(
-        `SELECT * FROM change_requests
-         WHERE cr_id = $1::uuid AND project_id = $2::uuid
-         FOR UPDATE;`,
-        [input.cr_id, input.project_id]
+    if (!/^[0-9a-f]{40}$/i.test(input.base_main_commit_hash)) {
+      throw new PostgresRlsError(
+        "23514",
+        `base_main_commit_hash '${input.base_main_commit_hash}' must be a 40-hex commit hash`
       );
-      const row = crRes.rows[0];
-      if (!row) {
-        throw new PostgresRlsError(
-          "23503",
-          `Change Request ${input.cr_id} not found for project ${input.project_id}`
-        );
-      }
-      const existing = mapChangeRequestRow(row);
-      if (existing.status !== "APPROVED") {
-        throw new PostgresRlsError(
-          "23514",
-          `Change Request ${input.cr_id} has status ${existing.status}; only APPROVED Change Requests can be applied`
-        );
-      }
-
-      const tasks: TaskRecord[] = [];
-      const taskLinks: TaskPlanLinkRecord[] = [];
-      for (const pt of existing.proposed_tasks) {
-        const contract: TaskContractSpec = {
-          allowed_files: [...pt.allowed_files],
-          protected_paths: [...input.protected_paths],
-          trusted_policy_sha256: input.trusted_policy_sha256,
-        };
-        const taskRec = await this.createTask({
-          project_id: input.project_id,
-          title: pt.title,
-          task_contract: contract,
-          base_main_commit_hash: input.base_main_commit_hash,
-        });
-        tasks.push(taskRec);
-        const linkRes = await this.pool.queryInActiveTx(
-          `INSERT INTO task_plan_links (
-            link_id, project_id, pipeline_session_id, baseline_id,
-            bootstrap_id, story_id, task_id, cr_id,
-            requirement_ids_json, ac_ids_json, assigned_profile_id
-          ) VALUES (
-            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-            $5::uuid, $6::uuid, $7::uuid, $8::uuid,
-            $9::jsonb, $10::jsonb, $11::uuid
-          ) RETURNING *;`,
-          [
-            randomUUID(),
-            input.project_id,
-            existing.pipeline_session_id,
-            existing.baseline_id,
-            input.bootstrap_id ?? null,
-            pt.story_id ?? null,
-            taskRec.task_id,
-            existing.cr_id,
-            [...pt.requirement_ids],
-            [...pt.ac_ids],
-            pt.developer_profile_id ?? null,
-          ]
-        );
-        taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
-      }
-
-      const updRes = await this.pool.queryInActiveTx(
-        `UPDATE change_requests
-         SET status = 'APPLIED',
-             applied_by_principal_id = $1::text,
-             applied_at = clock_timestamp(),
-             updated_at = clock_timestamp()
-         WHERE cr_id = $2::uuid AND project_id = $3::uuid
-         RETURNING *;`,
-        [input.applied_by_principal_id.trim(), existing.cr_id, input.project_id]
-      );
-      const updated = mapChangeRequestRow(updRes.rows[0]!);
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "change_request",
-        updated.cr_id,
-        "change_request.applied",
-        {
-          cr_id: updated.cr_id,
-          cr_key: updated.cr_key,
-          materialized_task_ids: tasks.map((t) => t.task_id),
-        }
-      );
-
-      return { changeRequest: updated, tasks, taskLinks };
-    } catch (error) {
-      mapPgError(error);
     }
+    if (!/^[0-9a-f]{64}$/i.test(input.trusted_policy_sha256)) {
+      throw new PostgresRlsError(
+        "23514",
+        `trusted_policy_sha256 '${input.trusted_policy_sha256}' must be a 64-hex SHA-256`
+      );
+    }
+    const normalizedBaseMain = input.base_main_commit_hash.toLowerCase();
+    const normalizedPolicySha = input.trusted_policy_sha256.toLowerCase();
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.applied_by_principal_id.trim(),
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const crRes = await this.pool.queryInActiveTx(
+            `SELECT * FROM change_requests
+             WHERE cr_id = $1::uuid AND project_id = $2::uuid
+             FOR UPDATE;`,
+            [input.cr_id, input.project_id]
+          );
+          const row = crRes.rows[0];
+          if (!row) {
+            throw new PostgresRlsError(
+              "23503",
+              `Change Request ${input.cr_id} not found for project ${input.project_id}`
+            );
+          }
+          const existing = mapChangeRequestRow(row);
+          if (existing.status !== "APPROVED") {
+            throw new PostgresRlsError(
+              "23514",
+              `Change Request ${input.cr_id} has status ${existing.status}; only APPROVED Change Requests can be applied`
+            );
+          }
+          if (existing.proposed_tasks.length === 0) {
+            throw new PostgresRlsError(
+              "23514",
+              `Change Request ${input.cr_id} has no proposed_tasks to materialize`
+            );
+          }
+
+          const tasks: TaskRecord[] = [];
+          const taskLinks: TaskPlanLinkRecord[] = [];
+          for (const pt of existing.proposed_tasks) {
+            const contract: TaskContractSpec = {
+              allowed_files: [...pt.allowed_files],
+              protected_paths: [...input.protected_paths],
+              trusted_policy_sha256: normalizedPolicySha,
+            };
+            const taskRec = await this.createTask({
+              project_id: input.project_id,
+              title: pt.title,
+              task_contract: contract,
+              base_main_commit_hash: normalizedBaseMain,
+            });
+            tasks.push(taskRec);
+            const linkRes = await this.pool.queryInActiveTx(
+              `INSERT INTO task_plan_links (
+                link_id, project_id, pipeline_session_id, baseline_id,
+                bootstrap_id, story_id, task_id, cr_id,
+                requirement_ids_json, ac_ids_json, assigned_profile_id
+              ) VALUES (
+                $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+                $5::uuid, $6::uuid, $7::uuid, $8::uuid,
+                $9::jsonb, $10::jsonb, $11::uuid
+              ) RETURNING *;`,
+              [
+                randomUUID(),
+                input.project_id,
+                existing.pipeline_session_id,
+                existing.baseline_id,
+                input.bootstrap_id ?? null,
+                pt.story_id ?? null,
+                taskRec.task_id,
+                existing.cr_id,
+                [...pt.requirement_ids],
+                [...pt.ac_ids],
+                pt.developer_profile_id ?? null,
+              ]
+            );
+            taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
+          }
+
+          const updRes = await this.pool.queryInActiveTx(
+            `UPDATE change_requests
+             SET status = 'APPLIED',
+                 applied_by_principal_id = $1::text,
+                 applied_at = clock_timestamp(),
+                 updated_at = clock_timestamp()
+             WHERE cr_id = $2::uuid AND project_id = $3::uuid
+             RETURNING *;`,
+            [input.applied_by_principal_id.trim(), existing.cr_id, input.project_id]
+          );
+          const updated = mapChangeRequestRow(updRes.rows[0]!);
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "change_request",
+            updated.cr_id,
+            "change_request.applied",
+            {
+              cr_id: updated.cr_id,
+              cr_key: updated.cr_key,
+              materialized_task_ids: tasks.map((t) => t.task_id),
+            }
+          );
+
+          return { changeRequest: updated, tasks, taskLinks };
+        } catch (error) {
+          mapPgError(error);
+        }
+      }
+    );
   }
 
   public async recordReleaseAcceptancePackage(
@@ -6512,57 +7030,76 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         )}, coverage_percent=${input.coverage_percent})`
       );
     }
+    if (
+      !/^[0-9a-f]{40}$/i.test(input.main_head_commit_hash) ||
+      !/^[0-9a-f]{64}$/i.test(input.traceability_sha256) ||
+      input.merged_task_ids.length === 0
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "Release acceptance package requires valid main_head_commit_hash, traceability_sha256, and >= 1 merged task"
+      );
+    }
     const releaseId = input.release_id ?? randomUUID();
     const packageSha = computeReleasePackageSha256(input);
-    try {
-      const insRes = await this.pool.queryInActiveTx(
-        `INSERT INTO release_acceptance_packages (
-          release_id, project_id, pipeline_session_id, baseline_id,
-          traceability_sha256, coverage_percent, is_complete, total_requirements,
-          merged_task_ids_json, applied_cr_ids_json,
-          main_head_commit_hash, summary_markdown, package_json,
-          package_sha256, accepted_by_principal_id
-        ) VALUES (
-          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
-          $5::char(64), $6::numeric(5,2), $7::boolean, $8::integer,
-          $9::jsonb, $10::jsonb,
-          $11::char(40), $12::text, $13::jsonb,
-          $14::char(64), $15::text
-        ) RETURNING *;`,
-        [
-          releaseId,
-          input.project_id,
-          input.pipeline_session_id,
-          input.baseline_id,
-          input.traceability_sha256.toLowerCase(),
-          input.coverage_percent,
-          input.complete,
-          input.total_requirements,
-          [...input.merged_task_ids],
-          [...input.applied_cr_ids],
-          input.main_head_commit_hash.toLowerCase(),
-          input.summary_markdown,
-          input.package_json,
-          packageSha,
-          input.accepted_by_principal_id,
-        ]
-      );
-      await this.insertOutboxEventSql(
-        input.project_id,
-        "release_acceptance",
-        releaseId,
-        "pipeline.release_accepted",
-        {
-          release_id: releaseId,
-          pipeline_session_id: input.pipeline_session_id,
-          baseline_id: input.baseline_id,
-          package_sha256: packageSha,
+    return this.withExistingOrRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.accepted_by_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        try {
+          const insRes = await this.pool.queryInActiveTx(
+            `INSERT INTO release_acceptance_packages (
+              release_id, project_id, pipeline_session_id, baseline_id,
+              traceability_sha256, coverage_percent, is_complete, total_requirements,
+              merged_task_ids_json, applied_cr_ids_json,
+              main_head_commit_hash, summary_markdown, package_json,
+              package_sha256, accepted_by_principal_id
+            ) VALUES (
+              $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+              $5::char(64), $6::numeric(5,2), $7::boolean, $8::integer,
+              $9::jsonb, $10::jsonb,
+              $11::char(40), $12::text, $13::jsonb,
+              $14::char(64), $15::text
+            ) RETURNING *;`,
+            [
+              releaseId,
+              input.project_id,
+              input.pipeline_session_id,
+              input.baseline_id,
+              input.traceability_sha256.toLowerCase(),
+              input.coverage_percent,
+              input.complete,
+              input.total_requirements,
+              [...input.merged_task_ids],
+              [...input.applied_cr_ids],
+              input.main_head_commit_hash.toLowerCase(),
+              input.summary_markdown,
+              input.package_json,
+              packageSha,
+              input.accepted_by_principal_id,
+            ]
+          );
+          await this.insertOutboxEventSql(
+            input.project_id,
+            "release_acceptance",
+            releaseId,
+            "pipeline.release_accepted",
+            {
+              release_id: releaseId,
+              pipeline_session_id: input.pipeline_session_id,
+              baseline_id: input.baseline_id,
+              package_sha256: packageSha,
+            }
+          );
+          return mapReleaseAcceptancePackageRow(insRes.rows[0]!);
+        } catch (error) {
+          mapPgError(error);
         }
-      );
-      return mapReleaseAcceptancePackageRow(insRes.rows[0]!);
-    } catch (error) {
-      mapPgError(error);
-    }
+      }
+    );
   }
 
   public async listReleaseAcceptancePackages(

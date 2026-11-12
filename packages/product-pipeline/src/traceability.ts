@@ -21,6 +21,7 @@ import {
   type TraceabilityRequirementRow,
   type TraceabilityStage8TaskLineage,
   canonicalizeJson,
+  computeCanonicalPayloadSha256,
   sha256Hex,
 } from "@software-factory/shared-types";
 
@@ -57,7 +58,6 @@ export interface IssueReleaseAcceptanceServiceInput {
   readonly project_id: string;
   readonly pipeline_session_id: string;
   readonly accepted_by_principal_id: string;
-  readonly live_main_head_commit_hash?: string;
   readonly notes?: string;
 }
 
@@ -290,7 +290,6 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
   input: {
     readonly project_id: string;
     readonly pipeline_session_id: string;
-    readonly live_main_head_commit_hash?: string;
   }
 ): Promise<BidirectionalTraceabilityMatrix> {
   const project = await store.getProjectById(input.project_id);
@@ -317,24 +316,47 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
     throw new PostgresRlsError("23503", "Frozen Stage 2 or Stage 3 artifact missing");
   }
 
+  // Verify Stage 2 & Stage 3 canonical SHA-256 digests against both artifact header and baseline freeze (M6A-FU-01)
+  const stage2ComputedSha = computeCanonicalPayloadSha256(stage2.content_json);
+  if (
+    stage2ComputedSha !== stage2.artifact_sha256.toLowerCase() ||
+    stage2ComputedSha !== baseline.stage2_artifact_sha256.toLowerCase()
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      `Frozen Stage 2 artifact ${stage2.artifact_id} SHA-256 mismatch against canonical content or baseline freeze`
+    );
+  }
+  const stage3ComputedSha = computeCanonicalPayloadSha256(stage3.content_json);
+  if (
+    stage3ComputedSha !== stage3.artifact_sha256.toLowerCase() ||
+    stage3ComputedSha !== baseline.stage3_artifact_sha256.toLowerCase()
+  ) {
+    throw new PostgresRlsError(
+      "23514",
+      `Frozen Stage 3 artifact ${stage3.artifact_id} SHA-256 mismatch against canonical content or baseline freeze`
+    );
+  }
+
+  const stage1Items = await store.listStage1DiscoveryItems(input.pipeline_session_id);
+  const stage1ById = new Map(stage1Items.map((item) => [item.item_id, item] as const));
   const bootstrap = await store.getProjectBootstrapBySession(input.pipeline_session_id);
   const milestones = await store.listDevMilestones(input.pipeline_session_id);
   const epics = await store.listDevEpics(input.pipeline_session_id);
   const stories = await store.listDevUserStories(input.pipeline_session_id);
   const taskLinks = await store.listTaskPlanLinks(input.pipeline_session_id);
+  const allProjectTasks = await store.selectVisibleTasks();
+  const allProjectLinks = await store.listProjectTaskPlanLinks();
   const changeRequests = await store.listChangeRequests(input.pipeline_session_id);
 
+  // Authoritative main head resolution: real Git repo refs/heads/main takes strict precedence over DB cache (M6B-FIX-01)
   const repoPath = bootstrap?.repo_path ?? project.repo_bare_path;
   const repoExists = Boolean(repoPath && existsSync(repoPath));
   const diskMainHead = repoExists ? tryGitRevParseMain(repoPath) : null;
   const storeMainHead = await store.getMainRefCommitHash(input.project_id);
-  const liveMainHead = (
-    input.live_main_head_commit_hash ??
-    diskMainHead ??
-    storeMainHead ??
-    project.main_ref_commit_hash ??
-    ""
-  ).toLowerCase() || null;
+  const authoritativeMainHead = repoExists
+    ? diskMainHead
+    : ((storeMainHead ?? project.main_ref_commit_hash ?? "").toLowerCase() || null);
 
   const reqs = extractStage2Requirements(stage2.content_json);
   const validReqIds = new Set(reqs.map((r) => r.req_id));
@@ -347,6 +369,7 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
   const lineageByTaskId = new Map<string, CandidateBoundLineage | null>();
   const stage8ByTaskId = new Map<string, TraceabilityStage8TaskLineage>();
   const taskCompleteById = new Map<string, boolean>();
+  const taskFailureReasonById = new Map<string, string>();
   const orphanLinks: TraceabilityOrphanLink[] = [];
 
   for (const link of taskLinks) {
@@ -370,7 +393,7 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
     }
 
     if (!lineageByTaskId.has(link.task_id)) {
-      const lineage = await store.getCandidateBoundLineage(link.task_id, liveMainHead);
+      const lineage = await store.getCandidateBoundLineage(link.task_id, authoritativeMainHead);
       lineageByTaskId.set(link.task_id, lineage);
       if (!lineage) {
         orphanLinks.push({
@@ -391,17 +414,31 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
 
       let mainReachable = false;
       if (lineage.task.status === "MergedAndCompleted" && mergedCommit) {
-        if (liveMainHead && mergedCommit === liveMainHead) {
-          mainReachable = true;
-        } else if (repoExists) {
-          mainReachable = isCommitAncestorOfMain(repoPath, mergedCommit);
+        if (repoExists) {
+          mainReachable = Boolean(
+            diskMainHead &&
+              (mergedCommit === diskMainHead || isCommitAncestorOfMain(repoPath, mergedCommit))
+          );
+        } else {
+          mainReachable = Boolean(authoritativeMainHead && mergedCommit === authoritativeMainHead);
         }
       }
 
-      const trustedPolicyMatch =
-        !bootstrap ||
-        !lineage.verificationRun?.trusted_policy_sha256 ||
-        lineage.verificationRun.trusted_policy_sha256 === bootstrap.trusted_policy_sha256;
+      // M6B-FIX-07: Require verified Tier 1 pass (`=== true`) and non-null matching policy SHA on both run & task contract
+      const bootstrapPolicySha = bootstrap?.trusted_policy_sha256.toLowerCase() ?? null;
+      const runPolicySha = lineage.verificationRun?.trusted_policy_sha256?.toLowerCase() ?? null;
+      const rawContractPolicySha = (
+        lineage.task.task_contract_json as { readonly trusted_policy_sha256?: unknown } | undefined
+      )?.trusted_policy_sha256;
+      const contractPolicySha =
+        typeof rawContractPolicySha === "string" ? rawContractPolicySha.toLowerCase() : null;
+      const trustedPolicyMatch = Boolean(
+        lineage.verificationRun &&
+          runPolicySha &&
+          (!bootstrapPolicySha ||
+            (runPolicySha === bootstrapPolicySha && contractPolicySha === bootstrapPolicySha))
+      );
+      const tier1Passed = lineage.verificationRun?.tier1_trusted_acceptance_passed === true;
 
       const stage8Lineage: TraceabilityStage8TaskLineage = {
         task_id: link.task_id,
@@ -427,14 +464,82 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
         main_reachable: mainReachable,
       };
       stage8ByTaskId.set(link.task_id, stage8Lineage);
-      taskCompleteById.set(
-        link.task_id,
-        lineage.task.status === "MergedAndCompleted" &&
-          lineage.lineageComplete &&
-          mainReachable &&
-          trustedPolicyMatch &&
-          lineage.verificationRun?.tier1_trusted_acceptance_passed !== false
-      );
+
+      let failureReason: string | null = null;
+      if (lineage.task.status !== "MergedAndCompleted") {
+        failureReason = `Task ${link.task_id} (${lineage.task.title}) is in status ${lineage.task.status}, expected MergedAndCompleted`;
+      } else if (!lineage.lineageComplete) {
+        failureReason = `Task ${link.task_id} Stage 8 hash-bound lineage is incomplete`;
+      } else if (!mainReachable) {
+        failureReason = `Task ${link.task_id} merged commit ${mergedCommit ?? "(none)"} is not reachable on refs/heads/main`;
+      } else if (!tier1Passed) {
+        failureReason = `Task ${link.task_id} did not record tier1_trusted_acceptance_passed === true`;
+      } else if (!trustedPolicyMatch) {
+        failureReason = `Task ${link.task_id} trusted_policy_sha256 (${runPolicySha ?? "null"} / contract ${contractPolicySha ?? "null"}) does not match Stage 5 bootstrap policy ${bootstrapPolicySha ?? "required"}`;
+      }
+
+      if (failureReason) {
+        taskFailureReasonById.set(link.task_id, failureReason);
+      }
+      taskCompleteById.set(link.task_id, failureReason === null);
+    }
+  }
+
+  // Bidirectional orphan scan (M6B-FIX-06):
+  // (a) Stage 8 tasks belonging to project without any task_plan_link
+  const linkedProjectTaskIds = new Set(
+    allProjectLinks.filter((l) => l.project_id === input.project_id).map((l) => l.task_id)
+  );
+  for (const projTask of allProjectTasks) {
+    if (projTask.project_id === input.project_id && !linkedProjectTaskIds.has(projTask.task_id)) {
+      orphanLinks.push({
+        entity_type: "task",
+        entity_id: projTask.task_id,
+        reason: `Unlinked task ${projTask.task_id} (${projTask.title}) exists in project without a Stage 7/9 task_plan_link`,
+      });
+    }
+  }
+
+  // (b) Stage 3 design elements referencing unknown Stage 2 req_ids
+  const scanStage3Orphans = (
+    map: ReadonlyMap<string, readonly string[]>,
+    entityType: string,
+    label: string
+  ) => {
+    for (const [reqId, entities] of map.entries()) {
+      if (!validReqIds.has(reqId)) {
+        for (const entityId of entities) {
+          orphanLinks.push({
+            entity_type: entityType,
+            entity_id: entityId,
+            reason: `Stage 3 ${label} '${entityId}' references unknown req_id '${reqId}'`,
+          });
+        }
+      }
+    }
+  };
+  scanStage3Orphans(designIndex.componentsByReqId, "stage3_component", "component");
+  scanStage3Orphans(designIndex.erdTablesByReqId, "stage3_erd_entity", "ERD entity");
+  scanStage3Orphans(designIndex.apiEndpointsByReqId, "stage3_api_endpoint", "API endpoint");
+  scanStage3Orphans(designIndex.securityControlsByReqId, "stage3_security_control", "security control");
+  scanStage3Orphans(designIndex.adrsByReqId, "stage3_adr", "ADR");
+
+  // (c) Bootstrap Trusted Acceptance Tests referencing unknown req_id or ac_id
+  if (bootstrap) {
+    for (const testSpec of bootstrap.acceptance_tests) {
+      if (!validReqIds.has(testSpec.req_id)) {
+        orphanLinks.push({
+          entity_type: "bootstrap_acceptance_test",
+          entity_id: `${bootstrap.bootstrap_id}:${testSpec.ac_id}`,
+          reason: `Bootstrap acceptance test ${testSpec.ac_id} references unknown req_id '${testSpec.req_id}'`,
+        });
+      } else if (!validAcIds.has(testSpec.ac_id)) {
+        orphanLinks.push({
+          entity_type: "bootstrap_acceptance_test",
+          entity_id: `${bootstrap.bootstrap_id}:${testSpec.ac_id}`,
+          reason: `Bootstrap acceptance test references unknown ac_id '${testSpec.ac_id}'`,
+        });
+      }
     }
   }
 
@@ -461,6 +566,7 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
 
   const crStatusById = new Map(changeRequests.map((cr) => [cr.cr_id, cr] as const));
   const openCrsByReqId = new Map<string, ChangeRequestRecord[]>();
+  const appliedCrsByReqId = new Map<string, ChangeRequestRecord[]>();
   for (const cr of changeRequests) {
     for (const r of cr.impacted_requirement_ids) {
       if (!validReqIds.has(r)) {
@@ -476,6 +582,12 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
         const list = openCrsByReqId.get(r);
         if (list) list.push(cr);
         else openCrsByReqId.set(r, [cr]);
+      }
+    } else if (cr.status === "APPLIED") {
+      for (const r of cr.impacted_requirement_ids) {
+        const list = appliedCrsByReqId.get(r);
+        if (list) list.push(cr);
+        else appliedCrsByReqId.set(r, [cr]);
       }
     }
   }
@@ -501,9 +613,28 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
       missingLinksGlobal.push({ req_id: req.req_id, stage, reason });
     };
 
+    // M6B-FIX-03: Verify Stage 1 discovery item existence & AUTO_VERIFIED/CONFIRMED status against DB
     const stage1Ids = uniqueSorted(req.source_discovery_item_ids);
     if (stage1Ids.length === 0) {
       pushReqMissing("STAGE_1_DISCOVERY", `Requirement ${req.req_id} has no Stage 1 discovery provenance`);
+    } else {
+      for (const s1Id of stage1Ids) {
+        const s1Item = stage1ById.get(s1Id);
+        if (!s1Item) {
+          pushReqMissing(
+            "STAGE_1_DISCOVERY",
+            `Requirement ${req.req_id} references unknown Stage 1 discovery item '${s1Id}'`
+          );
+        } else if (
+          s1Item.confirmation_status !== "AUTO_VERIFIED" &&
+          s1Item.confirmation_status !== "CONFIRMED"
+        ) {
+          pushReqMissing(
+            "STAGE_1_DISCOVERY",
+            `Requirement ${req.req_id} references unconfirmed/rejected Stage 1 item '${s1Id}' (status=${s1Item.confirmation_status})`
+          );
+        }
+      }
     }
     for (const s1 of stage1Ids) pushBackIndex(backStage1, s1, req.req_id);
 
@@ -627,18 +758,25 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
         }
       }
       if (!taskCompleteById.get(taskId)) {
-        const reason = !st8
-          ? `Task ${taskId} is missing Stage 8 lineage`
-          : st8.status !== "MergedAndCompleted"
-          ? `Task ${taskId} (${st8.title}) is in status ${st8.status}, expected MergedAndCompleted`
-          : !st8.main_reachable
-          ? `Task ${taskId} merged commit ${st8.merged_commit_hash ?? "(none)"} is not reachable on refs/heads/main`
-          : `Task ${taskId} Stage 8 hash-bound lineage is incomplete`;
+        const reason =
+          taskFailureReasonById.get(taskId) ?? `Task ${taskId} is missing Stage 8 lineage`;
         pushReqMissing("STAGE_8_EXECUTION", reason);
       }
     }
     for (const crId of appliedCrIds) {
       pushBackIndex(backCrs, crId, req.req_id);
+    }
+
+    // M6B-FIX-05: Ensure every APPLIED CR impacting this requirement actually materialized task_plan_links for it
+    const appliedImpactingCrs = appliedCrsByReqId.get(req.req_id) ?? [];
+    for (const appliedCr of appliedImpactingCrs) {
+      pushBackIndex(backCrs, appliedCr.cr_id, req.req_id);
+      if (!coveringTaskLinks.some((l) => l.cr_id === appliedCr.cr_id)) {
+        pushReqMissing(
+          "STAGE_9_CHANGE_REQUEST",
+          `Applied Change Request ${appliedCr.cr_key} impacting ${req.req_id} has zero linked tasks in task_plan_links`
+        );
+      }
     }
 
     const openCrs = openCrsByReqId.get(req.req_id) ?? [];
@@ -650,7 +788,6 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
       );
     }
 
-    // Check any story_id referenced by coveringTaskLinks resolves
     for (const link of coveringTaskLinks) {
       if (link.story_id && !storyById.has(link.story_id)) {
         orphanLinks.push({
@@ -686,12 +823,11 @@ export async function buildBidirectionalTraceabilityMatrixInTx(
     forwardIndex[req.req_id] = row;
   }
 
-  // Also ensure REJECTED CRs are indexed cleanly in backCrs if desired for discoverability?
-  // Wait: keep backCrs reflecting applied & active CRs mapped in rows; add rejected CRs only if none conflict.
   const totalReqs = requirementRows.length;
   const coveredReqs = requirementRows.filter((r) => r.complete).length;
+  // Minor #1: floor (truncate) to 2 decimal places per spec §6.2 rather than rounding partial coverage up to 100
   const coveragePercent =
-    totalReqs === 0 ? 0 : Math.round((coveredReqs / totalReqs) * 10000) / 100;
+    totalReqs === 0 ? 0 : Math.floor((coveredReqs / totalReqs) * 10000) / 100;
   const complete =
     totalReqs > 0 &&
     coveredReqs === totalReqs &&
@@ -746,7 +882,6 @@ export async function getBidirectionalTraceabilityMatrixService(
     readonly project_id: string;
     readonly pipeline_session_id: string;
     readonly actor_principal_id: string;
-    readonly live_main_head_commit_hash?: string;
   }
 ): Promise<BidirectionalTraceabilityMatrix> {
   return store.withRlsTransaction(
@@ -772,28 +907,34 @@ export async function issueReleaseAcceptancePackageService(
     async () => {
       const matrix = await buildBidirectionalTraceabilityMatrixInTx(store, input);
       if (!matrix.complete || matrix.coverage_percent !== 100) {
-        const preview = matrix.missing_links
+        const missingPreview = matrix.missing_links
           .slice(0, 3)
           .map((m) => `${m.req_id}:${m.stage}:${m.reason}`)
           .join("; ");
+        const orphanPreview = matrix.orphan_links
+          .slice(0, 3)
+          .map((o) => `ORPHAN:${o.entity_type}:${o.entity_id}:${o.reason}`)
+          .join("; ");
+        const details = [missingPreview, orphanPreview].filter(Boolean).join(" | ");
         throw new PostgresRlsError(
           "23514",
-          `Cannot issue Release Acceptance Package: AC-11b traceability coverage is ${matrix.coverage_percent}% (${matrix.covered_requirements}/${matrix.total_requirements}); missing: ${preview || "incomplete coverage"}`
+          `Cannot issue Release Acceptance Package: AC-11b traceability coverage is ${matrix.coverage_percent}% (${matrix.covered_requirements}/${matrix.total_requirements}); ${details || "incomplete coverage"}`
         );
       }
 
       const project = await store.getProjectById(input.project_id);
       const bootstrap = await store.getProjectBootstrapBySession(input.pipeline_session_id);
       const repoPath = bootstrap?.repo_path ?? project?.repo_bare_path ?? "";
-      const diskMainHead = repoPath && existsSync(repoPath) ? tryGitRevParseMain(repoPath) : null;
+      const repoExists = Boolean(repoPath && existsSync(repoPath));
+      const diskMainHead = repoExists ? tryGitRevParseMain(repoPath) : null;
       const storeMainHead = await store.getMainRefCommitHash(input.project_id);
       const mainHeadCommitHash = (
-        input.live_main_head_commit_hash ??
-        diskMainHead ??
-        storeMainHead ??
-        project?.main_ref_commit_hash ??
-        bootstrap?.base_main_commit_hash ??
-        ""
+        repoExists
+          ? diskMainHead ?? ""
+          : storeMainHead ??
+            project?.main_ref_commit_hash ??
+            bootstrap?.base_main_commit_hash ??
+            ""
       ).toLowerCase();
 
       if (!/^[0-9a-f]{40}$/.test(mainHeadCommitHash)) {
@@ -878,7 +1019,6 @@ export async function getM6BStages5To9BundleService(
     readonly project_id: string;
     readonly pipeline_session_id: string;
     readonly actor_principal_id: string;
-    readonly live_main_head_commit_hash?: string;
   }
 ): Promise<M6BStages5To9Bundle> {
   return store.withRlsTransaction(

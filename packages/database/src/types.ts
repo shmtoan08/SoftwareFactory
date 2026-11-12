@@ -794,6 +794,7 @@ export interface ControlPlaneStore {
   listTaskPlanLinks(
     pipelineSessionId: string
   ): TaskPlanLinkRecord[] | Promise<TaskPlanLinkRecord[]>;
+  listProjectTaskPlanLinks(): TaskPlanLinkRecord[] | Promise<TaskPlanLinkRecord[]>;
 
   createChangeRequest(
     input: CreateChangeRequestStoreInput

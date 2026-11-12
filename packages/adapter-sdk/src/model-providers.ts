@@ -13,6 +13,7 @@ import type { TaskContractSpec } from "@software-factory/task-contract";
 import {
   CostBudgetExceededError,
   type CostGuardRecorder,
+  type FinalizeModelCallInput,
   computeCostMicroUsd,
   estimateTokenCount,
   extractNormalizedTokenUsage,
@@ -41,12 +42,19 @@ export class ModelProviderConfigurationError extends Error {
 export class ModelProviderHttpError extends Error {
   public readonly statusCode: number;
   public readonly provider: ModelProviderName;
+  public readonly partialUsage?: ModelUsageMetrics;
 
-  constructor(provider: ModelProviderName, statusCode: number, message: string) {
+  constructor(
+    provider: ModelProviderName,
+    statusCode: number,
+    message: string,
+    partialUsage?: ModelUsageMetrics
+  ) {
     super(message);
     this.name = "ModelProviderHttpError";
     this.provider = provider;
     this.statusCode = statusCode;
+    this.partialUsage = partialUsage;
   }
 }
 
@@ -278,15 +286,57 @@ function isOpenAiReasoningModel(model: string): boolean {
   return /^(?:o1|o3|o4)(?:$|[-_])/i.test(model.trim());
 }
 
-async function readTruncatedResponseText(resp: Response): Promise<string> {
+async function readHttpErrorBodyAndPartialUsage(
+  provider: ModelProviderName,
+  resp: Response
+): Promise<{ readonly truncatedText: string; readonly partialUsage?: ModelUsageMetrics }> {
+  let rawText = "";
   try {
-    const text = await resp.text();
-    return text.length > MAX_HTTP_ERROR_BODY_CHARS
-      ? `${text.slice(0, MAX_HTTP_ERROR_BODY_CHARS)}...[truncated]`
-      : text;
+    rawText = await resp.text();
   } catch {
-    return "<unreadable response body>";
+    return { truncatedText: "<unreadable response body>" };
   }
+  const truncatedText =
+    rawText.length > MAX_HTTP_ERROR_BODY_CHARS
+      ? `${rawText.slice(0, MAX_HTTP_ERROR_BODY_CHARS)}...[truncated]`
+      : rawText;
+
+  let partialUsage: ModelUsageMetrics | undefined;
+  try {
+    const parsed = JSON.parse(rawText) as Record<string, unknown>;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const errObj =
+        parsed.error && typeof parsed.error === "object" && !Array.isArray(parsed.error)
+          ? (parsed.error as Record<string, unknown>)
+          : undefined;
+      const rawUsage =
+        provider === "google"
+          ? parsed.usageMetadata ?? errObj?.usageMetadata
+          : parsed.usage ?? errObj?.usage;
+      if (rawUsage && typeof rawUsage === "object" && !Array.isArray(rawUsage)) {
+        const rec = rawUsage as Record<string, unknown>;
+        const hasAnyCounter =
+          (typeof rec.input_tokens === "number" && Number.isFinite(rec.input_tokens)) ||
+          (typeof rec.output_tokens === "number" && Number.isFinite(rec.output_tokens)) ||
+          (typeof rec.cache_creation_input_tokens === "number" &&
+            Number.isFinite(rec.cache_creation_input_tokens)) ||
+          (typeof rec.cache_read_input_tokens === "number" &&
+            Number.isFinite(rec.cache_read_input_tokens)) ||
+          (typeof rec.prompt_tokens === "number" && Number.isFinite(rec.prompt_tokens)) ||
+          (typeof rec.completion_tokens === "number" && Number.isFinite(rec.completion_tokens)) ||
+          (typeof rec.promptTokenCount === "number" && Number.isFinite(rec.promptTokenCount)) ||
+          (typeof rec.candidatesTokenCount === "number" &&
+            Number.isFinite(rec.candidatesTokenCount));
+        if (hasAnyCounter) {
+          partialUsage = extractNormalizedTokenUsage(provider, rec, "", "");
+        }
+      }
+    }
+  } catch {
+    // Non-JSON provider error body has no structured usage metadata
+  }
+
+  return { truncatedText, partialUsage };
 }
 
 async function parseProviderJsonResponse<T>(
@@ -386,10 +436,12 @@ export class LiveModelProviderClient {
           }),
         });
         if (!resp.ok) {
+          const errBody = await readHttpErrorBodyAndPartialUsage("anthropic", resp);
           throw new ModelProviderHttpError(
             "anthropic",
             resp.status,
-            `Anthropic API error HTTP ${resp.status}: ${await readTruncatedResponseText(resp)}`
+            `Anthropic API error HTTP ${resp.status}: ${errBody.truncatedText}`,
+            errBody.partialUsage
           );
         }
         const json = await parseProviderJsonResponse<{
@@ -452,10 +504,12 @@ export class LiveModelProviderClient {
           body: JSON.stringify(bodyPayload),
         });
         if (!resp.ok) {
+          const errBody = await readHttpErrorBodyAndPartialUsage("openai", resp);
           throw new ModelProviderHttpError(
             "openai",
             resp.status,
-            `OpenAI API error HTTP ${resp.status}: ${await readTruncatedResponseText(resp)}`
+            `OpenAI API error HTTP ${resp.status}: ${errBody.truncatedText}`,
+            errBody.partialUsage
           );
         }
         const json = await parseProviderJsonResponse<{
@@ -501,10 +555,12 @@ export class LiveModelProviderClient {
         }),
       });
       if (!resp.ok) {
+        const errBody = await readHttpErrorBodyAndPartialUsage("google", resp);
         throw new ModelProviderHttpError(
           "google",
           resp.status,
-          `Google Gemini API error HTTP ${resp.status}: ${await readTruncatedResponseText(resp)}`
+          `Google Gemini API error HTTP ${resp.status}: ${errBody.truncatedText}`,
+          errBody.partialUsage
         );
       }
       const json = await parseProviderJsonResponse<{
@@ -749,6 +805,23 @@ export interface ManagedStructuredExecutionResult<T> {
   readonly costSession: CostSessionRecord;
 }
 
+export interface DeferredStructuredExecutionResult<T> {
+  readonly parsed: T;
+  readonly rawCompletion: ModelCompletionResponse;
+  readonly renderedPrompt: RenderedPrompt;
+  readonly usage: ModelUsageMetrics;
+  readonly actualCostMicroUsd: number;
+  readonly pendingAllowedLedgerInput: FinalizeModelCallInput;
+  commitAllowedLedger(): Promise<{
+    readonly ledger: ModelCallLedgerRecord;
+    readonly costSession: CostSessionRecord;
+  }>;
+  finalizeDomainFailure(
+    errorMessage: string,
+    outcome?: "FAILED_VALIDATION" | "FAILED_PROVIDER"
+  ): Promise<void>;
+}
+
 /**
  * Config-driven Model Executor (`M6A`):
  * Orchestrates immutable `PromptRegistry` versioning, `AC-12b` Pre-Flight Cost Guard,
@@ -790,9 +863,14 @@ export class ManagedModelProviderExecutor {
     });
   }
 
-  public async executeStructuredPrompt<T>(
+  /**
+   * Runs AC-12b preflight, provider invocation, and structured schema validation while
+   * deferring the final `ALLOWED` ledger write so callers can commit domain artifacts
+   * and the `ALLOWED` ledger entry atomically inside the same TX2 (`M6A-FU-02`).
+   */
+  public async executeStructuredPromptDeferred<T>(
     input: ManagedPromptExecutionInput
-  ): Promise<ManagedStructuredExecutionResult<T>> {
+  ): Promise<DeferredStructuredExecutionResult<T>> {
     const provider = this.client.config.provider;
     const model = this.client.config.model;
     const maxTokens = input.maxTokens ?? this.defaultMaxTokens;
@@ -869,7 +947,19 @@ export class ManagedModelProviderExecutor {
       });
     } catch (providerErr: unknown) {
       const latencyMs = Math.max(0, Date.now() - startMs);
-      await this.costGuard.finalizeModelCallLedger({
+      const partialUsage =
+        providerErr instanceof ModelProviderHttpError ? providerErr.partialUsage : undefined;
+      const actualIn = partialUsage ? partialUsage.inputTokens : 0;
+      const actualOut = partialUsage ? partialUsage.outputTokens : 0;
+      const partialCostMicroUsd = partialUsage
+        ? computeCostMicroUsd(actualIn, actualOut, rate)
+        : 0;
+      // M6A-FU-05: Record partial provider-reported tokens if present; otherwise mark usage_estimated=true
+      // to indicate actual token consumption before upstream failure is unknown.
+      const usageEstimated = partialUsage ? Boolean(partialUsage.usageEstimated) : true;
+      const providerErrMsg =
+        providerErr instanceof Error ? providerErr.message : String(providerErr);
+      const finalizedProviderErr = await this.costGuard.finalizeModelCallLedger({
         project_id: input.projectId,
         cost_session_id: input.costSessionId,
         pipeline_session_id: input.pipelineSessionId ?? null,
@@ -883,16 +973,33 @@ export class ManagedModelProviderExecutor {
         request_sha256: requestSha256,
         estimated_input_tokens: estimatedInputTokens,
         reserved_output_tokens: maxTokens,
-        actual_input_tokens: 0,
-        actual_output_tokens: 0,
+        actual_input_tokens: actualIn,
+        actual_output_tokens: actualOut,
         estimated_cost_micro_usd: estimatedCostMicroUsd,
-        actual_cost_micro_usd: 0,
-        usage_estimated: false,
+        actual_cost_micro_usd: partialCostMicroUsd,
+        usage_estimated: usageEstimated,
         outcome: "FAILED_PROVIDER",
-        error_message:
-          providerErr instanceof Error ? providerErr.message : String(providerErr),
+        error_message: providerErrMsg,
         latency_ms: latencyMs,
       });
+      if (!finalizedProviderErr.allowed && partialCostMicroUsd > 0) {
+        throw new CostBudgetExceededError({
+          limitScope: finalizedProviderErr.limitScope ?? "SESSION_COST_BUDGET",
+          costSessionId: input.costSessionId,
+          ledgerId: finalizedProviderErr.ledger.call_id,
+          message: `${finalizedProviderErr.reason ?? "Post-call cost budget exceeded"} (after upstream failure: ${providerErrMsg})`,
+          cause: providerErr,
+          details: {
+            stage: input.stage,
+            provider,
+            model,
+            actualInputTokens: actualIn,
+            actualOutputTokens: actualOut,
+            actualCostMicroUsd: partialCostMicroUsd,
+            ledgerStatus: finalizedProviderErr.ledger.status,
+          },
+        });
+      }
       throw providerErr;
     }
 
@@ -900,6 +1007,28 @@ export class ManagedModelProviderExecutor {
     const usage = completion.usage;
     const actualCostMicroUsd = computeCostMicroUsd(usage.inputTokens, usage.outputTokens, rate);
     const schema = input.outputSchemaOverride ?? renderedPrompt.outputSchema;
+
+    const baseLedgerFields = {
+      project_id: input.projectId,
+      cost_session_id: input.costSessionId,
+      pipeline_session_id: input.pipelineSessionId ?? null,
+      task_id: input.taskId ?? null,
+      stage: input.stage,
+      provider,
+      model,
+      prompt_id: renderedPrompt.promptId,
+      prompt_version: renderedPrompt.version,
+      prompt_sha256: renderedPrompt.promptSha256,
+      request_sha256: requestSha256,
+      estimated_input_tokens: estimatedInputTokens,
+      reserved_output_tokens: maxTokens,
+      actual_input_tokens: usage.inputTokens,
+      actual_output_tokens: usage.outputTokens,
+      estimated_cost_micro_usd: estimatedCostMicroUsd,
+      actual_cost_micro_usd: actualCostMicroUsd,
+      usage_estimated: Boolean(usage.usageEstimated),
+      latency_ms: latencyMs,
+    } as const;
 
     let parsed: T;
     if (schema) {
@@ -909,27 +1038,9 @@ export class ManagedModelProviderExecutor {
         const validationMsg =
           validationErr instanceof Error ? validationErr.message : String(validationErr);
         const finalizeFailed = await this.costGuard.finalizeModelCallLedger({
-          project_id: input.projectId,
-          cost_session_id: input.costSessionId,
-          pipeline_session_id: input.pipelineSessionId ?? null,
-          task_id: input.taskId ?? null,
-          stage: input.stage,
-          provider,
-          model,
-          prompt_id: renderedPrompt.promptId,
-          prompt_version: renderedPrompt.version,
-          prompt_sha256: renderedPrompt.promptSha256,
-          request_sha256: requestSha256,
-          estimated_input_tokens: estimatedInputTokens,
-          reserved_output_tokens: maxTokens,
-          actual_input_tokens: usage.inputTokens,
-          actual_output_tokens: usage.outputTokens,
-          estimated_cost_micro_usd: estimatedCostMicroUsd,
-          actual_cost_micro_usd: actualCostMicroUsd,
-          usage_estimated: Boolean(usage.usageEstimated),
+          ...baseLedgerFields,
           outcome: "FAILED_VALIDATION",
           error_message: validationMsg,
-          latency_ms: latencyMs,
         });
         if (!finalizeFailed.allowed) {
           throw new CostBudgetExceededError({
@@ -960,46 +1071,10 @@ export class ManagedModelProviderExecutor {
       parsed = completion.contentText as unknown as T;
     }
 
-    const finalized = await this.costGuard.finalizeModelCallLedger({
-      project_id: input.projectId,
-      cost_session_id: input.costSessionId,
-      pipeline_session_id: input.pipelineSessionId ?? null,
-      task_id: input.taskId ?? null,
-      stage: input.stage,
-      provider,
-      model,
-      prompt_id: renderedPrompt.promptId,
-      prompt_version: renderedPrompt.version,
-      prompt_sha256: renderedPrompt.promptSha256,
-      request_sha256: requestSha256,
-      estimated_input_tokens: estimatedInputTokens,
-      reserved_output_tokens: maxTokens,
-      actual_input_tokens: usage.inputTokens,
-      actual_output_tokens: usage.outputTokens,
-      estimated_cost_micro_usd: estimatedCostMicroUsd,
-      actual_cost_micro_usd: actualCostMicroUsd,
-      usage_estimated: Boolean(usage.usageEstimated),
+    const pendingAllowedLedgerInput: FinalizeModelCallInput = {
+      ...baseLedgerFields,
       outcome: "ALLOWED",
-      latency_ms: latencyMs,
-    });
-
-    if (!finalized.allowed) {
-      throw new CostBudgetExceededError({
-        limitScope: finalized.limitScope ?? "SESSION_COST_BUDGET",
-        costSessionId: input.costSessionId,
-        ledgerId: finalized.ledger.call_id,
-        message: finalized.reason ?? "Post-call cost budget exceeded",
-        details: {
-          stage: input.stage,
-          provider,
-          model,
-          actualInputTokens: usage.inputTokens,
-          actualOutputTokens: usage.outputTokens,
-          actualCostMicroUsd,
-          ledgerStatus: finalized.ledger.status,
-        },
-      });
-    }
+    };
 
     return {
       parsed,
@@ -1007,8 +1082,75 @@ export class ManagedModelProviderExecutor {
       renderedPrompt,
       usage,
       actualCostMicroUsd,
-      ledger: finalized.ledger,
-      costSession: finalized.session,
+      pendingAllowedLedgerInput,
+      commitAllowedLedger: async () => {
+        const finalized = await this.costGuard.finalizeModelCallLedger(pendingAllowedLedgerInput);
+        if (!finalized.allowed) {
+          throw new CostBudgetExceededError({
+            limitScope: finalized.limitScope ?? "SESSION_COST_BUDGET",
+            costSessionId: input.costSessionId,
+            ledgerId: finalized.ledger.call_id,
+            message: finalized.reason ?? "Post-call cost budget exceeded",
+            details: {
+              stage: input.stage,
+              provider,
+              model,
+              actualInputTokens: usage.inputTokens,
+              actualOutputTokens: usage.outputTokens,
+              actualCostMicroUsd,
+              ledgerStatus: finalized.ledger.status,
+            },
+          });
+        }
+        return {
+          ledger: finalized.ledger,
+          costSession: finalized.session,
+        };
+      },
+      finalizeDomainFailure: async (
+        errorMessage: string,
+        outcome: "FAILED_VALIDATION" | "FAILED_PROVIDER" = "FAILED_VALIDATION"
+      ) => {
+        const finalizeFailed = await this.costGuard.finalizeModelCallLedger({
+          ...baseLedgerFields,
+          outcome,
+          error_message: errorMessage,
+        });
+        if (!finalizeFailed.allowed) {
+          throw new CostBudgetExceededError({
+            limitScope: finalizeFailed.limitScope ?? "SESSION_COST_BUDGET",
+            costSessionId: input.costSessionId,
+            ledgerId: finalizeFailed.ledger.call_id,
+            message: `${finalizeFailed.reason ?? "Post-call cost budget exceeded"} (after domain validation failure: ${errorMessage})`,
+            details: {
+              stage: input.stage,
+              provider,
+              model,
+              actualInputTokens: usage.inputTokens,
+              actualOutputTokens: usage.outputTokens,
+              actualCostMicroUsd,
+              ledgerStatus: finalizeFailed.ledger.status,
+              validationFailed: true,
+            },
+          });
+        }
+      },
+    };
+  }
+
+  public async executeStructuredPrompt<T>(
+    input: ManagedPromptExecutionInput
+  ): Promise<ManagedStructuredExecutionResult<T>> {
+    const deferred = await this.executeStructuredPromptDeferred<T>(input);
+    const committed = await deferred.commitAllowedLedger();
+    return {
+      parsed: deferred.parsed,
+      rawCompletion: deferred.rawCompletion,
+      renderedPrompt: deferred.renderedPrompt,
+      usage: deferred.usage,
+      actualCostMicroUsd: deferred.actualCostMicroUsd,
+      ledger: committed.ledger,
+      costSession: committed.costSession,
     };
   }
 }

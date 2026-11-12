@@ -12,6 +12,7 @@ import {
   LiveModelProviderClient,
   ManagedModelProviderExecutor,
   ModelProviderConfigurationError,
+  ModelProviderHttpError,
   PromptNotFoundError,
   PromptRegistry,
   PromptRenderError,
@@ -56,6 +57,7 @@ import {
   type Stage3ArchitectureSpec,
   type StructuredJsonSchema,
   computeCanonicalPayloadSha256,
+  sha256Hex,
 } from "@software-factory/shared-types";
 import { createControlPlaneStackRuntime } from "@software-factory/web";
 
@@ -72,6 +74,7 @@ interface RecordedProviderRequest {
 interface ProviderResponseOverride {
   readonly statusCode?: number;
   readonly text?: string;
+  readonly jsonBody?: unknown;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly cacheCreationInputTokens?: number;
@@ -350,6 +353,10 @@ async function startMockModelProviderServers(): Promise<MockModelProviderHarness
           typeof rawOverride === "function" ? rawOverride(recorded) : rawOverride;
 
         if (resolvedOverride?.statusCode && resolvedOverride.statusCode >= 400) {
+          if (resolvedOverride.jsonBody !== undefined) {
+            writeJsonResponse(res, resolvedOverride.statusCode, resolvedOverride.jsonBody);
+            return;
+          }
           res.writeHead(resolvedOverride.statusCode, { "Content-Type": "text/plain", Connection: "close" });
           res.end(resolvedOverride.text ?? `Simulated HTTP ${resolvedOverride.statusCode}`);
           return;
@@ -4281,6 +4288,1008 @@ describe("M6A Review Hardening & Regression Suite (M6A-FIX-01..10 + Minor Notes)
       } catch {
         // best-effort cleanup
       }
+    }
+  });
+
+  it("M6A-FU-01..05 (In-Memory): Hash integrity verification, TX2 failure compensation, autonomous denial survival, bare TX atomicity & HTTP error partial usage", async () => {
+    const mock = await startMockModelProviderServers();
+    const stack = await createControlPlaneStackRuntime({
+      env: {},
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+      withGatewayHttp: false,
+    });
+    try {
+      const store = stack.coreApiRuntime!.store as SoftwareFactoryControlPlaneStore;
+      const coreApi = stack.coreApiRuntime!.coreApi;
+      const coreClient = new HttpCoreApiClient(stack.coreApiRuntime!.coreApiEndpoint!.baseUrl);
+
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: `m6a-fu-mem-${randomUUID().slice(0, 8)}`,
+            name: "M6A Follow-up Memory Suite",
+            repo_bare_path: "/tmp/m6a-fu-mem.git",
+            initial_main_commit_hash: "1".repeat(40),
+            initial_main_tree_hash: "2".repeat(40),
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          return p;
+        }
+      );
+
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      // M6A-FU-02: Deferred ledger atomicity in TX2 (domain error AND persistence failure bill once via FAILED_VALIDATION, 0 ALLOWED, 0 orphans)
+      const tx2Sess = await coreClient.createPipelineSession(proj.project_id, authDev, {
+        title: "M6A-FU-02 TX2 Compensation",
+        raw_idea_text: "Verify TX2 failure rolls back ALLOWED ledger & records single FAILED_VALIDATION.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 2_000_000,
+          session_token_budget: 80_000,
+          session_cost_budget_micro_usd: 15_000_000,
+        },
+      });
+      const tx2SessId = tx2Sess.session.pipeline_session_id;
+      const tx2CostId = tx2Sess.costSession!.cost_session_id;
+      const s1Tx2 = await coreClient.runPipelineStage1Extract(proj.project_id, authDev, tx2SessId);
+      const unconfirmedAssump = s1Tx2.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+
+      // (a) TX2 domain AC-10 validation failure
+      mock.setResponseOverride("anthropic", {
+        inputTokens: 110,
+        outputTokens: 70,
+        text: JSON.stringify({
+          prd: { product_vision: "v", target_personas: ["Op"], goals: ["g"], non_goals: [] },
+          srs: {
+            functional_requirements: [
+              {
+                req_id: "REQ-HALLUCINATED",
+                title: "Bad AC-10 ref",
+                description: "Cites unconfirmed Stage 1 assumption",
+                priority: "MUST",
+                source_discovery_item_ids: [unconfirmedAssump.item_id],
+                acceptance_criteria: [{ ac_id: "AC-1", given: "g", when: "w", then: "t" }],
+              },
+            ],
+            non_functional_requirements: [],
+          },
+        }),
+      });
+      await assert.rejects(
+        () => coreClient.runPipelineStage2Requirements(proj.project_id, authDev, tx2SessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      mock.setResponseOverride("anthropic", null);
+
+      const costAfterAc10 = await coreClient.getCostSession(proj.project_id, authDev, tx2CostId);
+      const ac10S2Ledgers = costAfterAc10.ledgers.filter((l) => l.stage === "STAGE_2_REQUIREMENTS");
+      assert.equal(ac10S2Ledgers.length, 1);
+      assert.equal(ac10S2Ledgers[0]!.status, "FAILED_VALIDATION");
+      assert.equal(ac10S2Ledgers[0]!.actual_input_tokens, 110);
+      assert.equal(ac10S2Ledgers[0]!.actual_output_tokens, 70);
+      assert.ok(ac10S2Ledgers[0]!.actual_cost_micro_usd > 0);
+      const bundleAfterAc10 = await coreClient.getPipelineBundle(proj.project_id, authDev, tx2SessId);
+      assert.equal(bundleAfterAc10.artifacts.filter((a) => a.stage === "STAGE_2_REQUIREMENTS").length, 0);
+      assert.equal(bundleAfterAc10.session.current_stage, "STAGE_1_IDEA_DISCOVERY");
+
+      // (b) TX2 persistence failure AFTER commitAllowedLedger() succeeds inside same TX2 -> ALLOWED rolled back, single FAILED_VALIDATION with [PERSISTENCE_FAILURE]
+      const origRecordStageArtifact = store.recordStageArtifact.bind(store);
+      let failOnce = true;
+      (store as unknown as { recordStageArtifact: typeof store.recordStageArtifact }).recordStageArtifact = async (
+        arg
+      ) => {
+        if (failOnce && arg.stage === "STAGE_2_REQUIREMENTS") {
+          failOnce = false;
+          throw new Error("Simulated TX2 storage error after commitAllowedLedger");
+        }
+        return origRecordStageArtifact(arg);
+      };
+      try {
+        await assert.rejects(
+          () => coreClient.runPipelineStage2Requirements(proj.project_id, authDev, tx2SessId),
+          (err: unknown) => err instanceof HttpCoreApiError && err.statusCode >= 500
+        );
+      } finally {
+        (store as unknown as { recordStageArtifact: typeof store.recordStageArtifact }).recordStageArtifact =
+          origRecordStageArtifact;
+      }
+
+      const costAfterPersistErr = await coreClient.getCostSession(proj.project_id, authDev, tx2CostId);
+      const s2LedgersAfterPersistErr = costAfterPersistErr.ledgers.filter(
+        (l) => l.stage === "STAGE_2_REQUIREMENTS"
+      );
+      assert.equal(s2LedgersAfterPersistErr.length, 2);
+      assert.equal(
+        s2LedgersAfterPersistErr.filter((l) => l.status === "ALLOWED").length,
+        0,
+        "TX2 rollback must leave 0 ALLOWED ledgers"
+      );
+      const persistErrLedger = s2LedgersAfterPersistErr[1]!;
+      assert.equal(persistErrLedger.status, "FAILED_VALIDATION");
+      assert.ok(persistErrLedger.error_message?.startsWith("[PERSISTENCE_FAILURE] "));
+      assert.equal(
+        costAfterPersistErr.session.cost_used_micro_usd,
+        costAfterAc10.session.cost_used_micro_usd + persistErrLedger.actual_cost_micro_usd
+      );
+      const bundleAfterPersistErr = await coreClient.getPipelineBundle(
+        proj.project_id,
+        authDev,
+        tx2SessId
+      );
+      assert.equal(
+        bundleAfterPersistErr.artifacts.filter((a) => a.stage === "STAGE_2_REQUIREMENTS").length,
+        0
+      );
+
+      // M6A-FU-01: Tamper stored artifact_sha256 in memory -> getStageArtifactById, listStageArtifacts & freezeBaselineSpec reject 23514
+      const s2Good = await coreClient.runPipelineStage2Requirements(proj.project_id, authDev, tx2SessId);
+      const s3Good = await coreClient.runPipelineStage3Architecture(proj.project_id, authDev, tx2SessId);
+      const s4Good = await coreClient.runPipelineStage4ConsistencyCheck(
+        proj.project_id,
+        authDev,
+        tx2SessId
+      );
+      assert.equal(s4Good.report.passed, true);
+      const gateGood = await coreClient.submitPipelineApprovalGate(
+        proj.project_id,
+        authApprover,
+        tx2SessId,
+        {
+          gate_stage: "STAGE_4_SPEC_FREEZE",
+          target_artifact_id: s4Good.artifact.artifact_id,
+          target_artifact_sha256: s4Good.artifact.artifact_sha256,
+          decision: "APPROVED",
+        }
+      );
+
+      const artifactMap = (
+        store as unknown as { stageArtifacts: Map<string, { artifact_sha256: string }> }
+      ).stageArtifacts;
+      const savedS2Sha = artifactMap.get(s2Good.artifact.artifact_id)!.artifact_sha256;
+      artifactMap.get(s2Good.artifact.artifact_id)!.artifact_sha256 = sha256Hex("tampered-sha");
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "alice-dev",
+              currentRole: "core_api_service",
+            },
+            () => store.getStageArtifactById(s2Good.artifact.artifact_id)
+          ),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "alice-dev",
+              currentRole: "core_api_service",
+            },
+            () => store.listStageArtifacts(tx2SessId)
+          ),
+        (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+      );
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(proj.project_id, authApprover, tx2SessId, {
+            approval_gate_id: gateGood.gate_id,
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      artifactMap.get(s2Good.artifact.artifact_id)!.artifact_sha256 = savedS2Sha;
+
+      // M6A-FU-04: Bare multi-statement freezeBaselineSpec failure rolls back both baselineSpecFreezes & pipelineSessions
+      const origInsertOutbox = (
+        store as unknown as {
+          insertOutboxEventInternal: (
+            p: string,
+            t: string,
+            id: string,
+            ev: string,
+            payload: Record<string, unknown>
+          ) => void;
+        }
+      ).insertOutboxEventInternal.bind(store);
+      let failOutboxOnce = true;
+      (
+        store as unknown as {
+          insertOutboxEventInternal: typeof origInsertOutbox;
+        }
+      ).insertOutboxEventInternal = (p, t, id, ev, payload) => {
+        if (failOutboxOnce && ev === "pipeline.baseline_frozen") {
+          failOutboxOnce = false;
+          throw new Error("Simulated mid-freeze outbox failure");
+        }
+        origInsertOutbox(p, t, id, ev, payload);
+      };
+      try {
+        await store.withRlsTransaction(
+          {
+            currentProjectId: proj.project_id,
+            currentPrincipalId: "bob-approver",
+            currentRole: "core_api_service",
+          },
+          async () => {
+            await assert.rejects(
+              () =>
+                store.freezeBaselineSpec({
+                  project_id: proj.project_id,
+                  pipeline_session_id: tx2SessId,
+                  stage1_artifact_id: s1Tx2.artifact.artifact_id,
+                  stage1_artifact_sha256: s1Tx2.artifact.artifact_sha256,
+                  stage2_artifact_id: s2Good.artifact.artifact_id,
+                  stage2_artifact_sha256: s2Good.artifact.artifact_sha256,
+                  stage3_artifact_id: s3Good.artifact.artifact_id,
+                  stage3_artifact_sha256: s3Good.artifact.artifact_sha256,
+                  validation_report_artifact_id: s4Good.artifact.artifact_id,
+                  validation_report_sha256: s4Good.artifact.artifact_sha256,
+                  approval_gate_id: gateGood.gate_id,
+                  frozen_by_principal_id: "bob-approver",
+                }),
+              /Simulated mid-freeze outbox failure/
+            );
+            // Even INSIDE the same outer TX after catching, freezeBaselineSpec's internal rollback boundary must have undone partial writes!
+            assert.equal(store.getBaselineSpecFreeze(tx2SessId), null);
+            assert.equal(store.getProductPipelineSession(tx2SessId)?.status, "ACTIVE");
+          }
+        );
+      } finally {
+        (
+          store as unknown as {
+            insertOutboxEventInternal: typeof origInsertOutbox;
+          }
+        ).insertOutboxEventInternal = origInsertOutbox;
+      }
+
+      // M6A-FU-03: Autonomous denial survival across rolling-back outer TX on committed session vs clean rollback on uncommitted parent
+      const committedCs = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          store.createCostSession({
+            project_id: proj.project_id,
+            max_tokens_per_request: 100,
+            max_cost_micro_usd_per_request: 100_000,
+            session_token_budget: 150,
+            session_cost_budget_micro_usd: 100_000,
+          })
+      );
+
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "alice-dev",
+              currentRole: "core_api_service",
+            },
+            async () => {
+              const preRes = await store.preflightCheckCostSession({
+                project_id: proj.project_id,
+                cost_session_id: committedCs.cost_session_id,
+                stage: "STAGE_1_IDEA_DISCOVERY",
+                provider: "anthropic",
+                model: "claude-sonnet-4-20250514",
+                prompt_id: STAGE1_DISCOVERY_PROMPT_ID,
+                prompt_version: "1.0.0",
+                prompt_sha256: "a".repeat(64),
+                request_sha256: "b".repeat(64),
+                estimated_input_tokens: 10,
+                reserved_output_tokens: 500,
+                estimated_cost_micro_usd: 100,
+              });
+              assert.equal(preRes.allowed, false);
+              assert.equal(preRes.limitScope, "PER_REQUEST_TOKENS");
+              throw new Error("FORCE_OUTER_TX_ROLLBACK_PREFLIGHT");
+            }
+          ),
+        /FORCE_OUTER_TX_ROLLBACK_PREFLIGHT/
+      );
+
+      const ledgersAfterPreRollback = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () => store.listModelCallLedgers({ cost_session_id: committedCs.cost_session_id })
+      );
+      assert.equal(ledgersAfterPreRollback.length, 1);
+      assert.equal(ledgersAfterPreRollback[0]!.status, "BLOCKED_PREFLIGHT");
+
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "alice-dev",
+              currentRole: "core_api_service",
+            },
+            async () => {
+              const postRes = await store.finalizeModelCallLedger({
+                project_id: proj.project_id,
+                cost_session_id: committedCs.cost_session_id,
+                stage: "STAGE_1_IDEA_DISCOVERY",
+                provider: "anthropic",
+                model: "claude-sonnet-4-20250514",
+                prompt_id: STAGE1_DISCOVERY_PROMPT_ID,
+                prompt_version: "1.0.0",
+                prompt_sha256: "a".repeat(64),
+                request_sha256: "c".repeat(64),
+                estimated_input_tokens: 10,
+                reserved_output_tokens: 50,
+                actual_input_tokens: 120,
+                actual_output_tokens: 80, // 200 > 150 session_token_budget -> BLOCKED_POSTCALL + EXHAUSTED
+                estimated_cost_micro_usd: 100,
+                actual_cost_micro_usd: 500,
+                outcome: "ALLOWED",
+                latency_ms: 15,
+              });
+              assert.equal(postRes.allowed, false);
+              assert.equal(postRes.session.status, "EXHAUSTED");
+              assert.equal(postRes.ledger.status, "BLOCKED_POSTCALL");
+              throw new Error("FORCE_OUTER_TX_ROLLBACK_POSTCALL");
+            }
+          ),
+        /FORCE_OUTER_TX_ROLLBACK_POSTCALL/
+      );
+
+      const afterPostRollback = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () => ({
+          session: store.getCostSession(committedCs.cost_session_id),
+          ledgers: store.listModelCallLedgers({ cost_session_id: committedCs.cost_session_id }),
+        })
+      );
+      assert.equal(afterPostRollback.session?.status, "EXHAUSTED");
+      assert.equal(afterPostRollback.ledgers.length, 2);
+      assert.equal(afterPostRollback.ledgers[1]!.status, "BLOCKED_POSTCALL");
+
+      // Uncommitted parent created INSIDE outer TX must roll back cleanly (0 orphaned ledgers)
+      let uncommittedCsId = "";
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "alice-dev",
+              currentRole: "core_api_service",
+            },
+            async () => {
+              const uncomm = await store.createCostSession({
+                project_id: proj.project_id,
+                max_tokens_per_request: 100,
+                max_cost_micro_usd_per_request: 100_000,
+                session_token_budget: 200,
+                session_cost_budget_micro_usd: 100_000,
+              });
+              uncommittedCsId = uncomm.cost_session_id;
+              const blocked = await store.preflightCheckCostSession({
+                project_id: proj.project_id,
+                cost_session_id: uncommittedCsId,
+                stage: "STAGE_1_IDEA_DISCOVERY",
+                provider: "anthropic",
+                model: "claude-sonnet-4-20250514",
+                prompt_id: STAGE1_DISCOVERY_PROMPT_ID,
+                prompt_version: "1.0.0",
+                prompt_sha256: "a".repeat(64),
+                request_sha256: "d".repeat(64),
+                estimated_input_tokens: 10,
+                reserved_output_tokens: 500,
+                estimated_cost_micro_usd: 100,
+              });
+              assert.equal(blocked.allowed, false);
+              throw new Error("ROLLBACK_UNCOMMITTED_PARENT");
+            }
+          ),
+        /ROLLBACK_UNCOMMITTED_PARENT/
+      );
+      await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () => {
+          assert.equal(store.getCostSession(uncommittedCsId), null);
+          assert.equal(store.listModelCallLedgers({ cost_session_id: uncommittedCsId }).length, 0);
+        }
+      );
+
+      // M6A-FU-05: HTTP 429/500 partial usage billing (Anthropic, OpenAI, Google) + BLOCKED_POSTCALL budget trip
+      const partialExec = new ManagedModelProviderExecutor({
+        client: new LiveModelProviderClient({
+          provider: "anthropic",
+          model: "claude-sonnet-4-20250514",
+          apiKey: "test-anthropic-key-local",
+          baseUrl: mock.anthropicBaseUrl,
+        }),
+        promptRegistry: createDefaultPipelinePromptRegistry(),
+        costGuard: store,
+      });
+      const partialCs = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          store.createCostSession({
+            project_id: proj.project_id,
+            max_tokens_per_request: 8000,
+            max_cost_micro_usd_per_request: 2_000_000,
+            session_token_budget: 20_000,
+            session_cost_budget_micro_usd: 10_000_000,
+          })
+      );
+
+      mock.setResponseOverride("anthropic", {
+        statusCode: 429,
+        jsonBody: {
+          type: "error",
+          error: { type: "rate_limit_error", message: "Anthropic 429 with usage" },
+          usage: { input_tokens: 90, output_tokens: 25 },
+        },
+      });
+      await assert.rejects(
+        () =>
+          partialExec.executeStructuredPrompt({
+            projectId: proj.project_id,
+            costSessionId: partialCs.cost_session_id,
+            stage: "STAGE_1_IDEA_DISCOVERY",
+            promptId: STAGE1_DISCOVERY_PROMPT_ID,
+            variables: {
+              project_id: proj.project_id,
+              pipeline_session_id: tx2SessId,
+              title: "Partial",
+              raw_idea_text: "Idea",
+            },
+          }),
+        (err: unknown) =>
+          err instanceof ModelProviderHttpError &&
+          err.statusCode === 429 &&
+          err.partialUsage?.inputTokens === 90 &&
+          err.partialUsage?.outputTokens === 25
+      );
+      mock.setResponseOverride("anthropic", null);
+
+      const openaiExec = partialExec.withProviderConfig({
+        provider: "openai",
+        model: "gpt-4.1",
+        apiKey: "test-openai-key-local",
+        baseUrl: mock.openaiBaseUrl,
+      });
+      mock.setResponseOverride("openai", {
+        statusCode: 500,
+        jsonBody: {
+          error: { message: "OpenAI 500 with usage" },
+          usage: { prompt_tokens: 70, completion_tokens: 15 },
+        },
+      });
+      await assert.rejects(
+        () =>
+          openaiExec.executeStructuredPrompt({
+            projectId: proj.project_id,
+            costSessionId: partialCs.cost_session_id,
+            stage: "STAGE_1_IDEA_DISCOVERY",
+            promptId: STAGE1_DISCOVERY_PROMPT_ID,
+            variables: {
+              project_id: proj.project_id,
+              pipeline_session_id: tx2SessId,
+              title: "Partial OAI",
+              raw_idea_text: "Idea",
+            },
+          }),
+        (err: unknown) =>
+          err instanceof ModelProviderHttpError &&
+          err.statusCode === 500 &&
+          err.partialUsage?.inputTokens === 70 &&
+          err.partialUsage?.outputTokens === 15
+      );
+      mock.setResponseOverride("openai", null);
+
+      const googleExec = partialExec.withProviderConfig({
+        provider: "google",
+        model: "gemini-2.5-pro",
+        apiKey: "test-google-key-local",
+        baseUrl: mock.googleBaseUrl,
+      });
+      mock.setResponseOverride("google", {
+        statusCode: 429,
+        jsonBody: {
+          error: { message: "Google 429 with usageMetadata" },
+          usageMetadata: { promptTokenCount: 60, candidatesTokenCount: 10 },
+        },
+      });
+      await assert.rejects(
+        () =>
+          googleExec.executeStructuredPrompt({
+            projectId: proj.project_id,
+            costSessionId: partialCs.cost_session_id,
+            stage: "STAGE_1_IDEA_DISCOVERY",
+            promptId: STAGE1_DISCOVERY_PROMPT_ID,
+            variables: {
+              project_id: proj.project_id,
+              pipeline_session_id: tx2SessId,
+              title: "Partial Google",
+              raw_idea_text: "Idea",
+            },
+          }),
+        (err: unknown) =>
+          err instanceof ModelProviderHttpError &&
+          err.statusCode === 429 &&
+          err.partialUsage?.inputTokens === 60 &&
+          err.partialUsage?.outputTokens === 10
+      );
+      mock.setResponseOverride("google", null);
+
+      const partialAfterThree = await coreClient.getCostSession(
+        proj.project_id,
+        authDev,
+        partialCs.cost_session_id
+      );
+      assert.equal(partialAfterThree.ledgers.length, 3);
+      for (const l of partialAfterThree.ledgers) {
+        assert.equal(l.status, "FAILED_PROVIDER");
+        assert.equal(l.usage_estimated, false);
+        assert.ok(l.actual_total_tokens > 0);
+        assert.ok(l.actual_cost_micro_usd > 0);
+      }
+      assert.equal(partialAfterThree.session.tokens_used_total, 115 + 85 + 70);
+
+      // Partial usage exceeding remaining budget trips BLOCKED_POSTCALL + EXHAUSTED + CostBudgetExceededError
+      const tightPartialCs = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          store.createCostSession({
+            project_id: proj.project_id,
+            max_tokens_per_request: 1000,
+            max_cost_micro_usd_per_request: 1_000_000,
+            session_token_budget: 250,
+            session_cost_budget_micro_usd: 1_000_000,
+          })
+      );
+      mock.setResponseOverride("anthropic", {
+        statusCode: 429,
+        jsonBody: {
+          error: { message: "Over-budget HTTP error" },
+          usage: { input_tokens: 200, output_tokens: 80 }, // 280 > 250 post-call budget
+        },
+      });
+      await assert.rejects(
+        () =>
+          partialExec.executeStructuredPrompt({
+            projectId: proj.project_id,
+            costSessionId: tightPartialCs.cost_session_id,
+            stage: "STAGE_1_IDEA_DISCOVERY",
+            promptId: STAGE1_DISCOVERY_PROMPT_ID,
+            maxTokens: 16,
+            variables: {
+              project_id: proj.project_id,
+              pipeline_session_id: tx2SessId,
+              title: "OverBudget",
+              raw_idea_text: "Idea",
+            },
+          }),
+        (err: unknown) =>
+          err instanceof CostBudgetExceededError && err.limitScope === "SESSION_TOKEN_BUDGET"
+      );
+      mock.setResponseOverride("anthropic", null);
+      const tightPartialAfter = await coreClient.getCostSession(
+        proj.project_id,
+        authDev,
+        tightPartialCs.cost_session_id
+      );
+      assert.equal(tightPartialAfter.session.status, "EXHAUSTED");
+      assert.equal(tightPartialAfter.ledgers[0]?.status, "BLOCKED_POSTCALL");
+      assert.equal(tightPartialAfter.ledgers[0]?.actual_input_tokens, 200);
+      assert.equal(tightPartialAfter.ledgers[0]?.actual_output_tokens, 80);
+      assert.equal(tightPartialAfter.ledgers[0]?.usage_estimated, false);
+    } finally {
+      await Promise.allSettled([stack.close(), mock.close()]);
+    }
+  });
+
+  it("M6A-FU-PG: Live PostgreSQL 17 M6A-FU-01..05 (tamper detection, TX2 compensation, autonomous denials & bare TX atomicity)", async (t) => {
+    const pgConfig = buildPostgresPoolConfigFromEnv();
+    if (!pgConfig) {
+      t.skip("PostgreSQL connection env (PGHOST/DATABASE_URL) not configured on local workstation");
+      return;
+    }
+
+    const mock = await startMockModelProviderServers();
+    const stack = await createControlPlaneStackRuntime({
+      poolConfig: pgConfig,
+      requirePostgres: true,
+      defaultModelConfig: {
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        apiKey: "test-anthropic-key-local",
+        baseUrl: mock.anthropicBaseUrl,
+      },
+      withGatewayHttp: false,
+    });
+    const createdProjectIds: string[] = [];
+    try {
+      const pool = stack.pool!;
+      const store = stack.coreApiRuntime!.store;
+      const coreApi = stack.coreApiRuntime!.coreApi;
+      const coreClient = new HttpCoreApiClient(stack.coreApiRuntime!.coreApiEndpoint!.baseUrl);
+
+      const proj = await store.withRlsTransaction(
+        { currentRole: "system_admin_role", currentPrincipalId: "pg-admin" },
+        async () => {
+          const p = await store.createProject({
+            slug: `m6a-fu-pg-${randomUUID().slice(0, 8)}`,
+            name: "M6A Follow-up PG",
+            repo_bare_path: `/tmp/m6a-fu-pg-${randomUUID().slice(0, 8)}.git`,
+            initial_main_commit_hash: "a".repeat(40),
+            initial_main_tree_hash: "b".repeat(40),
+          });
+          createdProjectIds.push(p.project_id);
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "pg-alice-dev",
+            member_role: "DEVELOPER",
+          });
+          await store.addProjectMembership({
+            project_id: p.project_id,
+            principal_id: "pg-bob-approver",
+            member_role: "PROJECT_APPROVER",
+          });
+          return p;
+        }
+      );
+
+      const authDev = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "pg-alice-dev",
+        roles: ["DEVELOPER"],
+      });
+      const authApprover = coreApi.issueAuthContext({
+        projectId: proj.project_id,
+        principalId: "pg-bob-approver",
+        roles: ["PROJECT_APPROVER"],
+      });
+
+      // M6A-FU-02 on live PG: Stage 2 AC-10 trigger failure in TX2 rolls back ALLOWED ledger & bills once via FAILED_VALIDATION
+      const sess = await coreClient.createPipelineSession(proj.project_id, authDev, {
+        title: "PG M6A-FU-02",
+        raw_idea_text: "Prove PG TX2 failure records single FAILED_VALIDATION and 0 ALLOWED.",
+        cost_budget: {
+          max_tokens_per_request: 8000,
+          max_cost_micro_usd_per_request: 2_000_000,
+          session_token_budget: 80_000,
+          session_cost_budget_micro_usd: 15_000_000,
+        },
+      });
+      const sessId = sess.session.pipeline_session_id;
+      const costSessionId = sess.costSession!.cost_session_id;
+      const s1 = await coreClient.runPipelineStage1Extract(proj.project_id, authDev, sessId);
+      const unconf = s1.discoveryItems.find((i) => i.kind === "ASSUMPTION")!;
+
+      mock.setResponseOverride("anthropic", {
+        inputTokens: 130,
+        outputTokens: 60,
+        text: JSON.stringify({
+          prd: { product_vision: "v", target_personas: ["Op"], goals: ["g"], non_goals: [] },
+          srs: {
+            functional_requirements: [
+              {
+                req_id: "REQ-PG-BAD-AC10",
+                title: "Bad ref",
+                description: "D",
+                priority: "MUST",
+                source_discovery_item_ids: [unconf.item_id],
+                acceptance_criteria: [{ ac_id: "AC-1", given: "g", when: "w", then: "t" }],
+              },
+            ],
+            non_functional_requirements: [],
+          },
+        }),
+      });
+      await assert.rejects(
+        () => coreClient.runPipelineStage2Requirements(proj.project_id, authDev, sessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 422
+      );
+      mock.setResponseOverride("anthropic", null);
+
+      const costAfterFail = await coreClient.getCostSession(proj.project_id, authDev, costSessionId);
+      const pgS2Ledgers = costAfterFail.ledgers.filter((l) => l.stage === "STAGE_2_REQUIREMENTS");
+      assert.equal(pgS2Ledgers.length, 1);
+      assert.equal(pgS2Ledgers[0]!.status, "FAILED_VALIDATION");
+      assert.equal(pgS2Ledgers[0]!.actual_input_tokens, 130);
+      assert.equal(pgS2Ledgers[0]!.actual_output_tokens, 60);
+      const pgBundleAfterFail = await coreClient.getPipelineBundle(proj.project_id, authDev, sessId);
+      assert.equal(
+        pgBundleAfterFail.artifacts.filter((a) => a.stage === "STAGE_2_REQUIREMENTS").length,
+        0
+      );
+
+      // M6A-FU-03 on live PG: autonomous BLOCKED_PREFLIGHT & BLOCKED_POSTCALL survive outer TX rollback
+      const commCs = await store.withRlsTransaction(
+        {
+          currentProjectId: proj.project_id,
+          currentPrincipalId: "pg-alice-dev",
+          currentRole: "core_api_service",
+        },
+        () =>
+          store.createCostSession({
+            project_id: proj.project_id,
+            max_tokens_per_request: 100,
+            max_cost_micro_usd_per_request: 100_000,
+            session_token_budget: 150,
+            session_cost_budget_micro_usd: 100_000,
+          })
+      );
+
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            async () => {
+              const pre = await store.preflightCheckCostSession({
+                project_id: proj.project_id,
+                cost_session_id: commCs.cost_session_id,
+                stage: "STAGE_1_IDEA_DISCOVERY",
+                provider: "anthropic",
+                model: "claude-sonnet-4-20250514",
+                prompt_id: STAGE1_DISCOVERY_PROMPT_ID,
+                prompt_version: "1.0.0",
+                prompt_sha256: "a".repeat(64),
+                request_sha256: "e".repeat(64),
+                estimated_input_tokens: 10,
+                reserved_output_tokens: 500,
+                estimated_cost_micro_usd: 100,
+              });
+              assert.equal(pre.allowed, false);
+              throw new Error("PG_OUTER_TX_ROLLBACK");
+            }
+          ),
+        /PG_OUTER_TX_ROLLBACK/
+      );
+      await assert.rejects(
+        () =>
+          store.withRlsTransaction(
+            {
+              currentProjectId: proj.project_id,
+              currentPrincipalId: "pg-alice-dev",
+              currentRole: "core_api_service",
+            },
+            async () => {
+              const post = await store.finalizeModelCallLedger({
+                project_id: proj.project_id,
+                cost_session_id: commCs.cost_session_id,
+                stage: "STAGE_1_IDEA_DISCOVERY",
+                provider: "anthropic",
+                model: "claude-sonnet-4-20250514",
+                prompt_id: STAGE1_DISCOVERY_PROMPT_ID,
+                prompt_version: "1.0.0",
+                prompt_sha256: "a".repeat(64),
+                request_sha256: "f".repeat(64),
+                estimated_input_tokens: 10,
+                reserved_output_tokens: 50,
+                actual_input_tokens: 120,
+                actual_output_tokens: 80,
+                estimated_cost_micro_usd: 100,
+                actual_cost_micro_usd: 500,
+                outcome: "ALLOWED",
+                latency_ms: 12,
+              });
+              assert.equal(post.allowed, false);
+              assert.equal(post.ledger.status, "BLOCKED_POSTCALL");
+              throw new Error("PG_OUTER_TX_ROLLBACK_POST");
+            }
+          ),
+        /PG_OUTER_TX_ROLLBACK_POST/
+      );
+      const pgDurable = await coreClient.getCostSession(
+        proj.project_id,
+        authDev,
+        commCs.cost_session_id
+      );
+      assert.equal(pgDurable.session.status, "EXHAUSTED");
+      assert.equal(pgDurable.ledgers.length, 2);
+      assert.equal(pgDurable.ledgers[0]!.status, "BLOCKED_PREFLIGHT");
+      assert.equal(pgDurable.ledgers[1]!.status, "BLOCKED_POSTCALL");
+
+      // M6A-FU-01 on live PG: Complete pipeline, tamper stage_artifacts.content_json via table owner (if psql present) OR verify mismatched SHA on freeze -> 23514
+      const s2Pg = await coreClient.runPipelineStage2Requirements(proj.project_id, authDev, sessId);
+      await coreClient.runPipelineStage3Architecture(proj.project_id, authDev, sessId);
+      const s4Pg = await coreClient.runPipelineStage4ConsistencyCheck(proj.project_id, authDev, sessId);
+      const gatePg = await coreClient.submitPipelineApprovalGate(proj.project_id, authApprover, sessId, {
+        gate_stage: "STAGE_4_SPEC_FREEZE",
+        target_artifact_id: s4Pg.artifact.artifact_id,
+        target_artifact_sha256: s4Pg.artifact.artifact_sha256,
+        decision: "APPROVED",
+      });
+      await assert.rejects(
+        () =>
+          coreClient.freezePipelineBaseline(proj.project_id, authApprover, sessId, {
+            approval_gate_id: gatePg.gate_id,
+            validation_report_sha256: "0".repeat(64),
+          }),
+        (err: unknown) => err instanceof HttpCoreApiError && (err.statusCode === 422 || err.statusCode === 404)
+      );
+
+      // If psql binary & table owner credentials are configured, tamper DB content_json directly & confirm 23514 on read
+      const repoRoot = resolve(import.meta.dirname ?? process.cwd(), "../../..");
+      const psqlBin = (() => {
+        for (const candidate of [
+          "psql",
+          "/opt/homebrew/opt/postgresql@17/bin/psql",
+          "/usr/local/opt/postgresql@17/bin/psql",
+          "/opt/homebrew/bin/psql",
+          "/usr/local/bin/psql",
+        ]) {
+          try {
+            execFileSync(candidate, ["--version"], { stdio: "ignore" });
+            return candidate;
+          } catch {
+            // continue
+          }
+        }
+        return null;
+      })();
+      if (psqlBin) {
+        execFileSync(psqlBin, ["-v", "ON_ERROR_STOP=1"], {
+          cwd: repoRoot,
+          input: `UPDATE stage_artifacts SET content_json = '{"tampered":true}'::jsonb WHERE artifact_id = '${s2Pg.artifact.artifact_id}';`,
+          env: {
+            ...process.env,
+            PGHOST: pgConfig.host,
+            PGPORT: String(pgConfig.port),
+            PGUSER: pgConfig.user,
+            PGDATABASE: pgConfig.database,
+            ...(pgConfig.password !== undefined ? { PGPASSWORD: pgConfig.password } : {}),
+            ...(pgConfig.sslMode ? { PGSSLMODE: pgConfig.sslMode } : {}),
+            ...(pgConfig.sslRootCertPath ? { PGSSLROOTCERT: pgConfig.sslRootCertPath } : {}),
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        await assert.rejects(
+          () =>
+            store.withRlsTransaction(
+              {
+                currentProjectId: proj.project_id,
+                currentPrincipalId: "pg-alice-dev",
+                currentRole: "core_api_service",
+              },
+              () => store.getStageArtifactById(s2Pg.artifact.artifact_id)
+            ),
+          (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+        );
+        await assert.rejects(
+          () =>
+            store.withRlsTransaction(
+              {
+                currentProjectId: proj.project_id,
+                currentPrincipalId: "pg-alice-dev",
+                currentRole: "core_api_service",
+              },
+              () => store.listStageArtifacts(sessId)
+            ),
+          (err: unknown) => err instanceof PostgresRlsError && err.sqlState === "23514"
+        );
+      }
+
+      // M6A-FU-05 on live PG: HTTP 429 with partial usage via Anthropic records exact partial tokens in PG model_call_ledgers
+      mock.setResponseOverride("anthropic", {
+        statusCode: 429,
+        jsonBody: {
+          type: "error",
+          error: { type: "rate_limit_error", message: "PG HTTP 429 with usage" },
+          usage: { input_tokens: 77, output_tokens: 23 },
+        },
+      });
+      await assert.rejects(
+        () => coreClient.runPipelineStage1Extract(proj.project_id, authDev, sessId),
+        (err: unknown) => err instanceof HttpCoreApiError && err.statusCode >= 500
+      );
+      mock.setResponseOverride("anthropic", null);
+      const pgAfterHttpErr = await coreClient.getCostSession(proj.project_id, authDev, costSessionId);
+      const failedProv = pgAfterHttpErr.ledgers.find((l) => l.status === "FAILED_PROVIDER");
+      assert.ok(failedProv);
+      assert.equal(failedProv!.actual_input_tokens, 77);
+      assert.equal(failedProv!.actual_output_tokens, 23);
+      assert.equal(failedProv!.usage_estimated, false);
+      assert.ok(failedProv!.actual_cost_micro_usd > 0);
+      assert.ok(pool.getStats().discardAllExecuted > 0);
+    } finally {
+      for (const pid of createdProjectIds) {
+        try {
+          await stack.coreApiRuntime!.store.withRlsTransaction(
+            { currentRole: "system_admin_role", currentPrincipalId: "pg-cleanup" },
+            async () => {
+              if (!stack.pool) return;
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM baseline_spec_freezes WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM stage_approval_gates WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM stage_artifacts WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM stage1_discovery_items WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM model_call_ledgers WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM product_pipeline_sessions WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM model_cost_sessions WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM outbox_events WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(
+                `DELETE FROM project_memberships WHERE project_id = $1::uuid;`,
+                [pid]
+              );
+              await stack.pool.queryInActiveTx(`DELETE FROM projects WHERE project_id = $1::uuid;`, [
+                pid,
+              ]);
+            }
+          );
+        } catch {
+          // ignore if connected as non-owner app_runtime
+        }
+      }
+      await Promise.allSettled([stack.close(), mock.close()]);
     }
   });
 });

@@ -1,17 +1,22 @@
 import { execFileSync } from "node:child_process";
 import {
+  cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import {
   type ControlPlaneStore,
   PostgresRlsError,
+  REQUIRED_STAGE5_PROTECTED_PATHS,
   extractStage2Requirements,
   extractStage3DesignIndex,
   slugifyIdentifier,
@@ -51,6 +56,12 @@ export interface Stage5BootstrapOutcome {
   readonly baseline: BaselineSpecFreezeRecord;
 }
 
+const FORBIDDEN_ASSERTION_PATTERNS: readonly RegExp[] = [
+  /[\r\n]/,
+  /\b(?:process|eval|Function|require|import|child_process|fs|globalThis|global|fetch|Buffer|__dirname|__filename|Reflect|Proxy)\b/,
+  /;/,
+];
+
 function runGit(cwd: string, args: readonly string[]): string {
   return execFileSync("git", args, {
     cwd,
@@ -67,12 +78,81 @@ function tryRunGit(cwd: string, args: readonly string[]): string | null {
   }
 }
 
+/**
+ * Resolves the canonical filesystem path by following symlinks along every existing
+ * prefix down to the target (including when the leaf directory itself does not yet exist).
+ */
+function resolveCanonicalPathFollowingExistingPrefix(targetPath: string): string {
+  const abs = resolve(targetPath);
+  const parsedRoot = parse(abs).root;
+  const relFromRoot = abs.slice(parsedRoot.length);
+  const parts = relFromRoot.split(sep).filter(Boolean);
+
+  let current = parsedRoot;
+  let existingPrefixReal = existsSync(parsedRoot) ? realpathSync(parsedRoot) : parsedRoot;
+  let uncreatedStartIdx = parts.length;
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const next = join(current, parts[i]!);
+    if (existsSync(next)) {
+      current = next;
+      existingPrefixReal = realpathSync(next);
+    } else {
+      uncreatedStartIdx = i;
+      break;
+    }
+  }
+
+  return uncreatedStartIdx < parts.length
+    ? join(existingPrefixReal, ...parts.slice(uncreatedStartIdx))
+    : existingPrefixReal;
+}
+
+function isPathSameOrInside(parentReal: string, candidateReal: string): boolean {
+  if (candidateReal === parentReal) {
+    return true;
+  }
+  const rel = relative(parentReal, candidateReal);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function validateAssertionLines(
+  acId: string,
+  lines: readonly string[] | undefined
+): string[] {
+  const validated: string[] = [];
+  for (const rawLine of lines ?? []) {
+    const trimmed = rawLine.trim().replace(/;+\s*$/, "");
+    if (!trimmed) {
+      throw new PostgresRlsError(
+        "23514",
+        `Stage 5 acceptance_specs['${acId}'] contains blank assertion_line`
+      );
+    }
+    for (const pattern of FORBIDDEN_ASSERTION_PATTERNS) {
+      if (pattern.test(trimmed)) {
+        throw new PostgresRlsError(
+          "23514",
+          `Stage 5 acceptance_specs['${acId}'] assertion_line contains forbidden construct or delimiter`
+        );
+      }
+    }
+    if (!/^(?:const\s+[A-Za-z_$][\w$]*\s*=|assert\.[A-Za-z_$][\w$]*\()/.test(trimmed)) {
+      throw new PostgresRlsError(
+        "23514",
+        `Stage 5 acceptance_specs['${acId}'] assertion_line must be an assert.*(...) call or const binding`
+      );
+    }
+    validated.push(`${trimmed};`);
+  }
+  return validated;
+}
+
 function normalizeExtraProtectedPaths(
   extras: readonly string[] | undefined
 ): string[] {
   const base = [
-    "policy/trusted-verification-policy.json",
-    "tests/protected/**",
+    ...REQUIRED_STAGE5_PROTECTED_PATHS,
     "README.md",
     "package.json",
   ];
@@ -147,6 +227,7 @@ function buildTrustedAcceptanceTestSource(input: {
     "",
     'const EXPECTED_BASELINE_ID = ' + JSON.stringify(input.baseline.baseline_id) + ";",
     'const EXPECTED_STAGE2_SHA = ' + JSON.stringify(input.baseline.stage2_artifact_sha256) + ";",
+    'const EMPTY_FN_PATTERN = /^(?:async\\s+)?(?:function(?:\\s+\\w+)?\\s*)?\\([^)]*\\)\\s*(?:=>\\s*)?\\{\\s*(?:return\\s*;?)?\\s*\\}$/;',
     "",
     'test("Protected Verification Policy manifest matches frozen Stage 4 baseline", () => {',
     '  const policyPath = join(process.cwd(), "policy/trusted-verification-policy.json");',
@@ -167,6 +248,7 @@ function buildTrustedAcceptanceTestSource(input: {
         `Unsafe target_file '${targetRel}' for acceptance criterion '${spec.ac_id}'`
       );
     }
+    const extraAssertions = validateAssertionLines(spec.ac_id, override?.assertion_lines);
     const testLabel = `[${spec.req_id}/${spec.ac_id}] Given ${spec.given} When ${spec.when} Then ${spec.then}`;
     lines.push(`test(${JSON.stringify(testLabel)}, async () => {`);
     lines.push(`  const targetPath = join(process.cwd(), ${JSON.stringify(targetRel)});`);
@@ -176,6 +258,53 @@ function buildTrustedAcceptanceTestSource(input: {
       )});`
     );
     lines.push("  const mod = await import(pathToFileURL(targetPath).href);");
+    // Independent baseline verification always runs first and cannot be replaced by overrides (M6B-FIX-02)
+    lines.push(
+      "  const implementedAcs = Array.isArray(mod.implementedAcIds) ? mod.implementedAcIds : [];"
+    );
+    lines.push(
+      "  const implementedReqs = Array.isArray(mod.implementedRequirements) ? mod.implementedRequirements : [];"
+    );
+    lines.push(
+      `  assert.equal(implementedAcs.includes(${JSON.stringify(
+        spec.ac_id
+      )}) || implementedReqs.includes(${JSON.stringify(
+        spec.req_id
+      )}), true, ${JSON.stringify(
+        `Deliverable '${targetRel}' must declare implementation of ${spec.ac_id} or ${spec.req_id}`
+      )});`
+    );
+    lines.push(
+      '  const exportedFns = Object.entries(mod).filter(([k, v]) => typeof v === "function" && !k.startsWith("_"));'
+    );
+    lines.push(
+      `  assert.ok(exportedFns.length >= 1, ${JSON.stringify(
+        `Deliverable '${targetRel}' must export at least one executable function for ${spec.ac_id}`
+      )});`
+    );
+    lines.push(
+      `  assert.equal(exportedFns.some(([, fn]) => !EMPTY_FN_PATTERN.test(Function.prototype.toString.call(fn).trim())), true, ${JSON.stringify(
+        `Deliverable '${targetRel}' must implement non-empty executable behavior for ${spec.ac_id}`
+      )});`
+    );
+    if (extraAssertions.length === 0) {
+      lines.push(
+        `  if (typeof mod.verifyAcceptance === "function") {`,
+        `    const ok = await mod.verifyAcceptance(${JSON.stringify(spec.ac_id)}, ${JSON.stringify(spec.req_id)});`,
+        `    assert.equal(ok, true, ${JSON.stringify(
+          `verifyAcceptance('${spec.ac_id}') on '${targetRel}' must return true`
+        )});`,
+        `  } else {`,
+        `    const zeroArgFn = exportedFns.find(([, fn]) => fn.length === 0)?.[1];`,
+        `    if (zeroArgFn) {`,
+        `      const out = await zeroArgFn();`,
+        `      assert.ok(out !== undefined && out !== null && out !== false, ${JSON.stringify(
+          `Default behavioral invocation on '${targetRel}' returned empty/false outcome`
+        )});`,
+        `    }`,
+        `  }`
+      );
+    }
     if (override?.export_name) {
       lines.push(
         `  assert.notEqual(mod[${JSON.stringify(override.export_name)}], undefined, ${JSON.stringify(
@@ -183,26 +312,8 @@ function buildTrustedAcceptanceTestSource(input: {
         )});`
       );
     }
-    if (override?.assertion_lines && override.assertion_lines.length > 0) {
-      for (const stmt of override.assertion_lines) {
-        lines.push(`  ${stmt}`);
-      }
-    } else {
-      lines.push(
-        "  const implementedAcs = Array.isArray(mod.implementedAcIds) ? mod.implementedAcIds : [];"
-      );
-      lines.push(
-        "  const implementedReqs = Array.isArray(mod.implementedRequirements) ? mod.implementedRequirements : [];"
-      );
-      lines.push(
-        `  assert.equal(implementedAcs.includes(${JSON.stringify(
-          spec.ac_id
-        )}) || implementedReqs.includes(${JSON.stringify(
-          spec.req_id
-        )}), true, ${JSON.stringify(
-          `Deliverable '${targetRel}' must declare implementation of ${spec.ac_id} or ${spec.req_id}`
-        )});`
-      );
+    for (const stmt of extraAssertions) {
+      lines.push(`  ${stmt}`);
     }
     lines.push("});");
     lines.push("");
@@ -211,15 +322,24 @@ function buildTrustedAcceptanceTestSource(input: {
   return lines.join("\n");
 }
 
-function commitBaselineFilesToGitRepo(input: {
+interface PreparedBaselineGitCommit {
+  readonly baseMainCommitHash: string;
+  finalizeGitMainRef(): void;
+  cleanup(): void;
+}
+
+function prepareBaselineGitCommit(input: {
+  readonly baselineId: string;
   readonly repoPath: string;
   readonly files: Readonly<Record<string, string>>;
   readonly commitMessage: string;
-}): string {
+}): PreparedBaselineGitCommit {
   const absRepo = resolve(input.repoPath);
+  let createdRepoDir = false;
   if (!existsSync(absRepo)) {
     mkdirSync(absRepo, { recursive: true });
     runGit(absRepo, ["init", "--bare", "--initial-branch=main"]);
+    createdRepoDir = true;
   } else {
     const entries = readdirSync(absRepo);
     if (entries.length === 0) {
@@ -237,29 +357,10 @@ function commitBaselineFilesToGitRepo(input: {
   const isBare = isBareRaw === "true";
   const existingMainSha = tryRunGit(absRepo, ["rev-parse", "--verify", "refs/heads/main"]);
 
-  if (!isBare) {
-    if (!existingMainSha) {
-      tryRunGit(absRepo, ["checkout", "-B", "main"]);
-    } else {
-      runGit(absRepo, ["checkout", "main"]);
-    }
-    runGit(absRepo, ["config", "user.name", "Software Factory Stage5 Bootstrapper"]);
-    runGit(absRepo, ["config", "user.email", "bootstrapper@software-factory.local"]);
-    for (const [relPath, content] of Object.entries(input.files)) {
-      const dest = join(absRepo, ...relPath.split("/"));
-      mkdirSync(dirname(dest), { recursive: true });
-      writeFileSync(dest, content, "utf8");
-    }
-    runGit(absRepo, ["add", ...Object.keys(input.files)]);
-    const statusOut = runGit(absRepo, ["status", "--porcelain"]);
-    if (statusOut.length > 0 || !existingMainSha) {
-      runGit(absRepo, ["commit", "--allow-empty", "-m", input.commitMessage]);
-    }
-    return runGit(absRepo, ["rev-parse", "refs/heads/main"]).toLowerCase();
-  }
-
-  // Bare repo flow via ephemeral working directory + atomic update-ref
+  // Build commit in an isolated scratch clone so refs/heads/main is untouched until TX2 succeeds
   const scratchDir = mkdtempSync(join(tmpdir(), "sf-stage5-bootstrap-"));
+  const pendingRef = `refs/sf/pending-bootstrap/${input.baselineId}-${Date.now()}`;
+  let pendingRefWritten = false;
   try {
     if (existingMainSha) {
       runGit(tmpdir(), ["clone", absRepo, scratchDir]);
@@ -278,16 +379,65 @@ function commitBaselineFilesToGitRepo(input: {
     runGit(scratchDir, ["add", ...Object.keys(input.files)]);
     runGit(scratchDir, ["commit", "--allow-empty", "-m", input.commitMessage]);
     const newMainSha = runGit(scratchDir, ["rev-parse", "HEAD"]).toLowerCase();
-    runGit(absRepo, ["fetch", scratchDir, "main"]);
-    if (existingMainSha) {
-      runGit(absRepo, ["update-ref", "refs/heads/main", newMainSha, existingMainSha]);
-    } else {
-      runGit(absRepo, ["update-ref", "refs/heads/main", newMainSha]);
-    }
-    tryRunGit(absRepo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
-    return newMainSha;
-  } finally {
+    runGit(absRepo, ["fetch", scratchDir, `refs/heads/main:${pendingRef}`]);
+    pendingRefWritten = true;
+
+    return {
+      baseMainCommitHash: newMainSha,
+      finalizeGitMainRef: () => {
+        if (existingMainSha) {
+          runGit(absRepo, ["update-ref", "refs/heads/main", newMainSha, existingMainSha]);
+        } else {
+          runGit(absRepo, ["update-ref", "refs/heads/main", newMainSha]);
+        }
+        tryRunGit(absRepo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+        if (!isBare) {
+          runGit(absRepo, ["checkout", "-f", "main"]);
+        }
+        tryRunGit(absRepo, ["update-ref", "-d", pendingRef]);
+        pendingRefWritten = false;
+      },
+      cleanup: () => {
+        rmSync(scratchDir, { recursive: true, force: true });
+        if (pendingRefWritten) {
+          tryRunGit(absRepo, ["update-ref", "-d", pendingRef]);
+          pendingRefWritten = false;
+        }
+        if (createdRepoDir && !tryRunGit(absRepo, ["rev-parse", "--verify", "refs/heads/main"])) {
+          try {
+            rmSync(absRepo, { recursive: true, force: true });
+          } catch {
+            // ignore cleanup failure
+          }
+        }
+      },
+    };
+  } catch (err) {
     rmSync(scratchDir, { recursive: true, force: true });
+    if (pendingRefWritten) {
+      tryRunGit(absRepo, ["update-ref", "-d", pendingRef]);
+    }
+    throw err;
+  }
+}
+
+function publishDirectoryAtomically(stagingDir: string, destinationDir: string): void {
+  mkdirSync(dirname(destinationDir), { recursive: true });
+  if (existsSync(destinationDir)) {
+    const entries = readdirSync(destinationDir);
+    if (entries.length > 0) {
+      throw new PostgresRlsError(
+        "23514",
+        `trusted_acceptance_dir (${destinationDir}) must be empty before publishing`
+      );
+    }
+    rmSync(destinationDir, { recursive: true, force: true });
+  }
+  try {
+    renameSync(stagingDir, destinationDir);
+  } catch {
+    // Cross-device EXDEV fallback: copy staged files and remove staging dir
+    cpSync(stagingDir, destinationDir, { recursive: true });
   }
 }
 
@@ -357,18 +507,42 @@ export async function runStage5ProjectBootstrap(
   const designIndex = extractStage3DesignIndex(pre.stage3.content_json);
   const protectedPaths = normalizeExtraProtectedPaths(input.extra_protected_paths);
 
-  const repoPath = resolve(input.repo_path?.trim() || pre.project.repo_bare_path);
+  const rawRepoPath = input.repo_path?.trim() || pre.project.repo_bare_path;
+  if (!rawRepoPath) {
+    throw new PostgresRlsError("23514", "repo_path is required for Stage 5 bootstrap");
+  }
+  const repoPath = resolve(rawRepoPath);
   const trustedAcceptanceDir = resolve(
     input.trusted_acceptance_dir?.trim() ||
       join(dirname(repoPath), `.sf-trusted-acceptance-${pre.baseline.baseline_id}`)
   );
 
-  // Guard against trustedAcceptanceDir nested inside non-bare repoPath
-  if (trustedAcceptanceDir === repoPath || trustedAcceptanceDir.startsWith(`${repoPath}/`)) {
+  // Guard against symlinked or nested trusted_acceptance_dir inside repo_path (M6B-FIX-09)
+  const repoReal = resolveCanonicalPathFollowingExistingPrefix(repoPath);
+  const trustedReal = resolveCanonicalPathFollowingExistingPrefix(trustedAcceptanceDir);
+  if (isPathSameOrInside(repoReal, trustedReal)) {
     throw new PostgresRlsError(
       "23514",
       `trusted_acceptance_dir (${trustedAcceptanceDir}) must reside outside repo_path (${repoPath}) so agents cannot read or tamper with it`
     );
+  }
+
+  // Reject pre-existing symlinks, files, or non-empty trusted_acceptance_dir
+  if (existsSync(trustedAcceptanceDir)) {
+    const stat = lstatSync(trustedAcceptanceDir);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new PostgresRlsError(
+        "23514",
+        `trusted_acceptance_dir (${trustedAcceptanceDir}) must be an empty directory, not a file or symlink`
+      );
+    }
+    const existingFiles = readdirSync(trustedAcceptanceDir);
+    if (existingFiles.length > 0) {
+      throw new PostgresRlsError(
+        "23514",
+        `trusted_acceptance_dir (${trustedAcceptanceDir}) must be empty prior to Stage 5 bootstrap (found ${existingFiles.length} leftover entries)`
+      );
+    }
   }
 
   const overrides = input.acceptance_specs ?? {};
@@ -401,121 +575,133 @@ export async function runStage5ProjectBootstrap(
     }
   }
 
-  // Write Trusted Acceptance Tests outside the agent workspace and hash the directory
-  mkdirSync(trustedAcceptanceDir, { recursive: true });
-  const trustedManifest = canonicalizeJson({
-    baseline_id: pre.baseline.baseline_id,
-    pipeline_session_id: pre.session.pipeline_session_id,
-    stage2_artifact_sha256: pre.baseline.stage2_artifact_sha256,
-    stage3_artifact_sha256: pre.baseline.stage3_artifact_sha256,
-    protected_paths: protectedPaths,
-    acceptance_tests: acceptanceTests,
-  });
-  writeFileSync(join(trustedAcceptanceDir, "trusted-manifest.json"), trustedManifest, "utf8");
-  writeFileSync(
-    join(trustedAcceptanceDir, "acceptance.test.mjs"),
-    buildTrustedAcceptanceTestSource({
-      baseline: pre.baseline,
-      specs: acceptanceTests,
-      overrides,
-    }),
-    "utf8"
-  );
-  const trustedPolicySha256 = computeDirectorySha256(trustedAcceptanceDir);
-
-  const policyJson = JSON.stringify(
-    {
-      schema_version: "1.5",
+  // Stage Trusted Acceptance Tests in isolated temporary directory before DB TX2
+  const stagingTrustedDir = mkdtempSync(join(tmpdir(), "sf-stage5-trusted-"));
+  let preparedGit: PreparedBaselineGitCommit | null = null;
+  try {
+    const trustedManifest = canonicalizeJson({
       baseline_id: pre.baseline.baseline_id,
       pipeline_session_id: pre.session.pipeline_session_id,
       stage2_artifact_sha256: pre.baseline.stage2_artifact_sha256,
       stage3_artifact_sha256: pre.baseline.stage3_artifact_sha256,
-      trusted_policy_sha256: trustedPolicySha256,
       protected_paths: protectedPaths,
-      requirements: reqs.map((r) => ({ req_id: r.req_id, ac_ids: r.ac_ids })),
-    },
-    null,
-    2
-  );
+      acceptance_tests: acceptanceTests,
+    });
+    writeFileSync(join(stagingTrustedDir, "trusted-manifest.json"), trustedManifest, "utf8");
+    writeFileSync(
+      join(stagingTrustedDir, "acceptance.test.mjs"),
+      buildTrustedAcceptanceTestSource({
+        baseline: pre.baseline,
+        specs: acceptanceTests,
+        overrides,
+      }),
+      "utf8"
+    );
+    const trustedPolicySha256 = computeDirectorySha256(stagingTrustedDir);
 
-  const repoFiles: Record<string, string> = {
-    "policy/trusted-verification-policy.json": `${policyJson}\n`,
-    "tests/protected/baseline-spec.test.mjs": buildProtectedBaselineTestSource({
-      baseline: pre.baseline,
-    }),
-    "README.md": buildBaselineReadme({
-      title: pre.session.title,
-      baseline: pre.baseline,
-      reqCount: reqs.length,
-    }),
-    "package.json": `${JSON.stringify(
+    const policyJson = JSON.stringify(
       {
-        name: slugifyIdentifier(pre.project.slug || pre.session.title),
-        version: "0.1.0",
-        private: true,
-        type: "module",
-        scripts: {
-          "test:baseline": "node tests/protected/baseline-spec.test.mjs",
-        },
+        schema_version: "1.5",
+        baseline_id: pre.baseline.baseline_id,
+        pipeline_session_id: pre.session.pipeline_session_id,
+        stage2_artifact_sha256: pre.baseline.stage2_artifact_sha256,
+        stage3_artifact_sha256: pre.baseline.stage3_artifact_sha256,
+        trusted_policy_sha256: trustedPolicySha256,
+        protected_paths: protectedPaths,
+        requirements: reqs.map((r) => ({ req_id: r.req_id, ac_ids: r.ac_ids })),
       },
       null,
       2
-    )}\n`,
-  };
+    );
 
-  for (const [relPath, content] of Object.entries(input.scaffold_files ?? {})) {
-    const cleanRel = relPath.trim();
-    if (!isSafeRelativePosixPath(cleanRel)) {
-      throw new PostgresRlsError("23514", `Unsafe Stage 5 scaffold_files path '${relPath}'`);
+    const repoFiles: Record<string, string> = {
+      "policy/trusted-verification-policy.json": `${policyJson}\n`,
+      "tests/protected/baseline-spec.test.mjs": buildProtectedBaselineTestSource({
+        baseline: pre.baseline,
+      }),
+      "README.md": buildBaselineReadme({
+        title: pre.session.title,
+        baseline: pre.baseline,
+        reqCount: reqs.length,
+      }),
+      "package.json": `${JSON.stringify(
+        {
+          name: slugifyIdentifier(pre.project.slug || pre.session.title),
+          version: "0.1.0",
+          private: true,
+          type: "module",
+          scripts: {
+            "test:baseline": "node tests/protected/baseline-spec.test.mjs",
+          },
+        },
+        null,
+        2
+      )}\n`,
+    };
+
+    for (const [relPath, content] of Object.entries(input.scaffold_files ?? {})) {
+      const cleanRel = relPath.trim();
+      if (!isSafeRelativePosixPath(cleanRel)) {
+        throw new PostgresRlsError("23514", `Unsafe Stage 5 scaffold_files path '${relPath}'`);
+      }
+      if (
+        matchesAnyGlob(cleanRel, protectedPaths, false) ||
+        matchesAnyGlob(cleanRel, DEFAULT_SYSTEM_FORBIDDEN_PATHS, true)
+      ) {
+        throw new PostgresRlsError(
+          "23514",
+          `Stage 5 scaffold_files '${cleanRel}' cannot collide with protected or forbidden paths`
+        );
+      }
+      repoFiles[cleanRel] = content;
     }
-    if (
-      matchesAnyGlob(cleanRel, protectedPaths, false) ||
-      matchesAnyGlob(cleanRel, DEFAULT_SYSTEM_FORBIDDEN_PATHS, true)
-    ) {
-      throw new PostgresRlsError(
-        "23514",
-        `Stage 5 scaffold_files '${cleanRel}' cannot collide with protected or forbidden paths`
-      );
-    }
-    repoFiles[cleanRel] = content;
+
+    preparedGit = prepareBaselineGitCommit({
+      baselineId: pre.baseline.baseline_id,
+      repoPath,
+      files: repoFiles,
+      commitMessage: `chore(stage5): bootstrap baseline ${pre.baseline.baseline_id}`,
+    });
+    const baseMainCommitHash = preparedGit.baseMainCommitHash;
+
+    // Short TX2: enforce DB UNIQUE (project_id, baseline_id) BEFORE publishing refs/heads/main or trusted dir
+    const bootstrap = await store.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.actor_principal_id,
+        currentRole: "core_api_service",
+      },
+      async () => {
+        await store.updateProjectMainRefCommitHash({
+          project_id: input.project_id,
+          main_ref_commit_hash: baseMainCommitHash,
+        });
+        return store.createProjectBootstrap({
+          project_id: input.project_id,
+          pipeline_session_id: input.pipeline_session_id,
+          baseline_id: pre.baseline.baseline_id,
+          repo_path: repoPath,
+          trusted_acceptance_dir: trustedAcceptanceDir,
+          base_main_commit_hash: baseMainCommitHash,
+          protected_paths: protectedPaths,
+          trusted_policy_sha256: trustedPolicySha256,
+          generated_files: Object.keys(repoFiles).sort(),
+          acceptance_tests: acceptanceTests,
+          created_by_principal_id: input.actor_principal_id,
+        });
+      }
+    );
+
+    // TX2 committed -> atomically publish trusted acceptance directory and move refs/heads/main
+    publishDirectoryAtomically(stagingTrustedDir, trustedAcceptanceDir);
+    preparedGit.finalizeGitMainRef();
+
+    return {
+      bootstrap,
+      baseline: pre.baseline,
+    };
+  } finally {
+    rmSync(stagingTrustedDir, { recursive: true, force: true });
+    preparedGit?.cleanup();
   }
-
-  const baseMainCommitHash = commitBaselineFilesToGitRepo({
-    repoPath,
-    files: repoFiles,
-    commitMessage: `chore(stage5): bootstrap baseline ${pre.baseline.baseline_id}`,
-  });
-
-  // Short TX2: update project main_ref_commit_hash & persist immutable project_bootstraps record
-  const bootstrap = await store.withRlsTransaction(
-    {
-      currentProjectId: input.project_id,
-      currentPrincipalId: input.actor_principal_id,
-      currentRole: "core_api_service",
-    },
-    async () => {
-      await store.updateProjectMainRefCommitHash({
-        project_id: input.project_id,
-        main_ref_commit_hash: baseMainCommitHash,
-      });
-      return store.createProjectBootstrap({
-        project_id: input.project_id,
-        pipeline_session_id: input.pipeline_session_id,
-        baseline_id: pre.baseline.baseline_id,
-        repo_path: repoPath,
-        trusted_acceptance_dir: trustedAcceptanceDir,
-        base_main_commit_hash: baseMainCommitHash,
-        protected_paths: protectedPaths,
-        trusted_policy_sha256: trustedPolicySha256,
-        generated_files: Object.keys(repoFiles).sort(),
-        acceptance_tests: acceptanceTests,
-        created_by_principal_id: input.actor_principal_id,
-      });
-    }
-  );
-
-  return {
-    bootstrap,
-    baseline: pre.baseline,
-  };
 }

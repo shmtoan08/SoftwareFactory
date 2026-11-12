@@ -22,31 +22,32 @@ Milestone `M6B` completes the **Stage 1 → Stage 9** end-to-end Software Factor
 ## 2. Stage 5 — User Project Bootstrapper (`project_bootstraps`)
 
 Given a `FROZEN` `BaselineSpecFreezeRecord`:
-1. **Validation:** Verify `session.status === 'FROZEN'`, `baseline.status === 'FROZEN'`, and load frozen `STAGE_2_PRD_SRS` & `STAGE_3_ARCHITECTURE_DESIGN`. Reject duplicate bootstrap attempts for the same `(project_id, baseline_id)` (`SQLSTATE 23505`).
+1. **Validation:** Verify `session.status === 'FROZEN'`, `baseline.status === 'FROZEN'`, and load frozen `STAGE_2_PRD_SRS` & `STAGE_3_ARCHITECTURE_DESIGN`. Reject duplicate bootstrap attempts for the same `(project_id, baseline_id)` (`SQLSTATE 23505`). Reject non-empty `trusted_acceptance_dir` or symlink escapes out of canonical `repo_path` (`realpath` check).
 2. **Protected Paths Generation:** Create immutable governance and integrity test files in the user project repository:
    - `policy/trusted-verification-policy.json` (canonical manifest of `baseline_id`, `pipeline_session_id`, `stage2_artifact_sha256`, `stage3_artifact_sha256`, `protected_paths`, requirement → AC mappings)
    - `tests/protected/baseline-spec.test.mjs` (Tier 2 integrity test validating protected baseline manifest consistency)
-   - `protected_paths` = `["policy/trusted-verification-policy.json", "tests/protected/**", "README.md", "package.json"]` (plus caller extensions if non-overlapping).
+   - `protected_paths` = `["policy/trusted-verification-policy.json", "tests/protected/**", "README.md", "package.json"]` (plus caller extensions; deleting/omitting required paths is rejected).
 3. **Trusted Acceptance Tests (`trusted_acceptance_dir`):** Outside the agent-writable repository workspace, synthesize runnable `node:test` acceptance suites (`acceptance.test.mjs`) mapped 1:1 from every frozen Stage 2 `acceptance_criteria[]` (`ac_id`, `req_id`, `given`, `when`, `then`).
-   - Supports custom per-`ac_id` behavioral test checks (`acceptance_specs`) and deterministic generic Stage 3 component deliverable assertions (`src/components/<component-slug>.mjs` or mapped deliverable modules verifying implemented `ac_id`s).
+   - Supplying custom `acceptance_specs` requires `APPROVAL_ROLES` (`PROJECT_APPROVER` or `ORG_ADMIN`), undergoes strict static assertion syntax validation (declarative assertions only; rejects `process`, `require`, `import`, `eval`, control flow, statements separated by `;`), and **augments rather than replaces** independent Stage 2 AC + Stage 3 deliverable behavioral checks (`src/components/<component-slug>.mjs` / mapped deliverable modules verifying implemented `ac_id`s).
    - Computes `trusted_policy_sha256 = computeDirectorySha256(trusted_acceptance_dir)` identically to `Docker3TierVerifier` so Stage 8 verification enforces cryptographic policy pinning (`TaskContractSpec.trusted_policy_sha256`).
-4. **Git Initialization / Commit on `refs/heads/main`:** Initialize or fast-forward commit the bootstrapped baseline onto `refs/heads/main` in `repo_path` (`bare` or working repo), capture the resulting 40-hex `base_main_commit_hash`, update `projects.main_ref_commit_hash` (`0007` column-level `UPDATE` grant), and insert the immutable `project_bootstraps` row with `bootstrap_sha256`.
+4. **Atomic Git Staging & Commit on `refs/heads/main`:** Stage files in a temporary directory and advance/initialize a staging branch before DB commit (`createProjectBootstrap`); only finalize `refs/heads/main` on success and clean up staged artifacts on rollback/failure, capturing the resulting 40-hex `base_main_commit_hash` (`projects.main_ref_commit_hash`) and `bootstrap_sha256`.
 
 ---
 
 ## 3. Stage 6 — Agent Organization & Multi-Target Execution Binding (`agent_organization_profiles`)
 
 1. **Roles:** `PLANNER`, `DEVELOPER`, `REVIEWER_READONLY`, `VERIFIER`.
-2. **Execution Target Taxonomy:**
+2. **Project Scoping (v1.5 Design Note):** `agent_organization_profiles` is project-scoped (anchored to `projects`), allowing validated org/execution profiles to be reused across pipeline sessions and baselines within the same project rather than keyed 1:1 to a single `pipeline_session_id`.
+3. **Execution Target Taxonomy:**
    - `factory_managed_worker` (`TIER_1_FACTORY_MANAGED`)
    - `user_managed_worker` (`TIER_2_USER_MANAGED`)
    - `provider_managed_vm` (`TIER_3_PROVIDER_VM`)
    - `remote_agent_session` (`TIER_4_REMOTE_SESSION`)
-3. **3D Reviewer Separation Enforcement:** When pairing or validating a `DEVELOPER` profile against a `REVIEWER_READONLY` profile, Stage 6 & Core API strictly enforce all 3 orthogonal axes:
+4. **3D Reviewer Separation Enforcement:** When pairing or validating a `DEVELOPER` profile against a `REVIEWER_READONLY` profile, Stage 6 & Core API strictly enforce all 3 orthogonal axes:
    - Distinct identity (`lower(btrim(dev.principal_id)) !== lower(btrim(rev.principal_id))`)
    - Distinct profile (`dev.agent_profile_id !== rev.agent_profile_id` / `dev.profile_id !== rev.profile_id`)
    - Distinct provider+model pair (`(lower(btrim(dev.provider)), lower(btrim(dev.model))) !== (lower(btrim(rev.provider)), lower(btrim(rev.model)))`)
-4. **RBAC:** Upserting/modifying profiles requires `MUTATION_ROLES` (`DEVELOPER`, `PROJECT_APPROVER`, `ORG_ADMIN`); listing requires `READ_ROLES`.
+5. **RBAC:** Upserting/modifying profiles requires `MUTATION_ROLES` (`DEVELOPER`, `PROJECT_APPROVER`, `ORG_ADMIN`); listing requires `READ_ROLES`.
 
 ---
 
@@ -54,10 +55,10 @@ Given a `FROZEN` `BaselineSpecFreezeRecord`:
 
 Tables: `dev_milestones`, `dev_epics`, `dev_user_stories`, `task_plan_links`.
 
-1. **Prompt Registry & AC-12b Cost Guard:** Uses versioned immutable prompt `stage7.planning.decompose@1.0.0` with fail-closed `STAGE7_PLANNING_OUTPUT_SCHEMA`, `ManagedModelProviderExecutor`, `AC-12b` preflight + actual ledger recording tied to the session's `cost_session_id`. Model calls run **outside** open SQL transactions.
-2. **Plan Completeness & Security Validation (`validateStage7PlanCoverage`):**
-   - Every Stage 2 `req_id` (FR + NFR) MUST be covered by ≥ 1 story and ≥ 1 planned task (`100%` requirement coverage).
-   - Zero unknown/dangling `req_id`s or `ac_id`s are permitted.
+1. **Prompt Registry & AC-12b Cost Guard:** Uses versioned immutable prompt `stage7.planning.decompose@1.0.0` with fail-closed `STAGE7_PLANNING_OUTPUT_SCHEMA`, `ManagedModelProviderExecutor` (`executeStructuredPromptDeferred` committing `ALLOWED` ledger atomically with Stage 7 DB persistence / recording `FAILED_VALIDATION` or `FAILED_INTERNAL` on abort), `AC-12b` preflight + actual ledger recording tied to the session's `cost_session_id`. Model calls run **outside** open SQL transactions. Note that Stage 7 returns `{ milestone_count, epic_count, story_count, task_ids, plan_sha256, cost_ledger }` (coverage summary is surfaced on the Stage 9 / `AC-11b` traceability endpoint rather than duplicated on the Stage 7 write response).
+2. **Plan Completeness & Security Validation (`validateStage7PlanAgainstBaseline`):**
+   - Every Stage 2 `req_id` (FR + NFR) **AND** every Stage 2 `ac_id` MUST be covered by ≥ 1 story and ≥ 1 planned task (`100%` requirement AND AC coverage), with each `(req_id, ac_id)` pair validated against the canonical frozen Stage 2 mapping and each task's `requirement_ids` / `ac_ids` constrained to its parent story's assigned subset. (Stage 7 validates planning completeness + Stage 5 AC binding upfront, while Stage 9 Release also requires every requirement/AC to be backed by executed Tier 1 trusted acceptance tests and complete Stage 8 lineage.)
+   - Zero unknown/dangling `req_id`s or `ac_id`s are permitted; task dependency graphs are iteratively validated to be acyclic (`23514` on cycles or deep chains without stack overflow).
    - Task `allowed_files` must be safe relative POSIX paths, must NEVER overlap Stage 5 `protected_paths` or `DEFAULT_SYSTEM_FORBIDDEN_PATHS` (`.git/**`, `.github/workflows/**`, `.env*`, `**/*.pem`, `**/*.key`, etc.).
    - All `depends_on_task_keys` and `story_key` references must resolve strictly inside the plan.
 3. **Control Plane Materialization:** Within a short atomic RLS write transaction:
@@ -78,9 +79,11 @@ Each materialized Stage 8 task executes identically to `M5`:
 
 ### 6.1 Post-Freeze Change Requests (`change_requests`)
 - Direct mutation of frozen Stage 1–4 records remains blocked by `0006`/`0007` DB triggers.
-- Post-freeze changes are submitted as `ChangeRequestRecord` (`PENDING_APPROVAL`) targeting specific `impacted_requirement_ids`, `impacted_component_ids`, and `proposed_tasks[]`.
-- **Workflow State Machine (DB Trigger `fn_enforce_change_request_transitions`):**
-  - `PENDING_APPROVAL → APPROVED | REJECTED` (RBAC strictly `PROJECT_APPROVER` or `ORG_ADMIN`; `DEVELOPER`/`AUDITOR` denied `403`).
+- Post-freeze changes are submitted as `ChangeRequestRecord` (`PENDING_APPROVAL`) targeting specific `impacted_requirement_ids`, `impacted_component_ids`, and `proposed_tasks[]`. Creation validates a snapshot against the immutable frozen Stage 2/3/5 baseline (requiring every `impacted_requirement_id` to be covered by `proposed_tasks` and matching `(req_id, ac_id)` bindings). `get`/`list`/`decide`/`apply` verify `cr_sha256` integrity against the stored payload.
+- **CR Supersede & Binding Semantics (v1.5):** There is no separate CR-supersedes-CR relation table in v1.5; every `APPROVED`/`APPLIED` CR remains binding against the frozen baseline, any still-open (`PENDING_APPROVAL` or unapplied `APPROVED`) CR blocks release, and `AC-11b` requires all `APPLIED` CRs targeting a `req_id` to have every linked CR task reach `MergedAndCompleted` with complete Stage 8 lineage covering `impacted_requirement_ids`.
+- **RBAC & Concurrency Workflow (`fn_enforce_change_request_transitions`):**
+  - Submitting a CR (`createChangeRequest`) and materializing Stage 8 tasks from an already-`APPROVED` CR (`applyChangeRequestAndMaterializeTasks`) require `MUTATION_ROLES` (`DEVELOPER`, `PROJECT_APPROVER`, `ORG_ADMIN`) — materialized CR tasks still traverse the full Stage 8 Verifier, 3D Reviewer, and Human Approval pipeline before reaching `main`.
+  - `decideChangeRequest` (`PENDING_APPROVAL → APPROVED | REJECTED`, serialized in-memory per `change-request:${cr_id}` lock and row-locked in PostgreSQL) **strictly requires `APPROVAL_ROLES`** (`PROJECT_APPROVER` or `ORG_ADMIN`; `DEVELOPER`/`AUDITOR` denied `403`).
   - `APPROVED → APPLIED` via `applyChangeRequestAndMaterializeTasks`: materializes new Stage 8 `tasks` inheriting Stage 5 `protected_paths` & `trusted_policy_sha256` and links via `task_plan_links.cr_id`.
   - DB trigger `fn_enforce_task_plan_link_invariants` strictly rejects any `task_plan_links` with non-null `cr_id` unless the referenced CR has `status = 'APPROVED'`.
   - `REJECTED` and `APPLIED` are terminal; immutable CR payload columns cannot be altered once created.
@@ -88,23 +91,23 @@ Each materialized Stage 8 task executes identically to `M5`:
 ### 6.2 `AC-11b` — 100% Bidirectional Traceability Matrix
 `buildBidirectionalTraceabilityMatrix` inspects Stages 1, 2, 3, 5, 7, 8 (`getCandidateBoundLineage` for each linked task), and Stage 9 (`APPLIED` CRs):
 - **Per-Requirement Chain (`req_id`):**
-  - **Stage 1:** `stage1_item_ids[]` (each verified `AUTO_VERIFIED` or `CONFIRMED`, non-empty)
-  - **Stage 2:** `ac_ids[]` (≥ 1 acceptance criterion in frozen Stage 2)
-  - **Stage 3:** at least one architectural component (`stage3_component_ids[]`) AND technical design reference (`stage3_erd_tables` / `stage3_api_endpoints` / `stage3_security_controls` / `stage3_adr_ids`)
-  - **Stage 5:** `bootstrap_id` + covered `trusted_acceptance_test_files[]` covering all `ac_ids[]`
+  - **Stage 1:** `stage1_item_ids[]` — each ID must resolve in the session's `stage1_discovery_items` with `verification_status IN ('AUTO_VERIFIED', 'CONFIRMED')` (non-empty).
+  - **Stage 2:** `ac_ids[]` (≥ 1 acceptance criterion in canonical-hash-verified frozen Stage 2)
+  - **Stage 3:** at least one architectural component (`stage3_component_ids[]`) AND technical design reference (`stage3_erd_tables` / `stage3_api_endpoints` / `stage3_security_controls` / `stage3_adr_ids`), all validated bidirectional in canonical-hash-verified Stage 3
+  - **Stage 5:** `bootstrap_id` + covered `trusted_acceptance_test_files[]` covering all `ac_ids[]` (no unknown `req_id`/`ac_id` refs in `acceptance_tests`)
   - **Stage 7:** `milestone_ids[]`, `epic_ids[]`, `story_ids[]`, `task_ids[]` (and valid `TaskContractSpec` with Stage 5 `trusted_policy_sha256`)
-  - **Stage 8:** for the requirement's latest/active linked implementation path (including applied CR tasks when an applied CR supersedes/extends a requirement): `MergedAndCompleted`, valid non-empty `lease_ids`, `import_ids`, `merge_candidate_ids`, PASS `verification_run_ids`, PASS `review_session_ids` + `review_artifact_ids`, APPROVED `approval_request_ids` + `approval_decision_ids`, `merged_commit_hash` present (and reachable on `refs/heads/main` when checked against repo).
-  - **Stage 9:** any applied `cr_id`s targeting `req_id` must have their CR-linked tasks likewise `MergedAndCompleted` with complete Stage 8 lineage.
+  - **Stage 8:** for the requirement's linked tasks (and all applied CR tasks targeting the requirement): `MergedAndCompleted`, valid non-empty `lease_ids`, `import_ids`, `merge_candidate_ids`, PASS `verification_run_ids` (`tier1_trusted_acceptance_passed === true` AND `trusted_policy_sha256 === bootstrap.trusted_policy_sha256`), PASS `review_session_ids` + `review_artifact_ids`, APPROVED `approval_request_ids` + `approval_decision_ids`, `merged_commit_hash` present and reachable on real Git `refs/heads/main` (`git merge-base --is-ancestor`, without caller overrides) and recorded in `projects.main_ref_commit_hash` (or matched in merged lineage).
+  - **Stage 9:** every `APPLIED` CR targeting `req_id` must have linked CR tasks covering `impacted_requirement_ids` that reached `MergedAndCompleted` with complete Stage 8 lineage.
 - **Bidirectional Indexes & Metrics:**
   - `forward_index`: `req_id → Stage 1 → Stage 2 ACs → Stage 3 → Stage 5 → Stage 7 → Stage 8 → Stage 9 CRs`
   - `backward_index`: `main commit / task / story / CR / trusted test / component / AC / Stage 1 item → req_id[]`
-  - `orphan_links`: detects any tasks/stories/CRs/artifacts referencing unknown `req_id`s or unlinked tasks.
-  - `coverage_percent`: `floor((covered_requirements / total_requirements) * 10000) / 100` (100 ONLY when every requirement is 100% linked forward & backward AND `orphan_links.length === 0` AND `missing_links.length === 0`).
+  - `orphan_links`: detects unlinked tasks in the project (`project tasks` not in `task_plan_links`), tasks/stories/CRs referencing unknown `req_id`s, Stage 3 component/ERD/API/security references to unknown `req_id`s, and Stage 5 `acceptance_tests` entries referencing unknown `req_id`/`ac_id`s.
+  - `coverage_percent`: `Math.floor((covered_requirements / total_requirements) * 10000) / 100` (equals `100` ONLY when `complete === true` — every requirement is 100% linked forward & backward AND `orphan_links.length === 0` AND `missing_links.length === 0` — preventing floating-point rounding up to `100`).
   - `traceability_sha256`: canonical JSON SHA-256 of the matrix body.
 
 ### 6.3 Release Acceptance Package (`release_acceptance_packages`)
 - Strictly **append-only** (`REVOKE UPDATE, DELETE FROM app_runtime`).
-- Strictly requires `PROJECT_APPROVER` or `ORG_ADMIN`.
+- **RBAC (`AC-11b` Matrix vs Seal):** Reading the `AC-11b` traceability matrix requires `READ_ROLES`, while sealing `ReleaseAcceptancePackage` strictly requires `APPROVAL_ROLES` (`PROJECT_APPROVER` or `ORG_ADMIN`; `DEVELOPER`/`AUDITOR` denied `403`). v1.5 does not split matrix computation/viewing and release sealing into two separate human personas (unlike Stage 6/8 3D agent coder-vs-reviewer separation).
 - Strictly **fail-closed (`422` / `SQLSTATE 23514`)** unless `matrix.complete === true && matrix.coverage_percent === 100 && matrix.missing_links.length === 0 && matrix.orphan_links.length === 0`.
 - Reinforced by PostgreSQL CHECK constraint `chk_rap_complete_100 CHECK (coverage_percent = 100 AND is_complete = TRUE)`.
 

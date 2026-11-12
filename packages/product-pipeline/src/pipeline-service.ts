@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  CostBudgetExceededError,
   type CostGuardRecorder,
   type LiveModelProviderClient,
   ManagedModelProviderExecutor,
@@ -459,7 +460,7 @@ export class ProductPipelineService {
     );
 
     const executor = this.resolveExecutor(input);
-    const execRes = await executor.executeStructuredPrompt<Stage1DiscoveryBundle>({
+    const execRes = await executor.executeStructuredPromptDeferred<Stage1DiscoveryBundle>({
       projectId: input.project_id,
       costSessionId: pre.costSessionId,
       pipelineSessionId: pre.session.pipeline_session_id,
@@ -476,109 +477,138 @@ export class ProductPipelineService {
       },
     });
 
-    const persisted = await this.store.withRlsTransaction(
-      {
-        currentProjectId: input.project_id,
-        currentPrincipalId: input.actor_principal_id,
-        currentRole: "core_api_service",
-      },
-      async () => {
-        const itemsInput = [
-          ...execRes.parsed.facts.map((f) => ({
-            kind: "FACT" as const,
-            title: f.title,
-            statement: f.statement,
-            rationale: f.rationale,
-            confirmation_status: "AUTO_VERIFIED" as const,
-          })),
-          ...execRes.parsed.assumptions.map((a) => ({
-            kind: "ASSUMPTION" as const,
-            title: a.title,
-            statement: a.statement,
-            rationale: a.rationale,
-            clarification_question: a.clarification_question,
-            confirmation_status: "UNCONFIRMED" as const,
-          })),
-          ...execRes.parsed.recommendations.map((r) => ({
-            kind: "RECOMMENDATION" as const,
-            title: r.title,
-            statement: r.statement,
-            rationale: r.rationale,
-            clarification_question: r.clarification_question,
-            confirmation_status: "UNCONFIRMED" as const,
-          })),
-        ];
+    let persisted: {
+      readonly session: ProductPipelineSessionRecord;
+      readonly artifact: StageArtifactRecord;
+      readonly discoveryItems: Stage1DiscoveryItemRecord[];
+      readonly ledger: ModelCallLedgerRecord;
+      readonly costSession: CostSessionRecord;
+    };
+    try {
+      persisted = await this.store.withRlsTransaction(
+        {
+          currentProjectId: input.project_id,
+          currentPrincipalId: input.actor_principal_id,
+          currentRole: "core_api_service",
+        },
+        async () => {
+          const ledgerRes = await execRes.commitAllowedLedger();
+          const itemsInput = [
+            ...execRes.parsed.facts.map((f) => ({
+              kind: "FACT" as const,
+              title: f.title,
+              statement: f.statement,
+              rationale: f.rationale,
+              confirmation_status: "AUTO_VERIFIED" as const,
+            })),
+            ...execRes.parsed.assumptions.map((a) => ({
+              kind: "ASSUMPTION" as const,
+              title: a.title,
+              statement: a.statement,
+              rationale: a.rationale,
+              clarification_question: a.clarification_question,
+              confirmation_status: "UNCONFIRMED" as const,
+            })),
+            ...execRes.parsed.recommendations.map((r) => ({
+              kind: "RECOMMENDATION" as const,
+              title: r.title,
+              statement: r.statement,
+              rationale: r.rationale,
+              clarification_question: r.clarification_question,
+              confirmation_status: "UNCONFIRMED" as const,
+            })),
+          ];
 
-        const discoveryItems =
-          itemsInput.length > 0
-            ? await this.store.createStage1DiscoveryItems({
-                project_id: input.project_id,
-                pipeline_session_id: pre.session.pipeline_session_id,
-                items: itemsInput,
-              })
-            : [];
+          const discoveryItems =
+            itemsInput.length > 0
+              ? await this.store.createStage1DiscoveryItems({
+                  project_id: input.project_id,
+                  pipeline_session_id: pre.session.pipeline_session_id,
+                  items: itemsInput,
+                })
+              : [];
 
-        const factsCreated = discoveryItems.filter((i) => i.kind === "FACT");
-        const assumptionsCreated = discoveryItems.filter((i) => i.kind === "ASSUMPTION");
-        const recommendationsCreated = discoveryItems.filter((i) => i.kind === "RECOMMENDATION");
+          const factsCreated = discoveryItems.filter((i) => i.kind === "FACT");
+          const assumptionsCreated = discoveryItems.filter((i) => i.kind === "ASSUMPTION");
+          const recommendationsCreated = discoveryItems.filter((i) => i.kind === "RECOMMENDATION");
 
-        const contentJson: Record<string, unknown> = {
-          summary: execRes.parsed.summary,
-          facts: factsCreated.map((i) => ({
-            item_id: i.item_id,
-            title: i.title,
-            statement: i.statement,
-            rationale: i.rationale,
-            confirmation_status: i.confirmation_status,
-          })),
-          assumptions: assumptionsCreated.map((i) => ({
-            item_id: i.item_id,
-            title: i.title,
-            statement: i.statement,
-            rationale: i.rationale,
-            clarification_question: i.clarification_question,
-            confirmation_status: i.confirmation_status,
-          })),
-          recommendations: recommendationsCreated.map((i) => ({
-            item_id: i.item_id,
-            title: i.title,
-            statement: i.statement,
-            rationale: i.rationale,
-            clarification_question: i.clarification_question,
-            confirmation_status: i.confirmation_status,
-          })),
-        };
+          const contentJson: Record<string, unknown> = {
+            summary: execRes.parsed.summary,
+            facts: factsCreated.map((i) => ({
+              item_id: i.item_id,
+              title: i.title,
+              statement: i.statement,
+              rationale: i.rationale,
+              confirmation_status: i.confirmation_status,
+            })),
+            assumptions: assumptionsCreated.map((i) => ({
+              item_id: i.item_id,
+              title: i.title,
+              statement: i.statement,
+              rationale: i.rationale,
+              clarification_question: i.clarification_question,
+              confirmation_status: i.confirmation_status,
+            })),
+            recommendations: recommendationsCreated.map((i) => ({
+              item_id: i.item_id,
+              title: i.title,
+              statement: i.statement,
+              rationale: i.rationale,
+              clarification_question: i.clarification_question,
+              confirmation_status: i.confirmation_status,
+            })),
+          };
 
-        const artifact = await this.store.recordStageArtifact({
-          project_id: input.project_id,
-          pipeline_session_id: pre.session.pipeline_session_id,
-          stage: "STAGE_1_IDEA_DISCOVERY",
-          artifact_kind: "STAGE_1_DISCOVERY_BUNDLE",
-          provider: execRes.rawCompletion.provider,
-          model: execRes.rawCompletion.model,
-          prompt_id: execRes.renderedPrompt.promptId,
-          prompt_version: execRes.renderedPrompt.version,
-          prompt_sha256: execRes.renderedPrompt.promptSha256,
-          content_json: contentJson,
-          created_by_principal_id: input.actor_principal_id,
-          advance_session_stage: "STAGE_1_IDEA_DISCOVERY",
-        });
+          const artifact = await this.store.recordStageArtifact({
+            project_id: input.project_id,
+            pipeline_session_id: pre.session.pipeline_session_id,
+            stage: "STAGE_1_IDEA_DISCOVERY",
+            artifact_kind: "STAGE_1_DISCOVERY_BUNDLE",
+            provider: execRes.rawCompletion.provider,
+            model: execRes.rawCompletion.model,
+            prompt_id: execRes.renderedPrompt.promptId,
+            prompt_version: execRes.renderedPrompt.version,
+            prompt_sha256: execRes.renderedPrompt.promptSha256,
+            content_json: contentJson,
+            created_by_principal_id: input.actor_principal_id,
+            advance_session_stage: "STAGE_1_IDEA_DISCOVERY",
+          });
 
-        const updatedSession =
-          (await this.store.getProductPipelineSession(pre.session.pipeline_session_id)) ??
-          pre.session;
+          const updatedSession =
+            (await this.store.getProductPipelineSession(pre.session.pipeline_session_id)) ??
+            pre.session;
 
-        return { session: updatedSession, artifact, discoveryItems };
+          return {
+            session: updatedSession,
+            artifact,
+            discoveryItems,
+            ledger: ledgerRes.ledger,
+            costSession: ledgerRes.costSession,
+          };
+        }
+      );
+    } catch (error) {
+      if (error instanceof CostBudgetExceededError) {
+        throw error;
       }
-    );
+      const isValidation =
+        error instanceof Ac10ViolationError ||
+        (error instanceof PostgresRlsError && error.sqlState === "23514");
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      await execRes.finalizeDomainFailure(
+        isValidation ? rawMsg : `[PERSISTENCE_FAILURE] ${rawMsg}`,
+        "FAILED_VALIDATION"
+      );
+      throw error;
+    }
 
     return {
       session: persisted.session,
       artifact: persisted.artifact,
       discoveryItems: persisted.discoveryItems,
       parsed: execRes.parsed,
-      ledger: execRes.ledger,
-      costSession: execRes.costSession,
+      ledger: persisted.ledger,
+      costSession: persisted.costSession,
     };
   }
 
@@ -666,7 +696,7 @@ export class ProductPipelineService {
     );
 
     const executor = this.resolveExecutor(input);
-    const execRes = await executor.executeStructuredPrompt<Record<string, unknown>>({
+    const execRes = await executor.executeStructuredPromptDeferred<Record<string, unknown>>({
       projectId: input.project_id,
       costSessionId: pre.costSessionId,
       pipelineSessionId: pre.session.pipeline_session_id,
@@ -694,40 +724,67 @@ export class ProductPipelineService {
       },
     });
 
-    const persisted = await this.store.withRlsTransaction(
-      {
-        currentProjectId: input.project_id,
-        currentPrincipalId: input.actor_principal_id,
-        currentRole: "core_api_service",
-      },
-      async () => {
-        const artifact = await this.store.recordStageArtifact({
-          project_id: input.project_id,
-          pipeline_session_id: pre.session.pipeline_session_id,
-          stage: "STAGE_2_REQUIREMENTS",
-          artifact_kind: "STAGE_2_PRD_SRS",
-          provider: execRes.rawCompletion.provider,
-          model: execRes.rawCompletion.model,
-          prompt_id: execRes.renderedPrompt.promptId,
-          prompt_version: execRes.renderedPrompt.version,
-          prompt_sha256: execRes.renderedPrompt.promptSha256,
-          content_json: execRes.parsed,
-          created_by_principal_id: input.actor_principal_id,
-          advance_session_stage: "STAGE_2_REQUIREMENTS",
-        });
-        const updatedSession =
-          (await this.store.getProductPipelineSession(pre.session.pipeline_session_id)) ??
-          pre.session;
-        return { session: updatedSession, artifact };
+    let persisted: {
+      readonly session: ProductPipelineSessionRecord;
+      readonly artifact: StageArtifactRecord;
+      readonly ledger: ModelCallLedgerRecord;
+      readonly costSession: CostSessionRecord;
+    };
+    try {
+      persisted = await this.store.withRlsTransaction(
+        {
+          currentProjectId: input.project_id,
+          currentPrincipalId: input.actor_principal_id,
+          currentRole: "core_api_service",
+        },
+        async () => {
+          const ledgerRes = await execRes.commitAllowedLedger();
+          const artifact = await this.store.recordStageArtifact({
+            project_id: input.project_id,
+            pipeline_session_id: pre.session.pipeline_session_id,
+            stage: "STAGE_2_REQUIREMENTS",
+            artifact_kind: "STAGE_2_PRD_SRS",
+            provider: execRes.rawCompletion.provider,
+            model: execRes.rawCompletion.model,
+            prompt_id: execRes.renderedPrompt.promptId,
+            prompt_version: execRes.renderedPrompt.version,
+            prompt_sha256: execRes.renderedPrompt.promptSha256,
+            content_json: execRes.parsed,
+            created_by_principal_id: input.actor_principal_id,
+            advance_session_stage: "STAGE_2_REQUIREMENTS",
+          });
+          const updatedSession =
+            (await this.store.getProductPipelineSession(pre.session.pipeline_session_id)) ??
+            pre.session;
+          return {
+            session: updatedSession,
+            artifact,
+            ledger: ledgerRes.ledger,
+            costSession: ledgerRes.costSession,
+          };
+        }
+      );
+    } catch (error) {
+      if (error instanceof CostBudgetExceededError) {
+        throw error;
       }
-    );
+      const isValidation =
+        error instanceof Ac10ViolationError ||
+        (error instanceof PostgresRlsError && error.sqlState === "23514");
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      await execRes.finalizeDomainFailure(
+        isValidation ? rawMsg : `[PERSISTENCE_FAILURE] ${rawMsg}`,
+        "FAILED_VALIDATION"
+      );
+      throw error;
+    }
 
     return {
       session: persisted.session,
       artifact: persisted.artifact,
       parsed: execRes.parsed,
-      ledger: execRes.ledger,
-      costSession: execRes.costSession,
+      ledger: persisted.ledger,
+      costSession: persisted.costSession,
     };
   }
 
@@ -808,7 +865,7 @@ export class ProductPipelineService {
     );
 
     const executor = this.resolveExecutor(input);
-    const execRes = await executor.executeStructuredPrompt<Record<string, unknown>>({
+    const execRes = await executor.executeStructuredPromptDeferred<Record<string, unknown>>({
       projectId: input.project_id,
       costSessionId: pre.costSessionId,
       pipelineSessionId: pre.session.pipeline_session_id,
@@ -825,40 +882,67 @@ export class ProductPipelineService {
       },
     });
 
-    const persisted = await this.store.withRlsTransaction(
-      {
-        currentProjectId: input.project_id,
-        currentPrincipalId: input.actor_principal_id,
-        currentRole: "core_api_service",
-      },
-      async () => {
-        const artifact = await this.store.recordStageArtifact({
-          project_id: input.project_id,
-          pipeline_session_id: pre.session.pipeline_session_id,
-          stage: "STAGE_3_ARCHITECTURE",
-          artifact_kind: "STAGE_3_ARCHITECTURE_DESIGN",
-          provider: execRes.rawCompletion.provider,
-          model: execRes.rawCompletion.model,
-          prompt_id: execRes.renderedPrompt.promptId,
-          prompt_version: execRes.renderedPrompt.version,
-          prompt_sha256: execRes.renderedPrompt.promptSha256,
-          content_json: execRes.parsed,
-          created_by_principal_id: input.actor_principal_id,
-          advance_session_stage: "STAGE_3_ARCHITECTURE",
-        });
-        const updatedSession =
-          (await this.store.getProductPipelineSession(pre.session.pipeline_session_id)) ??
-          pre.session;
-        return { session: updatedSession, artifact };
+    let persisted: {
+      readonly session: ProductPipelineSessionRecord;
+      readonly artifact: StageArtifactRecord;
+      readonly ledger: ModelCallLedgerRecord;
+      readonly costSession: CostSessionRecord;
+    };
+    try {
+      persisted = await this.store.withRlsTransaction(
+        {
+          currentProjectId: input.project_id,
+          currentPrincipalId: input.actor_principal_id,
+          currentRole: "core_api_service",
+        },
+        async () => {
+          const ledgerRes = await execRes.commitAllowedLedger();
+          const artifact = await this.store.recordStageArtifact({
+            project_id: input.project_id,
+            pipeline_session_id: pre.session.pipeline_session_id,
+            stage: "STAGE_3_ARCHITECTURE",
+            artifact_kind: "STAGE_3_ARCHITECTURE_DESIGN",
+            provider: execRes.rawCompletion.provider,
+            model: execRes.rawCompletion.model,
+            prompt_id: execRes.renderedPrompt.promptId,
+            prompt_version: execRes.renderedPrompt.version,
+            prompt_sha256: execRes.renderedPrompt.promptSha256,
+            content_json: execRes.parsed,
+            created_by_principal_id: input.actor_principal_id,
+            advance_session_stage: "STAGE_3_ARCHITECTURE",
+          });
+          const updatedSession =
+            (await this.store.getProductPipelineSession(pre.session.pipeline_session_id)) ??
+            pre.session;
+          return {
+            session: updatedSession,
+            artifact,
+            ledger: ledgerRes.ledger,
+            costSession: ledgerRes.costSession,
+          };
+        }
+      );
+    } catch (error) {
+      if (error instanceof CostBudgetExceededError) {
+        throw error;
       }
-    );
+      const isValidation =
+        error instanceof Ac10ViolationError ||
+        (error instanceof PostgresRlsError && error.sqlState === "23514");
+      const rawMsg = error instanceof Error ? error.message : String(error);
+      await execRes.finalizeDomainFailure(
+        isValidation ? rawMsg : `[PERSISTENCE_FAILURE] ${rawMsg}`,
+        "FAILED_VALIDATION"
+      );
+      throw error;
+    }
 
     return {
       session: persisted.session,
       artifact: persisted.artifact,
       parsed: execRes.parsed,
-      ledger: execRes.ledger,
-      costSession: execRes.costSession,
+      ledger: persisted.ledger,
+      costSession: persisted.costSession,
     };
   }
 
@@ -1202,7 +1286,6 @@ export class ProductPipelineService {
     readonly project_id: string;
     readonly pipeline_session_id: string;
     readonly actor_principal_id: string;
-    readonly live_main_head_commit_hash?: string;
   }): Promise<BidirectionalTraceabilityMatrix> {
     return getBidirectionalTraceabilityMatrixService(this.store, input);
   }
@@ -1232,7 +1315,6 @@ export class ProductPipelineService {
     readonly project_id: string;
     readonly pipeline_session_id: string;
     readonly actor_principal_id: string;
-    readonly live_main_head_commit_hash?: string;
   }): Promise<M6BStages5To9Bundle> {
     return getM6BStages5To9BundleService(this.store, input);
   }
