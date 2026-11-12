@@ -1,6 +1,6 @@
 # Software Factory — Development Roadmap v1.5
 
-- **Cập nhật:** 2026-11-12 · @toan-hm
+- **Cập nhật:** 2026-11-13 · @toan-hm
 - **Phiên bản:** 1.5 (Cập nhật xử lý toàn bộ 8 nhóm cải thiện `P0-1`→`P0-4` và `P1-5`→`P1-8` từ đợt Review v1.4; tái cấu trúc theo **7 Milestone Gates `M0` → `M6`**)
 - **Tài liệu thiết kế đi kèm:** [Software Factory — System Design Plan v1.5](./software-factory-design-plan.md)
 - **Bộ tài liệu Core Specs `M0.2`:** [`MVP_SCOPE_AND_ARCHITECTURE.md`](./mvp_scope_and_architecture_specification_v1_5.md) · [`MVP_DATABASE_AND_RLS_SPEC.md`](./mvp_database_schema_and_rls_specification_v1_5.md) · [`MVP_LEASE_EVENT_AND_SANDBOX_SPEC.md`](./mvp_lease_event_protocol_sandbox_and_git_import_specification_v1_5.md) · [`MVP_VERIFIER_REVIEWER_AND_RECOVERY_SPEC.md`](./mvp_verifier_3d_reviewer_approval_and_recovery_specification_v1_5.md)
@@ -253,7 +253,7 @@ Sau khi vòng thực thi cốt lõi đã được chứng minh vững chắc t�
 
 #### Chặng `M6C` (Phase 8) — Thực thi Song song, Đa Runtime, Mở rộng Đường Import, External Targets & Budget Auto-Pause (`AC-12c`)
 
-Tiến độ ngày **2026-11-12**, theo [M6C-SPEC-01](./m6c_parallel_execution_adapters_imports_targets_v1_5.md):
+Tiến độ ngày **2026-11-13**, theo [M6C-SPEC-01](./m6c_parallel_execution_adapters_imports_targets_v1_5.md):
 
 | Slice | Trạng thái |
 |---|---|
@@ -261,7 +261,7 @@ Tiến độ ngày **2026-11-12**, theo [M6C-SPEC-01](./m6c_parallel_execution_a
 | `M6C-2` | Đã triển khai Codex CLI adapter + chọn runtime qua WNA; Bundle/Patch/Artifact dùng chung validator, receipt bất biến có ràng buộc lease/epoch, replay và phục hồi lỗi COMMIT. Acceptance 9/9 trên PG17; native sandbox/WNA 2/2. Chưa gọi provider Codex thật; kết quả hồi quy và giới hạn tại báo cáo M6C-2. |
 | `M6C-3` | Chưa triển khai: connectors Tier 2/3/4, verifier cô lập nhân, Lima/WSL2 và production deployment approval. |
 
-Vòng sửa theo issue #8: đã triển khai M6C-FIX-01..05 trên `review/m6c-1-2`, chờ review lại; regression cục bộ trên PostgreSQL 17 đạt **115/115**, không skip. Xem [báo cáo fix](./m6c-review-fixes-validation.md). Chưa merge vào `main`; CI PG16/17 sau merge vẫn là điều kiện bắt buộc.
+Vòng sửa issue #8 đã merge `main`, được team review **ĐẠT** và issue đã đóng. Commit `b79df9b` xử lý đủ 14 ghi chú tiếp theo, review **ĐẠT**; [CI #43228644198](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43228644198) đạt **120/120** trên cả PG16/17, native Codex sandbox **2/2**, không skip. Xem [báo cáo ghi chú](./m6c-review-notes-validation.md). Codex production bị chặn theo quyết định của owner cho đến khi có Cost Guard đáng tin cậy; emulator không chứng minh production metering. Review mới có bốn ghi chú nhỏ: vòng đánh giá budget và spawn-error cleanup được chỉnh rõ hơn, assertion journal được bổ sung; giới hạn GC cross-host/PID reuse giữ nguyên có chủ đích. Đây là vòng hardening trước M6C-3, chưa phải nghiệm thu G7.
 
 Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
 

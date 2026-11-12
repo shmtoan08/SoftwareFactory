@@ -30,9 +30,9 @@ export async function acquireBootstrapLock(path: string): Promise<{ assertHeld()
         clearTimeout(timer); held = true; resolveReady();
       });
     });
-  } catch (error) { child.stdin.end(); await exited; throw error; }
+  } catch (error) { child.stdin?.end(); await exited; throw error; }
   return {
     assertHeld() { if (!held || child.exitCode !== null) throw new PostgresRlsError("23514", "Bootstrap lock ownership lost"); },
-    async release() { child.stdin.end(); await exited; },
+    async release() { child.stdin?.end(); await exited; },
   };
 }

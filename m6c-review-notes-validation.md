@@ -39,3 +39,14 @@ Journal payloads store validated request metadata/hashes and observed violations
 Bootstrap requires POSIX flock and a C compiler on the coordinator. A helper is compiled once into a private temporary directory. Lock files persist intentionally and must not be unlinked while in use. Stop old existence-lock coordinators during upgrade. Cleanup skips foreign-host/live owners; it does not claim distributed-filesystem lock semantics where flock is unsupported.
 
 Codex production remains unavailable by explicit owner policy, not declared metered or approved for unbounded spend. No live provider call or provider-cost enforcement claim is made. M6C-3/G7 remain pending. No Rust work is included.
+
+## Follow-up review of b79df9b (2026-11-13)
+
+The team marked the commit **ĐẠT** ([review](https://github.com/shmtoan08/SoftwareFactory/commit/b79df9b887fd31118c55e198269b98c9cf114dec#commitcomment-209581859)); [CI](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43228644198) passed 120/120 on both PG16/17 and 2/2 native Codex tests, with no skips.
+
+- Budget evaluation now repeats until no active violating policy remains. The old two-iteration bound already covered the two pauseable policies (project and task): token/cost/time ceilings are dimensions of each policy, not three independently pauseable records. A paused policy skips all its dimensions. The existing simultaneous project/task regression remains the relevant coverage.
+- Bootstrap helper cleanup uses optional stdin access. A new subprocess regression forces spawn ENOENT after a successful fake compilation and verifies that the original error survives and the process exits cleanly.
+- Journal crash recovery now separately verifies that the original intent remains visible to an authorized tenant after DELETE is rejected, is COMPLETED with a timestamp, and matches the exactly-once ledger call ID. The unscoped zero-row assertion remains a separate RLS check.
+- Cross-host pending-ref cleanup and PID reuse retain conservative ownership handling. No cross-host liveness or PID-generation identity was added; foreign-host or reused-live-PID refs may require operator cleanup after ownership verification.
+
+This follow-up addresses the new actionable notes before starting M6C-3; it does not claim external target, VM backend or production deployment gate acceptance.

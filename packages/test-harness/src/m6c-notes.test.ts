@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir, hostname } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -79,6 +79,19 @@ describe("M6C remaining review notes", () => {
     const foreign = { ...ctx, modelProviderConfig: { provider: "anthropic" as const, apiKey: "unrelated-provider-key", model: "test" } };
     assert.equal((await new CodexCliAdapter({ writerModel: "test" }).parseExecutionResult(foreign, 1, "unrelated-provider-key", "")).stdoutTail, "unrelated-provider-key");
   });
+  it("bootstrap helper spawn failure preserves the original error and exits cleanly", () => {
+    const root = mkdtempSync(join(tmpdir(), "sf-lock-spawn-failure-"));
+    try {
+      // A successful compiler whose output has a missing interpreter forces ENOENT
+      // at spawn time, after compilation, independently of the host toolchain.
+      writeFileSync(join(root, "cc"), '#!/bin/sh\nfor arg do output="$arg"; done\nprintf "#!/sf-nonexistent-lock-interpreter\\n" > "$output"\nchmod +x "$output"\n', { mode: 0o700 });
+      const module = pathToFileURL(resolve("packages/product-pipeline/src/bootstrap-lock.ts")).href;
+      const script = `import assert from "node:assert/strict"; import { acquireBootstrapLock } from ${JSON.stringify(module)}; await assert.rejects(acquireBootstrapLock(${JSON.stringify(join(root, "lock"))}), (error) => error.code === "ENOENT");`;
+      execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+        env: { ...process.env, PATH: `${root}:${process.env.PATH}` }, timeout: 20000, stdio: "pipe",
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
   it("kernel bootstrap lock releases on coordinator death and stale ref pruning preserves live owners", async () => {
     const root = mkdtempSync(join(tmpdir(), "sf-lock-notes-")); const path = join(root, "trusted.sf-bootstrap.lock");
     const module = pathToFileURL(resolve("packages/product-pipeline/src/bootstrap-lock.ts")).href;
@@ -153,7 +166,13 @@ describe("M6C remaining review notes", () => {
       await core.getBudgetSnapshot(crash.projectId, auth);
       assert.equal((await reopened.withRlsTransaction(scope(crash.projectId), () => reopened.listModelCallLedgers({ cost_session_id: cs.cost_session_id }))).length, 1);
       await assert.rejects(repo.withRlsTransaction(scope(crash.projectId), () => pool.queryInActiveTx("DELETE FROM budget_denial_intents;")));
+      // The unscoped read proves isolation; a separate authorized read proves durability.
       assert.equal((await pool.queryInActiveTx("SELECT * FROM budget_denial_intents;")).rowCount, 0);
+      const retained = await repo.withRlsTransaction(scope(crash.projectId), () => pool.queryInActiveTx(
+        "SELECT intent_id,status,completed_at FROM budget_denial_intents WHERE intent_id=$1;", [pending.rows[0]!.intent_id]));
+      assert.equal(retained.rowCount, 1); assert.equal(retained.rows[0]!.status, "COMPLETED");
+      assert.ok(retained.rows[0]!.completed_at);
+      assert.equal(ledgers[0]!.call_id, retained.rows[0]!.intent_id);
     } finally { await pool.close(); }
   });
 });

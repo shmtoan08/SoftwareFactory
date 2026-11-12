@@ -7991,7 +7991,9 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   }
 
   private async evaluatePostSpendBudgetPauseSql(input: { project_id: string; task_id?: string | null }): Promise<void> {
-    for (let i = 0; i < 2; i++) {
+    // A pause covers every budget dimension of its project/task policy.
+    // Re-evaluate until no active policy violates its ceiling.
+    while (true) {
       const violation = await this.detectBudgetViolationSql(input, true);
       if (!violation) break;
       await this.persistBudgetViolationSql(input.project_id, violation);
