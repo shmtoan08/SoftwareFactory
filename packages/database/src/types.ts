@@ -1,11 +1,19 @@
 import type {
+  AgentOrgRole,
+  AgentOrganizationProfileRecord,
   ApprovalDecisionRecord,
   ApprovalRequestRecord,
   BaselineSpecFreezeRecord,
   CandidateBoundLineage,
+  ChangeRequestProposedTaskSpec,
+  ChangeRequestRecord,
   CostPreflightCheckInput,
   CostPreflightCheckResult,
   CostSessionRecord,
+  DevEpicRecord,
+  DevMilestoneRecord,
+  DevUserStoryRecord,
+  ExecutionTargetType,
   FinalizeModelCallInput,
   FinalizeModelCallResult,
   LeaseSyncStatusResponse,
@@ -18,6 +26,8 @@ import type {
   ProcessedWorkerEventRecord,
   ProductPipelineBundle,
   ProductPipelineSessionRecord,
+  ProjectBootstrapRecord,
+  ReleaseAcceptancePackageRecord,
   ResourceUsageMetricRecord,
   ResourceUsageMetricsSource,
   ResourceUsagePhase,
@@ -29,14 +39,18 @@ import type {
   Stage1ConfirmationStatus,
   Stage1DiscoveryItemRecord,
   Stage1ItemKind,
+  Stage7DevelopmentPlanBundle,
   StageApprovalGateRecord,
   StageApprovalGateStage,
   StageArtifactKind,
   StageArtifactRecord,
+  TargetTrustTier,
   TaskLeaseRecord,
+  TaskPlanLinkRecord,
   TaskRecord,
   TaskStatus,
   Tier3AssertionEvidence,
+  TrustedAcceptanceTestSpec,
   VerificationExecutionBackend,
   VerificationOverallStatus,
   VerificationRunRecord,
@@ -249,6 +263,129 @@ export interface FreezeBaselineSpecInput {
   readonly validation_report_sha256: string;
   readonly approval_gate_id: string;
   readonly frozen_by_principal_id: string;
+}
+
+export interface CreateProjectBootstrapInput {
+  readonly bootstrap_id?: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly repo_path: string;
+  readonly trusted_acceptance_dir: string;
+  readonly base_main_commit_hash: string;
+  readonly protected_paths: readonly string[];
+  readonly trusted_policy_sha256: string;
+  readonly generated_files: readonly string[];
+  readonly acceptance_tests: readonly TrustedAcceptanceTestSpec[];
+  readonly created_by_principal_id: string;
+}
+
+export interface UpsertAgentOrganizationProfileInput {
+  readonly profile_id?: string;
+  readonly project_id: string;
+  readonly profile_key: string;
+  readonly role: AgentOrgRole;
+  readonly principal_id: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly execution_target_type: ExecutionTargetType;
+  readonly trust_tier: TargetTrustTier;
+  readonly target_locator?: string | null;
+  readonly capabilities_json?: Readonly<Record<string, unknown>>;
+  readonly is_active?: boolean;
+  readonly created_by_principal_id: string;
+}
+
+export interface CreateStage7DevelopmentPlanInput {
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly bootstrap_id: string;
+  readonly base_main_commit_hash: string;
+  readonly milestones: ReadonlyArray<{
+    readonly milestone_id?: string;
+    readonly milestone_key: string;
+    readonly title: string;
+    readonly description: string;
+    readonly sequence_order: number;
+  }>;
+  readonly epics: ReadonlyArray<{
+    readonly epic_id?: string;
+    readonly milestone_key: string;
+    readonly epic_key: string;
+    readonly title: string;
+    readonly description: string;
+    readonly sequence_order: number;
+  }>;
+  readonly stories: ReadonlyArray<{
+    readonly story_id?: string;
+    readonly epic_key: string;
+    readonly story_key: string;
+    readonly title: string;
+    readonly description: string;
+    readonly requirement_ids: readonly string[];
+    readonly ac_ids: readonly string[];
+    readonly sequence_order: number;
+  }>;
+  readonly tasks: ReadonlyArray<{
+    readonly task_id?: string;
+    readonly story_key: string;
+    readonly title: string;
+    readonly task_contract: TaskContractSpec;
+    readonly requirement_ids: readonly string[];
+    readonly ac_ids: readonly string[];
+    readonly assigned_profile_id?: string | null;
+    readonly max_rework_cycles?: number;
+  }>;
+}
+
+export interface CreateChangeRequestStoreInput {
+  readonly cr_id?: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly cr_key: string;
+  readonly title: string;
+  readonly rationale: string;
+  readonly impacted_requirement_ids: readonly string[];
+  readonly impacted_component_ids?: readonly string[];
+  readonly proposed_tasks: readonly ChangeRequestProposedTaskSpec[];
+  readonly requested_by_principal_id: string;
+}
+
+export interface DecideChangeRequestStoreInput {
+  readonly project_id: string;
+  readonly cr_id: string;
+  readonly decision: "APPROVED" | "REJECTED";
+  readonly decided_by_principal_id: string;
+  readonly decision_rationale?: string | null;
+}
+
+export interface ApplyChangeRequestStoreInput {
+  readonly project_id: string;
+  readonly cr_id: string;
+  readonly bootstrap_id?: string | null;
+  readonly applied_by_principal_id: string;
+  readonly base_main_commit_hash: string;
+  readonly protected_paths: readonly string[];
+  readonly trusted_policy_sha256: string;
+}
+
+export interface RecordReleaseAcceptancePackageInput {
+  readonly release_id?: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly traceability_sha256: string;
+  readonly coverage_percent: number;
+  readonly complete: boolean;
+  readonly total_requirements: number;
+  readonly merged_task_ids: readonly string[];
+  readonly applied_cr_ids: readonly string[];
+  readonly main_head_commit_hash: string;
+  readonly summary_markdown: string;
+  readonly package_json: Readonly<Record<string, unknown>>;
+  readonly accepted_by_principal_id: string;
 }
 
 /**
@@ -614,4 +751,78 @@ export interface ControlPlaneStore {
   getProductPipelineBundle(
     pipelineSessionId: string
   ): ProductPipelineBundle | null | Promise<ProductPipelineBundle | null>;
+
+  // Milestone M6B: Stages 5-9 Lifecycle, Multi-Target Profiles, CR & Release Acceptance
+  updateProjectMainRefCommitHash(input: {
+    readonly project_id: string;
+    readonly main_ref_commit_hash: string;
+  }): ProjectRecord | Promise<ProjectRecord>;
+
+  createProjectBootstrap(
+    input: CreateProjectBootstrapInput
+  ): ProjectBootstrapRecord | Promise<ProjectBootstrapRecord>;
+  getProjectBootstrapBySession(
+    pipelineSessionId: string
+  ): ProjectBootstrapRecord | null | Promise<ProjectBootstrapRecord | null>;
+  getProjectBootstrapById(
+    bootstrapId: string
+  ): ProjectBootstrapRecord | null | Promise<ProjectBootstrapRecord | null>;
+
+  upsertAgentOrganizationProfile(
+    input: UpsertAgentOrganizationProfileInput
+  ): AgentOrganizationProfileRecord | Promise<AgentOrganizationProfileRecord>;
+  listAgentOrganizationProfiles(
+    projectId: string,
+    filter?: { readonly role?: AgentOrgRole; readonly active_only?: boolean }
+  ): AgentOrganizationProfileRecord[] | Promise<AgentOrganizationProfileRecord[]>;
+  getAgentOrganizationProfileById(
+    profileId: string
+  ): AgentOrganizationProfileRecord | null | Promise<AgentOrganizationProfileRecord | null>;
+
+  createStage7DevelopmentPlan(
+    input: CreateStage7DevelopmentPlanInput
+  ): Stage7DevelopmentPlanBundle | Promise<Stage7DevelopmentPlanBundle>;
+  listDevMilestones(
+    pipelineSessionId: string
+  ): DevMilestoneRecord[] | Promise<DevMilestoneRecord[]>;
+  listDevEpics(
+    pipelineSessionId: string
+  ): DevEpicRecord[] | Promise<DevEpicRecord[]>;
+  listDevUserStories(
+    pipelineSessionId: string
+  ): DevUserStoryRecord[] | Promise<DevUserStoryRecord[]>;
+  listTaskPlanLinks(
+    pipelineSessionId: string
+  ): TaskPlanLinkRecord[] | Promise<TaskPlanLinkRecord[]>;
+
+  createChangeRequest(
+    input: CreateChangeRequestStoreInput
+  ): ChangeRequestRecord | Promise<ChangeRequestRecord>;
+  getChangeRequestById(
+    crId: string
+  ): ChangeRequestRecord | null | Promise<ChangeRequestRecord | null>;
+  listChangeRequests(
+    pipelineSessionId: string
+  ): ChangeRequestRecord[] | Promise<ChangeRequestRecord[]>;
+  decideChangeRequest(
+    input: DecideChangeRequestStoreInput
+  ): ChangeRequestRecord | Promise<ChangeRequestRecord>;
+  applyChangeRequestAndMaterializeTasks(input: ApplyChangeRequestStoreInput):
+    | {
+        readonly changeRequest: ChangeRequestRecord;
+        readonly tasks: readonly TaskRecord[];
+        readonly taskLinks: readonly TaskPlanLinkRecord[];
+      }
+    | Promise<{
+        readonly changeRequest: ChangeRequestRecord;
+        readonly tasks: readonly TaskRecord[];
+        readonly taskLinks: readonly TaskPlanLinkRecord[];
+      }>;
+
+  recordReleaseAcceptancePackage(
+    input: RecordReleaseAcceptancePackageInput
+  ): ReleaseAcceptancePackageRecord | Promise<ReleaseAcceptancePackageRecord>;
+  listReleaseAcceptancePackages(
+    pipelineSessionId: string
+  ): ReleaseAcceptancePackageRecord[] | Promise<ReleaseAcceptancePackageRecord[]>;
 }

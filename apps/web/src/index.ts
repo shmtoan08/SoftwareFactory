@@ -18,19 +18,28 @@ import {
 } from "@software-factory/core-api";
 import { Ac10ViolationError, PostgresRlsError } from "@software-factory/database";
 import type {
+  AgentOrgRole,
+  AgentOrganizationProfileRecord,
   ApprovalDecisionRecord,
   BaselineSpecFreezeRecord,
+  BidirectionalTraceabilityMatrix,
   CandidateBoundLineage,
+  ChangeRequestProposedTaskSpec,
+  ChangeRequestRecord,
+  ExecutionTargetType,
+  M6BStages5To9Bundle,
   MergeCandidateRecord,
   PipelineStageName,
   ProductPipelineBundle,
   ProductPipelineSessionRecord,
+  ReleaseAcceptancePackageRecord,
   ReviewArtifactRecord,
   Stage1DiscoveryItemRecord,
   Stage4ConsistencyReport,
   StageApprovalGateRecord,
   StageApprovalGateStage,
   StageArtifactRecord,
+  TargetTrustTier,
   VerificationRunRecord,
 } from "@software-factory/shared-types";
 
@@ -606,6 +615,7 @@ export class WebApprovalConsoleController {
       `<main data-project-id="${escapeHtml(input.projectId)}">`,
       `<h1>Product Pipeline Sessions (${escapeHtml(input.projectId)})</h1>`,
       errorBannerHtml,
+      `<p><a href="/projects/${projectEnc}/agent-profiles">Agent Org Profiles (Stage 6)</a></p>`,
       "<section>",
       `<h2>Existing Sessions (${input.sessions.length})</h2>`,
       input.sessions.length > 0
@@ -793,7 +803,7 @@ export class WebApprovalConsoleController {
         bundle.session.frozen_baseline_id ?? "none"
       )}</code></p>`,
       errorBannerHtml,
-      `<p><a href="/projects/${projectEnc}/pipeline-sessions">All Pipeline Sessions</a></p>`,
+      `<p><a href="/projects/${projectEnc}/pipeline-sessions">All Pipeline Sessions</a> | <a href="${baseActionUrl}/m6b">Stage 5–9 &amp; Traceability Workbench</a> | <a href="/projects/${projectEnc}/agent-profiles">Agent Org Profiles</a></p>`,
       "<section>",
       "<h2>Cost Session (AC-12b)</h2>",
       cost
@@ -960,6 +970,732 @@ export class WebApprovalConsoleController {
       validation_report_sha256: input.validationReportSha256,
       approval_gate_id: input.approvalGateId,
     });
+  }
+
+  // ===========================================================================
+  // Milestone M6B: Stages 5–9 Workbench, Agent Profiles, CRs & AC-11b Views
+  // ===========================================================================
+
+  public async bootstrapPipelineProject(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    repoPath?: string;
+    trustedAcceptanceDir?: string;
+    extraProtectedPaths?: readonly string[];
+    scaffoldFiles?: Readonly<Record<string, string>>;
+    acceptanceSpecs?: Parameters<CoreApiService["bootstrapPipelineProject"]>[2]["acceptance_specs"];
+  }): Promise<Awaited<ReturnType<CoreApiService["bootstrapPipelineProject"]>>> {
+    return this.coreApi.bootstrapPipelineProject(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      repo_path: input.repoPath,
+      trusted_acceptance_dir: input.trustedAcceptanceDir,
+      extra_protected_paths: input.extraProtectedPaths,
+      scaffold_files: input.scaffoldFiles,
+      acceptance_specs: input.acceptanceSpecs,
+    });
+  }
+
+  public async listAgentOrganizationProfiles(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    role?: AgentOrgRole;
+    activeOnly?: boolean;
+  }): Promise<AgentOrganizationProfileRecord[]> {
+    return this.coreApi.listAgentOrganizationProfiles(input.projectId, input.auth, {
+      role: input.role,
+      active_only: input.activeOnly,
+    });
+  }
+
+  public async upsertAgentOrganizationProfile(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    profileId?: string;
+    profileKey: string;
+    role: AgentOrgRole;
+    principalId: string;
+    provider: string;
+    model: string;
+    executionTargetType: ExecutionTargetType;
+    trustTier: TargetTrustTier;
+    targetLocator?: string | null;
+    capabilitiesJson?: Readonly<Record<string, unknown>>;
+    isActive?: boolean;
+  }): Promise<AgentOrganizationProfileRecord> {
+    return this.coreApi.upsertAgentOrganizationProfile(input.projectId, input.auth, {
+      profile_id: input.profileId,
+      profile_key: input.profileKey,
+      role: input.role,
+      principal_id: input.principalId,
+      provider: input.provider,
+      model: input.model,
+      execution_target_type: input.executionTargetType,
+      trust_tier: input.trustTier,
+      target_locator: input.targetLocator,
+      capabilities_json: input.capabilitiesJson,
+      is_active: input.isActive,
+    });
+  }
+
+  public async validateStage6ReviewerPair(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    developerProfileId: string;
+    reviewerProfileId: string;
+  }): Promise<Awaited<ReturnType<CoreApiService["validateStage6ReviewerPair"]>>> {
+    return this.coreApi.validateStage6ReviewerPair(input.projectId, input.auth, {
+      developer_profile_id: input.developerProfileId,
+      reviewer_profile_id: input.reviewerProfileId,
+    });
+  }
+
+  public async runPipelineStage7Plan(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    costSessionId?: string;
+    promptVersion?: string;
+    maxTokens?: number;
+    temperature?: number;
+    maxReworkCycles?: number;
+    modelConfig?: ModelProviderConfig;
+  }): Promise<Awaited<ReturnType<CoreApiService["runPipelineStage7Plan"]>>> {
+    return this.coreApi.runPipelineStage7Plan(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      cost_session_id: input.costSessionId,
+      prompt_version: input.promptVersion,
+      max_tokens: input.maxTokens,
+      temperature: input.temperature,
+      max_rework_cycles: input.maxReworkCycles,
+      model_config: input.modelConfig,
+    });
+  }
+
+  public async loadM6BBundle(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    liveMainHeadCommitHash?: string;
+  }): Promise<M6BStages5To9Bundle> {
+    return this.coreApi.getPipelineM6BBundle(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      live_main_head_commit_hash: input.liveMainHeadCommitHash,
+    });
+  }
+
+  public async submitChangeRequest(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    crId?: string;
+    crKey: string;
+    title: string;
+    rationale: string;
+    impactedRequirementIds: readonly string[];
+    impactedComponentIds?: readonly string[];
+    proposedTasks: readonly ChangeRequestProposedTaskSpec[];
+  }): Promise<ChangeRequestRecord> {
+    return this.coreApi.submitPipelineChangeRequest(input.projectId, input.auth, {
+      cr_id: input.crId,
+      pipeline_session_id: input.pipelineSessionId,
+      cr_key: input.crKey,
+      title: input.title,
+      rationale: input.rationale,
+      impacted_requirement_ids: input.impactedRequirementIds,
+      impacted_component_ids: input.impactedComponentIds,
+      proposed_tasks: input.proposedTasks,
+    });
+  }
+
+  public async decideChangeRequest(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId?: string;
+    crId: string;
+    decision: "APPROVED" | "REJECTED";
+    decisionRationale?: string | null;
+  }): Promise<ChangeRequestRecord> {
+    return this.coreApi.decidePipelineChangeRequest(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      cr_id: input.crId,
+      decision: input.decision,
+      decision_rationale: input.decisionRationale,
+    });
+  }
+
+  public async applyChangeRequest(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId?: string;
+    crId: string;
+  }): Promise<Awaited<ReturnType<CoreApiService["applyPipelineChangeRequest"]>>> {
+    return this.coreApi.applyPipelineChangeRequest(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      cr_id: input.crId,
+    });
+  }
+
+  public async loadTraceabilityMatrix(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    liveMainHeadCommitHash?: string;
+  }): Promise<BidirectionalTraceabilityMatrix> {
+    return this.coreApi.getPipelineTraceabilityMatrix(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      live_main_head_commit_hash: input.liveMainHeadCommitHash,
+    });
+  }
+
+  public async issueReleasePackage(input: {
+    auth: CoreApiAuthContext;
+    projectId: string;
+    pipelineSessionId: string;
+    liveMainHeadCommitHash?: string;
+    notes?: string;
+  }): Promise<ReleaseAcceptancePackageRecord> {
+    return this.coreApi.issuePipelineReleasePackage(input.projectId, input.auth, {
+      pipeline_session_id: input.pipelineSessionId,
+      live_main_head_commit_hash: input.liveMainHeadCommitHash,
+      notes: input.notes,
+    });
+  }
+
+  public renderAgentProfilesMarkdown(
+    projectId: string,
+    profiles: readonly AgentOrganizationProfileRecord[]
+  ): string {
+    const rows = profiles
+      .map(
+        (p) =>
+          `| \`${p.profile_key}\` | ${p.role} | \`${p.principal_id}\` | ${p.provider}/${p.model} | \`${p.execution_target_type}\` | \`${p.trust_tier}\` | \`${String(p.is_active)}\` |`
+      )
+      .join("\n");
+    return [
+      `# Agent Organization Profiles — Project \`${projectId}\``,
+      `| Key | Role | Principal | Provider/Model | Execution Target | Trust Tier | Active |`,
+      `|---|---|---|---|---|---|---|`,
+      rows,
+    ].join("\n");
+  }
+
+  public renderAgentProfilesHtml(input: {
+    projectId: string;
+    profiles: readonly AgentOrganizationProfileRecord[];
+    errorMessage?: string;
+    pairValidationMessage?: string;
+  }): string {
+    const projectEnc = encodeURIComponent(input.projectId);
+    const errorBannerHtml = input.errorMessage
+      ? `<div role="alert" data-error-banner="true" class="error-banner">${escapeHtml(
+          input.errorMessage
+        )}</div>`
+      : "";
+    const pairStatusHtml = input.pairValidationMessage
+      ? `<div role="status" data-pair-validation="valid">${escapeHtml(
+          input.pairValidationMessage
+        )}</div>`
+      : "";
+    const rows = input.profiles
+      .map(
+        (p) =>
+          `<tr><td><code>${escapeHtml(p.profile_id)}</code></td><td><code>${escapeHtml(
+            p.profile_key
+          )}</code></td><td><code>${escapeHtml(p.role)}</code></td><td><code>${escapeHtml(
+            p.principal_id
+          )}</code></td><td>${escapeHtml(p.provider)}/${escapeHtml(
+            p.model
+          )}</td><td><code>${escapeHtml(
+            p.execution_target_type
+          )}</code></td><td><code>${escapeHtml(p.trust_tier)}</code></td><td><code>${escapeHtml(
+            p.target_locator ?? "-"
+          )}</code></td><td>${String(p.is_active)}</td></tr>`
+      )
+      .join("");
+
+    return [
+      "<!DOCTYPE html>",
+      '<html lang="en">',
+      "<head>",
+      '<meta charset="utf-8">',
+      `<title>Agent Organization Profiles - ${escapeHtml(input.projectId)}</title>`,
+      "</head>",
+      "<body>",
+      `<main data-project-id="${escapeHtml(input.projectId)}">`,
+      `<h1>Agent Organization Profiles (${escapeHtml(input.projectId)})</h1>`,
+      errorBannerHtml,
+      pairStatusHtml,
+      `<p><a href="/projects/${projectEnc}/pipeline-sessions">All Pipeline Sessions</a></p>`,
+      "<section>",
+      `<h2>Configured Profiles (${input.profiles.length})</h2>`,
+      input.profiles.length > 0
+        ? `<table><thead><tr><th>Profile ID</th><th>Key</th><th>Role</th><th>Principal</th><th>Provider/Model</th><th>Execution Target</th><th>Trust Tier</th><th>Target Locator</th><th>Active</th></tr></thead><tbody>${rows}</tbody></table>`
+        : "<p>No agent organization profiles configured yet.</p>",
+      "</section>",
+      "<section>",
+      "<h2>Create / Update Agent Profile (Stage 6)</h2>",
+      `<form method="POST" action="/projects/${projectEnc}/agent-profiles">`,
+      '<label>Profile Key <input type="text" name="profile_key" required></label>',
+      '<label>Role <select name="role"><option value="PLANNER">PLANNER</option><option value="DEVELOPER" selected>DEVELOPER</option><option value="REVIEWER_READONLY">REVIEWER_READONLY</option><option value="VERIFIER">VERIFIER</option></select></label>',
+      '<label>Principal ID <input type="text" name="principal_id" required></label>',
+      '<label>Provider <input type="text" name="provider" required></label>',
+      '<label>Model <input type="text" name="model" required></label>',
+      '<label>Execution Target <select name="execution_target_type"><option value="factory_managed_worker" selected>factory_managed_worker</option><option value="user_managed_worker">user_managed_worker</option><option value="provider_managed_vm">provider_managed_vm</option><option value="remote_agent_session">remote_agent_session</option></select></label>',
+      '<label>Trust Tier <select name="trust_tier"><option value="TIER_1_FACTORY_MANAGED" selected>TIER_1_FACTORY_MANAGED</option><option value="TIER_2_USER_MANAGED">TIER_2_USER_MANAGED</option><option value="TIER_3_PROVIDER_VM">TIER_3_PROVIDER_VM</option><option value="TIER_4_REMOTE_SESSION">TIER_4_REMOTE_SESSION</option></select></label>',
+      '<label>Target Locator <input type="text" name="target_locator" placeholder="optional"></label>',
+      '<label>Capabilities JSON <input type="text" name="capabilities_json" placeholder="{}"></label>',
+      '<label>Active <select name="is_active"><option value="true" selected>true</option><option value="false">false</option></select></label>',
+      '<button type="submit">Save Agent Profile</button>',
+      "</form>",
+      "</section>",
+      "<section>",
+      "<h2>Validate Stage 6 3D Reviewer Separation Pair</h2>",
+      `<form method="POST" action="/projects/${projectEnc}/agent-profiles/validate-pair">`,
+      '<label>Developer Profile ID <input type="text" name="developer_profile_id" required></label>',
+      '<label>Reviewer Profile ID <input type="text" name="reviewer_profile_id" required></label>',
+      '<button type="submit">Validate 3D Separation</button>',
+      "</form>",
+      "</section>",
+      "</main>",
+      "</body>",
+      "</html>",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  public renderTraceabilityMatrixMarkdown(matrix: BidirectionalTraceabilityMatrix): string {
+    const reqRows = matrix.requirement_rows
+      .map((r) => {
+        const taskSummary = r.stage8_lineage
+          .map(
+            (s) =>
+              `${s.task_id}(${s.status}${s.merged_commit_hash ? `,commit=${s.merged_commit_hash.slice(0, 8)},main=${String(s.main_reachable)}` : ""})`
+          )
+          .join("; ");
+        return `| \`${r.req_id}\` | ${r.stage1_item_ids.length} | ${r.ac_ids.join(", ") || "-"} | ${
+          r.stage3_component_ids.join(", ") || "-"
+        } | ${r.trusted_acceptance_test_files.join(", ") || "-"} | ${
+          r.story_ids.length
+        } | ${taskSummary || "-"} | ${r.applied_cr_ids.join(", ") || "-"} | \`${String(
+          r.complete
+        )}\` |`;
+      })
+      .join("\n");
+
+    const missingRows = matrix.missing_links
+      .map((m) => `- **${m.req_id}** [${m.stage}]: ${m.reason}`)
+      .join("\n");
+    const orphanRows = matrix.orphan_links
+      .map((o) => `- **${o.entity_type}** (\`${o.entity_id}\`): ${o.reason}`)
+      .join("\n");
+
+    return [
+      `## Bidirectional Traceability Matrix (AC-11b)`,
+      `- **Baseline ID:** \`${matrix.baseline_id}\` | **Coverage:** **${matrix.coverage_percent}%** (${matrix.covered_requirements}/${matrix.total_requirements}) | **Complete:** \`${String(
+        matrix.complete
+      )}\` | **Digest:** \`${matrix.traceability_sha256}\``,
+      "",
+      "| Requirement | Stage 1 | ACs | Components | Trusted Tests | Stories | Stage 8 Tasks & Commits | Applied CRs | Complete |",
+      "|---|---:|---|---|---|---:|---|---|---|",
+      reqRows,
+      missingRows ? `\n### Missing Links (${matrix.missing_links.length})\n${missingRows}` : "",
+      orphanRows ? `\n### Orphan Links (${matrix.orphan_links.length})\n${orphanRows}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  public renderTraceabilityMatrixHtml(matrix: BidirectionalTraceabilityMatrix): string {
+    const projectEnc = encodeURIComponent(matrix.project_id);
+    const sessionEnc = encodeURIComponent(matrix.pipeline_session_id);
+    const rows = matrix.requirement_rows
+      .map((r) => {
+        const lineageLinks = r.stage8_lineage
+          .map((s) => {
+            const taskEnc = encodeURIComponent(s.task_id);
+            return `<div><code>${escapeHtml(s.task_id)}</code> [<code>${escapeHtml(
+              s.status
+            )}</code>] mainReachable=${String(s.main_reachable)} <a href="/projects/${projectEnc}/tasks/${taskEnc}/approval-center">Approval Center</a> <a href="/projects/${projectEnc}/tasks/${taskEnc}/lineage">Lineage</a></div>`;
+          })
+          .join("");
+        return `<tr><td><code>${escapeHtml(r.req_id)}</code><br>${escapeHtml(
+          r.title
+        )}</td><td>${escapeHtml(r.stage1_item_ids.join(", ") || "-")}</td><td>${escapeHtml(
+          r.ac_ids.join(", ") || "-"
+        )}</td><td>${escapeHtml(r.stage3_component_ids.join(", ") || "-")}</td><td>${escapeHtml(
+          r.trusted_acceptance_test_files.join(", ") || "-"
+        )}</td><td>${escapeHtml(r.story_ids.join(", ") || "-")}</td><td>${
+          lineageLinks || "-"
+        }</td><td>${escapeHtml(r.applied_cr_ids.join(", ") || "-")}</td><td><code>${String(
+          r.complete
+        )}</code></td><td>${escapeHtml(r.missing_links.join("; ") || "-")}</td></tr>`;
+      })
+      .join("");
+
+    return [
+      "<!DOCTYPE html>",
+      '<html lang="en">',
+      "<head>",
+      '<meta charset="utf-8">',
+      `<title>AC-11b Traceability Matrix - ${escapeHtml(matrix.pipeline_session_id)}</title>`,
+      "</head>",
+      "<body>",
+      `<main data-pipeline-session-id="${escapeHtml(matrix.pipeline_session_id)}">`,
+      `<h1>AC-11b Bidirectional Traceability Matrix</h1>`,
+      `<p>Baseline: <code>${escapeHtml(
+        matrix.baseline_id
+      )}</code> | Coverage: <strong>${matrix.coverage_percent}%</strong> (${
+        matrix.covered_requirements
+      }/${matrix.total_requirements}) | Complete: <strong>${String(
+        matrix.complete
+      )}</strong> | SHA-256: <code>${escapeHtml(matrix.traceability_sha256)}</code></p>`,
+      `<p><a href="/projects/${projectEnc}/pipeline-sessions/${sessionEnc}/m6b">Back to Stage 5–9 Workbench</a></p>`,
+      "<table><thead><tr><th>Requirement</th><th>Stage 1</th><th>ACs</th><th>Components</th><th>Trusted Tests</th><th>Stories</th><th>Stage 8 Lineages</th><th>Applied CRs</th><th>Complete</th><th>Missing</th></tr></thead>",
+      `<tbody>${rows}</tbody></table>`,
+      "</main>",
+      "</body>",
+      "</html>",
+    ].join("\n");
+  }
+
+  public renderM6BBundleMarkdown(bundle: M6BStages5To9Bundle): string {
+    const profileRows = bundle.agent_profiles
+      .map(
+        (p) =>
+          `| \`${p.profile_key}\` | ${p.role} | \`${p.principal_id}\` | ${p.provider}/${p.model} | \`${p.execution_target_type}\` | \`${p.trust_tier}\` |`
+      )
+      .join("\n");
+    const taskLinkById = new Map(bundle.stage7_plan.taskLinks.map((l) => [l.task_id, l] as const));
+    const taskRows = bundle.stage7_plan.tasks
+      .map((t) => {
+        const link = taskLinkById.get(t.task_id);
+        return `| \`${t.task_id}\` | ${t.title} | \`${t.status}\` | \`${
+          link?.cr_id ?? "stage7"
+        }\` | ${link?.requirement_ids.join(", ") ?? "-"} | \`${
+          link?.assigned_profile_id ?? "-"
+        }\` |`;
+      })
+      .join("\n");
+    const crRows = bundle.change_requests
+      .map(
+        (cr) =>
+          `| \`${cr.cr_key}\` | ${cr.title} | \`${cr.status}\` | ${cr.impacted_requirement_ids.join(
+            ", "
+          )} | \`${cr.cr_sha256}\` |`
+      )
+      .join("\n");
+    const relRows = bundle.release_packages
+      .map(
+        (rp) =>
+          `| \`${rp.release_id}\` | ${rp.coverage_percent}% | \`${rp.main_head_commit_hash}\` | \`${rp.package_sha256}\` | \`${rp.accepted_by_principal_id}\` |`
+      )
+      .join("\n");
+
+    return [
+      `# M6B Stages 5–9 Workbench — Session \`${bundle.pipeline_session_id}\``,
+      `- **Project:** \`${bundle.project_id}\` | **Baseline ID:** \`${bundle.baseline.baseline_id}\` | **Freeze SHA-256:** \`${bundle.baseline.freeze_bundle_sha256}\``,
+      "",
+      "## Stage 5 Project Bootstrap",
+      bundle.bootstrap
+        ? [
+            `- **Bootstrap ID:** \`${bundle.bootstrap.bootstrap_id}\``,
+            `- **Repo Path:** \`${bundle.bootstrap.repo_path}\``,
+            `- **Trusted Acceptance Dir:** \`${bundle.bootstrap.trusted_acceptance_dir}\``,
+            `- **Base Main Commit:** \`${bundle.bootstrap.base_main_commit_hash}\``,
+            `- **Trusted Policy SHA-256:** \`${bundle.bootstrap.trusted_policy_sha256}\``,
+            `- **Acceptance Tests:** ${bundle.bootstrap.acceptance_tests.length}`,
+          ].join("\n")
+        : "- Not bootstrapped yet",
+      "",
+      "## Stage 6 Agent Organization Profiles",
+      "| Key | Role | Principal | Provider/Model | Target Type | Trust Tier |",
+      "|---|---|---|---|---|---|",
+      profileRows,
+      "",
+      `## Stage 7 Development Plan (Milestones=${bundle.stage7_plan.milestones.length}, Epics=${bundle.stage7_plan.epics.length}, Stories=${bundle.stage7_plan.stories.length}, Tasks=${bundle.stage7_plan.tasks.length})`,
+      "| Task ID | Title | Status | Source | Requirements | Profile |",
+      "|---|---|---|---|---|---|",
+      taskRows,
+      "",
+      `## Stage 9 Change Requests (${bundle.change_requests.length})`,
+      "| CR Key | Title | Status | Impacted Reqs | CR SHA-256 |",
+      "|---|---|---|---|---|",
+      crRows,
+      "",
+      this.renderTraceabilityMatrixMarkdown(bundle.traceability),
+      "",
+      `## Stage 9 Release Acceptance Packages (${bundle.release_packages.length})`,
+      "| Release ID | Coverage | Main HEAD | Package SHA-256 | Accepted By |",
+      "|---|---:|---|---|---|",
+      relRows,
+    ].join("\n");
+  }
+
+  public renderM6BBundleHtml(
+    bundle: M6BStages5To9Bundle,
+    options?: { readonly errorMessage?: string }
+  ): string {
+    const projectEnc = encodeURIComponent(bundle.project_id);
+    const sessionEnc = encodeURIComponent(bundle.pipeline_session_id);
+    const baseActionUrl = `/projects/${projectEnc}/pipeline-sessions/${sessionEnc}`;
+    const errorBannerHtml = options?.errorMessage
+      ? `<div role="alert" data-error-banner="true" class="error-banner">${escapeHtml(
+          options.errorMessage
+        )}</div>`
+      : "";
+
+    const boot = bundle.bootstrap;
+    const acceptanceRows = (boot?.acceptance_tests ?? [])
+      .map(
+        (t) =>
+          `<tr><td><code>${escapeHtml(t.ac_id)}</code></td><td><code>${escapeHtml(
+            t.req_id
+          )}</code></td><td><code>${escapeHtml(
+            t.test_file_path
+          )}</code></td><td>${escapeHtml(t.component_ids.join(", ") || "-")}</td><td>${escapeHtml(
+            t.expected_deliverables.join(", ") || "-"
+          )}</td></tr>`
+      )
+      .join("");
+
+    const profileRows = bundle.agent_profiles
+      .map(
+        (p) =>
+          `<tr><td><code>${escapeHtml(p.profile_key)}</code></td><td><code>${escapeHtml(
+            p.role
+          )}</code></td><td><code>${escapeHtml(p.principal_id)}</code></td><td>${escapeHtml(
+            p.provider
+          )}/${escapeHtml(p.model)}</td><td><code>${escapeHtml(
+            p.execution_target_type
+          )}</code></td><td><code>${escapeHtml(p.trust_tier)}</code></td><td>${String(
+            p.is_active
+          )}</td></tr>`
+      )
+      .join("");
+
+    const taskLinkById = new Map(bundle.stage7_plan.taskLinks.map((l) => [l.task_id, l] as const));
+    const storyById = new Map(bundle.stage7_plan.stories.map((s) => [s.story_id, s] as const));
+    const epicById = new Map(bundle.stage7_plan.epics.map((e) => [e.epic_id, e] as const));
+
+    const storyRows = bundle.stage7_plan.stories
+      .map((s) => {
+        const epic = epicById.get(s.epic_id);
+        return `<li><strong>${escapeHtml(s.story_key)}</strong> (${escapeHtml(
+          epic?.epic_key ?? "-"
+        )}): ${escapeHtml(s.title)} — reqs=[${escapeHtml(
+          s.requirement_ids.join(", ")
+        )}] acs=[${escapeHtml(s.ac_ids.join(", "))}]</li>`;
+      })
+      .join("");
+
+    const taskRows = bundle.stage7_plan.tasks
+      .map((t) => {
+        const link = taskLinkById.get(t.task_id);
+        const story = link?.story_id ? storyById.get(link.story_id) : undefined;
+        const taskEnc = encodeURIComponent(t.task_id);
+        return `<tr><td><code>${escapeHtml(t.task_id)}</code></td><td>${escapeHtml(
+          t.title
+        )}</td><td><code>${escapeHtml(t.status)}</code></td><td><code>${escapeHtml(
+          story?.story_key ?? "-"
+        )}</code></td><td><code>${escapeHtml(
+          link?.cr_id ?? "-"
+        )}</code></td><td>${escapeHtml(
+          link?.requirement_ids.join(", ") ?? "-"
+        )}</td><td><a href="/projects/${projectEnc}/tasks/${taskEnc}/approval-center">Approval Center</a> | <a href="/projects/${projectEnc}/tasks/${taskEnc}/lineage">Lineage</a></td></tr>`;
+      })
+      .join("");
+
+    const crRows = bundle.change_requests
+      .map((cr) => {
+        const crEnc = encodeURIComponent(cr.cr_id);
+        let actionHtml = "<code>-</code>";
+        if (cr.status === "PENDING_APPROVAL") {
+          actionHtml = `<form method="POST" action="${baseActionUrl}/change-requests/${crEnc}/decide" style="display:inline"><input type="hidden" name="decision" value="APPROVED"><input type="text" name="decision_rationale" placeholder="Rationale"><button type="submit">Approve CR</button></form> <form method="POST" action="${baseActionUrl}/change-requests/${crEnc}/decide" style="display:inline"><input type="hidden" name="decision" value="REJECTED"><input type="text" name="decision_rationale" placeholder="Rejection reason"><button type="submit">Reject CR</button></form>`;
+        } else if (cr.status === "APPROVED") {
+          actionHtml = `<form method="POST" action="${baseActionUrl}/change-requests/${crEnc}/apply" style="display:inline"><button type="submit">Apply CR</button></form>`;
+        }
+        return `<tr><td><code>${escapeHtml(cr.cr_key)}</code><br><small><code>${escapeHtml(
+          cr.cr_id
+        )}</code></small></td><td>${escapeHtml(cr.title)}</td><td><code>${escapeHtml(
+          cr.status
+        )}</code></td><td>${escapeHtml(
+          cr.impacted_requirement_ids.join(", ")
+        )}</td><td><code>${escapeHtml(cr.cr_sha256)}</code></td><td>${actionHtml}</td></tr>`;
+      })
+      .join("");
+
+    const trace = bundle.traceability;
+    const traceRows = trace.requirement_rows
+      .map((r) => {
+        const stage8Html = r.stage8_lineage
+          .map((s) => {
+            const taskEnc = encodeURIComponent(s.task_id);
+            return `<div><code>${escapeHtml(s.task_id)}</code> [<code>${escapeHtml(
+              s.status
+            )}</code>] commit=<code>${escapeHtml(
+              s.merged_commit_hash ?? "none"
+            )}</code> mainReachable=<strong>${String(
+              s.main_reachable
+            )}</strong> <a href="/projects/${projectEnc}/tasks/${taskEnc}/approval-center">Approval Center</a> <a href="/projects/${projectEnc}/tasks/${taskEnc}/lineage">Lineage</a></div>`;
+          })
+          .join("");
+        return `<tr><td><code>${escapeHtml(r.req_id)}</code><br>${escapeHtml(
+          r.title
+        )}</td><td>${escapeHtml(r.stage1_item_ids.join(", ") || "-")}</td><td>${escapeHtml(
+          r.ac_ids.join(", ") || "-"
+        )}</td><td>${escapeHtml(r.stage3_component_ids.join(", ") || "-")}</td><td>${escapeHtml(
+          r.trusted_acceptance_test_files.join(", ") || "-"
+        )}</td><td>${escapeHtml(r.story_ids.join(", ") || "-")}</td><td>${
+          stage8Html || "-"
+        }</td><td>${escapeHtml(r.applied_cr_ids.join(", ") || "-")}</td><td><code>${String(
+          r.complete
+        )}</code></td><td>${escapeHtml(r.missing_links.join("; ") || "-")}</td></tr>`;
+      })
+      .join("");
+
+    const releaseRows = bundle.release_packages
+      .map(
+        (rp) =>
+          `<tr><td><code>${escapeHtml(rp.release_id)}</code></td><td><strong>${
+            rp.coverage_percent
+          }%</strong> (${String(rp.complete)})</td><td><code>${escapeHtml(
+            rp.main_head_commit_hash
+          )}</code></td><td><code>${escapeHtml(
+            rp.package_sha256
+          )}</code></td><td><code>${escapeHtml(
+            rp.accepted_by_principal_id
+          )}</code></td><td><code>${escapeHtml(rp.accepted_at)}</code></td></tr>`
+      )
+      .join("");
+
+    return [
+      "<!DOCTYPE html>",
+      '<html lang="en">',
+      "<head>",
+      '<meta charset="utf-8">',
+      `<title>M6B Workbench - ${escapeHtml(bundle.pipeline_session_id)}</title>`,
+      "</head>",
+      "<body>",
+      `<main data-m6b-session-id="${escapeHtml(bundle.pipeline_session_id)}">`,
+      `<h1>M6B Stages 5–9 &amp; AC-11b Traceability Workbench</h1>`,
+      `<p>Project: <code>${escapeHtml(bundle.project_id)}</code> | Session: <code>${escapeHtml(
+        bundle.pipeline_session_id
+      )}</code> | Frozen Baseline: <code>${escapeHtml(
+        bundle.baseline.baseline_id
+      )}</code> | Freeze SHA-256: <code>${escapeHtml(
+        bundle.baseline.freeze_bundle_sha256
+      )}</code></p>`,
+      errorBannerHtml,
+      `<nav><a href="/projects/${projectEnc}/pipeline-sessions">All Pipeline Sessions</a> | <a href="${baseActionUrl}">Stages 1–4 Console</a> | <a href="/projects/${projectEnc}/agent-profiles">Agent Org Profiles</a> | <a href="${baseActionUrl}/traceability">Standalone Traceability Matrix</a></nav>`,
+      '<section data-workbench="stage5-bootstrap">',
+      "<h2>Stage 5: Project Bootstrap &amp; Trusted Acceptance Tests</h2>",
+      boot
+        ? `<div><p>Bootstrap ID: <code>${escapeHtml(
+            boot.bootstrap_id
+          )}</code> | Repo Path: <code>${escapeHtml(
+            boot.repo_path
+          )}</code> | Trusted Acceptance Dir: <code>${escapeHtml(
+            boot.trusted_acceptance_dir
+          )}</code> | Base Main Commit: <code>${escapeHtml(
+            boot.base_main_commit_hash
+          )}</code></p><p>Trusted Policy SHA-256: <code>${escapeHtml(
+            boot.trusted_policy_sha256
+          )}</code> | Bootstrap SHA-256: <code>${escapeHtml(
+            boot.bootstrap_sha256
+          )}</code></p><p>Protected Paths: ${boot.protected_paths
+            .map((p) => `<code>${escapeHtml(p)}</code>`)
+            .join(", ")}</p><table><thead><tr><th>AC ID</th><th>Req ID</th><th>Test File</th><th>Components</th><th>Expected Deliverables</th></tr></thead><tbody>${acceptanceRows}</tbody></table></div>`
+        : "<p>Project has not been bootstrapped yet.</p>",
+      `<form method="POST" action="${baseActionUrl}/bootstrap">`,
+      '<label>Repo Path <input type="text" name="repo_path" placeholder="optional"></label>',
+      '<label>Trusted Acceptance Dir <input type="text" name="trusted_acceptance_dir" placeholder="optional"></label>',
+      '<label>Extra Protected Paths (comma-separated) <input type="text" name="extra_protected_paths" placeholder="optional"></label>',
+      '<button type="submit">Run Stage 5 Bootstrap</button>',
+      "</form>",
+      "</section>",
+      '<section data-workbench="stage6-profiles">',
+      `<h2>Stage 6: Agent Organization Profiles (${bundle.agent_profiles.length})</h2>`,
+      `<p><a href="/projects/${projectEnc}/agent-profiles">Manage Agent Org Profiles &amp; 3D Separation</a></p>`,
+      bundle.agent_profiles.length > 0
+        ? `<table><thead><tr><th>Key</th><th>Role</th><th>Principal</th><th>Provider/Model</th><th>Execution Target</th><th>Trust Tier</th><th>Active</th></tr></thead><tbody>${profileRows}</tbody></table>`
+        : "<p>No agent organization profiles configured.</p>",
+      "</section>",
+      '<section data-workbench="stage7-plan">',
+      `<h2>Stage 7: Development Plan &amp; Materialized Stage 8 Tasks</h2>`,
+      `<p>Milestones: <strong>${bundle.stage7_plan.milestones.length}</strong> | Epics: <strong>${bundle.stage7_plan.epics.length}</strong> | Stories: <strong>${bundle.stage7_plan.stories.length}</strong> | Tasks: <strong>${bundle.stage7_plan.tasks.length}</strong></p>`,
+      `<form method="POST" action="${baseActionUrl}/stage7/plan">`,
+      '<label>Prompt Version <input type="text" name="prompt_version" placeholder="1.0.0"></label>',
+      '<label>Max Tokens <input type="number" name="max_tokens" placeholder="8192"></label>',
+      '<label>Temperature <input type="number" step="0.1" name="temperature" placeholder="0"></label>',
+      '<label>Max Rework Cycles <input type="number" name="max_rework_cycles" placeholder="3"></label>',
+      '<button type="submit">Run Stage 7 Planning</button>',
+      "</form>",
+      storyRows ? `<ul>${storyRows}</ul>` : "",
+      bundle.stage7_plan.tasks.length > 0
+        ? `<table><thead><tr><th>Task ID</th><th>Title</th><th>Status</th><th>Story</th><th>CR ID</th><th>Requirements</th><th>Links</th></tr></thead><tbody>${taskRows}</tbody></table>`
+        : "<p>No Stage 8 tasks materialized yet.</p>",
+      "</section>",
+      '<section data-workbench="stage9-change-requests">',
+      `<h2>Stage 9: Post-Freeze Change Requests (${bundle.change_requests.length})</h2>`,
+      bundle.change_requests.length > 0
+        ? `<table><thead><tr><th>CR Key</th><th>Title</th><th>Status</th><th>Impacted Reqs</th><th>CR SHA-256</th><th>Actions</th></tr></thead><tbody>${crRows}</tbody></table>`
+        : "<p>No change requests submitted.</p>",
+      `<form method="POST" action="${baseActionUrl}/change-requests">`,
+      '<label>CR Key <input type="text" name="cr_key" required placeholder="CR-001"></label>',
+      '<label>Title <input type="text" name="title" required></label>',
+      '<label>Rationale <input type="text" name="rationale" required></label>',
+      '<label>Impacted Requirement IDs (comma-separated or JSON) <input type="text" name="impacted_requirement_ids" required></label>',
+      '<label>Impacted Component IDs (optional) <input type="text" name="impacted_component_ids"></label>',
+      '<label>Proposed Tasks JSON <textarea name="proposed_tasks" required placeholder=\'[{"task_key":"TASK-CR-1","title":"...","description":"...","requirement_ids":["REQ-FUNC-001"],"ac_ids":["AC-FUNC-1"],"allowed_files":["src/index.js"]}]\'></textarea></label>',
+      '<button type="submit">Submit Change Request</button>',
+      "</form>",
+      "</section>",
+      '<section data-workbench="ac11b-traceability">',
+      "<h2>AC-11b: Bidirectional Traceability Matrix</h2>",
+      `<p>Coverage: <strong>${trace.coverage_percent}%</strong> (${trace.covered_requirements}/${trace.total_requirements}) | Complete: <strong>${String(
+        trace.complete
+      )}</strong> | Digest: <code>${escapeHtml(trace.traceability_sha256)}</code></p>`,
+      `<table><thead><tr><th>Requirement</th><th>Stage 1</th><th>ACs</th><th>Components</th><th>Trusted Tests</th><th>Stories</th><th>Stage 8 Tasks &amp; Commits</th><th>Applied CRs</th><th>Complete</th><th>Missing</th></tr></thead><tbody>${traceRows}</tbody></table>`,
+      trace.missing_links.length > 0
+        ? `<h3>Missing Links (${trace.missing_links.length})</h3><ul>${trace.missing_links
+            .map(
+              (m) =>
+                `<li><code>${escapeHtml(m.req_id)}</code> [<code>${escapeHtml(
+                  m.stage
+                )}</code>]: ${escapeHtml(m.reason)}</li>`
+            )
+            .join("")}</ul>`
+        : "",
+      trace.orphan_links.length > 0
+        ? `<h3>Orphan Links (${trace.orphan_links.length})</h3><ul>${trace.orphan_links
+            .map(
+              (o) =>
+                `<li><code>${escapeHtml(o.entity_type)}</code> (<code>${escapeHtml(
+                  o.entity_id
+                )}</code>): ${escapeHtml(o.reason)}</li>`
+            )
+            .join("")}</ul>`
+        : "",
+      "</section>",
+      '<section data-workbench="release-acceptance">',
+      `<h2>Stage 9: Release Acceptance Packages (${bundle.release_packages.length})</h2>`,
+      bundle.release_packages.length > 0
+        ? `<table><thead><tr><th>Release ID</th><th>Coverage</th><th>Main HEAD</th><th>Package SHA-256</th><th>Accepted By</th><th>Accepted At</th></tr></thead><tbody>${releaseRows}</tbody></table>`
+        : "<p>No release acceptance package issued yet.</p>",
+      `<form method="POST" action="${baseActionUrl}/release-package">`,
+      '<label>Live Main HEAD Commit (optional) <input type="text" name="live_main_head_commit_hash" placeholder="auto-resolved from git"></label>',
+      '<label>Release Notes <input type="text" name="notes" placeholder="Sign-off notes"></label>',
+      '<button type="submit">Issue Release Acceptance Package</button>',
+      "</form>",
+      "</section>",
+      "</main>",
+      "</body>",
+      "</html>",
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 }
 
@@ -1208,9 +1944,95 @@ function optionalModelConfigField(
   return sanitizeWebModelConfig(val);
 }
 
+function optionalBooleanField(
+  val: unknown,
+  isFormUrlEncoded: boolean,
+  fieldName: string
+): boolean | undefined {
+  if (val === undefined || val === null || val === "") {
+    return undefined;
+  }
+  if (typeof val === "boolean") {
+    return val;
+  }
+  if (isFormUrlEncoded && typeof val === "string") {
+    const lower = val.trim().toLowerCase();
+    if (lower === "true" || lower === "1" || lower === "on") {
+      return true;
+    }
+    if (lower === "false" || lower === "0" || lower === "off") {
+      return false;
+    }
+  }
+  throw new WebBadRequestError(`${fieldName} must be a boolean`);
+}
+
+function optionalStringArrayField(
+  val: unknown,
+  isFormUrlEncoded: boolean,
+  fieldName: string
+): string[] | undefined {
+  if (val === undefined || val === null || val === "") {
+    return undefined;
+  }
+  if (Array.isArray(val)) {
+    const out: string[] = [];
+    for (const entry of val) {
+      if (typeof entry !== "string" || !entry.trim()) {
+        throw new WebBadRequestError(`${fieldName} entries must be non-empty strings`);
+      }
+      out.push(entry.trim());
+    }
+    return out;
+  }
+  if (isFormUrlEncoded && typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    if (trimmed.startsWith("[")) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        throw new WebBadRequestError(`${fieldName} JSON array is malformed`);
+      }
+      return optionalStringArrayField(parsed, false, fieldName);
+    }
+    return trimmed
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  throw new WebBadRequestError(`${fieldName} must be an array of strings`);
+}
+
+function optionalJsonValueField<T>(
+  val: unknown,
+  isFormUrlEncoded: boolean,
+  fieldName: string
+): T | undefined {
+  if (val === undefined || val === null || val === "") {
+    return undefined;
+  }
+  if (isFormUrlEncoded && typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    try {
+      return JSON.parse(trimmed) as T;
+    } catch {
+      throw new WebBadRequestError(`${fieldName} form field must contain valid JSON`);
+    }
+  }
+  return val as T;
+}
+
 /**
- * Live HTTP Web Approval Console & Lineage Viewer Server (`M5` + `M6A`).
- * Renders Approval Center, Candidate-Bound Lineage, and Stages 1-4 Pipeline Workbench
+ * Live HTTP Web Approval Console & Lineage Viewer Server (`M5` + `M6A` + `M6B`).
+ * Renders Approval Center, Candidate-Bound Lineage, Stages 1-4 Pipeline Workbench,
+ * Stage 6 Agent Org Profiles, and Stages 5-9 & AC-11b Traceability Workbench
  * (`HTML`/`Markdown`/`JSON`) and enforces RBAC / fail-closed constraints over HTTP.
  */
 export class WebApprovalConsoleHttpServer {
@@ -1356,6 +2178,7 @@ export class WebApprovalConsoleHttpServer {
     auth?: CoreApiAuthContext;
     projectId?: string;
     pipelineSessionId?: string;
+    errorView?: "pipeline" | "m6b" | "agent-profiles";
   }): Promise<void> {
     const mapped = mapErrorToHttpPayload(input.err);
     if (!input.preferHtml) {
@@ -1366,6 +2189,50 @@ export class WebApprovalConsoleHttpServer {
     const reasonText = `${String(mapped.body.error_code ?? "ERROR")}: ${String(
       mapped.body.reason ?? "Request failed"
     )}`;
+    if (input.errorView === "agent-profiles" && input.auth && input.projectId) {
+      try {
+        const profiles = await this.controller.listAgentOrganizationProfiles({
+          auth: input.auth,
+          projectId: input.projectId,
+        });
+        this.sendBody(
+          input.res,
+          mapped.statusCode,
+          "text/html; charset=utf-8",
+          this.controller.renderAgentProfilesHtml({
+            projectId: input.projectId,
+            profiles,
+            errorMessage: reasonText,
+          })
+        );
+        return;
+      } catch {
+        // Fall through to generic HTML error banner
+      }
+    }
+    if (
+      input.errorView === "m6b" &&
+      input.auth &&
+      input.projectId &&
+      input.pipelineSessionId
+    ) {
+      try {
+        const m6bBundle = await this.controller.loadM6BBundle({
+          auth: input.auth,
+          projectId: input.projectId,
+          pipelineSessionId: input.pipelineSessionId,
+        });
+        this.sendBody(
+          input.res,
+          mapped.statusCode,
+          "text/html; charset=utf-8",
+          this.controller.renderM6BBundleHtml(m6bBundle, { errorMessage: reasonText })
+        );
+        return;
+      } catch {
+        // Baseline may not be frozen yet; try loading Stages 1-4 pipeline bundle below
+      }
+    }
     if (input.auth && input.projectId && input.pipelineSessionId) {
       try {
         const bundle = await this.controller.loadPipelineBundle({
@@ -1429,6 +2296,7 @@ export class WebApprovalConsoleHttpServer {
       auth?: CoreApiAuthContext;
       projectId?: string;
       pipelineSessionId?: string;
+      errorView?: "pipeline" | "m6b" | "agent-profiles";
     } = { preferHtml: false };
 
     try {
@@ -2202,6 +3070,599 @@ export class WebApprovalConsoleHttpServer {
         return;
       }
 
+      // Milestone M6B: Stage 6 Agent Organization Profiles & 3D Separation
+      const webAgentProfilesMatch = pathname.match(/^\/projects\/([^/]+)\/agent-profiles$/);
+      if (webAgentProfilesMatch?.[1]) {
+        const projectId = decodeURIComponent(webAgentProfilesMatch[1]);
+        if (method === "GET") {
+          const roleParam = url.searchParams.get("role") as AgentOrgRole | null;
+          const activeOnly = url.searchParams.get("active_only") === "true";
+          const profiles = await this.controller.listAgentOrganizationProfiles({
+            auth,
+            projectId,
+            role: roleParam ?? undefined,
+            activeOnly,
+          });
+          const format = url.searchParams.get("format") ?? "html";
+          if (format === "json") {
+            this.sendJson(res, 200, { profiles });
+            return;
+          }
+          if (format === "md") {
+            this.sendBody(
+              res,
+              200,
+              "text/markdown; charset=utf-8",
+              this.controller.renderAgentProfilesMarkdown(projectId, profiles)
+            );
+            return;
+          }
+          const errorMessage = url.searchParams.get("error") ?? undefined;
+          this.sendBody(
+            res,
+            200,
+            "text/html; charset=utf-8",
+            this.controller.renderAgentProfilesHtml({ projectId, profiles, errorMessage })
+          );
+          return;
+        }
+        if (method === "POST") {
+          const { data, isFormUrlEncoded } = await this.readRequestPayload<{
+            profile_id?: unknown;
+            profile_key?: unknown;
+            role?: unknown;
+            principal_id?: unknown;
+            provider?: unknown;
+            model?: unknown;
+            execution_target_type?: unknown;
+            trust_tier?: unknown;
+            target_locator?: unknown;
+            capabilities_json?: unknown;
+            is_active?: unknown;
+          }>(req);
+          const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+          errorHtmlContext = {
+            preferHtml,
+            auth,
+            projectId,
+            errorView: "agent-profiles",
+          };
+
+          const profileKey = optionalStringField(data.profile_key, "profile_key");
+          const principalId = optionalStringField(data.principal_id, "principal_id");
+          const provider = optionalStringField(data.provider, "provider");
+          const model = optionalStringField(data.model, "model");
+          if (!profileKey || !principalId || !provider || !model) {
+            throw new WebBadRequestError(
+              "profile_key, principal_id, provider, and model are required non-empty strings"
+            );
+          }
+          if (
+            data.role !== "PLANNER" &&
+            data.role !== "DEVELOPER" &&
+            data.role !== "REVIEWER_READONLY" &&
+            data.role !== "VERIFIER"
+          ) {
+            throw new WebBadRequestError(
+              "role must be PLANNER, DEVELOPER, REVIEWER_READONLY, or VERIFIER"
+            );
+          }
+          if (
+            data.execution_target_type !== "factory_managed_worker" &&
+            data.execution_target_type !== "user_managed_worker" &&
+            data.execution_target_type !== "provider_managed_vm" &&
+            data.execution_target_type !== "remote_agent_session"
+          ) {
+            throw new WebBadRequestError(
+              "execution_target_type must be factory_managed_worker, user_managed_worker, provider_managed_vm, or remote_agent_session"
+            );
+          }
+          if (
+            data.trust_tier !== "TIER_1_FACTORY_MANAGED" &&
+            data.trust_tier !== "TIER_2_USER_MANAGED" &&
+            data.trust_tier !== "TIER_3_PROVIDER_VM" &&
+            data.trust_tier !== "TIER_4_REMOTE_SESSION"
+          ) {
+            throw new WebBadRequestError(
+              "trust_tier must be TIER_1_FACTORY_MANAGED, TIER_2_USER_MANAGED, TIER_3_PROVIDER_VM, or TIER_4_REMOTE_SESSION"
+            );
+          }
+          const capabilitiesJson = optionalJsonValueField<Record<string, unknown>>(
+            data.capabilities_json,
+            isFormUrlEncoded,
+            "capabilities_json"
+          );
+          if (
+            capabilitiesJson !== undefined &&
+            (!capabilitiesJson || typeof capabilitiesJson !== "object" || Array.isArray(capabilitiesJson))
+          ) {
+            throw new WebBadRequestError("capabilities_json must be a JSON object");
+          }
+
+          const saved = await this.controller.upsertAgentOrganizationProfile({
+            auth,
+            projectId,
+            profileId: optionalStringField(data.profile_id, "profile_id"),
+            profileKey,
+            role: data.role,
+            principalId,
+            provider,
+            model,
+            executionTargetType: data.execution_target_type,
+            trustTier: data.trust_tier,
+            targetLocator: optionalStringField(data.target_locator, "target_locator") ?? null,
+            capabilitiesJson,
+            isActive: optionalBooleanField(data.is_active, isFormUrlEncoded, "is_active"),
+          });
+          if (preferHtml) {
+            this.sendRedirect(res, `/projects/${encodeURIComponent(projectId)}/agent-profiles`);
+            return;
+          }
+          this.sendJson(res, 200, saved);
+          return;
+        }
+      }
+
+      const webValidatePairMatch = pathname.match(
+        /^\/projects\/([^/]+)\/agent-profiles\/validate-pair$/
+      );
+      if (method === "POST" && webValidatePairMatch?.[1]) {
+        const projectId = decodeURIComponent(webValidatePairMatch[1]);
+        const { data, isFormUrlEncoded } = await this.readRequestPayload<{
+          developer_profile_id?: unknown;
+          reviewer_profile_id?: unknown;
+        }>(req);
+        const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+        errorHtmlContext = {
+          preferHtml,
+          auth,
+          projectId,
+          errorView: "agent-profiles",
+        };
+
+        const developerProfileId = optionalStringField(
+          data.developer_profile_id,
+          "developer_profile_id"
+        );
+        const reviewerProfileId = optionalStringField(
+          data.reviewer_profile_id,
+          "reviewer_profile_id"
+        );
+        if (!developerProfileId || !reviewerProfileId) {
+          throw new WebBadRequestError(
+            "developer_profile_id and reviewer_profile_id are required"
+          );
+        }
+        const pair = await this.controller.validateStage6ReviewerPair({
+          auth,
+          projectId,
+          developerProfileId,
+          reviewerProfileId,
+        });
+        if (preferHtml) {
+          const profiles = await this.controller.listAgentOrganizationProfiles({ auth, projectId });
+          this.sendBody(
+            res,
+            200,
+            "text/html; charset=utf-8",
+            this.controller.renderAgentProfilesHtml({
+              projectId,
+              profiles,
+              pairValidationMessage: `3D separation VALID: ${pair.developerProfile.profile_key} (${pair.developerProfile.provider}/${pair.developerProfile.model}) != ${pair.reviewerProfile.profile_key} (${pair.reviewerProfile.provider}/${pair.reviewerProfile.model})`,
+            })
+          );
+          return;
+        }
+        this.sendJson(res, 200, pair);
+        return;
+      }
+
+      // Milestone M6B: Stages 5–9 & AC-11b Traceability Workbench Views
+      const webM6BMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/m6b$/
+      );
+      if (method === "GET" && webM6BMatch?.[1] && webM6BMatch?.[2]) {
+        const projectId = decodeURIComponent(webM6BMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webM6BMatch[2]);
+        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
+        const bundle = await this.controller.loadM6BBundle({
+          auth,
+          projectId,
+          pipelineSessionId,
+          liveMainHeadCommitHash: liveMain,
+        });
+        const format = url.searchParams.get("format") ?? "html";
+        if (format === "json") {
+          this.sendJson(res, 200, bundle);
+          return;
+        }
+        if (format === "md") {
+          this.sendBody(
+            res,
+            200,
+            "text/markdown; charset=utf-8",
+            this.controller.renderM6BBundleMarkdown(bundle)
+          );
+          return;
+        }
+        const errorMessage = url.searchParams.get("error") ?? undefined;
+        this.sendBody(
+          res,
+          200,
+          "text/html; charset=utf-8",
+          this.controller.renderM6BBundleHtml(bundle, { errorMessage })
+        );
+        return;
+      }
+
+      const webTraceabilityMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/traceability$/
+      );
+      if (method === "GET" && webTraceabilityMatch?.[1] && webTraceabilityMatch?.[2]) {
+        const projectId = decodeURIComponent(webTraceabilityMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webTraceabilityMatch[2]);
+        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
+        const matrix = await this.controller.loadTraceabilityMatrix({
+          auth,
+          projectId,
+          pipelineSessionId,
+          liveMainHeadCommitHash: liveMain,
+        });
+        const format = url.searchParams.get("format") ?? "html";
+        if (format === "json") {
+          this.sendJson(res, 200, matrix);
+          return;
+        }
+        if (format === "md") {
+          this.sendBody(
+            res,
+            200,
+            "text/markdown; charset=utf-8",
+            this.controller.renderTraceabilityMatrixMarkdown(matrix)
+          );
+          return;
+        }
+        this.sendBody(
+          res,
+          200,
+          "text/html; charset=utf-8",
+          this.controller.renderTraceabilityMatrixHtml(matrix)
+        );
+        return;
+      }
+
+      const webBootstrapMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/bootstrap$/
+      );
+      if (method === "POST" && webBootstrapMatch?.[1] && webBootstrapMatch?.[2]) {
+        const projectId = decodeURIComponent(webBootstrapMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webBootstrapMatch[2]);
+        const { data, isFormUrlEncoded } = await this.readRequestPayload<{
+          repo_path?: unknown;
+          trusted_acceptance_dir?: unknown;
+          extra_protected_paths?: unknown;
+          scaffold_files?: unknown;
+          acceptance_specs?: unknown;
+        }>(req);
+        const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+        errorHtmlContext = {
+          preferHtml,
+          auth,
+          projectId,
+          pipelineSessionId,
+          errorView: "m6b",
+        };
+
+        const outcome = await this.controller.bootstrapPipelineProject({
+          auth,
+          projectId,
+          pipelineSessionId,
+          repoPath: optionalStringField(data.repo_path, "repo_path"),
+          trustedAcceptanceDir: optionalStringField(
+            data.trusted_acceptance_dir,
+            "trusted_acceptance_dir"
+          ),
+          extraProtectedPaths: optionalStringArrayField(
+            data.extra_protected_paths,
+            isFormUrlEncoded,
+            "extra_protected_paths"
+          ),
+          scaffoldFiles: optionalJsonValueField<Readonly<Record<string, string>>>(
+            data.scaffold_files,
+            isFormUrlEncoded,
+            "scaffold_files"
+          ),
+          acceptanceSpecs: optionalJsonValueField<
+            Parameters<CoreApiService["bootstrapPipelineProject"]>[2]["acceptance_specs"]
+          >(data.acceptance_specs, isFormUrlEncoded, "acceptance_specs"),
+        });
+        if (preferHtml) {
+          this.sendRedirect(
+            res,
+            `/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+              pipelineSessionId
+            )}/m6b`
+          );
+          return;
+        }
+        this.sendJson(res, 201, outcome);
+        return;
+      }
+
+      const webStage7PlanMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/stage7\/plan$/
+      );
+      if (method === "POST" && webStage7PlanMatch?.[1] && webStage7PlanMatch?.[2]) {
+        const projectId = decodeURIComponent(webStage7PlanMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webStage7PlanMatch[2]);
+        const { data, isFormUrlEncoded } = await this.readRequestPayload<{
+          cost_session_id?: unknown;
+          prompt_version?: unknown;
+          max_tokens?: unknown;
+          temperature?: unknown;
+          max_rework_cycles?: unknown;
+          model_config?: unknown;
+        }>(req);
+        const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+        errorHtmlContext = {
+          preferHtml,
+          auth,
+          projectId,
+          pipelineSessionId,
+          errorView: "m6b",
+        };
+
+        const outcome = await this.controller.runPipelineStage7Plan({
+          auth,
+          projectId,
+          pipelineSessionId,
+          costSessionId: optionalStringField(data.cost_session_id, "cost_session_id"),
+          promptVersion: optionalStringField(data.prompt_version, "prompt_version"),
+          maxTokens: optionalFiniteNumberField(data.max_tokens, isFormUrlEncoded, "max_tokens"),
+          temperature: optionalFiniteNumberField(
+            data.temperature,
+            isFormUrlEncoded,
+            "temperature"
+          ),
+          maxReworkCycles: optionalFiniteNumberField(
+            data.max_rework_cycles,
+            isFormUrlEncoded,
+            "max_rework_cycles"
+          ),
+          modelConfig: optionalModelConfigField(data.model_config, isFormUrlEncoded),
+        });
+        if (preferHtml) {
+          this.sendRedirect(
+            res,
+            `/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+              pipelineSessionId
+            )}/m6b`
+          );
+          return;
+        }
+        this.sendJson(res, 201, outcome);
+        return;
+      }
+
+      const webChangeRequestsMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/change-requests$/
+      );
+      if (
+        method === "POST" &&
+        webChangeRequestsMatch?.[1] &&
+        webChangeRequestsMatch?.[2]
+      ) {
+        const projectId = decodeURIComponent(webChangeRequestsMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webChangeRequestsMatch[2]);
+        const { data, isFormUrlEncoded } = await this.readRequestPayload<{
+          cr_id?: unknown;
+          cr_key?: unknown;
+          title?: unknown;
+          rationale?: unknown;
+          impacted_requirement_ids?: unknown;
+          impacted_component_ids?: unknown;
+          proposed_tasks?: unknown;
+        }>(req);
+        const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+        errorHtmlContext = {
+          preferHtml,
+          auth,
+          projectId,
+          pipelineSessionId,
+          errorView: "m6b",
+        };
+
+        const crKey = optionalStringField(data.cr_key, "cr_key");
+        const title = optionalStringField(data.title, "title");
+        const rationale = optionalStringField(data.rationale, "rationale");
+        const impactedReqIds = optionalStringArrayField(
+          data.impacted_requirement_ids,
+          isFormUrlEncoded,
+          "impacted_requirement_ids"
+        );
+        const proposedTasks = optionalJsonValueField<ChangeRequestProposedTaskSpec[]>(
+          data.proposed_tasks,
+          isFormUrlEncoded,
+          "proposed_tasks"
+        );
+        if (
+          !crKey ||
+          !title ||
+          !rationale ||
+          !impactedReqIds ||
+          !Array.isArray(proposedTasks)
+        ) {
+          throw new WebBadRequestError(
+            "cr_key, title, rationale, impacted_requirement_ids, and proposed_tasks array are required"
+          );
+        }
+
+        const created = await this.controller.submitChangeRequest({
+          auth,
+          projectId,
+          pipelineSessionId,
+          crId: optionalStringField(data.cr_id, "cr_id"),
+          crKey,
+          title,
+          rationale,
+          impactedRequirementIds: impactedReqIds,
+          impactedComponentIds: optionalStringArrayField(
+            data.impacted_component_ids,
+            isFormUrlEncoded,
+            "impacted_component_ids"
+          ),
+          proposedTasks,
+        });
+        if (preferHtml) {
+          this.sendRedirect(
+            res,
+            `/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+              pipelineSessionId
+            )}/m6b`
+          );
+          return;
+        }
+        this.sendJson(res, 201, created);
+        return;
+      }
+
+      const webCrDecideMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/change-requests\/([^/]+)\/decide$/
+      );
+      if (
+        method === "POST" &&
+        webCrDecideMatch?.[1] &&
+        webCrDecideMatch?.[2] &&
+        webCrDecideMatch?.[3]
+      ) {
+        const projectId = decodeURIComponent(webCrDecideMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webCrDecideMatch[2]);
+        const crId = decodeURIComponent(webCrDecideMatch[3]);
+        const { data, isFormUrlEncoded } = await this.readRequestPayload<{
+          decision?: unknown;
+          decision_rationale?: unknown;
+        }>(req);
+        const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+        errorHtmlContext = {
+          preferHtml,
+          auth,
+          projectId,
+          pipelineSessionId,
+          errorView: "m6b",
+        };
+
+        if (data.decision !== "APPROVED" && data.decision !== "REJECTED") {
+          throw new WebBadRequestError("decision must be APPROVED or REJECTED");
+        }
+        const decided = await this.controller.decideChangeRequest({
+          auth,
+          projectId,
+          pipelineSessionId,
+          crId,
+          decision: data.decision,
+          decisionRationale:
+            optionalStringField(data.decision_rationale, "decision_rationale") ?? null,
+        });
+        if (preferHtml) {
+          this.sendRedirect(
+            res,
+            `/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+              pipelineSessionId
+            )}/m6b`
+          );
+          return;
+        }
+        this.sendJson(res, 200, decided);
+        return;
+      }
+
+      const webCrApplyMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/change-requests\/([^/]+)\/apply$/
+      );
+      if (
+        method === "POST" &&
+        webCrApplyMatch?.[1] &&
+        webCrApplyMatch?.[2] &&
+        webCrApplyMatch?.[3]
+      ) {
+        const projectId = decodeURIComponent(webCrApplyMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webCrApplyMatch[2]);
+        const crId = decodeURIComponent(webCrApplyMatch[3]);
+        const { isFormUrlEncoded } = await this.readRequestPayload<Record<string, unknown>>(req);
+        const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+        errorHtmlContext = {
+          preferHtml,
+          auth,
+          projectId,
+          pipelineSessionId,
+          errorView: "m6b",
+        };
+
+        const applied = await this.controller.applyChangeRequest({
+          auth,
+          projectId,
+          pipelineSessionId,
+          crId,
+        });
+        if (preferHtml) {
+          this.sendRedirect(
+            res,
+            `/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+              pipelineSessionId
+            )}/m6b`
+          );
+          return;
+        }
+        this.sendJson(res, 200, applied);
+        return;
+      }
+
+      const webReleasePackageMatch = pathname.match(
+        /^\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/release-package$/
+      );
+      if (
+        method === "POST" &&
+        webReleasePackageMatch?.[1] &&
+        webReleasePackageMatch?.[2]
+      ) {
+        const projectId = decodeURIComponent(webReleasePackageMatch[1]);
+        const pipelineSessionId = decodeURIComponent(webReleasePackageMatch[2]);
+        const { data, isFormUrlEncoded } = await this.readRequestPayload<{
+          live_main_head_commit_hash?: unknown;
+          notes?: unknown;
+        }>(req);
+        const preferHtml = this.prefersHtmlResponse(req, url, isFormUrlEncoded);
+        errorHtmlContext = {
+          preferHtml,
+          auth,
+          projectId,
+          pipelineSessionId,
+          errorView: "m6b",
+        };
+
+        const pkg = await this.controller.issueReleasePackage({
+          auth,
+          projectId,
+          pipelineSessionId,
+          liveMainHeadCommitHash: optionalStringField(
+            data.live_main_head_commit_hash,
+            "live_main_head_commit_hash"
+          ),
+          notes: optionalStringField(data.notes, "notes"),
+        });
+        if (preferHtml) {
+          this.sendRedirect(
+            res,
+            `/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+              pipelineSessionId
+            )}/m6b`
+          );
+          return;
+        }
+        this.sendJson(res, 201, pkg);
+        return;
+      }
+
       this.sendJson(res, 404, {
         error_code: "ERR_NOT_FOUND",
         reason: `Unknown Web Approval Console route ${method} ${pathname}`,
@@ -2214,6 +3675,7 @@ export class WebApprovalConsoleHttpServer {
         auth: errorHtmlContext.auth,
         projectId: errorHtmlContext.projectId,
         pipelineSessionId: errorHtmlContext.pipelineSessionId,
+        errorView: errorHtmlContext.errorView,
       });
     }
   }

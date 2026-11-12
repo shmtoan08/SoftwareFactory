@@ -3,21 +3,29 @@ import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { existsSync } from "node:fs";
 import { types } from "node:util";
 import {
+  type AgentOrgRole,
+  type AgentOrganizationProfileRecord,
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
   type BaselineSpecFreezeRecord,
+  type BidirectionalTraceabilityMatrix,
   type CandidateBoundLineage,
+  type ChangeRequestProposedTaskSpec,
+  type ChangeRequestRecord,
   type CostSessionRecord,
+  type ExecutionTargetType,
   type M5AcceptanceCriterionReport,
   type M5EnvironmentCapabilities,
   type M5EvidenceBundle,
   type M5FaultRecoveryScenarioReport,
+  type M6BStages5To9Bundle,
   type MergeCandidateRecord,
   type MergeOperationRecord,
   type ModelCallLedgerRecord,
   type ModelPricingRate,
   type ProductPipelineBundle,
   type ProductPipelineSessionRecord,
+  type ReleaseAcceptancePackageRecord,
   type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
   type ReviewSessionRecord,
@@ -26,7 +34,9 @@ import {
   type StageApprovalGateRecord,
   type StageApprovalGateStage,
   type StageArtifactRecord,
+  type TargetTrustTier,
   type TaskLeaseRecord,
+  type TaskPlanLinkRecord,
   type TaskRecord,
   type TaskStatus,
   type VerificationRunRecord,
@@ -55,6 +65,10 @@ import {
 import {
   ProductPipelineService,
   type Stage1ExtractOutcome,
+  type Stage5AcceptanceSpecOverride,
+  type Stage5BootstrapOutcome,
+  type Stage6ReviewerPairOutcome,
+  type Stage7PlanExecutionOutcome,
   type StageExecutionOutcome,
 } from "@software-factory/product-pipeline";
 import {
@@ -2387,6 +2401,245 @@ export class CoreApiService {
       ...input,
       project_id: projectId,
       frozen_by_principal_id: verified.principalId,
+    });
+  }
+
+  // ===========================================================================
+  // Milestone M6B: Stages 5–9, Agent Profiles, Stage 9 CR & Release Acceptance
+  // ===========================================================================
+
+  public async bootstrapPipelineProject(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly repo_path?: string;
+      readonly trusted_acceptance_dir?: string;
+      readonly extra_protected_paths?: readonly string[];
+      readonly scaffold_files?: Readonly<Record<string, string>>;
+      readonly acceptance_specs?: Readonly<Record<string, Stage5AcceptanceSpecOverride>>;
+    }
+  ): Promise<Stage5BootstrapOutcome> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.bootstrapProject({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async upsertAgentOrganizationProfile(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly profile_id?: string;
+      readonly profile_key: string;
+      readonly role: AgentOrgRole;
+      readonly principal_id: string;
+      readonly provider: string;
+      readonly model: string;
+      readonly execution_target_type: ExecutionTargetType;
+      readonly trust_tier: TargetTrustTier;
+      readonly target_locator?: string | null;
+      readonly capabilities_json?: Readonly<Record<string, unknown>>;
+      readonly is_active?: boolean;
+    }
+  ): Promise<AgentOrganizationProfileRecord> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.upsertAgentOrganizationProfile({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async listAgentOrganizationProfiles(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    filter?: {
+      readonly role?: AgentOrgRole;
+      readonly active_only?: boolean;
+    }
+  ): Promise<AgentOrganizationProfileRecord[]> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.listAgentOrganizationProfiles({
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+      role: filter?.role,
+      active_only: filter?.active_only,
+    });
+  }
+
+  public async validateStage6ReviewerPair(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly developer_profile_id: string;
+      readonly reviewer_profile_id: string;
+    }
+  ): Promise<Stage6ReviewerPairOutcome> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.validateStage6ReviewerPair({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async runPipelineStage7Plan(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly cost_session_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly max_rework_cycles?: number;
+      readonly model_config?: ModelProviderConfig;
+      readonly model_executor?: ManagedModelProviderExecutor;
+    }
+  ): Promise<Stage7PlanExecutionOutcome> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.generateStage7DevelopmentPlan({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async submitPipelineChangeRequest(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly cr_id?: string;
+      readonly pipeline_session_id: string;
+      readonly cr_key: string;
+      readonly title: string;
+      readonly rationale: string;
+      readonly impacted_requirement_ids: readonly string[];
+      readonly impacted_component_ids?: readonly string[];
+      readonly proposed_tasks: readonly ChangeRequestProposedTaskSpec[];
+    }
+  ): Promise<ChangeRequestRecord> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.submitChangeRequest({
+      ...input,
+      project_id: projectId,
+      requested_by_principal_id: verified.principalId,
+    });
+  }
+
+  public async decidePipelineChangeRequest(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id?: string;
+      readonly cr_id: string;
+      readonly decision: "APPROVED" | "REJECTED";
+      readonly decision_rationale?: string | null;
+    }
+  ): Promise<ChangeRequestRecord> {
+    const verified = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.pipelineService.decideChangeRequest({
+      ...input,
+      project_id: projectId,
+      decided_by_principal_id: verified.principalId,
+    });
+  }
+
+  public async applyPipelineChangeRequest(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id?: string;
+      readonly cr_id: string;
+    }
+  ): Promise<{
+    readonly changeRequest: ChangeRequestRecord;
+    readonly tasks: readonly TaskRecord[];
+    readonly taskLinks: readonly TaskPlanLinkRecord[];
+  }> {
+    const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    return this.pipelineService.applyChangeRequest({
+      ...input,
+      project_id: projectId,
+      applied_by_principal_id: verified.principalId,
+    });
+  }
+
+  public async listPipelineChangeRequests(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string
+  ): Promise<ChangeRequestRecord[]> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.listChangeRequests({
+      project_id: projectId,
+      pipeline_session_id: pipelineSessionId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async getPipelineTraceabilityMatrix(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly live_main_head_commit_hash?: string;
+    }
+  ): Promise<BidirectionalTraceabilityMatrix> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.getBidirectionalTraceabilityMatrix({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async issuePipelineReleasePackage(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly live_main_head_commit_hash?: string;
+      readonly notes?: string;
+    }
+  ): Promise<ReleaseAcceptancePackageRecord> {
+    const verified = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.pipelineService.issueReleaseAcceptancePackage({
+      ...input,
+      project_id: projectId,
+      accepted_by_principal_id: verified.principalId,
+    });
+  }
+
+  public async listPipelineReleasePackages(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string
+  ): Promise<ReleaseAcceptancePackageRecord[]> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.listReleaseAcceptancePackages({
+      project_id: projectId,
+      pipeline_session_id: pipelineSessionId,
+      actor_principal_id: verified.principalId,
+    });
+  }
+
+  public async getPipelineM6BBundle(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly pipeline_session_id: string;
+      readonly live_main_head_commit_hash?: string;
+    }
+  ): Promise<M6BStages5To9Bundle> {
+    const verified = await this.authorize(auth, projectId, READ_ROLES);
+    return this.pipelineService.getM6BStages5To9Bundle({
+      ...input,
+      project_id: projectId,
+      actor_principal_id: verified.principalId,
     });
   }
 }

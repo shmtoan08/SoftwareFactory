@@ -24,19 +24,31 @@ import {
 } from "@software-factory/database";
 import type {
   Stage1ExtractOutcome,
+  Stage5AcceptanceSpecOverride,
+  Stage5BootstrapOutcome,
+  Stage6ReviewerPairOutcome,
+  Stage7PlanExecutionOutcome,
   StageExecutionOutcome,
 } from "@software-factory/product-pipeline";
 import type { IndependentReviewExecutionResult } from "@software-factory/reviewer";
 import type {
+  AgentOrgRole,
+  AgentOrganizationProfileRecord,
   ApprovalDecisionRecord,
   ApprovalRequestRecord,
   BaselineSpecFreezeRecord,
+  BidirectionalTraceabilityMatrix,
   CandidateBoundLineage,
+  ChangeRequestProposedTaskSpec,
+  ChangeRequestRecord,
   CostSessionRecord,
+  ExecutionTargetType,
+  M6BStages5To9Bundle,
   MergeCandidateRecord,
   ModelCallLedgerRecord,
   ProductPipelineBundle,
   ProductPipelineSessionRecord,
+  ReleaseAcceptancePackageRecord,
   ResourceUsageMetricRecord,
   ReviewArtifactRecord,
   ReviewSessionRecord,
@@ -45,7 +57,9 @@ import type {
   StageApprovalGateRecord,
   StageApprovalGateStage,
   StageArtifactRecord,
+  TargetTrustTier,
   TaskLeaseRecord,
+  TaskPlanLinkRecord,
   TaskRecord,
   TaskStatus,
   VerificationRunRecord,
@@ -781,6 +795,287 @@ export class CoreApiHttpServer {
         });
         this.sendJson(res, 201, freeze);
         return;
+      }
+
+      // Milestone M6B: Agent Profiles (Stage 6) & Stages 5–9 Lifecycle
+      const agentProfilesMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/agent-profiles$/
+      );
+      if (agentProfilesMatch?.[1]) {
+        const projectId = decodeURIComponent(agentProfilesMatch[1]);
+        if (method === "GET") {
+          const roleParam = url.searchParams.get("role") as AgentOrgRole | null;
+          const activeOnly = url.searchParams.get("active_only") === "true";
+          const profiles = await this.coreApi.listAgentOrganizationProfiles(projectId, auth, {
+            role: roleParam ?? undefined,
+            active_only: activeOnly,
+          });
+          this.sendJson(res, 200, { profiles });
+          return;
+        }
+        if (method === "POST") {
+          const body = await this.readJsonBody<{
+            profile_id?: string;
+            profile_key?: string;
+            role?: AgentOrgRole;
+            principal_id?: string;
+            provider?: string;
+            model?: string;
+            execution_target_type?: ExecutionTargetType;
+            trust_tier?: TargetTrustTier;
+            target_locator?: string | null;
+            capabilities_json?: Readonly<Record<string, unknown>>;
+            is_active?: boolean;
+          }>(req);
+          if (
+            !body.profile_key ||
+            !body.role ||
+            !body.principal_id ||
+            !body.provider ||
+            !body.model ||
+            !body.execution_target_type ||
+            !body.trust_tier
+          ) {
+            throw new BadRequestHttpError(
+              "profile_key, role, principal_id, provider, model, execution_target_type, and trust_tier are required"
+            );
+          }
+          const profile = await this.coreApi.upsertAgentOrganizationProfile(projectId, auth, {
+            profile_id: body.profile_id,
+            profile_key: body.profile_key,
+            role: body.role,
+            principal_id: body.principal_id,
+            provider: body.provider,
+            model: body.model,
+            execution_target_type: body.execution_target_type,
+            trust_tier: body.trust_tier,
+            target_locator: body.target_locator ?? null,
+            capabilities_json: body.capabilities_json ?? {},
+            is_active: body.is_active ?? true,
+          });
+          this.sendJson(res, 200, profile);
+          return;
+        }
+      }
+
+      const validatePairMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/agent-profiles\/validate-pair$/
+      );
+      if (method === "POST" && validatePairMatch?.[1]) {
+        const projectId = decodeURIComponent(validatePairMatch[1]);
+        const body = await this.readJsonBody<{
+          developer_profile_id?: string;
+          reviewer_profile_id?: string;
+        }>(req);
+        if (!body.developer_profile_id || !body.reviewer_profile_id) {
+          throw new BadRequestHttpError(
+            "developer_profile_id and reviewer_profile_id are required"
+          );
+        }
+        const pair = await this.coreApi.validateStage6ReviewerPair(projectId, auth, {
+          developer_profile_id: body.developer_profile_id,
+          reviewer_profile_id: body.reviewer_profile_id,
+        });
+        this.sendJson(res, 200, pair);
+        return;
+      }
+
+      const pipelineBootstrapMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/bootstrap$/
+      );
+      if (method === "POST" && pipelineBootstrapMatch?.[1] && pipelineBootstrapMatch?.[2]) {
+        const projectId = decodeURIComponent(pipelineBootstrapMatch[1]);
+        const pipelineSessionId = decodeURIComponent(pipelineBootstrapMatch[2]);
+        const body = await this.readJsonBody<{
+          repo_path?: string;
+          trusted_acceptance_dir?: string;
+          extra_protected_paths?: readonly string[];
+          scaffold_files?: Readonly<Record<string, string>>;
+          acceptance_specs?: Readonly<Record<string, Stage5AcceptanceSpecOverride>>;
+        }>(req);
+        const outcome = await this.coreApi.bootstrapPipelineProject(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          ...body,
+        });
+        this.sendJson(res, 201, outcome);
+        return;
+      }
+
+      const stage7PlanMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/stage7\/plan$/
+      );
+      if (method === "POST" && stage7PlanMatch?.[1] && stage7PlanMatch?.[2]) {
+        const projectId = decodeURIComponent(stage7PlanMatch[1]);
+        const pipelineSessionId = decodeURIComponent(stage7PlanMatch[2]);
+        const body = await this.readJsonBody<{
+          cost_session_id?: string;
+          prompt_version?: string;
+          max_tokens?: number;
+          temperature?: number;
+          max_rework_cycles?: number;
+          model_config?: unknown;
+        }>(req);
+        const outcome = await this.coreApi.runPipelineStage7Plan(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          cost_session_id: body.cost_session_id,
+          prompt_version: body.prompt_version,
+          max_tokens: body.max_tokens,
+          temperature: body.temperature,
+          max_rework_cycles: body.max_rework_cycles,
+          model_config: sanitizeHttpModelConfig(body.model_config),
+        });
+        this.sendJson(res, 201, outcome);
+        return;
+      }
+
+      const m6bBundleMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/m6b-bundle$/
+      );
+      if (method === "GET" && m6bBundleMatch?.[1] && m6bBundleMatch?.[2]) {
+        const projectId = decodeURIComponent(m6bBundleMatch[1]);
+        const pipelineSessionId = decodeURIComponent(m6bBundleMatch[2]);
+        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
+        const bundle = await this.coreApi.getPipelineM6BBundle(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          live_main_head_commit_hash: liveMain,
+        });
+        this.sendJson(res, 200, bundle);
+        return;
+      }
+
+      const changeRequestsMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/change-requests$/
+      );
+      if (changeRequestsMatch?.[1] && changeRequestsMatch?.[2]) {
+        const projectId = decodeURIComponent(changeRequestsMatch[1]);
+        const pipelineSessionId = decodeURIComponent(changeRequestsMatch[2]);
+        if (method === "GET") {
+          const changeRequests = await this.coreApi.listPipelineChangeRequests(
+            projectId,
+            auth,
+            pipelineSessionId
+          );
+          this.sendJson(res, 200, { change_requests: changeRequests });
+          return;
+        }
+        if (method === "POST") {
+          const body = await this.readJsonBody<{
+            cr_id?: string;
+            cr_key?: string;
+            title?: string;
+            rationale?: string;
+            impacted_requirement_ids?: readonly string[];
+            impacted_component_ids?: readonly string[];
+            proposed_tasks?: readonly ChangeRequestProposedTaskSpec[];
+          }>(req);
+          if (
+            !body.cr_key ||
+            !body.title ||
+            !body.rationale ||
+            !Array.isArray(body.impacted_requirement_ids) ||
+            !Array.isArray(body.proposed_tasks)
+          ) {
+            throw new BadRequestHttpError(
+              "cr_key, title, rationale, impacted_requirement_ids, and proposed_tasks are required"
+            );
+          }
+          const created = await this.coreApi.submitPipelineChangeRequest(projectId, auth, {
+            cr_id: body.cr_id,
+            pipeline_session_id: pipelineSessionId,
+            cr_key: body.cr_key,
+            title: body.title,
+            rationale: body.rationale,
+            impacted_requirement_ids: body.impacted_requirement_ids,
+            impacted_component_ids: body.impacted_component_ids,
+            proposed_tasks: body.proposed_tasks,
+          });
+          this.sendJson(res, 201, created);
+          return;
+        }
+      }
+
+      const crDecideMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/change-requests\/([^/]+)\/decide$/
+      );
+      if (method === "POST" && crDecideMatch?.[1] && crDecideMatch?.[2] && crDecideMatch?.[3]) {
+        const projectId = decodeURIComponent(crDecideMatch[1]);
+        const pipelineSessionId = decodeURIComponent(crDecideMatch[2]);
+        const crId = decodeURIComponent(crDecideMatch[3]);
+        const body = await this.readJsonBody<{
+          decision?: "APPROVED" | "REJECTED";
+          decision_rationale?: string | null;
+        }>(req);
+        if (body.decision !== "APPROVED" && body.decision !== "REJECTED") {
+          throw new BadRequestHttpError("decision must be APPROVED or REJECTED");
+        }
+        const decided = await this.coreApi.decidePipelineChangeRequest(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          cr_id: crId,
+          decision: body.decision,
+          decision_rationale: body.decision_rationale ?? null,
+        });
+        this.sendJson(res, 200, decided);
+        return;
+      }
+
+      const crApplyMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/change-requests\/([^/]+)\/apply$/
+      );
+      if (method === "POST" && crApplyMatch?.[1] && crApplyMatch?.[2] && crApplyMatch?.[3]) {
+        const projectId = decodeURIComponent(crApplyMatch[1]);
+        const pipelineSessionId = decodeURIComponent(crApplyMatch[2]);
+        const crId = decodeURIComponent(crApplyMatch[3]);
+        const applied = await this.coreApi.applyPipelineChangeRequest(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          cr_id: crId,
+        });
+        this.sendJson(res, 200, applied);
+        return;
+      }
+
+      const traceabilityMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/traceability$/
+      );
+      if (method === "GET" && traceabilityMatch?.[1] && traceabilityMatch?.[2]) {
+        const projectId = decodeURIComponent(traceabilityMatch[1]);
+        const pipelineSessionId = decodeURIComponent(traceabilityMatch[2]);
+        const liveMain = url.searchParams.get("live_main_head_commit_hash") ?? undefined;
+        const matrix = await this.coreApi.getPipelineTraceabilityMatrix(projectId, auth, {
+          pipeline_session_id: pipelineSessionId,
+          live_main_head_commit_hash: liveMain,
+        });
+        this.sendJson(res, 200, matrix);
+        return;
+      }
+
+      const releasePackageMatch = pathname.match(
+        /^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/release-package$/
+      );
+      if (releasePackageMatch?.[1] && releasePackageMatch?.[2]) {
+        const projectId = decodeURIComponent(releasePackageMatch[1]);
+        const pipelineSessionId = decodeURIComponent(releasePackageMatch[2]);
+        if (method === "GET") {
+          const releasePackages = await this.coreApi.listPipelineReleasePackages(
+            projectId,
+            auth,
+            pipelineSessionId
+          );
+          this.sendJson(res, 200, { release_packages: releasePackages });
+          return;
+        }
+        if (method === "POST") {
+          const body = await this.readJsonBody<{
+            live_main_head_commit_hash?: string;
+            notes?: string;
+          }>(req);
+          const pkg = await this.coreApi.issuePipelineReleasePackage(projectId, auth, {
+            pipeline_session_id: pipelineSessionId,
+            live_main_head_commit_hash: body.live_main_head_commit_hash,
+            notes: body.notes,
+          });
+          this.sendJson(res, 201, pkg);
+          return;
+        }
       }
 
       const taskActionMatch = pathname.match(
@@ -1853,5 +2148,297 @@ export class HttpCoreApiClient {
       [201]
     );
     return res.data;
+  }
+
+  // Milestone M6B: Agent Profiles (Stage 6) & Stages 5–9 Lifecycle
+  public async upsertAgentOrganizationProfile(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly profile_id?: string;
+      readonly profile_key: string;
+      readonly role: AgentOrgRole;
+      readonly principal_id: string;
+      readonly provider: string;
+      readonly model: string;
+      readonly execution_target_type: ExecutionTargetType;
+      readonly trust_tier: TargetTrustTier;
+      readonly target_locator?: string | null;
+      readonly capabilities_json?: Readonly<Record<string, unknown>>;
+      readonly is_active?: boolean;
+    }
+  ): Promise<AgentOrganizationProfileRecord> {
+    const res = await this.requestJson<AgentOrganizationProfileRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/agent-profiles`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async listAgentOrganizationProfiles(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    filter?: {
+      readonly role?: AgentOrgRole;
+      readonly active_only?: boolean;
+    }
+  ): Promise<AgentOrganizationProfileRecord[]> {
+    const qs = new URLSearchParams();
+    if (filter?.role) qs.set("role", filter.role);
+    if (filter?.active_only) qs.set("active_only", "true");
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    const res = await this.requestJson<{ profiles: AgentOrganizationProfileRecord[] }>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/agent-profiles${suffix}`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data.profiles;
+  }
+
+  public async validateStage6ReviewerPair(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      readonly developer_profile_id: string;
+      readonly reviewer_profile_id: string;
+    }
+  ): Promise<Stage6ReviewerPairOutcome> {
+    const res = await this.requestJson<Stage6ReviewerPairOutcome>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/agent-profiles/validate-pair`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async bootstrapPipelineProject(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly repo_path?: string;
+      readonly trusted_acceptance_dir?: string;
+      readonly extra_protected_paths?: readonly string[];
+      readonly scaffold_files?: Readonly<Record<string, string>>;
+      readonly acceptance_specs?: Readonly<Record<string, Stage5AcceptanceSpecOverride>>;
+    } = {}
+  ): Promise<Stage5BootstrapOutcome> {
+    const res = await this.requestJson<Stage5BootstrapOutcome>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/bootstrap`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
+  }
+
+  public async runPipelineStage7Plan(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly cost_session_id?: string;
+      readonly prompt_version?: string;
+      readonly max_tokens?: number;
+      readonly temperature?: number;
+      readonly max_rework_cycles?: number;
+      readonly model_config?: ModelProviderConfig;
+    } = {}
+  ): Promise<Stage7PlanExecutionOutcome> {
+    const res = await this.requestJson<Stage7PlanExecutionOutcome>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/stage7/plan`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
+  }
+
+  public async getPipelineM6BBundle(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    query?: { readonly live_main_head_commit_hash?: string }
+  ): Promise<M6BStages5To9Bundle> {
+    const qs = new URLSearchParams();
+    if (query?.live_main_head_commit_hash) {
+      qs.set("live_main_head_commit_hash", query.live_main_head_commit_hash);
+    }
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    const res = await this.requestJson<M6BStages5To9Bundle>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/m6b-bundle${suffix}`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async submitPipelineChangeRequest(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly cr_id?: string;
+      readonly cr_key: string;
+      readonly title: string;
+      readonly rationale: string;
+      readonly impacted_requirement_ids: readonly string[];
+      readonly impacted_component_ids?: readonly string[];
+      readonly proposed_tasks: readonly ChangeRequestProposedTaskSpec[];
+    }
+  ): Promise<ChangeRequestRecord> {
+    const res = await this.requestJson<ChangeRequestRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/change-requests`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
+  }
+
+  public async listPipelineChangeRequests(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string
+  ): Promise<ChangeRequestRecord[]> {
+    const res = await this.requestJson<{ change_requests: ChangeRequestRecord[] }>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/change-requests`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data.change_requests;
+  }
+
+  public async decidePipelineChangeRequest(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    crId: string,
+    input: {
+      readonly decision: "APPROVED" | "REJECTED";
+      readonly decision_rationale?: string | null;
+    }
+  ): Promise<ChangeRequestRecord> {
+    const res = await this.requestJson<ChangeRequestRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/change-requests/${encodeURIComponent(crId)}/decide`,
+      auth,
+      input,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async applyPipelineChangeRequest(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    crId: string
+  ): Promise<{
+    readonly changeRequest: ChangeRequestRecord;
+    readonly tasks: readonly TaskRecord[];
+    readonly taskLinks: readonly TaskPlanLinkRecord[];
+  }> {
+    const res = await this.requestJson<{
+      readonly changeRequest: ChangeRequestRecord;
+      readonly tasks: readonly TaskRecord[];
+      readonly taskLinks: readonly TaskPlanLinkRecord[];
+    }>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/change-requests/${encodeURIComponent(crId)}/apply`,
+      auth,
+      {},
+      [200]
+    );
+    return res.data;
+  }
+
+  public async getPipelineTraceabilityMatrix(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    query?: { readonly live_main_head_commit_hash?: string }
+  ): Promise<BidirectionalTraceabilityMatrix> {
+    const qs = new URLSearchParams();
+    if (query?.live_main_head_commit_hash) {
+      qs.set("live_main_head_commit_hash", query.live_main_head_commit_hash);
+    }
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    const res = await this.requestJson<BidirectionalTraceabilityMatrix>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/traceability${suffix}`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data;
+  }
+
+  public async issuePipelineReleasePackage(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string,
+    input: {
+      readonly live_main_head_commit_hash?: string;
+      readonly notes?: string;
+    } = {}
+  ): Promise<ReleaseAcceptancePackageRecord> {
+    const res = await this.requestJson<ReleaseAcceptancePackageRecord>(
+      "POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/release-package`,
+      auth,
+      input,
+      [201]
+    );
+    return res.data;
+  }
+
+  public async listPipelineReleasePackages(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    pipelineSessionId: string
+  ): Promise<ReleaseAcceptancePackageRecord[]> {
+    const res = await this.requestJson<{ release_packages: ReleaseAcceptancePackageRecord[] }>(
+      "GET",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/pipeline-sessions/${encodeURIComponent(
+        pipelineSessionId
+      )}/release-package`,
+      auth,
+      undefined,
+      [200]
+    );
+    return res.data.release_packages;
   }
 }

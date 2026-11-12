@@ -54,7 +54,7 @@ jobs:
       - name: TypeScript Typecheck
         run: npm run typecheck
 
-      - name: Verify PostgreSQL Migrations & RLS Matrix (RLS-T1..RLS-T8 + M4/M5/M6A)
+      - name: Verify PostgreSQL Migrations & RLS Matrix (RLS-T1..RLS-T8 + M4/M5/M6A/M6B)
         env:
           PGHOST: 127.0.0.1
           PGPORT: 5432
@@ -72,6 +72,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
           psql -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
@@ -79,6 +81,7 @@ jobs:
             v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
             v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
             v_task_a UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_task_a_cr UUID := 'a3333333-3333-3333-3333-333333333334';
             v_task_b UUID := 'b4444444-4444-4444-4444-444444444444';
             v_lease_a UUID := 'c3333333-3333-3333-3333-333333333333';
             v_lease_b UUID := 'c4444444-4444-4444-4444-444444444444';
@@ -108,10 +111,12 @@ jobs:
             v_pps_a UUID := '83333333-3333-3333-3333-333333333332';
             v_pps_a_act UUID := '83333333-3333-3333-3333-333333333333';
             v_pps_b UUID := '84444444-4444-4444-4444-444444444442';
+            v_pps_b_f UUID := '84444444-4444-4444-4444-444444444443';
             v_s1_fact_a UUID := '93333333-3333-3333-3333-333333333331';
             v_s1_assump_a UUID := '93333333-3333-3333-3333-333333333332';
             v_s1_act_unconf_a UUID := '93333333-3333-3333-3333-333333333333';
             v_s1_fact_b UUID := '94444444-4444-4444-4444-444444444441';
+            v_s1_b_f UUID := '94444444-4444-4444-4444-444444444442';
             v_sa1_a UUID := 'a5333333-3333-3333-3333-333333333331';
             v_sa2_a UUID := 'a5333333-3333-3333-3333-333333333332';
             v_sa3_a UUID := 'a5333333-3333-3333-3333-333333333333';
@@ -119,15 +124,45 @@ jobs:
             v_sa4_fail_a UUID := 'a5333333-3333-3333-3333-333333333335';
             v_sa4_a UUID := 'a5333333-3333-3333-3333-333333333334';
             v_sa1_b UUID := 'a5444444-4444-4444-4444-444444444441';
+            v_sa1_b_f UUID := 'a5444444-4444-4444-4444-444444444442';
+            v_sa2_b_f UUID := 'a5444444-4444-4444-4444-444444444443';
+            v_sa3_b_f UUID := 'a5444444-4444-4444-4444-444444444444';
+            v_sa4_b_f UUID := 'a5444444-4444-4444-4444-444444444445';
             v_sag1_a UUID := 'b5333333-3333-3333-3333-333333333331';
             v_sag4_old_pass_a UUID := 'b5333333-3333-3333-3333-333333333336';
             v_sag4_fail_a UUID := 'b5333333-3333-3333-3333-333333333335';
             v_sag4_a UUID := 'b5333333-3333-3333-3333-333333333334';
             v_sag1_b UUID := 'b5444444-4444-4444-4444-444444444441';
+            v_sag4_b_f UUID := 'b5444444-4444-4444-4444-444444444442';
             v_bsf_a UUID := 'c5333333-3333-3333-3333-333333333331';
+            v_bsf_b_f UUID := 'c5444444-4444-4444-4444-444444444441';
+            v_boot_a UUID := 'd5333333-3333-3333-3333-333333333331';
+            v_boot_b UUID := 'd5444444-4444-4444-4444-444444444441';
+            v_aop_a1 UUID := 'e5333333-3333-3333-3333-333333333331';
+            v_aop_a2 UUID := 'e5333333-3333-3333-3333-333333333332';
+            v_aop_b UUID := 'e5444444-4444-4444-4444-444444444441';
+            v_dm_a UUID := 'f5333333-3333-3333-3333-333333333331';
+            v_dm_b UUID := 'f5444444-4444-4444-4444-444444444441';
+            v_de_a UUID := 'f6333333-3333-3333-3333-333333333331';
+            v_de_b UUID := 'f6444444-4444-4444-4444-444444444441';
+            v_dus_a UUID := 'f7333333-3333-3333-3333-333333333331';
+            v_dus_b UUID := 'f7444444-4444-4444-4444-444444444441';
+            v_cr_a UUID := 'f8333333-3333-3333-3333-333333333331';
+            v_cr_a_pend UUID := 'f8333333-3333-3333-3333-333333333332';
+            v_cr_b UUID := 'f8444444-4444-4444-4444-444444444441';
+            v_rap_a UUID := 'f9333333-3333-3333-3333-333333333331';
+            v_rap_b UUID := 'f9444444-4444-4444-4444-444444444441';
             v_caught BOOLEAN := false;
           BEGIN
             -- Pre-clean any stale fixtures in FK-safe dependency order
+            DELETE FROM release_acceptance_packages WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM task_plan_links WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM change_requests WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM dev_user_stories WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM dev_epics WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM dev_milestones WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM project_bootstraps WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM agent_organization_profiles WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM baseline_spec_freezes WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM stage_approval_gates WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM stage_artifacts WHERE project_id IN (v_proj_a, v_proj_b);
@@ -160,8 +195,9 @@ jobs:
 
             INSERT INTO tasks (task_id, project_id, title, task_contract_json, status, base_main_commit_hash, current_attempt_no)
             VALUES
-              (v_task_a, v_proj_a, 'M4 Task A', '{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('1', 40), 1),
-              (v_task_b, v_proj_b, 'M4 Task B', '{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('2', 40), 1);
+              (v_task_a,    v_proj_a, 'M4 Task A',    '{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('1', 40), 1),
+              (v_task_a_cr, v_proj_a, 'M6B CR Task A','{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('1', 40), 1),
+              (v_task_b,    v_proj_b, 'M4 Task B',    '{"contract_version":"1.0"}'::jsonb, 'AwaitingHumanApproval', repeat('2', 40), 1);
 
             INSERT INTO task_leases (
               lease_id, project_id, task_id, attempt_no, lease_epoch, worker_id,
@@ -724,10 +760,209 @@ jobs:
             IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_ar_composite_binding') THEN
               RAISE EXCEPTION 'Missing unique constraint uq_ar_composite_binding';
             END IF;
+
+            -- M6B: Seed frozen Project B baseline for cross-tenant 8-table RLS SELECT isolation + Project A/B M6B fixtures & 0008 trigger probes
+            INSERT INTO product_pipeline_sessions (
+              pipeline_session_id, project_id, cost_session_id, title, raw_idea_text,
+              current_stage, status, created_by_principal_id
+            ) VALUES (
+              v_pps_b_f, v_proj_b, v_mcs_b, 'CI Frozen Pipeline B', 'Cross-tenant M6B isolation', 'STAGE_4_SPEC_FREEZE', 'ACTIVE', 'bob-dev'
+            );
+            INSERT INTO stage1_discovery_items (
+              item_id, project_id, pipeline_session_id, kind, title, statement, rationale, confirmation_status
+            ) VALUES (
+              v_s1_b_f, v_proj_b, v_pps_b_f, 'FACT', 'Fact B Frozen', 'B baseline fact', 'Given', 'AUTO_VERIFIED'
+            );
+            INSERT INTO stage_artifacts (
+              artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+              provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+            ) VALUES
+              (v_sa1_b_f, v_proj_b, v_pps_b_f, 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE', 1, 'anthropic', 'claude-sonnet-4', 'p1', '1.0.0', repeat('1', 64), '{"items":[]}'::jsonb, repeat('a', 64), 'bob-dev'),
+              (v_sa2_b_f, v_proj_b, v_pps_b_f, 'STAGE_2_REQUIREMENTS', 'STAGE_2_PRD_SRS', 1, 'openai', 'gpt-4.1', 'p2', '1.0.0', repeat('2', 64), jsonb_build_object('srs', jsonb_build_object('functional_requirements', jsonb_build_array(jsonb_build_object('req_id', 'FR-B1', 'source_discovery_item_ids', jsonb_build_array(v_s1_b_f::text))))), repeat('b', 64), 'bob-dev'),
+              (v_sa3_b_f, v_proj_b, v_pps_b_f, 'STAGE_3_ARCHITECTURE', 'STAGE_3_ARCHITECTURE_DESIGN', 1, 'google', 'gemini-2.5-pro', 'p3', '1.0.0', repeat('3', 64), '{"sections":5}'::jsonb, repeat('c', 64), 'bob-dev'),
+              (v_sa4_b_f, v_proj_b, v_pps_b_f, 'STAGE_4_SPEC_FREEZE', 'STAGE_4_VALIDATION_REPORT', 1, 'system', 'consistency-checker', 'p4', '1.0.0', repeat('4', 64), '{"passed":true}'::jsonb, repeat('d', 64), 'bob-approver');
+            INSERT INTO stage_approval_gates (
+              gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id,
+              target_artifact_sha256, approver_principal_id, decision
+            ) VALUES (
+              v_sag4_b_f, v_proj_b, v_pps_b_f, 'STAGE_4_SPEC_FREEZE', v_sa4_b_f, repeat('d', 64), 'bob-approver', 'APPROVED'
+            );
+            INSERT INTO baseline_spec_freezes (
+              baseline_id, project_id, pipeline_session_id,
+              stage1_artifact_id, stage1_artifact_sha256, stage2_artifact_id, stage2_artifact_sha256,
+              stage3_artifact_id, stage3_artifact_sha256, validation_report_artifact_id, validation_report_sha256,
+              approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+            ) VALUES (
+              v_bsf_b_f, v_proj_b, v_pps_b_f,
+              v_sa1_b_f, repeat('a', 64), v_sa2_b_f, repeat('b', 64), v_sa3_b_f, repeat('c', 64),
+              v_sa4_b_f, repeat('d', 64), v_sag4_b_f, 'bob-approver', repeat('e', 64)
+            );
+            UPDATE product_pipeline_sessions
+              SET status = 'FROZEN', frozen_baseline_id = v_bsf_b_f
+              WHERE pipeline_session_id = v_pps_b_f;
+
+            -- chk_aop_target_tier_mapping negative probe
+            v_caught := false;
+            BEGIN
+              INSERT INTO agent_organization_profiles (
+                profile_id, project_id, profile_key, role, principal_id,
+                provider, model, execution_target_type, trust_tier, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, 'bad-target-tier', 'DEVELOPER', 'dev-bad',
+                'anthropic', 'claude-sonnet-4', 'factory_managed_worker', 'TIER_4_REMOTE_SESSION', 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'chk_aop_target_tier_mapping failed'; END IF;
+
+            INSERT INTO agent_organization_profiles (
+              profile_id, project_id, profile_key, role, principal_id,
+              provider, model, execution_target_type, trust_tier, created_by_principal_id
+            ) VALUES
+              (v_aop_a1, v_proj_a, 'ci-dev-a', 'DEVELOPER',         'dev-a', 'anthropic', 'claude-sonnet-4', 'factory_managed_worker', 'TIER_1_FACTORY_MANAGED', 'alice-dev'),
+              (v_aop_a2, v_proj_a, 'ci-rev-a', 'REVIEWER_READONLY', 'rev-a', 'google',    'gemini-2.5-pro',  'provider_managed_vm',    'TIER_3_PROVIDER_VM',     'alice-dev'),
+              (v_aop_b,  v_proj_b, 'ci-dev-b', 'DEVELOPER',         'dev-b', 'openai',    'gpt-4.1',         'user_managed_worker',    'TIER_2_USER_MANAGED',    'bob-dev');
+
+            -- trg_pb_frozen_anchor negative probe on non-frozen baseline/session
+            v_caught := false;
+            BEGIN
+              INSERT INTO project_bootstraps (
+                bootstrap_id, project_id, pipeline_session_id, baseline_id,
+                repo_path, trusted_acceptance_dir, base_main_commit_hash,
+                protected_paths_json, trusted_policy_sha256, generated_files_json,
+                acceptance_tests_json, bootstrap_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, v_bsf_a,
+                '/tmp/unfrozen.git', '/tmp/unfrozen-acc', repeat('1', 40),
+                '["README.md"]'::jsonb, repeat('a', 64), '["README.md"]'::jsonb,
+                '[{"ac_id":"AC-1"}]'::jsonb, repeat('b', 64), 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation OR foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_pb_frozen_anchor failed on active session'; END IF;
+
+            INSERT INTO project_bootstraps (
+              bootstrap_id, project_id, pipeline_session_id, baseline_id,
+              repo_path, trusted_acceptance_dir, base_main_commit_hash,
+              protected_paths_json, trusted_policy_sha256, generated_files_json,
+              acceptance_tests_json, bootstrap_sha256, created_by_principal_id
+            ) VALUES
+              (v_boot_a, v_proj_a, v_pps_a,   v_bsf_a,   '/var/git/m4-a.git', '/var/acc/a', repeat('1', 40), '["README.md"]'::jsonb, repeat('a', 64), '["README.md"]'::jsonb, '[{"ac_id":"AC-1"}]'::jsonb, repeat('b', 64), 'alice-dev'),
+              (v_boot_b, v_proj_b, v_pps_b_f, v_bsf_b_f, '/var/git/m4-b.git', '/var/acc/b', repeat('2', 40), '["README.md"]'::jsonb, repeat('c', 64), '["README.md"]'::jsonb, '[{"ac_id":"AC-B1"}]'::jsonb, repeat('d', 64), 'bob-dev');
+
+            INSERT INTO dev_milestones (milestone_id, project_id, pipeline_session_id, baseline_id, milestone_key, title, description, sequence_order)
+            VALUES
+              (v_dm_a, v_proj_a, v_pps_a,   v_bsf_a,   'MS-A1', 'Milestone A1', 'CI milestone A', 0),
+              (v_dm_b, v_proj_b, v_pps_b_f, v_bsf_b_f, 'MS-B1', 'Milestone B1', 'CI milestone B', 0);
+
+            INSERT INTO dev_epics (epic_id, project_id, milestone_id, epic_key, title, description, sequence_order)
+            VALUES
+              (v_de_a, v_proj_a, v_dm_a, 'EP-A1', 'Epic A1', 'CI epic A', 0),
+              (v_de_b, v_proj_b, v_dm_b, 'EP-B1', 'Epic B1', 'CI epic B', 0);
+
+            INSERT INTO dev_user_stories (story_id, project_id, epic_id, story_key, title, description, requirement_ids_json, ac_ids_json, sequence_order)
+            VALUES
+              (v_dus_a, v_proj_a, v_de_a, 'ST-A1', 'Story A1', 'CI story A', '["FR-1"]'::jsonb,  '["AC-1"]'::jsonb,  0),
+              (v_dus_b, v_proj_b, v_de_b, 'ST-B1', 'Story B1', 'CI story B', '["FR-B1"]'::jsonb, '["AC-B1"]'::jsonb, 0);
+
+            -- trg_cr_frozen_anchor negative probe
+            v_caught := false;
+            BEGIN
+              INSERT INTO change_requests (
+                cr_id, project_id, pipeline_session_id, baseline_id,
+                cr_key, title, rationale, impacted_requirement_ids_json,
+                proposed_tasks_json, requested_by_principal_id, cr_sha256
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a_act, v_bsf_a,
+                'CR-UNFROZEN', 'T', 'R', '["FR-1"]'::jsonb,
+                '[{"task_key":"T1"}]'::jsonb, 'alice-dev', repeat('a', 64)
+              );
+            EXCEPTION WHEN check_violation OR foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_cr_frozen_anchor failed on active session'; END IF;
+
+            INSERT INTO change_requests (
+              cr_id, project_id, pipeline_session_id, baseline_id,
+              cr_key, title, rationale, impacted_requirement_ids_json,
+              proposed_tasks_json, requested_by_principal_id, cr_sha256
+            ) VALUES
+              (v_cr_a_pend, v_proj_a, v_pps_a,   v_bsf_a,   'CR-A-PEND', 'Pending CR',  'Stays pending', '["FR-1"]'::jsonb,  '[{"task_key":"TP"}]'::jsonb, 'alice-dev', repeat('1', 64)),
+              (v_cr_a,      v_proj_a, v_pps_a,   v_bsf_a,   'CR-A-APP',  'Applied CR',  'Apply helper',  '["FR-1"]'::jsonb,  '[{"task_key":"TA"}]'::jsonb, 'alice-dev', repeat('2', 64)),
+              (v_cr_b,      v_proj_b, v_pps_b_f, v_bsf_b_f, 'CR-B-1',    'Project B CR','Tenant B',      '["FR-B1"]'::jsonb, '[{"task_key":"TB"}]'::jsonb, 'bob-dev',   repeat('3', 64));
+
+            -- trg_tpl_invariants: PENDING_APPROVAL CR rejected in task_plan_links
+            v_caught := false;
+            BEGIN
+              INSERT INTO task_plan_links (
+                link_id, project_id, pipeline_session_id, baseline_id,
+                bootstrap_id, task_id, cr_id, requirement_ids_json, ac_ids_json
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a, v_bsf_a,
+                v_boot_a, v_task_a_cr, v_cr_a_pend, '["FR-1"]'::jsonb, '["AC-1"]'::jsonb
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_tpl_invariants allowed PENDING_APPROVAL CR'; END IF;
+
+            UPDATE change_requests
+              SET status = 'APPROVED', decided_by_principal_id = 'alice-approver',
+                  decision_rationale = 'Approved CR', decided_at = clock_timestamp(), updated_at = clock_timestamp()
+              WHERE cr_id = v_cr_a;
+
+            INSERT INTO task_plan_links (
+              link_id, project_id, pipeline_session_id, baseline_id,
+              bootstrap_id, story_id, task_id, cr_id, requirement_ids_json, ac_ids_json, assigned_profile_id
+            ) VALUES
+              (gen_random_uuid(), v_proj_a, v_pps_a,   v_bsf_a,   v_boot_a, v_dus_a, v_task_a,    NULL,   '["FR-1"]'::jsonb,  '["AC-1"]'::jsonb,  v_aop_a1),
+              (gen_random_uuid(), v_proj_a, v_pps_a,   v_bsf_a,   v_boot_a, NULL,    v_task_a_cr, v_cr_a, '["FR-1"]'::jsonb,  '["AC-1"]'::jsonb,  v_aop_a1),
+              (gen_random_uuid(), v_proj_b, v_pps_b_f, v_bsf_b_f, v_boot_b, v_dus_b, v_task_b,    NULL,   '["FR-B1"]'::jsonb, '["AC-B1"]'::jsonb, v_aop_b);
+
+            UPDATE change_requests
+              SET status = 'APPLIED', applied_by_principal_id = 'alice-dev',
+                  applied_at = clock_timestamp(), updated_at = clock_timestamp()
+              WHERE cr_id = v_cr_a;
+
+            -- trg_cr_transitions: terminal APPLIED CR cannot revert
+            v_caught := false;
+            BEGIN
+              UPDATE change_requests
+                SET status = 'PENDING_APPROVAL', decided_by_principal_id = NULL, decided_at = NULL,
+                    applied_by_principal_id = NULL, applied_at = NULL
+                WHERE cr_id = v_cr_a;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'trg_cr_transitions failed to block terminal APPLIED revert'; END IF;
+
+            -- chk_rap_complete_100 negative probe
+            v_caught := false;
+            BEGIN
+              INSERT INTO release_acceptance_packages (
+                release_id, project_id, pipeline_session_id, baseline_id,
+                traceability_sha256, coverage_percent, is_complete, total_requirements,
+                merged_task_ids_json, applied_cr_ids_json, main_head_commit_hash,
+                summary_markdown, package_json, package_sha256, accepted_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_a, v_pps_a, v_bsf_a,
+                repeat('a', 64), 95, false, 1,
+                '["t1"]'::jsonb, '[]'::jsonb, repeat('1', 40),
+                'incomplete', '{}'::jsonb, repeat('b', 64), 'alice-approver'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'chk_rap_complete_100 failed on < 100%% coverage'; END IF;
+
+            INSERT INTO release_acceptance_packages (
+              release_id, project_id, pipeline_session_id, baseline_id,
+              traceability_sha256, coverage_percent, is_complete, total_requirements,
+              merged_task_ids_json, applied_cr_ids_json, main_head_commit_hash,
+              summary_markdown, package_json, package_sha256, accepted_by_principal_id
+            ) VALUES
+              (v_rap_a, v_proj_a, v_pps_a,   v_bsf_a,   repeat('a', 64), 100, true, 1, jsonb_build_array(v_task_a::text, v_task_a_cr::text), jsonb_build_array(v_cr_a::text), repeat('1', 40), 'Release A', '{"complete":true}'::jsonb, repeat('b', 64), 'alice-approver'),
+              (v_rap_b, v_proj_b, v_pps_b_f, v_bsf_b_f, repeat('c', 64), 100, true, 1, jsonb_build_array(v_task_b::text), '[]'::jsonb, repeat('2', 40), 'Release B', '{"complete":true}'::jsonb, repeat('d', 64), 'bob-approver');
           END
           $$;
 
-          -- M4-FIX-07, M5 & M6A: Seeded Multi-Tenant RLS, Column GRANT & DISCARD ALL Probes under app_runtime
+          -- M4-FIX-07, M5, M6A & M6B: Seeded Multi-Tenant RLS, Column GRANT & DISCARD ALL Probes under app_runtime
           BEGIN;
           SET LOCAL ROLE app_runtime;
           DO $$
@@ -747,14 +982,18 @@ jobs:
             v_mcs_b           UUID := '84444444-4444-4444-4444-444444444441';
             v_pps_a_act       UUID := '83333333-3333-3333-3333-333333333333';
             v_pps_b           UUID := '84444444-4444-4444-4444-444444444442';
+            v_pps_b_f         UUID := '84444444-4444-4444-4444-444444444443';
             v_s1_act_unconf_a UUID := '93333333-3333-3333-3333-333333333333';
             v_sa1_b           UUID := 'a5444444-4444-4444-4444-444444444441';
+            v_bsf_b_f         UUID := 'c5444444-4444-4444-4444-444444444441';
+            v_aop_a1          UUID := 'e5333333-3333-3333-3333-333333333331';
+            v_cr_a_pend       UUID := 'f8333333-3333-3333-3333-333333333332';
             v_cnt INTEGER;
             v_caught BOOLEAN;
             v_forced BOOLEAN;
             tbl TEXT;
           BEGIN
-            -- Verify FORCE ROW LEVEL SECURITY on all 7 M6A tables
+            -- Verify FORCE ROW LEVEL SECURITY on all M6A (7) and M6B (8) tables
             FOREACH tbl IN ARRAY ARRAY[
               'model_cost_sessions',
               'model_call_ledgers',
@@ -762,7 +1001,15 @@ jobs:
               'stage1_discovery_items',
               'stage_artifacts',
               'stage_approval_gates',
-              'baseline_spec_freezes'
+              'baseline_spec_freezes',
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
             ]
             LOOP
               SELECT c.relforcerowsecurity INTO v_forced
@@ -789,7 +1036,15 @@ jobs:
               'stage1_discovery_items',
               'stage_artifacts',
               'stage_approval_gates',
-              'baseline_spec_freezes'
+              'baseline_spec_freezes',
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
             ]
             LOOP
               EXECUTE format('SELECT count(*) FROM %I', tbl) INTO v_cnt;
@@ -836,6 +1091,24 @@ jobs:
             SELECT count(*) INTO v_cnt FROM baseline_spec_freezes;
             IF v_cnt <> 1 THEN RAISE EXCEPTION 'baseline_spec_freezes tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
 
+            -- M6B Project A counts
+            SELECT count(*) INTO v_cnt FROM project_bootstraps;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'project_bootstraps tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM agent_organization_profiles;
+            IF v_cnt <> 2 THEN RAISE EXCEPTION 'agent_organization_profiles tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM dev_milestones;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'dev_milestones tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM dev_epics;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'dev_epics tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM dev_user_stories;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'dev_user_stories tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM change_requests;
+            IF v_cnt <> 2 THEN RAISE EXCEPTION 'change_requests tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM task_plan_links;
+            IF v_cnt <> 2 THEN RAISE EXCEPTION 'task_plan_links tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+            SELECT count(*) INTO v_cnt FROM release_acceptance_packages;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'release_acceptance_packages tenant SELECT mismatch for Project A: got %', v_cnt; END IF;
+
             FOREACH tbl IN ARRAY ARRAY[
               'model_cost_sessions',
               'model_call_ledgers',
@@ -843,7 +1116,15 @@ jobs:
               'stage1_discovery_items',
               'stage_artifacts',
               'stage_approval_gates',
-              'baseline_spec_freezes'
+              'baseline_spec_freezes',
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
             ]
             LOOP
               EXECUTE format('SELECT count(*) FROM %I WHERE project_id = $1', tbl) INTO v_cnt USING v_proj_b;
@@ -860,7 +1141,7 @@ jobs:
               1, 0, 'VERIFIER', 40, 1200, 16777216, 'docker', 'cgroup-v2'
             );
 
-            -- Same-tenant whitelisted UPDATE on model_cost_sessions & stage1_discovery_items succeeds
+            -- Same-tenant whitelisted UPDATE on model_cost_sessions, stage1_discovery_items, agent_organization_profiles & change_requests succeeds
             UPDATE model_cost_sessions
               SET tokens_used_total = 250, cost_used_micro_usd = 1250, updated_at = clock_timestamp()
               WHERE cost_session_id = v_mcs_a;
@@ -872,6 +1153,20 @@ jobs:
               WHERE item_id = v_s1_act_unconf_a;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 1 THEN RAISE EXCEPTION 'stage1_discovery_items whitelisted UPDATE failed: %', v_cnt; END IF;
+
+            UPDATE agent_organization_profiles
+              SET capabilities_json = '{"ci":true}'::jsonb, updated_at = clock_timestamp()
+              WHERE profile_id = v_aop_a1;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'agent_organization_profiles whitelisted UPDATE failed: %', v_cnt; END IF;
+
+            UPDATE change_requests
+              SET status = 'REJECTED', decided_by_principal_id = 'alice-approver',
+                  decision_rationale = 'ci-rls-probe', decided_at = clock_timestamp(),
+                  updated_at = clock_timestamp()
+              WHERE cr_id = v_cr_a_pend;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 1 THEN RAISE EXCEPTION 'change_requests whitelisted UPDATE failed: %', v_cnt; END IF;
 
             -- 3. Cross-tenant INSERT blocked (42501 insufficient_privilege; 23503 under SECURITY INVOKER RLS triggers)
             v_caught := false;
@@ -993,6 +1288,51 @@ jobs:
             END;
             IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into stage1_discovery_items was not blocked'; END IF;
 
+            v_caught := false;
+            BEGIN
+              INSERT INTO agent_organization_profiles (
+                profile_id, project_id, profile_key, role, principal_id,
+                provider, model, execution_target_type, trust_tier, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, 'intruder-prof', 'DEVELOPER', 'intruder',
+                'anthropic', 'claude-sonnet-4', 'factory_managed_worker', 'TIER_1_FACTORY_MANAGED', 'intruder'
+              );
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into agent_organization_profiles was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO project_bootstraps (
+                bootstrap_id, project_id, pipeline_session_id, baseline_id,
+                repo_path, trusted_acceptance_dir, base_main_commit_hash,
+                protected_paths_json, trusted_policy_sha256, generated_files_json,
+                acceptance_tests_json, bootstrap_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_pps_b_f, v_bsf_b_f,
+                '/tmp/intrusion.git', '/tmp/intrusion-acc', repeat('2', 40),
+                '["README.md"]'::jsonb, repeat('c', 64), '["README.md"]'::jsonb,
+                '[{"ac_id":"AC-B1"}]'::jsonb, repeat('d', 64), 'intruder'
+              );
+            EXCEPTION WHEN insufficient_privilege OR foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into project_bootstraps was not blocked'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO change_requests (
+                cr_id, project_id, pipeline_session_id, baseline_id,
+                cr_key, title, rationale, impacted_requirement_ids_json,
+                proposed_tasks_json, requested_by_principal_id, cr_sha256
+              ) VALUES (
+                gen_random_uuid(), v_proj_b, v_pps_b_f, v_bsf_b_f,
+                'CR-INTRUDER', 'Intrusion', 'Cross-tenant', '["FR-B1"]'::jsonb,
+                '[{"task_key":"T-INTR"}]'::jsonb, 'intruder', repeat('3', 64)
+              );
+            EXCEPTION WHEN insufficient_privilege OR foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION 'Cross-tenant INSERT into change_requests was not blocked'; END IF;
+
             -- 4. Cross-tenant UPDATE affects 0 rows & column-GRANT enforcement
             UPDATE review_sessions SET status = 'REVOKED' WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
@@ -1017,6 +1357,16 @@ jobs:
             UPDATE stage1_discovery_items SET resolution_note = 'hijack' WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified stage1_discovery_items rows: %', v_cnt; END IF;
+
+            UPDATE agent_organization_profiles SET is_active = FALSE WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified agent_organization_profiles rows: %', v_cnt; END IF;
+
+            UPDATE change_requests
+              SET status = 'REJECTED', decided_by_principal_id = 'intruder', decided_at = clock_timestamp()
+              WHERE project_id = v_proj_b;
+            GET DIAGNOSTICS v_cnt = ROW_COUNT;
+            IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant UPDATE modified change_requests rows: %', v_cnt; END IF;
 
             UPDATE projects SET main_ref_commit_hash = repeat('9', 40), updated_at = clock_timestamp() WHERE project_id = v_proj_a;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
@@ -1058,11 +1408,29 @@ jobs:
               RAISE EXCEPTION 'Non-whitelisted UPDATE on stage1_discovery_items.statement was unexpectedly allowed';
             END IF;
 
+            v_caught := false;
+            BEGIN
+              UPDATE agent_organization_profiles SET profile_key = 'hijacked-key' WHERE profile_id = v_aop_a1;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Non-whitelisted UPDATE on agent_organization_profiles.profile_key was unexpectedly allowed';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE change_requests SET rationale = 'hijacked-rationale' WHERE cr_id = v_cr_a_pend;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'Non-whitelisted UPDATE on change_requests.rationale was unexpectedly allowed';
+            END IF;
+
             UPDATE projects SET main_ref_commit_hash = repeat('9', 40) WHERE project_id = v_proj_b;
             GET DIAGNOSTICS v_cnt = ROW_COUNT;
             IF v_cnt <> 0 THEN RAISE EXCEPTION 'Cross-tenant projects UPDATE modified Project B rows: %', v_cnt; END IF;
 
-            -- 5. Append-only UPDATE denied on append-only tables, DELETE denied on M4/M5/M6A tables for app_runtime
+            -- 5. Append-only UPDATE denied on append-only tables, DELETE denied on M4/M5/M6A/M6B tables for app_runtime
             v_caught := false;
             BEGIN
               UPDATE resource_usage_metrics SET wall_time_ms = 0 WHERE project_id = v_proj_a;
@@ -1108,6 +1476,60 @@ jobs:
               RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on baseline_spec_freezes';
             END IF;
 
+            v_caught := false;
+            BEGIN
+              UPDATE project_bootstraps SET repo_path = '/tmp/hijack' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on project_bootstraps';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE dev_milestones SET title = 'Hijacked' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on dev_milestones';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE dev_epics SET title = 'Hijacked' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on dev_epics';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE dev_user_stories SET title = 'Hijacked' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on dev_user_stories';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE task_plan_links SET assigned_profile_id = NULL WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on task_plan_links';
+            END IF;
+
+            v_caught := false;
+            BEGIN
+              UPDATE release_acceptance_packages SET summary_markdown = 'Hijacked' WHERE project_id = v_proj_a;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN
+              RAISE EXCEPTION 'UPDATE privilege unexpectedly allowed for app_runtime on release_acceptance_packages';
+            END IF;
+
             FOREACH tbl IN ARRAY ARRAY[
               'review_sessions',
               'approval_requests',
@@ -1119,7 +1541,15 @@ jobs:
               'stage1_discovery_items',
               'stage_artifacts',
               'stage_approval_gates',
-              'baseline_spec_freezes'
+              'baseline_spec_freezes',
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
             ]
             LOOP
               v_caught := false;
@@ -1181,7 +1611,15 @@ jobs:
               'stage1_discovery_items',
               'stage_artifacts',
               'stage_approval_gates',
-              'baseline_spec_freezes'
+              'baseline_spec_freezes',
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
             ]
             LOOP
               EXECUTE format('SELECT count(*) FROM %I', tbl) INTO v_cnt;
@@ -1191,12 +1629,20 @@ jobs:
           $$;
           COMMIT;
 
-          -- Cleanup M4/M5/M6A CI fixtures cleanly as owner
+          -- Cleanup M4/M5/M6A/M6B CI fixtures cleanly as owner
           DO $$
           DECLARE
             v_proj_a UUID := '33333333-3333-3333-3333-333333333333';
             v_proj_b UUID := '44444444-4444-4444-4444-444444444444';
           BEGIN
+            DELETE FROM release_acceptance_packages WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM task_plan_links WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM change_requests WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM dev_user_stories WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM dev_epics WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM dev_milestones WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM project_bootstraps WHERE project_id IN (v_proj_a, v_proj_b);
+            DELETE FROM agent_organization_profiles WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM baseline_spec_freezes WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM stage_approval_gates WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM stage_artifacts WHERE project_id IN (v_proj_a, v_proj_b);
@@ -1220,7 +1666,7 @@ jobs:
             DELETE FROM audit_logs WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM project_memberships WHERE project_id IN (v_proj_a, v_proj_b);
             DELETE FROM projects WHERE project_id IN (v_proj_a, v_proj_b);
-            RAISE NOTICE 'M4, M5 & M6A Seeded Multi-Tenant RLS, Column-GRANT & Composite FK Matrix PASSED.';
+            RAISE NOTICE 'M4, M5, M6A & M6B Seeded Multi-Tenant RLS, Column-GRANT & Composite FK Matrix PASSED.';
           END
           $$;
           SQL
@@ -1296,7 +1742,7 @@ jobs:
           $$;
           SQL
 
-          # 3. Apply upgraded HEAD 0004, 0005, 0006 & 0007 twice (upgrade + idempotent re-run) on pre-populated DB
+          # 3. Apply upgraded HEAD 0004, 0005, 0006, 0007 & 0008 twice (upgrade + idempotent re-run) on pre-populated DB
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql
@@ -1305,6 +1751,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
           # 4. Assert upgraded constraints actually replaced the old definitions
@@ -1406,7 +1854,7 @@ jobs:
               RAISE EXCEPTION 'Upgraded 10-column fk_ad_approval_request failed to reject mismatched approval_request_id';
             END IF;
 
-            -- M6A tables & FORCE RLS + AC-10 + 0007 hardening check on upgraded DB
+            -- M6A & M6B tables & FORCE RLS + AC-10 + 0007 + 0008 hardening check on upgraded DB
             FOREACH m6a_tbl IN ARRAY ARRAY[
               'model_cost_sessions',
               'model_call_ledgers',
@@ -1414,7 +1862,15 @@ jobs:
               'stage1_discovery_items',
               'stage_artifacts',
               'stage_approval_gates',
-              'baseline_spec_freezes'
+              'baseline_spec_freezes',
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
             ]
             LOOP
               SELECT c.relforcerowsecurity INTO v_forced
@@ -1465,8 +1921,38 @@ jobs:
             ) THEN
               RAISE EXCEPTION 'Upgraded DB missing fk_mcs_pipeline_session constraint';
             END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'chk_aop_target_tier_mapping' AND conrelid = 'agent_organization_profiles'::regclass
+            ) THEN
+              RAISE EXCEPTION 'Upgraded DB missing chk_aop_target_tier_mapping constraint';
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'chk_rap_complete_100' AND conrelid = 'release_acceptance_packages'::regclass
+            ) THEN
+              RAISE EXCEPTION 'Upgraded DB missing chk_rap_complete_100 constraint';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_pb_frozen_anchor') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_pb_frozen_anchor trigger';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_dm_frozen_anchor') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_dm_frozen_anchor trigger';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_cr_frozen_anchor') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_cr_frozen_anchor trigger';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_rap_frozen_anchor') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_rap_frozen_anchor trigger';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_cr_transitions') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_cr_transitions trigger';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_tpl_invariants') THEN
+              RAISE EXCEPTION 'Upgraded DB missing trg_tpl_invariants trigger';
+            END IF;
 
-            RAISE NOTICE 'M4, M5 & M6A Upgrade Path Verification (86076639 -> HEAD) PASSED.';
+            RAISE NOTICE 'M4, M5, M6A & M6B Upgrade Path Verification (86076639 -> HEAD) PASSED.';
           END
           $$;
           BEGIN;
@@ -1575,12 +2061,14 @@ jobs:
           $$;
           SQL
 
-          # 3. Apply HEAD 0007_m6a_review_fixes.sql twice (upgrade + idempotency) + 0002 RLS matrix
+          # 3. Apply HEAD 0007_m6a_review_fixes.sql & 0008_m6b_stages_5_9_and_traceability.sql twice (upgrade + idempotency) + 0002 RLS matrix
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
-          # 4. Assert M6A-FIX-01..03, 07 and Minor Notes 1, 5, 6, 7, 8, 17, 18 on upgraded DB
+          # 4. Assert M6A-FIX-01..03, 07, Minor Notes 1, 5, 6, 7, 8, 17, 18 & M6B 0008 on upgraded DB
           psql -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
           DECLARE
@@ -1596,6 +2084,8 @@ jobs:
             v_sag_v2 UUID := 'b5333333-3333-3333-3333-333333333332';
             v_bsf    UUID := 'c5333333-3333-3333-3333-333333333331';
             v_caught BOOLEAN := false;
+            v_forced BOOLEAN;
+            m6b_tbl  TEXT;
           BEGIN
             -- M6A-FIX-01
             v_caught := false;
@@ -1683,6 +2173,26 @@ jobs:
             EXCEPTION WHEN check_violation THEN v_caught := true;
             END;
             IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: trg_sag_mutable_until_frozen failed'; END IF;
+
+            -- Verify all 8 M6B tables have FORCE ROW LEVEL SECURITY
+            FOREACH m6b_tbl IN ARRAY ARRAY[
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
+            ]
+            LOOP
+              SELECT c.relforcerowsecurity INTO v_forced
+              FROM pg_class c
+              WHERE c.relname = m6b_tbl AND c.relnamespace = 'public'::regnamespace;
+              IF v_forced IS NOT TRUE THEN
+                RAISE EXCEPTION '8044774 upgrade: missing FORCE ROW LEVEL SECURITY on %', m6b_tbl;
+              END IF;
+            END LOOP;
           END
           $$;
           BEGIN;
@@ -1693,19 +2203,399 @@ jobs:
             set_config('app.current_role', 'core_api_service', true);
           DO $$
           DECLARE
+            v_proj   UUID := '33333333-3333-3333-3333-333333333333';
+            v_pps    UUID := '83333333-3333-3333-3333-333333333332';
+            v_bsf    UUID := 'c5333333-3333-3333-3333-333333333331';
             v_caught BOOLEAN := false;
           BEGIN
             BEGIN
-              UPDATE stage_artifacts SET model = 'tampered' WHERE project_id = '33333333-3333-3333-3333-333333333333'::uuid;
+              UPDATE stage_artifacts SET model = 'tampered' WHERE project_id = v_proj;
             EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
             END;
             IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: REVOKE UPDATE on stage_artifacts failed'; END IF;
+
+            -- M6B runtime checks under app_runtime on upgraded DB
+            v_caught := false;
+            BEGIN
+              INSERT INTO agent_organization_profiles (
+                profile_id, project_id, profile_key, role, principal_id,
+                provider, model, execution_target_type, trust_tier, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj, 'bad-upg-tier', 'DEVELOPER', 'dev-bad',
+                'anthropic', 'claude-sonnet-4', 'factory_managed_worker', 'TIER_2_USER_MANAGED', 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '8044774 upgrade: chk_aop_target_tier_mapping failed under app_runtime'; END IF;
+
+            INSERT INTO agent_organization_profiles (
+              profile_id, project_id, profile_key, role, principal_id,
+              provider, model, execution_target_type, trust_tier, created_by_principal_id
+            ) VALUES (
+              gen_random_uuid(), v_proj, 'upg-dev', 'DEVELOPER', 'dev-upg',
+              'anthropic', 'claude-sonnet-4', 'factory_managed_worker', 'TIER_1_FACTORY_MANAGED', 'alice-dev'
+            );
+
+            INSERT INTO change_requests (
+              cr_id, project_id, pipeline_session_id, baseline_id,
+              cr_key, title, rationale, impacted_requirement_ids_json,
+              proposed_tasks_json, requested_by_principal_id, cr_sha256
+            ) VALUES (
+              gen_random_uuid(), v_proj, v_pps, v_bsf,
+              'CR-8044774-UPG', 'Upgrade CR', 'Verify M6B CR post upgrade', '["FR-1"]'::jsonb,
+              '[{"task_key":"T-UPG"}]'::jsonb, 'alice-dev', repeat('a', 64)
+            );
           END
           $$;
           COMMIT;
           SQL
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6a_upgrade_test;"
+
+      - name: Verify Upgrade Path from M6A Hardened Schema (6f1faa8 -> HEAD)
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGDATABASE: software_factory_m6b_upgrade_test
+          PGUSER: factory_admin
+          PGPASSWORD: factory_secret_password
+        run: |
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6b_upgrade_test;"
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE software_factory_m6b_upgrade_test;"
+
+          # 1. Install hardened M6A schema baseline (commit 6f1faa8)
+          git show 6f1faa8:packages/database/migrations/0001_mvp_core_schema_and_rls.sql | psql -v ON_ERROR_STOP=1
+          git show 6f1faa8:packages/database/migrations/0003_m3_candidate_snapshot_and_verifier_tiers.sql | psql -v ON_ERROR_STOP=1
+          git show 6f1faa8:packages/database/migrations/0004_m4_reviewer_sessions_approval_ttl_and_merge_ops.sql | psql -v ON_ERROR_STOP=1
+          git show 6f1faa8:packages/database/migrations/0005_m5_resource_metrics_and_runtime_pool.sql | psql -v ON_ERROR_STOP=1
+          git show 6f1faa8:packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql | psql -v ON_ERROR_STOP=1
+          git show 6f1faa8:packages/database/migrations/0007_m6a_review_fixes.sql | psql -v ON_ERROR_STOP=1
+
+          # 2. Seed hardened M6A project + FROZEN baseline + ACTIVE session BEFORE applying 0008
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            v_proj    UUID := '33333333-3333-3333-3333-333333333333';
+            v_task    UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_task_cr UUID := 'a3333333-3333-3333-3333-333333333334';
+            v_mcs     UUID := '83333333-3333-3333-3333-333333333331';
+            v_pps     UUID := '83333333-3333-3333-3333-333333333332';
+            v_pps_act UUID := '83333333-3333-3333-3333-333333333333';
+            v_fact    UUID := '93333333-3333-3333-3333-333333333331';
+            v_assump  UUID := '93333333-3333-3333-3333-333333333332';
+            v_sa1     UUID := 'a5333333-3333-3333-3333-333333333331';
+            v_sa2     UUID := 'a5333333-3333-3333-3333-333333333332';
+            v_sa3     UUID := 'a5333333-3333-3333-3333-333333333333';
+            v_sa4     UUID := 'a5333333-3333-3333-3333-333333333334';
+            v_sag4    UUID := 'b5333333-3333-3333-3333-333333333331';
+            v_bsf     UUID := 'c5333333-3333-3333-3333-333333333331';
+          BEGIN
+            INSERT INTO projects (project_id, slug, name, repo_bare_path, default_branch, approval_ttl_seconds)
+            VALUES (v_proj, 'm6b-upg-proj', 'M6B Upgrade Test', '/var/git/m6b-upg.git', 'main', 3600);
+
+            INSERT INTO tasks (task_id, project_id, title, task_contract_json, status, base_main_commit_hash, current_attempt_no)
+            VALUES
+              (v_task,    v_proj, 'Pre-0008 Plan Task', '{"contract_version":"1.0"}'::jsonb, 'MergedAndCompleted', repeat('1', 40), 1),
+              (v_task_cr, v_proj, 'Pre-0008 CR Task',   '{"contract_version":"1.0"}'::jsonb, 'MergedAndCompleted', repeat('1', 40), 1);
+
+            INSERT INTO model_cost_sessions (
+              cost_session_id, project_id, pipeline_session_id,
+              max_tokens_per_request, max_cost_micro_usd_per_request,
+              session_token_budget, session_cost_budget_micro_usd
+            ) VALUES (v_mcs, v_proj, v_pps, 4000, 100000, 20000, 500000);
+
+            INSERT INTO product_pipeline_sessions (
+              pipeline_session_id, project_id, cost_session_id, title, raw_idea_text,
+              current_stage, status, created_by_principal_id
+            ) VALUES
+              (v_pps,     v_proj, v_mcs, 'Frozen 6f1faa8 Session', 'Upgrade to M6B', 'STAGE_4_SPEC_FREEZE', 'ACTIVE', 'alice-dev'),
+              (v_pps_act, v_proj, v_mcs, 'Active 6f1faa8 Session', 'Unfrozen guard', 'STAGE_1_IDEA_DISCOVERY', 'ACTIVE', 'alice-dev');
+
+            INSERT INTO stage1_discovery_items (
+              item_id, project_id, pipeline_session_id, kind, title, statement, rationale,
+              clarification_question, confirmation_status, confirmed_by_principal_id, confirmed_at
+            ) VALUES
+              (v_fact,   v_proj, v_pps, 'FACT',       'Fact 1',   'Given fact', 'G', NULL,           'AUTO_VERIFIED', NULL,             NULL),
+              (v_assump, v_proj, v_pps, 'ASSUMPTION', 'Assump 1', 'Confirmed',  'R', 'Confirm SLA?', 'CONFIRMED',     'alice-approver', clock_timestamp());
+
+            INSERT INTO stage_artifacts (
+              artifact_id, project_id, pipeline_session_id, stage, artifact_kind, version,
+              provider, model, prompt_id, prompt_version, prompt_sha256, content_json, artifact_sha256, created_by_principal_id
+            ) VALUES
+              (v_sa1, v_proj, v_pps, 'STAGE_1_IDEA_DISCOVERY', 'STAGE_1_DISCOVERY_BUNDLE',    1, 'anthropic', 'claude-sonnet-4', 'p1', '1.0.0', repeat('1', 64), '{"items":[]}'::jsonb, repeat('a', 64), 'alice-dev'),
+              (v_sa2, v_proj, v_pps, 'STAGE_2_REQUIREMENTS',   'STAGE_2_PRD_SRS',             1, 'openai',    'gpt-4.1',         'p2', '1.0.0', repeat('2', 64), jsonb_build_object('srs', jsonb_build_object('functional_requirements', jsonb_build_array(jsonb_build_object('req_id', 'FR-1', 'source_discovery_item_ids', jsonb_build_array(v_fact::text, v_assump::text))))), repeat('b', 64), 'alice-dev'),
+              (v_sa3, v_proj, v_pps, 'STAGE_3_ARCHITECTURE',   'STAGE_3_ARCHITECTURE_DESIGN', 1, 'google',    'gemini-2.5-pro',  'p3', '1.0.0', repeat('3', 64), '{}'::jsonb, repeat('c', 64), 'alice-dev'),
+              (v_sa4, v_proj, v_pps, 'STAGE_4_SPEC_FREEZE',    'STAGE_4_VALIDATION_REPORT',   1, 'system',    'consistency-checker', 'p4', '1.0.0', repeat('4', 64), '{"passed":true}'::jsonb, repeat('d', 64), 'alice-approver');
+
+            INSERT INTO stage_approval_gates (
+              gate_id, project_id, pipeline_session_id, gate_stage, target_artifact_id,
+              target_artifact_sha256, approver_principal_id, decision
+            ) VALUES (v_sag4, v_proj, v_pps, 'STAGE_4_SPEC_FREEZE', v_sa4, repeat('d', 64), 'bob-approver', 'APPROVED');
+
+            INSERT INTO baseline_spec_freezes (
+              baseline_id, project_id, pipeline_session_id,
+              stage1_artifact_id, stage1_artifact_sha256,
+              stage2_artifact_id, stage2_artifact_sha256,
+              stage3_artifact_id, stage3_artifact_sha256,
+              validation_report_artifact_id, validation_report_sha256,
+              approval_gate_id, frozen_by_principal_id, freeze_bundle_sha256
+            ) VALUES (
+              v_bsf, v_proj, v_pps,
+              v_sa1, repeat('a', 64), v_sa2, repeat('b', 64), v_sa3, repeat('c', 64),
+              v_sa4, repeat('d', 64), v_sag4, 'bob-approver', repeat('9', 64)
+            );
+            UPDATE product_pipeline_sessions
+              SET status = 'FROZEN', frozen_baseline_id = v_bsf
+              WHERE pipeline_session_id = v_pps;
+          END
+          $$;
+          SQL
+
+          # 3. Apply HEAD 0008_m6b_stages_5_9_and_traceability.sql twice (upgrade + idempotency) + 0002 RLS matrix
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
+
+          # 4. Assert M6B schema, FORCE RLS, triggers, CHECK constraints & full Stage 5-9 runtime workflow
+          psql -v ON_ERROR_STOP=1 <<'SQL'
+          DO $$
+          DECLARE
+            v_forced BOOLEAN;
+            m6b_tbl  TEXT;
+          BEGIN
+            FOREACH m6b_tbl IN ARRAY ARRAY[
+              'project_bootstraps',
+              'agent_organization_profiles',
+              'dev_milestones',
+              'dev_epics',
+              'dev_user_stories',
+              'change_requests',
+              'task_plan_links',
+              'release_acceptance_packages'
+            ]
+            LOOP
+              SELECT c.relforcerowsecurity INTO v_forced
+              FROM pg_class c
+              WHERE c.relname = m6b_tbl AND c.relnamespace = 'public'::regnamespace;
+              IF v_forced IS NOT TRUE THEN
+                RAISE EXCEPTION '6f1faa8 upgrade: missing FORCE ROW LEVEL SECURITY on %', m6b_tbl;
+              END IF;
+            END LOOP;
+
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'chk_aop_target_tier_mapping' AND conrelid = 'agent_organization_profiles'::regclass
+            ) THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing chk_aop_target_tier_mapping';
+            END IF;
+            IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint
+              WHERE conname = 'chk_rap_complete_100' AND conrelid = 'release_acceptance_packages'::regclass
+            ) THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing chk_rap_complete_100';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_pb_frozen_anchor') THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing trg_pb_frozen_anchor';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_dm_frozen_anchor') THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing trg_dm_frozen_anchor';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_cr_frozen_anchor') THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing trg_cr_frozen_anchor';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_rap_frozen_anchor') THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing trg_rap_frozen_anchor';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_cr_transitions') THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing trg_cr_transitions';
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'trg_tpl_invariants') THEN
+              RAISE EXCEPTION '6f1faa8 upgrade: missing trg_tpl_invariants';
+            END IF;
+          END
+          $$;
+          BEGIN;
+          SET LOCAL ROLE app_runtime;
+          SELECT
+            set_config('app.current_project_id', '33333333-3333-3333-3333-333333333333', true),
+            set_config('app.current_principal_id', 'core-api', true),
+            set_config('app.current_role', 'core_api_service', true);
+          DO $$
+          DECLARE
+            v_proj    UUID := '33333333-3333-3333-3333-333333333333';
+            v_task    UUID := 'a3333333-3333-3333-3333-333333333333';
+            v_task_cr UUID := 'a3333333-3333-3333-3333-333333333334';
+            v_pps     UUID := '83333333-3333-3333-3333-333333333332';
+            v_pps_act UUID := '83333333-3333-3333-3333-333333333333';
+            v_bsf     UUID := 'c5333333-3333-3333-3333-333333333331';
+            v_boot    UUID := 'd5333333-3333-3333-3333-333333333331';
+            v_aop     UUID := 'e5333333-3333-3333-3333-333333333331';
+            v_dm      UUID := 'f5333333-3333-3333-3333-333333333331';
+            v_de      UUID := 'f6333333-3333-3333-3333-333333333331';
+            v_dus     UUID := 'f7333333-3333-3333-3333-333333333331';
+            v_cr      UUID := 'f8333333-3333-3333-3333-333333333331';
+            v_caught  BOOLEAN := false;
+          BEGIN
+            -- chk_aop_target_tier_mapping negative + valid profile insert
+            BEGIN
+              INSERT INTO agent_organization_profiles (
+                profile_id, project_id, profile_key, role, principal_id,
+                provider, model, execution_target_type, trust_tier, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj, 'bad-6f-tier', 'DEVELOPER', 'dev-bad',
+                'anthropic', 'claude-sonnet-4', 'remote_agent_session', 'TIER_1_FACTORY_MANAGED', 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '6f1faa8 upgrade: chk_aop_target_tier_mapping failed'; END IF;
+
+            INSERT INTO agent_organization_profiles (
+              profile_id, project_id, profile_key, role, principal_id,
+              provider, model, execution_target_type, trust_tier, created_by_principal_id
+            ) VALUES (
+              v_aop, v_proj, 'upg-6f-dev', 'DEVELOPER', 'dev-6f',
+              'anthropic', 'claude-sonnet-4', 'factory_managed_worker', 'TIER_1_FACTORY_MANAGED', 'alice-dev'
+            );
+
+            -- trg_pb_frozen_anchor negative on active session + valid bootstrap
+            v_caught := false;
+            BEGIN
+              INSERT INTO project_bootstraps (
+                bootstrap_id, project_id, pipeline_session_id, baseline_id,
+                repo_path, trusted_acceptance_dir, base_main_commit_hash,
+                protected_paths_json, trusted_policy_sha256, generated_files_json,
+                acceptance_tests_json, bootstrap_sha256, created_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_pps_act, v_bsf,
+                '/tmp/bad.git', '/tmp/bad-acc', repeat('1', 40),
+                '["README.md"]'::jsonb, repeat('a', 64), '["README.md"]'::jsonb,
+                '[{"ac_id":"AC-1"}]'::jsonb, repeat('b', 64), 'alice-dev'
+              );
+            EXCEPTION WHEN check_violation OR foreign_key_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '6f1faa8 upgrade: trg_pb_frozen_anchor failed on active session'; END IF;
+
+            INSERT INTO project_bootstraps (
+              bootstrap_id, project_id, pipeline_session_id, baseline_id,
+              repo_path, trusted_acceptance_dir, base_main_commit_hash,
+              protected_paths_json, trusted_policy_sha256, generated_files_json,
+              acceptance_tests_json, bootstrap_sha256, created_by_principal_id
+            ) VALUES (
+              v_boot, v_proj, v_pps, v_bsf,
+              '/var/git/m6b-upg.git', '/var/acc/m6b-upg', repeat('1', 40),
+              '["README.md"]'::jsonb, repeat('a', 64), '["README.md"]'::jsonb,
+              '[{"ac_id":"AC-1"}]'::jsonb, repeat('b', 64), 'alice-dev'
+            );
+
+            INSERT INTO dev_milestones (milestone_id, project_id, pipeline_session_id, baseline_id, milestone_key, title, description, sequence_order)
+            VALUES (v_dm, v_proj, v_pps, v_bsf, 'MS-1', 'Milestone 1', 'Post-6f1faa8 MS', 0);
+
+            INSERT INTO dev_epics (epic_id, project_id, milestone_id, epic_key, title, description, sequence_order)
+            VALUES (v_de, v_proj, v_dm, 'EP-1', 'Epic 1', 'Post-6f1faa8 EP', 0);
+
+            INSERT INTO dev_user_stories (story_id, project_id, epic_id, story_key, title, description, requirement_ids_json, ac_ids_json, sequence_order)
+            VALUES (v_dus, v_proj, v_de, 'ST-1', 'Story 1', 'Post-6f1faa8 ST', '["FR-1"]'::jsonb, '["AC-1"]'::jsonb, 0);
+
+            INSERT INTO change_requests (
+              cr_id, project_id, pipeline_session_id, baseline_id,
+              cr_key, title, rationale, impacted_requirement_ids_json,
+              proposed_tasks_json, requested_by_principal_id, cr_sha256
+            ) VALUES (
+              v_cr, v_proj, v_pps, v_bsf,
+              'CR-6F-1', 'Upgrade CR', 'Verify CR gate', '["FR-1"]'::jsonb,
+              '[{"task_key":"T-CR"}]'::jsonb, 'alice-dev', repeat('a', 64)
+            );
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO task_plan_links (
+                link_id, project_id, pipeline_session_id, baseline_id,
+                bootstrap_id, task_id, cr_id, requirement_ids_json, ac_ids_json
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_pps, v_bsf,
+                v_boot, v_task_cr, v_cr, '["FR-1"]'::jsonb, '["AC-1"]'::jsonb
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '6f1faa8 upgrade: trg_tpl_invariants allowed unapproved CR'; END IF;
+
+            UPDATE change_requests
+              SET status = 'APPROVED', decided_by_principal_id = 'alice-approver',
+                  decision_rationale = 'Approved CR', decided_at = clock_timestamp(), updated_at = clock_timestamp()
+              WHERE cr_id = v_cr;
+
+            INSERT INTO task_plan_links (
+              link_id, project_id, pipeline_session_id, baseline_id,
+              bootstrap_id, story_id, task_id, cr_id, requirement_ids_json, ac_ids_json, assigned_profile_id
+            ) VALUES
+              (gen_random_uuid(), v_proj, v_pps, v_bsf, v_boot, v_dus, v_task,    NULL, '["FR-1"]'::jsonb, '["AC-1"]'::jsonb, v_aop),
+              (gen_random_uuid(), v_proj, v_pps, v_bsf, v_boot, NULL,  v_task_cr, v_cr, '["FR-1"]'::jsonb, '["AC-1"]'::jsonb, v_aop);
+
+            UPDATE change_requests
+              SET status = 'APPLIED', applied_by_principal_id = 'alice-dev',
+                  applied_at = clock_timestamp(), updated_at = clock_timestamp()
+              WHERE cr_id = v_cr;
+
+            v_caught := false;
+            BEGIN
+              UPDATE change_requests
+                SET status = 'PENDING_APPROVAL', decided_by_principal_id = NULL, decided_at = NULL,
+                    applied_by_principal_id = NULL, applied_at = NULL
+                WHERE cr_id = v_cr;
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '6f1faa8 upgrade: trg_cr_transitions allowed APPLIED revert'; END IF;
+
+            v_caught := false;
+            BEGIN
+              INSERT INTO release_acceptance_packages (
+                release_id, project_id, pipeline_session_id, baseline_id,
+                traceability_sha256, coverage_percent, is_complete, total_requirements,
+                merged_task_ids_json, applied_cr_ids_json, main_head_commit_hash,
+                summary_markdown, package_json, package_sha256, accepted_by_principal_id
+              ) VALUES (
+                gen_random_uuid(), v_proj, v_pps, v_bsf,
+                repeat('a', 64), 95, false, 1,
+                jsonb_build_array(v_task::text), '[]'::jsonb, repeat('1', 40),
+                'incomplete', '{}'::jsonb, repeat('b', 64), 'alice-approver'
+              );
+            EXCEPTION WHEN check_violation THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '6f1faa8 upgrade: chk_rap_complete_100 failed'; END IF;
+
+            INSERT INTO release_acceptance_packages (
+              release_id, project_id, pipeline_session_id, baseline_id,
+              traceability_sha256, coverage_percent, is_complete, total_requirements,
+              merged_task_ids_json, applied_cr_ids_json, main_head_commit_hash,
+              summary_markdown, package_json, package_sha256, accepted_by_principal_id
+            ) VALUES (
+              gen_random_uuid(), v_proj, v_pps, v_bsf,
+              repeat('a', 64), 100, true, 1,
+              jsonb_build_array(v_task::text, v_task_cr::text), jsonb_build_array(v_cr::text), repeat('1', 40),
+              'Complete Release', '{"complete":true}'::jsonb, repeat('c', 64), 'alice-approver'
+            );
+
+            v_caught := false;
+            BEGIN
+              UPDATE project_bootstraps SET repo_path = '/tmp/hijack' WHERE project_id = v_proj;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '6f1faa8 upgrade: append-only UPDATE on project_bootstraps allowed'; END IF;
+
+            v_caught := false;
+            BEGIN
+              DELETE FROM change_requests WHERE cr_id = v_cr;
+            EXCEPTION WHEN insufficient_privilege THEN v_caught := true;
+            END;
+            IF NOT v_caught THEN RAISE EXCEPTION '6f1faa8 upgrade: DELETE on change_requests allowed'; END IF;
+
+            RAISE NOTICE 'M6B Upgrade Path Verification (6f1faa8 -> HEAD) PASSED.';
+          END
+          $$;
+          COMMIT;
+          SQL
+
+          PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6b_upgrade_test;"
 
       - name: Prepare Optional Docker Verifier Base Image
         run: docker pull node:22-alpine || true

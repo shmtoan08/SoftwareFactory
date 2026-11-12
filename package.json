@@ -18,14 +18,15 @@
     "start:core-api": "node apps/core-api/src/main.ts",
     "start:gateway": "node apps/agent-gateway/src/main.ts",
     "start:web": "node apps/web/src/main.ts",
-    "test": "node --test packages/test-harness/src/m1-acceptance.test.ts packages/test-harness/src/m2-acceptance.test.ts packages/test-harness/src/m3-acceptance.test.ts packages/test-harness/src/m4-acceptance.test.ts packages/test-harness/src/m5-acceptance.test.ts packages/test-harness/src/m6a-acceptance.test.ts",
+    "test": "node --test --test-concurrency=1 packages/test-harness/src/m1-acceptance.test.ts packages/test-harness/src/m2-acceptance.test.ts packages/test-harness/src/m3-acceptance.test.ts packages/test-harness/src/m4-acceptance.test.ts packages/test-harness/src/m5-acceptance.test.ts packages/test-harness/src/m6a-acceptance.test.ts packages/test-harness/src/m6b-acceptance.test.ts",
     "test:m1": "node --test packages/test-harness/src/m1-acceptance.test.ts",
     "test:m2": "node --test packages/test-harness/src/m2-acceptance.test.ts",
     "test:m3": "node --test packages/test-harness/src/m3-acceptance.test.ts",
     "test:m4": "node --test packages/test-harness/src/m4-acceptance.test.ts",
     "test:m5": "node --test packages/test-harness/src/m5-acceptance.test.ts",
     "test:m6a": "node --test packages/test-harness/src/m6a-acceptance.test.ts",
-    "test:all": "node --test packages/*/src/*.test.ts packages/test-harness/src/*.test.ts",
+    "test:m6b": "node --test packages/test-harness/src/m6b-acceptance.test.ts",
+    "test:all": "node --test --test-concurrency=1 packages/*/src/*.test.ts packages/test-harness/src/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {

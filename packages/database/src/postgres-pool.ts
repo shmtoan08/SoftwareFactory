@@ -4,13 +4,21 @@ import { readFileSync } from "node:fs";
 import net from "node:net";
 import tls from "node:tls";
 import {
+  type AgentOrgRole,
+  type AgentOrganizationProfileRecord,
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
   type BaselineSpecFreezeRecord,
   type CandidateBoundLineage,
+  type ChangeRequestProposedTaskSpec,
+  type ChangeRequestRecord,
   type CostPreflightCheckInput,
   type CostPreflightCheckResult,
   type CostSessionRecord,
+  type DevEpicRecord,
+  type DevMilestoneRecord,
+  type DevUserStoryRecord,
+  type ExecutionTargetType,
   type FinalizeModelCallInput,
   type FinalizeModelCallResult,
   type LeaseSyncStatusResponse,
@@ -25,6 +33,8 @@ import {
   type ProcessedWorkerEventRecord,
   type ProductPipelineBundle,
   type ProductPipelineSessionRecord,
+  type ProjectBootstrapRecord,
+  type ReleaseAcceptancePackageRecord,
   type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
   type ReviewSessionRecord,
@@ -34,14 +44,18 @@ import {
   type Stage1ConfirmationStatus,
   type Stage1DiscoveryItemRecord,
   type Stage1ItemKind,
+  type Stage7DevelopmentPlanBundle,
   type StageApprovalGateRecord,
   type StageApprovalGateStage,
   type StageArtifactKind,
   type StageArtifactRecord,
+  type TargetTrustTier,
   type TaskLeaseRecord,
+  type TaskPlanLinkRecord,
   type TaskRecord,
   type TaskStatus,
   type Tier3AssertionEvidence,
+  type TrustedAcceptanceTestSpec,
   type VerificationExecutionBackend,
   type VerificationOverallStatus,
   type VerificationRunRecord,
@@ -61,23 +75,30 @@ import {
 } from "@software-factory/task-contract";
 import {
   Ac10ViolationError,
+  type ApplyChangeRequestStoreInput,
   ApprovalExpiredOrStaleError,
   type CasMergeResult,
   type ControlPlaneStore,
+  type CreateChangeRequestStoreInput,
   type CreateCostSessionInput,
   type CreateProductPipelineSessionInput,
+  type CreateProjectBootstrapInput,
   type CreateStage1DiscoveryItemsInput,
+  type CreateStage7DevelopmentPlanInput,
+  type DecideChangeRequestStoreInput,
   type FreezeBaselineSpecInput,
   PostgresRlsError,
   type ProjectMemberRole,
   type ProjectMembershipRecord,
   type ProjectRecord,
+  type RecordReleaseAcceptancePackageInput,
   type RecordResourceUsageMetricInput,
   type RecordStageApprovalGateInput,
   type RecordStageArtifactInput,
   type ResolveStage1DiscoveryItemInput,
   type RlsSessionContext,
   SimulatedPostMergeCrashError,
+  type UpsertAgentOrganizationProfileInput,
 } from "./types.ts";
 import {
   buildProductPipelineBundle,
@@ -88,6 +109,13 @@ import {
   validateStage2Ac10References,
   validateStageArtifactKindAndHash,
 } from "./m6a-validation.ts";
+import {
+  computeChangeRequestSha256,
+  computeProjectBootstrapSha256,
+  computeReleasePackageSha256,
+  serializeTrustedAcceptanceTestSpecs,
+  validateAgentOrganizationProfileInput,
+} from "./m6b-validation.ts";
 
 export type PostgresSslMode = "disable" | "prefer" | "require" | "verify-ca" | "verify-full";
 
@@ -1915,6 +1943,166 @@ function mapBaselineSpecFreezeRow(row: Record<string, unknown>): BaselineSpecFre
     freeze_bundle_sha256: String(row.freeze_bundle_sha256).trimEnd(),
     status: "FROZEN",
     frozen_at: String(row.frozen_at),
+  };
+}
+
+function asStringArrayCell(val: unknown): string[] {
+  return Array.isArray(val) ? val.map((item) => String(item)) : [];
+}
+
+function mapProjectBootstrapRow(row: Record<string, unknown>): ProjectBootstrapRecord {
+  return {
+    bootstrap_id: String(row.bootstrap_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    baseline_id: String(row.baseline_id),
+    repo_path: String(row.repo_path),
+    trusted_acceptance_dir: String(row.trusted_acceptance_dir),
+    base_main_commit_hash: String(row.base_main_commit_hash).trimEnd(),
+    protected_paths: asStringArrayCell(row.protected_paths_json),
+    trusted_policy_sha256: String(row.trusted_policy_sha256).trimEnd(),
+    generated_files: asStringArrayCell(row.generated_files_json),
+    acceptance_tests: Array.isArray(row.acceptance_tests_json)
+      ? (row.acceptance_tests_json as TrustedAcceptanceTestSpec[])
+      : [],
+    bootstrap_sha256: String(row.bootstrap_sha256).trimEnd(),
+    created_by_principal_id: String(row.created_by_principal_id),
+    created_at: String(row.created_at),
+  };
+}
+
+function mapAgentOrganizationProfileRow(
+  row: Record<string, unknown>
+): AgentOrganizationProfileRecord {
+  return {
+    profile_id: String(row.profile_id),
+    project_id: String(row.project_id),
+    profile_key: String(row.profile_key),
+    role: String(row.role) as AgentOrgRole,
+    principal_id: String(row.principal_id),
+    provider: String(row.provider),
+    model: String(row.model),
+    execution_target_type: String(row.execution_target_type) as ExecutionTargetType,
+    trust_tier: String(row.trust_tier) as TargetTrustTier,
+    target_locator: row.target_locator ? String(row.target_locator) : null,
+    capabilities_json: (row.capabilities_json as Record<string, unknown>) ?? {},
+    is_active: Boolean(row.is_active),
+    created_by_principal_id: String(row.created_by_principal_id),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapDevMilestoneRow(row: Record<string, unknown>): DevMilestoneRecord {
+  return {
+    milestone_id: String(row.milestone_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    baseline_id: String(row.baseline_id),
+    milestone_key: String(row.milestone_key),
+    title: String(row.title),
+    description: String(row.description),
+    sequence_order: Number(row.sequence_order),
+    created_at: String(row.created_at),
+  };
+}
+
+function mapDevEpicRow(row: Record<string, unknown>): DevEpicRecord {
+  return {
+    epic_id: String(row.epic_id),
+    project_id: String(row.project_id),
+    milestone_id: String(row.milestone_id),
+    epic_key: String(row.epic_key),
+    title: String(row.title),
+    description: String(row.description),
+    sequence_order: Number(row.sequence_order),
+    created_at: String(row.created_at),
+  };
+}
+
+function mapDevUserStoryRow(row: Record<string, unknown>): DevUserStoryRecord {
+  return {
+    story_id: String(row.story_id),
+    project_id: String(row.project_id),
+    epic_id: String(row.epic_id),
+    story_key: String(row.story_key),
+    title: String(row.title),
+    description: String(row.description),
+    requirement_ids: asStringArrayCell(row.requirement_ids_json),
+    ac_ids: asStringArrayCell(row.ac_ids_json),
+    sequence_order: Number(row.sequence_order),
+    created_at: String(row.created_at),
+  };
+}
+
+function mapTaskPlanLinkRow(row: Record<string, unknown>): TaskPlanLinkRecord {
+  return {
+    link_id: String(row.link_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    baseline_id: String(row.baseline_id),
+    bootstrap_id: row.bootstrap_id ? String(row.bootstrap_id) : null,
+    story_id: row.story_id ? String(row.story_id) : null,
+    task_id: String(row.task_id),
+    cr_id: row.cr_id ? String(row.cr_id) : null,
+    requirement_ids: asStringArrayCell(row.requirement_ids_json),
+    ac_ids: asStringArrayCell(row.ac_ids_json),
+    assigned_profile_id: row.assigned_profile_id ? String(row.assigned_profile_id) : null,
+    created_at: String(row.created_at),
+  };
+}
+
+function mapChangeRequestRow(row: Record<string, unknown>): ChangeRequestRecord {
+  return {
+    cr_id: String(row.cr_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    baseline_id: String(row.baseline_id),
+    cr_key: String(row.cr_key),
+    title: String(row.title),
+    rationale: String(row.rationale),
+    impacted_requirement_ids: asStringArrayCell(row.impacted_requirement_ids_json),
+    impacted_component_ids: asStringArrayCell(row.impacted_component_ids_json),
+    proposed_tasks: Array.isArray(row.proposed_tasks_json)
+      ? (row.proposed_tasks_json as ChangeRequestProposedTaskSpec[])
+      : [],
+    status: String(row.status) as ChangeRequestRecord["status"],
+    requested_by_principal_id: String(row.requested_by_principal_id),
+    decided_by_principal_id: row.decided_by_principal_id
+      ? String(row.decided_by_principal_id)
+      : null,
+    decision_rationale: row.decision_rationale ? String(row.decision_rationale) : null,
+    decided_at: row.decided_at ? String(row.decided_at) : null,
+    applied_by_principal_id: row.applied_by_principal_id
+      ? String(row.applied_by_principal_id)
+      : null,
+    applied_at: row.applied_at ? String(row.applied_at) : null,
+    cr_sha256: String(row.cr_sha256).trimEnd(),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapReleaseAcceptancePackageRow(
+  row: Record<string, unknown>
+): ReleaseAcceptancePackageRecord {
+  return {
+    release_id: String(row.release_id),
+    project_id: String(row.project_id),
+    pipeline_session_id: String(row.pipeline_session_id),
+    baseline_id: String(row.baseline_id),
+    traceability_sha256: String(row.traceability_sha256).trimEnd(),
+    coverage_percent: Number(row.coverage_percent),
+    complete: Boolean(row.is_complete),
+    total_requirements: Number(row.total_requirements),
+    merged_task_ids: asStringArrayCell(row.merged_task_ids_json),
+    applied_cr_ids: asStringArrayCell(row.applied_cr_ids_json),
+    main_head_commit_hash: String(row.main_head_commit_hash).trimEnd(),
+    summary_markdown: String(row.summary_markdown),
+    package_json: (row.package_json as Record<string, unknown>) ?? {},
+    package_sha256: String(row.package_sha256).trimEnd(),
+    accepted_by_principal_id: String(row.accepted_by_principal_id),
+    accepted_at: String(row.accepted_at),
   };
 }
 
@@ -5620,6 +5808,773 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       approvalGates,
       baselineFreeze,
     });
+  }
+
+  // ===========================================================================
+  // Milestone M6B: Stages 5-9 Lifecycle, Multi-Target Profiles, CR & Release
+  // ===========================================================================
+
+  public async updateProjectMainRefCommitHash(input: {
+    readonly project_id: string;
+    readonly main_ref_commit_hash: string;
+  }): Promise<ProjectRecord> {
+    if (!/^[0-9a-f]{40}$/i.test(input.main_ref_commit_hash.trim())) {
+      throw new PostgresRlsError(
+        "23514",
+        `main_ref_commit_hash '${input.main_ref_commit_hash}' must be a 40-hex commit hash`
+      );
+    }
+    const normalizedHash = input.main_ref_commit_hash.trim().toLowerCase();
+    try {
+      const res = await this.pool.queryInActiveTx(
+        `UPDATE projects
+         SET main_ref_commit_hash = $1::char(40),
+             updated_at = clock_timestamp()
+         WHERE project_id = $2::uuid
+         RETURNING *;`,
+        [normalizedHash, input.project_id]
+      );
+      if (res.rowCount === 0 || !res.rows[0]) {
+        throw new PostgresRlsError(
+          "23503",
+          `Project ${input.project_id} not found or inaccessible under current RLS context`
+        );
+      }
+      let refs = this.fallbackGitRefsByProject.get(input.project_id);
+      if (!refs) {
+        refs = new Map();
+        this.fallbackGitRefsByProject.set(input.project_id, refs);
+      }
+      refs.set("refs/heads/main", normalizedHash);
+      let commits = this.fallbackGitCommitsByProject.get(input.project_id);
+      if (!commits) {
+        commits = new Map();
+        this.fallbackGitCommitsByProject.set(input.project_id, commits);
+      }
+      if (!commits.has(normalizedHash)) {
+        commits.set(normalizedHash, {
+          commitHash: normalizedHash,
+          treeHash: normalizedHash,
+          parents: [],
+        });
+      }
+      return mapProjectRow(res.rows[0]);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async createProjectBootstrap(
+    input: CreateProjectBootstrapInput
+  ): Promise<ProjectBootstrapRecord> {
+    if (
+      !/^[0-9a-f]{40}$/i.test(input.base_main_commit_hash) ||
+      !/^[0-9a-f]{64}$/i.test(input.trusted_policy_sha256) ||
+      input.acceptance_tests.length === 0
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "Invalid project bootstrap hashes or empty acceptance_tests"
+      );
+    }
+    const bootstrapId = input.bootstrap_id ?? randomUUID();
+    const normalizedHash = input.base_main_commit_hash.toLowerCase();
+    const normalizedPolicySha = input.trusted_policy_sha256.toLowerCase();
+    const normalizedSpecs = serializeTrustedAcceptanceTestSpecs(input.acceptance_tests);
+    const bootstrapSha = computeProjectBootstrapSha256({
+      ...input,
+      base_main_commit_hash: normalizedHash,
+      trusted_policy_sha256: normalizedPolicySha,
+      acceptance_tests: normalizedSpecs,
+    });
+    try {
+      const insRes = await this.pool.queryInActiveTx(
+        `INSERT INTO project_bootstraps (
+          bootstrap_id, project_id, pipeline_session_id, baseline_id,
+          repo_path, trusted_acceptance_dir, base_main_commit_hash,
+          protected_paths_json, trusted_policy_sha256,
+          generated_files_json, acceptance_tests_json,
+          bootstrap_sha256, created_by_principal_id
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+          $5::text, $6::text, $7::char(40),
+          $8::jsonb, $9::char(64),
+          $10::jsonb, $11::jsonb,
+          $12::char(64), $13::text
+        ) RETURNING *;`,
+        [
+          bootstrapId,
+          input.project_id,
+          input.pipeline_session_id,
+          input.baseline_id,
+          input.repo_path,
+          input.trusted_acceptance_dir,
+          normalizedHash,
+          [...input.protected_paths],
+          normalizedPolicySha,
+          [...input.generated_files],
+          normalizedSpecs,
+          bootstrapSha,
+          input.created_by_principal_id,
+        ]
+      );
+      await this.insertOutboxEventSql(
+        input.project_id,
+        "project_bootstrap",
+        bootstrapId,
+        "pipeline.project_bootstrapped",
+        {
+          pipeline_session_id: input.pipeline_session_id,
+          baseline_id: input.baseline_id,
+          bootstrap_id: bootstrapId,
+          base_main_commit_hash: normalizedHash,
+          trusted_policy_sha256: normalizedPolicySha,
+        }
+      );
+      return mapProjectBootstrapRow(insRes.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async getProjectBootstrapBySession(
+    pipelineSessionId: string
+  ): Promise<ProjectBootstrapRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM project_bootstraps WHERE pipeline_session_id = $1::uuid ORDER BY created_at DESC LIMIT 1;",
+      [pipelineSessionId]
+    );
+    return res.rows[0] ? mapProjectBootstrapRow(res.rows[0]) : null;
+  }
+
+  public async getProjectBootstrapById(
+    bootstrapId: string
+  ): Promise<ProjectBootstrapRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM project_bootstraps WHERE bootstrap_id = $1::uuid LIMIT 1;",
+      [bootstrapId]
+    );
+    return res.rows[0] ? mapProjectBootstrapRow(res.rows[0]) : null;
+  }
+
+  public async upsertAgentOrganizationProfile(
+    input: UpsertAgentOrganizationProfileInput
+  ): Promise<AgentOrganizationProfileRecord> {
+    validateAgentOrganizationProfileInput(input);
+    const profileId = input.profile_id ?? randomUUID();
+    const keyTrimmed = input.profile_key.trim();
+    try {
+      const res = await this.pool.queryInActiveTx(
+        `INSERT INTO agent_organization_profiles (
+          profile_id, project_id, profile_key, role, principal_id,
+          provider, model, execution_target_type, trust_tier,
+          target_locator, capabilities_json, is_active, created_by_principal_id
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::text, $4::text, $5::text,
+          $6::text, $7::text, $8::text, $9::text,
+          $10::text, $11::jsonb, $12::boolean, $13::text
+        )
+        ON CONFLICT (project_id, profile_key) DO UPDATE SET
+          role = EXCLUDED.role,
+          principal_id = EXCLUDED.principal_id,
+          provider = EXCLUDED.provider,
+          model = EXCLUDED.model,
+          execution_target_type = EXCLUDED.execution_target_type,
+          trust_tier = EXCLUDED.trust_tier,
+          target_locator = EXCLUDED.target_locator,
+          capabilities_json = EXCLUDED.capabilities_json,
+          is_active = EXCLUDED.is_active,
+          updated_at = clock_timestamp()
+        RETURNING *;`,
+        [
+          profileId,
+          input.project_id,
+          keyTrimmed,
+          input.role,
+          input.principal_id.trim(),
+          input.provider.trim(),
+          input.model.trim(),
+          input.execution_target_type,
+          input.trust_tier,
+          input.target_locator ?? null,
+          input.capabilities_json ?? {},
+          input.is_active ?? true,
+          input.created_by_principal_id.trim(),
+        ]
+      );
+      return mapAgentOrganizationProfileRow(res.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async listAgentOrganizationProfiles(
+    projectId: string,
+    filter?: { readonly role?: AgentOrgRole; readonly active_only?: boolean }
+  ): Promise<AgentOrganizationProfileRecord[]> {
+    const clauses = ["project_id = $1::uuid"];
+    const params: unknown[] = [projectId];
+    if (filter?.role) {
+      params.push(filter.role);
+      clauses.push(`role = $${params.length}::text`);
+    }
+    if (filter?.active_only) {
+      clauses.push("is_active = TRUE");
+    }
+    const res = await this.pool.queryInActiveTx(
+      `SELECT * FROM agent_organization_profiles
+       WHERE ${clauses.join(" AND ")}
+       ORDER BY profile_key ASC;`,
+      params
+    );
+    return res.rows.map(mapAgentOrganizationProfileRow);
+  }
+
+  public async getAgentOrganizationProfileById(
+    profileId: string
+  ): Promise<AgentOrganizationProfileRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM agent_organization_profiles WHERE profile_id = $1::uuid LIMIT 1;",
+      [profileId]
+    );
+    return res.rows[0] ? mapAgentOrganizationProfileRow(res.rows[0]) : null;
+  }
+
+  public async createStage7DevelopmentPlan(
+    input: CreateStage7DevelopmentPlanInput
+  ): Promise<Stage7DevelopmentPlanBundle> {
+    try {
+      const existingPlan = await this.pool.queryInActiveTx(
+        "SELECT 1 FROM dev_milestones WHERE project_id = $1::uuid AND baseline_id = $2::uuid LIMIT 1;",
+        [input.project_id, input.baseline_id]
+      );
+      if (existingPlan.rowCount > 0) {
+        throw new PostgresRlsError(
+          "23514",
+          `Stage 7 development plan already exists for frozen baseline ${input.baseline_id}; submit a Stage 9 Change Request to add or modify tasks`
+        );
+      }
+
+      const bootRes = await this.pool.queryInActiveTx(
+        `SELECT bootstrap_id, baseline_id FROM project_bootstraps
+         WHERE bootstrap_id = $1::uuid AND project_id = $2::uuid LIMIT 1;`,
+        [input.bootstrap_id, input.project_id]
+      );
+      if (
+        !bootRes.rows[0] ||
+        String(bootRes.rows[0].baseline_id) !== input.baseline_id
+      ) {
+        throw new PostgresRlsError(
+          "23514",
+          `Bootstrap ${input.bootstrap_id} does not match baseline ${input.baseline_id}`
+        );
+      }
+
+      const milestones: DevMilestoneRecord[] = [];
+      const milestoneIdByKey = new Map<string, string>();
+      for (const m of input.milestones) {
+        const milestoneId = m.milestone_id ?? randomUUID();
+        const res = await this.pool.queryInActiveTx(
+          `INSERT INTO dev_milestones (
+            milestone_id, project_id, pipeline_session_id, baseline_id,
+            milestone_key, title, description, sequence_order
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+            $5::text, $6::text, $7::text, $8::integer
+          ) RETURNING *;`,
+          [
+            milestoneId,
+            input.project_id,
+            input.pipeline_session_id,
+            input.baseline_id,
+            m.milestone_key,
+            m.title,
+            m.description,
+            m.sequence_order,
+          ]
+        );
+        const mapped = mapDevMilestoneRow(res.rows[0]!);
+        milestoneIdByKey.set(m.milestone_key, mapped.milestone_id);
+        milestones.push(mapped);
+      }
+
+      const epics: DevEpicRecord[] = [];
+      const epicIdByKey = new Map<string, string>();
+      for (const e of input.epics) {
+        const milestoneId = milestoneIdByKey.get(e.milestone_key);
+        if (!milestoneId) {
+          throw new PostgresRlsError("23503", `Milestone key '${e.milestone_key}' not found`);
+        }
+        const epicId = e.epic_id ?? randomUUID();
+        const res = await this.pool.queryInActiveTx(
+          `INSERT INTO dev_epics (
+            epic_id, project_id, milestone_id,
+            epic_key, title, description, sequence_order
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid,
+            $4::text, $5::text, $6::text, $7::integer
+          ) RETURNING *;`,
+          [
+            epicId,
+            input.project_id,
+            milestoneId,
+            e.epic_key,
+            e.title,
+            e.description,
+            e.sequence_order,
+          ]
+        );
+        const mapped = mapDevEpicRow(res.rows[0]!);
+        epicIdByKey.set(e.epic_key, mapped.epic_id);
+        epics.push(mapped);
+      }
+
+      const stories: DevUserStoryRecord[] = [];
+      const storyIdByKey = new Map<string, string>();
+      for (const s of input.stories) {
+        const epicId = epicIdByKey.get(s.epic_key);
+        if (!epicId) {
+          throw new PostgresRlsError("23503", `Epic key '${s.epic_key}' not found`);
+        }
+        const storyId = s.story_id ?? randomUUID();
+        const res = await this.pool.queryInActiveTx(
+          `INSERT INTO dev_user_stories (
+            story_id, project_id, epic_id, story_key, title, description,
+            requirement_ids_json, ac_ids_json, sequence_order
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text, $6::text,
+            $7::jsonb, $8::jsonb, $9::integer
+          ) RETURNING *;`,
+          [
+            storyId,
+            input.project_id,
+            epicId,
+            s.story_key,
+            s.title,
+            s.description,
+            [...s.requirement_ids],
+            [...s.ac_ids],
+            s.sequence_order,
+          ]
+        );
+        const mapped = mapDevUserStoryRow(res.rows[0]!);
+        storyIdByKey.set(s.story_key, mapped.story_id);
+        stories.push(mapped);
+      }
+
+      const tasks: TaskRecord[] = [];
+      const taskLinks: TaskPlanLinkRecord[] = [];
+      for (const t of input.tasks) {
+        const storyId = storyIdByKey.get(t.story_key);
+        if (!storyId) {
+          throw new PostgresRlsError("23503", `Story key '${t.story_key}' not found`);
+        }
+        const taskRec = await this.createTask({
+          task_id: t.task_id,
+          project_id: input.project_id,
+          title: t.title,
+          task_contract: t.task_contract,
+          base_main_commit_hash: input.base_main_commit_hash,
+          max_rework_cycles: t.max_rework_cycles,
+        });
+        tasks.push(taskRec);
+        const linkId = randomUUID();
+        const linkRes = await this.pool.queryInActiveTx(
+          `INSERT INTO task_plan_links (
+            link_id, project_id, pipeline_session_id, baseline_id,
+            bootstrap_id, story_id, task_id, cr_id,
+            requirement_ids_json, ac_ids_json, assigned_profile_id
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+            $5::uuid, $6::uuid, $7::uuid, NULL,
+            $8::jsonb, $9::jsonb, $10::uuid
+          ) RETURNING *;`,
+          [
+            linkId,
+            input.project_id,
+            input.pipeline_session_id,
+            input.baseline_id,
+            input.bootstrap_id,
+            storyId,
+            taskRec.task_id,
+            [...t.requirement_ids],
+            [...t.ac_ids],
+            t.assigned_profile_id ?? null,
+          ]
+        );
+        taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
+      }
+
+      await this.insertOutboxEventSql(
+        input.project_id,
+        "product_pipeline",
+        input.pipeline_session_id,
+        "pipeline.stage7_plan_materialized",
+        {
+          pipeline_session_id: input.pipeline_session_id,
+          baseline_id: input.baseline_id,
+          task_ids: tasks.map((t) => t.task_id),
+        }
+      );
+
+      return { milestones, epics, stories, taskLinks, tasks };
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async listDevMilestones(pipelineSessionId: string): Promise<DevMilestoneRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      `SELECT * FROM dev_milestones
+       WHERE pipeline_session_id = $1::uuid
+       ORDER BY sequence_order ASC, created_at ASC;`,
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapDevMilestoneRow);
+  }
+
+  public async listDevEpics(pipelineSessionId: string): Promise<DevEpicRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      `SELECT e.* FROM dev_epics e
+       JOIN dev_milestones m ON m.milestone_id = e.milestone_id AND m.project_id = e.project_id
+       WHERE m.pipeline_session_id = $1::uuid
+       ORDER BY e.sequence_order ASC, e.created_at ASC;`,
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapDevEpicRow);
+  }
+
+  public async listDevUserStories(pipelineSessionId: string): Promise<DevUserStoryRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      `SELECT s.* FROM dev_user_stories s
+       JOIN dev_epics e ON e.epic_id = s.epic_id AND e.project_id = s.project_id
+       JOIN dev_milestones m ON m.milestone_id = e.milestone_id AND m.project_id = e.project_id
+       WHERE m.pipeline_session_id = $1::uuid
+       ORDER BY s.sequence_order ASC, s.created_at ASC;`,
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapDevUserStoryRow);
+  }
+
+  public async listTaskPlanLinks(pipelineSessionId: string): Promise<TaskPlanLinkRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      `SELECT * FROM task_plan_links
+       WHERE pipeline_session_id = $1::uuid
+       ORDER BY created_at ASC;`,
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapTaskPlanLinkRow);
+  }
+
+  public async createChangeRequest(
+    input: CreateChangeRequestStoreInput
+  ): Promise<ChangeRequestRecord> {
+    const crId = input.cr_id ?? randomUUID();
+    const crSha = computeChangeRequestSha256(input);
+    try {
+      const res = await this.pool.queryInActiveTx(
+        `INSERT INTO change_requests (
+          cr_id, project_id, pipeline_session_id, baseline_id,
+          cr_key, title, rationale,
+          impacted_requirement_ids_json, impacted_component_ids_json, proposed_tasks_json,
+          status, requested_by_principal_id, cr_sha256
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+          $5::text, $6::text, $7::text,
+          $8::jsonb, $9::jsonb, $10::jsonb,
+          'PENDING_APPROVAL', $11::text, $12::char(64)
+        ) RETURNING *;`,
+        [
+          crId,
+          input.project_id,
+          input.pipeline_session_id,
+          input.baseline_id,
+          input.cr_key.trim(),
+          input.title.trim(),
+          input.rationale.trim(),
+          [...input.impacted_requirement_ids],
+          [...(input.impacted_component_ids ?? [])],
+          [...input.proposed_tasks],
+          input.requested_by_principal_id,
+          crSha,
+        ]
+      );
+      await this.insertOutboxEventSql(
+        input.project_id,
+        "change_request",
+        crId,
+        "change_request.submitted",
+        {
+          cr_id: crId,
+          cr_key: input.cr_key.trim(),
+          pipeline_session_id: input.pipeline_session_id,
+          baseline_id: input.baseline_id,
+          cr_sha256: crSha,
+        }
+      );
+      return mapChangeRequestRow(res.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async getChangeRequestById(crId: string): Promise<ChangeRequestRecord | null> {
+    const res = await this.pool.queryInActiveTx(
+      "SELECT * FROM change_requests WHERE cr_id = $1::uuid LIMIT 1;",
+      [crId]
+    );
+    return res.rows[0] ? mapChangeRequestRow(res.rows[0]) : null;
+  }
+
+  public async listChangeRequests(pipelineSessionId: string): Promise<ChangeRequestRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      `SELECT * FROM change_requests
+       WHERE pipeline_session_id = $1::uuid
+       ORDER BY created_at DESC;`,
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapChangeRequestRow);
+  }
+
+  public async decideChangeRequest(
+    input: DecideChangeRequestStoreInput
+  ): Promise<ChangeRequestRecord> {
+    if (!input.decided_by_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "decided_by_principal_id is required");
+    }
+    try {
+      const existingRes = await this.pool.queryInActiveTx(
+        `SELECT * FROM change_requests
+         WHERE cr_id = $1::uuid AND project_id = $2::uuid
+         FOR UPDATE;`,
+        [input.cr_id, input.project_id]
+      );
+      const row = existingRes.rows[0];
+      if (!row) {
+        throw new PostgresRlsError(
+          "23503",
+          `Change Request ${input.cr_id} not found for project ${input.project_id}`
+        );
+      }
+      if (String(row.status) !== "PENDING_APPROVAL") {
+        throw new PostgresRlsError(
+          "23514",
+          `Change Request ${input.cr_id} is in status ${String(row.status)}; only PENDING_APPROVAL can be decided`
+        );
+      }
+      const updRes = await this.pool.queryInActiveTx(
+        `UPDATE change_requests
+         SET status = $1::text,
+             decided_by_principal_id = $2::text,
+             decision_rationale = $3::text,
+             decided_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE cr_id = $4::uuid AND project_id = $5::uuid
+         RETURNING *;`,
+        [
+          input.decision,
+          input.decided_by_principal_id.trim(),
+          input.decision_rationale ?? null,
+          input.cr_id,
+          input.project_id,
+        ]
+      );
+      const mapped = mapChangeRequestRow(updRes.rows[0]!);
+      await this.insertOutboxEventSql(
+        input.project_id,
+        "change_request",
+        mapped.cr_id,
+        `change_request.${input.decision.toLowerCase()}`,
+        {
+          cr_id: mapped.cr_id,
+          cr_key: mapped.cr_key,
+          decision: input.decision,
+          decided_by_principal_id: mapped.decided_by_principal_id,
+        }
+      );
+      return mapped;
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async applyChangeRequestAndMaterializeTasks(
+    input: ApplyChangeRequestStoreInput
+  ): Promise<{
+    readonly changeRequest: ChangeRequestRecord;
+    readonly tasks: readonly TaskRecord[];
+    readonly taskLinks: readonly TaskPlanLinkRecord[];
+  }> {
+    if (!input.applied_by_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "applied_by_principal_id is required");
+    }
+    try {
+      const crRes = await this.pool.queryInActiveTx(
+        `SELECT * FROM change_requests
+         WHERE cr_id = $1::uuid AND project_id = $2::uuid
+         FOR UPDATE;`,
+        [input.cr_id, input.project_id]
+      );
+      const row = crRes.rows[0];
+      if (!row) {
+        throw new PostgresRlsError(
+          "23503",
+          `Change Request ${input.cr_id} not found for project ${input.project_id}`
+        );
+      }
+      const existing = mapChangeRequestRow(row);
+      if (existing.status !== "APPROVED") {
+        throw new PostgresRlsError(
+          "23514",
+          `Change Request ${input.cr_id} has status ${existing.status}; only APPROVED Change Requests can be applied`
+        );
+      }
+
+      const tasks: TaskRecord[] = [];
+      const taskLinks: TaskPlanLinkRecord[] = [];
+      for (const pt of existing.proposed_tasks) {
+        const contract: TaskContractSpec = {
+          allowed_files: [...pt.allowed_files],
+          protected_paths: [...input.protected_paths],
+          trusted_policy_sha256: input.trusted_policy_sha256,
+        };
+        const taskRec = await this.createTask({
+          project_id: input.project_id,
+          title: pt.title,
+          task_contract: contract,
+          base_main_commit_hash: input.base_main_commit_hash,
+        });
+        tasks.push(taskRec);
+        const linkRes = await this.pool.queryInActiveTx(
+          `INSERT INTO task_plan_links (
+            link_id, project_id, pipeline_session_id, baseline_id,
+            bootstrap_id, story_id, task_id, cr_id,
+            requirement_ids_json, ac_ids_json, assigned_profile_id
+          ) VALUES (
+            $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+            $5::uuid, $6::uuid, $7::uuid, $8::uuid,
+            $9::jsonb, $10::jsonb, $11::uuid
+          ) RETURNING *;`,
+          [
+            randomUUID(),
+            input.project_id,
+            existing.pipeline_session_id,
+            existing.baseline_id,
+            input.bootstrap_id ?? null,
+            pt.story_id ?? null,
+            taskRec.task_id,
+            existing.cr_id,
+            [...pt.requirement_ids],
+            [...pt.ac_ids],
+            pt.developer_profile_id ?? null,
+          ]
+        );
+        taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
+      }
+
+      const updRes = await this.pool.queryInActiveTx(
+        `UPDATE change_requests
+         SET status = 'APPLIED',
+             applied_by_principal_id = $1::text,
+             applied_at = clock_timestamp(),
+             updated_at = clock_timestamp()
+         WHERE cr_id = $2::uuid AND project_id = $3::uuid
+         RETURNING *;`,
+        [input.applied_by_principal_id.trim(), existing.cr_id, input.project_id]
+      );
+      const updated = mapChangeRequestRow(updRes.rows[0]!);
+      await this.insertOutboxEventSql(
+        input.project_id,
+        "change_request",
+        updated.cr_id,
+        "change_request.applied",
+        {
+          cr_id: updated.cr_id,
+          cr_key: updated.cr_key,
+          materialized_task_ids: tasks.map((t) => t.task_id),
+        }
+      );
+
+      return { changeRequest: updated, tasks, taskLinks };
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async recordReleaseAcceptancePackage(
+    input: RecordReleaseAcceptancePackageInput
+  ): Promise<ReleaseAcceptancePackageRecord> {
+    if (!input.complete || input.coverage_percent !== 100) {
+      throw new PostgresRlsError(
+        "23514",
+        `Release acceptance requires 100% bidirectional traceability (got complete=${String(
+          input.complete
+        )}, coverage_percent=${input.coverage_percent})`
+      );
+    }
+    const releaseId = input.release_id ?? randomUUID();
+    const packageSha = computeReleasePackageSha256(input);
+    try {
+      const insRes = await this.pool.queryInActiveTx(
+        `INSERT INTO release_acceptance_packages (
+          release_id, project_id, pipeline_session_id, baseline_id,
+          traceability_sha256, coverage_percent, is_complete, total_requirements,
+          merged_task_ids_json, applied_cr_ids_json,
+          main_head_commit_hash, summary_markdown, package_json,
+          package_sha256, accepted_by_principal_id
+        ) VALUES (
+          $1::uuid, $2::uuid, $3::uuid, $4::uuid,
+          $5::char(64), $6::numeric(5,2), $7::boolean, $8::integer,
+          $9::jsonb, $10::jsonb,
+          $11::char(40), $12::text, $13::jsonb,
+          $14::char(64), $15::text
+        ) RETURNING *;`,
+        [
+          releaseId,
+          input.project_id,
+          input.pipeline_session_id,
+          input.baseline_id,
+          input.traceability_sha256.toLowerCase(),
+          input.coverage_percent,
+          input.complete,
+          input.total_requirements,
+          [...input.merged_task_ids],
+          [...input.applied_cr_ids],
+          input.main_head_commit_hash.toLowerCase(),
+          input.summary_markdown,
+          input.package_json,
+          packageSha,
+          input.accepted_by_principal_id,
+        ]
+      );
+      await this.insertOutboxEventSql(
+        input.project_id,
+        "release_acceptance",
+        releaseId,
+        "pipeline.release_accepted",
+        {
+          release_id: releaseId,
+          pipeline_session_id: input.pipeline_session_id,
+          baseline_id: input.baseline_id,
+          package_sha256: packageSha,
+        }
+      );
+      return mapReleaseAcceptancePackageRow(insRes.rows[0]!);
+    } catch (error) {
+      mapPgError(error);
+    }
+  }
+
+  public async listReleaseAcceptancePackages(
+    pipelineSessionId: string
+  ): Promise<ReleaseAcceptancePackageRecord[]> {
+    const res = await this.pool.queryInActiveTx(
+      `SELECT * FROM release_acceptance_packages
+       WHERE pipeline_session_id = $1::uuid
+       ORDER BY accepted_at DESC;`,
+      [pipelineSessionId]
+    );
+    return res.rows.map(mapReleaseAcceptancePackageRow);
   }
 }
 

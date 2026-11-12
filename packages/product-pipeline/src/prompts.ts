@@ -16,6 +16,9 @@ export const STAGE3_ARCHITECTURE_PROMPT_VERSION = "1.0.0";
 export const STAGE4_CONSISTENCY_CHECK_PROMPT_ID = "stage4.consistency.check";
 export const STAGE4_CONSISTENCY_CHECK_PROMPT_VERSION = "1.0.0";
 
+export const STAGE7_PLANNING_PROMPT_ID = "stage7.planning.decompose";
+export const STAGE7_PLANNING_PROMPT_VERSION = "1.0.0";
+
 export const STAGE1_DISCOVERY_OUTPUT_SCHEMA: StructuredJsonSchema = {
   type: "object",
   additionalProperties: false,
@@ -351,6 +354,133 @@ export const STAGE4_CONSISTENCY_CHECK_OUTPUT_SCHEMA: StructuredJsonSchema = {
   },
 };
 
+export const STAGE7_PLANNING_OUTPUT_SCHEMA: StructuredJsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["milestones", "epics", "stories", "tasks", "planning_notes"],
+  properties: {
+    milestones: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["milestone_key", "title", "description"],
+        properties: {
+          milestone_key: { type: "string", minLength: 1 },
+          title: { type: "string", minLength: 1 },
+          description: { type: "string", minLength: 1 },
+        },
+      },
+    },
+    epics: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["epic_key", "milestone_key", "title", "description"],
+        properties: {
+          epic_key: { type: "string", minLength: 1 },
+          milestone_key: { type: "string", minLength: 1 },
+          title: { type: "string", minLength: 1 },
+          description: { type: "string", minLength: 1 },
+        },
+      },
+    },
+    stories: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "story_key",
+          "epic_key",
+          "title",
+          "description",
+          "requirement_ids",
+          "ac_ids",
+        ],
+        properties: {
+          story_key: { type: "string", minLength: 1 },
+          epic_key: { type: "string", minLength: 1 },
+          title: { type: "string", minLength: 1 },
+          description: { type: "string", minLength: 1 },
+          requirement_ids: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1 },
+          },
+          ac_ids: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1 },
+          },
+        },
+      },
+    },
+    tasks: {
+      type: "array",
+      minItems: 1,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "task_key",
+          "story_key",
+          "title",
+          "description",
+          "requirement_ids",
+          "ac_ids",
+          "allowed_files",
+          "depends_on_task_keys",
+        ],
+        properties: {
+          task_key: { type: "string", minLength: 1 },
+          story_key: { type: "string", minLength: 1 },
+          title: { type: "string", minLength: 1 },
+          description: { type: "string", minLength: 1 },
+          requirement_ids: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1 },
+          },
+          ac_ids: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1 },
+          },
+          allowed_files: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1 },
+          },
+          depends_on_task_keys: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+          },
+          developer_profile_key: { type: "string", minLength: 1 },
+          verification_tier1_command: {
+            type: "object",
+            additionalProperties: false,
+            required: ["command", "args"],
+            properties: {
+              command: { type: "string", minLength: 1 },
+              args: {
+                type: "array",
+                items: { type: "string" },
+              },
+              cwd: { type: "string", minLength: 1 },
+            },
+          },
+        },
+      },
+    },
+    planning_notes: { type: "string", minLength: 1 },
+  },
+};
+
 export const STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC: PromptTemplateSpec = {
   promptId: STAGE4_CONSISTENCY_CHECK_PROMPT_ID,
   version: STAGE4_CONSISTENCY_CHECK_PROMPT_VERSION,
@@ -379,6 +509,48 @@ export const STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC: PromptTemplateSpec = {
 export const STAGE4_CONSISTENCY_CHECK_PROMPT_SHA256 = computePromptSha256(
   STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC
 );
+
+export const STAGE7_PLANNING_PROMPT_SPEC: PromptTemplateSpec = {
+  promptId: STAGE7_PLANNING_PROMPT_ID,
+  version: STAGE7_PLANNING_PROMPT_VERSION,
+  description:
+    "Stage 7 Development Plan Decomposition into Milestones -> Epics -> Stories -> Stage 8 TaskContracts with 100% Stage 2 req/AC coverage.",
+  requiredVariables: [
+    "project_id",
+    "pipeline_session_id",
+    "baseline_id",
+    "title",
+    "stage2_requirements_json",
+    "stage3_architecture_json",
+    "protected_paths_json",
+    "agent_profiles_json",
+  ],
+  systemTemplate: [
+    "You are the Software Factory v1.5 Stage 7 Delivery Planner.",
+    "Decompose the frozen Stage 2 SRS and Stage 3 Architecture into Milestones -> Epics -> User Stories -> executable Stage 8 Task Contracts.",
+    "CRITICAL RULES:",
+    "1) 100% of Stage 2 req_id and ac_id MUST be covered across both stories and tasks; zero dangling or invented req_id/ac_id.",
+    "2) Every task allowed_files MUST be safe relative POSIX globs/paths and MUST NEVER overlap protected_paths or system forbidden paths (.git/**, .factory/**, policy/**, tests/protected/**).",
+    "3) Task dependencies (depends_on_task_keys) MUST form a strict acyclic DAG referencing valid task_key values.",
+    "4) Optionally bind developer_profile_key to an active DEVELOPER profile from agent_profiles_json.",
+    "Respond ONLY with a valid JSON object matching { milestones, epics, stories, tasks, planning_notes }.",
+  ].join("\n"),
+  userTemplate: [
+    "Project ID: {{project_id}}",
+    "Pipeline Session ID: {{pipeline_session_id}}",
+    "Frozen Baseline ID: {{baseline_id}}",
+    "Title: {{title}}",
+    "Frozen Stage 2 Requirements:",
+    "{{stage2_requirements_json}}",
+    "Frozen Stage 3 Architecture:",
+    "{{stage3_architecture_json}}",
+    "Stage 5 Protected Paths (FORBIDDEN in task allowed_files):",
+    "{{protected_paths_json}}",
+    "Stage 6 Agent Organization Profiles:",
+    "{{agent_profiles_json}}",
+  ].join("\n"),
+  outputSchema: STAGE7_PLANNING_OUTPUT_SCHEMA,
+};
 
 export const DEFAULT_PIPELINE_PROMPT_TEMPLATES: readonly PromptTemplateSpec[] = [
   {
@@ -458,6 +630,7 @@ export const DEFAULT_PIPELINE_PROMPT_TEMPLATES: readonly PromptTemplateSpec[] = 
     outputSchema: STAGE3_ARCHITECTURE_OUTPUT_SCHEMA,
   },
   STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC,
+  STAGE7_PLANNING_PROMPT_SPEC,
 ];
 
 export function createDefaultPipelinePromptRegistry(): PromptRegistry {

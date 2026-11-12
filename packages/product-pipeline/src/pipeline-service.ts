@@ -15,21 +15,45 @@ import {
   validateStage2Ac10References,
 } from "@software-factory/database";
 import {
+  type AgentOrgRole,
+  type AgentOrganizationProfileRecord,
   type BaselineSpecFreezeRecord,
+  type BidirectionalTraceabilityMatrix,
+  type ChangeRequestRecord,
   type CostSessionRecord,
+  type M6BStages5To9Bundle,
   type ModelCallLedgerRecord,
   type ModelPricingRate,
   type PipelineStageName,
   type ProductPipelineBundle,
   type ProductPipelineSessionRecord,
+  type ReleaseAcceptancePackageRecord,
   type Stage1DiscoveryBundle,
   type Stage1DiscoveryItemRecord,
   type Stage4ConsistencyReport,
   type StageApprovalGateRecord,
   type StageApprovalGateStage,
   type StageArtifactRecord,
+  type TaskPlanLinkRecord,
+  type TaskRecord,
 } from "@software-factory/shared-types";
+import {
+  type RunStage5ProjectBootstrapInput,
+  type Stage5BootstrapOutcome,
+  runStage5ProjectBootstrap,
+} from "./bootstrapper.ts";
 import { runCrossArtifactConsistencyCheck } from "./consistency-checker.ts";
+import {
+  type RunStage7DevelopmentPlanInput,
+  type Stage6ReviewerPairOutcome,
+  type Stage7PlanExecutionOutcome,
+  type UpsertAgentOrganizationProfileServiceInput,
+  type ValidateStage6ReviewerPairInput,
+  listAgentOrganizationProfilesService,
+  runStage7DevelopmentPlan,
+  upsertAgentOrganizationProfileService,
+  validateStage6ReviewerPairService,
+} from "./planning-service.ts";
 import {
   STAGE1_DISCOVERY_PROMPT_ID,
   STAGE2_REQUIREMENTS_PROMPT_ID,
@@ -39,6 +63,18 @@ import {
   STAGE4_CONSISTENCY_CHECK_PROMPT_VERSION,
   createDefaultPipelinePromptRegistry,
 } from "./prompts.ts";
+import {
+  type ApplyChangeRequestServiceInput,
+  type DecideChangeRequestServiceInput,
+  type IssueReleaseAcceptanceServiceInput,
+  type SubmitChangeRequestServiceInput,
+  applyChangeRequestService,
+  decideChangeRequestService,
+  getBidirectionalTraceabilityMatrixService,
+  getM6BStages5To9BundleService,
+  issueReleaseAcceptancePackageService,
+  submitChangeRequestService,
+} from "./traceability.ts";
 
 const GATE_STAGE_TO_ARTIFACT_STAGE: Readonly<
   Record<StageApprovalGateStage, PipelineStageName>
@@ -1083,5 +1119,121 @@ export class ProductPipelineService {
         });
       }
     );
+  }
+
+  // ===========================================================================
+  // Milestone M6B: Stages 5–9 Lifecycle, 3D Profiles, CR & AC-11b Release Acceptance
+  // ===========================================================================
+
+  public async bootstrapProject(
+    input: RunStage5ProjectBootstrapInput
+  ): Promise<Stage5BootstrapOutcome> {
+    return runStage5ProjectBootstrap(this.store, input);
+  }
+
+  public async upsertAgentOrganizationProfile(
+    input: UpsertAgentOrganizationProfileServiceInput
+  ): Promise<AgentOrganizationProfileRecord> {
+    return upsertAgentOrganizationProfileService(this.store, input);
+  }
+
+  public async listAgentOrganizationProfiles(input: {
+    readonly project_id: string;
+    readonly actor_principal_id: string;
+    readonly role?: AgentOrgRole;
+    readonly active_only?: boolean;
+  }): Promise<AgentOrganizationProfileRecord[]> {
+    return listAgentOrganizationProfilesService(this.store, input);
+  }
+
+  public async validateStage6ReviewerPair(
+    input: ValidateStage6ReviewerPairInput
+  ): Promise<Stage6ReviewerPairOutcome> {
+    return validateStage6ReviewerPairService(this.store, input);
+  }
+
+  public async generateStage7DevelopmentPlan(
+    input: RunStage7DevelopmentPlanInput & {
+      readonly model_config?: ModelProviderConfig;
+      readonly model_executor?: ManagedModelProviderExecutor;
+      readonly model_client?: LiveModelProviderClient;
+    }
+  ): Promise<Stage7PlanExecutionOutcome> {
+    const executor = this.resolveExecutor(input);
+    return runStage7DevelopmentPlan(this.store, executor, input);
+  }
+
+  public async submitChangeRequest(
+    input: SubmitChangeRequestServiceInput
+  ): Promise<ChangeRequestRecord> {
+    return submitChangeRequestService(this.store, input);
+  }
+
+  public async decideChangeRequest(
+    input: DecideChangeRequestServiceInput
+  ): Promise<ChangeRequestRecord> {
+    return decideChangeRequestService(this.store, input);
+  }
+
+  public async applyChangeRequest(input: ApplyChangeRequestServiceInput): Promise<{
+    readonly changeRequest: ChangeRequestRecord;
+    readonly tasks: readonly TaskRecord[];
+    readonly taskLinks: readonly TaskPlanLinkRecord[];
+  }> {
+    return applyChangeRequestService(this.store, input);
+  }
+
+  public async listChangeRequests(input: {
+    readonly project_id: string;
+    readonly pipeline_session_id: string;
+    readonly actor_principal_id: string;
+  }): Promise<ChangeRequestRecord[]> {
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.actor_principal_id,
+        currentRole: "core_api_service",
+      },
+      () => this.store.listChangeRequests(input.pipeline_session_id)
+    );
+  }
+
+  public async getBidirectionalTraceabilityMatrix(input: {
+    readonly project_id: string;
+    readonly pipeline_session_id: string;
+    readonly actor_principal_id: string;
+    readonly live_main_head_commit_hash?: string;
+  }): Promise<BidirectionalTraceabilityMatrix> {
+    return getBidirectionalTraceabilityMatrixService(this.store, input);
+  }
+
+  public async issueReleaseAcceptancePackage(
+    input: IssueReleaseAcceptanceServiceInput
+  ): Promise<ReleaseAcceptancePackageRecord> {
+    return issueReleaseAcceptancePackageService(this.store, input);
+  }
+
+  public async listReleaseAcceptancePackages(input: {
+    readonly project_id: string;
+    readonly pipeline_session_id: string;
+    readonly actor_principal_id: string;
+  }): Promise<ReleaseAcceptancePackageRecord[]> {
+    return this.store.withRlsTransaction(
+      {
+        currentProjectId: input.project_id,
+        currentPrincipalId: input.actor_principal_id,
+        currentRole: "core_api_service",
+      },
+      () => this.store.listReleaseAcceptancePackages(input.pipeline_session_id)
+    );
+  }
+
+  public async getM6BStages5To9Bundle(input: {
+    readonly project_id: string;
+    readonly pipeline_session_id: string;
+    readonly actor_principal_id: string;
+    readonly live_main_head_commit_hash?: string;
+  }): Promise<M6BStages5To9Bundle> {
+    return getM6BStages5To9BundleService(this.store, input);
   }
 }

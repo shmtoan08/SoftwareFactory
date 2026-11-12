@@ -9,7 +9,6 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  readlinkSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,8 +18,11 @@ import {
   type VerificationExecutionBackend,
   type VerificationOverallStatus,
   canonicalizeJson,
+  computeDirectorySha256,
   sha256Hex,
 } from "@software-factory/shared-types";
+
+export { computeDirectorySha256 };
 import { type TaskContractSpec, matchesAnyGlob } from "@software-factory/task-contract";
 import { LinuxCgroupV2SandboxBackend } from "@software-factory/wna";
 import {
@@ -358,30 +360,6 @@ function collectFilesRecursively(rootDir: string, relPrefix = ""): string[] {
   return out;
 }
 
-/**
- * Deterministic SHA-256 across an entire directory tree (sorted relative POSIX paths + bytes).
- */
-export function computeDirectorySha256(dirPath: string): string {
-  const absDir = resolve(dirPath);
-  const relFiles = collectFilesRecursively(absDir).sort();
-  const hash = createHash("sha256");
-
-  for (const relPath of relFiles) {
-    const absFile = join(absDir, ...relPath.split("/"));
-    const st = lstatSync(absFile);
-    if (st.isSymbolicLink()) {
-      const target = readlinkSync(absFile);
-      hash.update(`L\0${relPath}\0${target}\0`);
-    } else if (st.isFile()) {
-      const bytes = readFileSync(absFile);
-      hash.update(`F\0${relPath}\0${bytes.byteLength}\0`);
-      hash.update(bytes);
-      hash.update("\0");
-    }
-  }
-
-  return hash.digest("hex");
-}
 
 function findSymlinksInDirectory(rootDir: string): string[] {
   const absRoot = resolve(rootDir);

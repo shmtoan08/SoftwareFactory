@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 /**
  * Canonical Task Statuses (MVP-SPEC-01 Section 4 & MVP-SPEC-02 Section 2)
@@ -1191,4 +1193,373 @@ export interface ProductPipelineBundle {
   readonly approvalGates: readonly StageApprovalGateRecord[];
   readonly baselineFreeze: BaselineSpecFreezeRecord | null;
 }
+
+function collectDirectoryFilesRecursively(rootDir: string, relPrefix = ""): string[] {
+  if (!existsSync(rootDir)) {
+    return [];
+  }
+  const entries = readdirSync(rootDir, { withFileTypes: true }).sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+  );
+  const out: string[] = [];
+  for (const entry of entries) {
+    const relPath = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+    const absPath = join(rootDir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === ".git") {
+        continue;
+      }
+      out.push(...collectDirectoryFilesRecursively(absPath, relPath));
+    } else {
+      out.push(relPath);
+    }
+  }
+  return out;
+}
+
+/**
+ * Deterministic SHA-256 across an entire directory tree (sorted relative POSIX paths + bytes).
+ * Shared by Stage 5 Project Bootstrapper and Stage 8 Docker3TierVerifier (`M6B-SPEC-01`).
+ */
+export function computeDirectorySha256(dirPath: string): string {
+  const absDir = resolve(dirPath);
+  const relFiles = collectDirectoryFilesRecursively(absDir).sort();
+  const hash = createHash("sha256");
+
+  for (const relPath of relFiles) {
+    const absFile = join(absDir, ...relPath.split("/"));
+    const st = lstatSync(absFile);
+    if (st.isSymbolicLink()) {
+      const target = readlinkSync(absFile);
+      hash.update(`L\0${relPath}\0${target}\0`);
+    } else if (st.isFile()) {
+      const bytes = readFileSync(absFile);
+      hash.update(`F\0${relPath}\0${bytes.byteLength}\0`);
+      hash.update(bytes);
+      hash.update("\0");
+    }
+  }
+
+  return hash.digest("hex");
+}
+
+// =============================================================================
+// Milestone M6B: Stages 5-9 Software Development Lifecycle & AC-11b Traceability
+// =============================================================================
+
+export type ExecutionTargetType =
+  | "factory_managed_worker"
+  | "user_managed_worker"
+  | "provider_managed_vm"
+  | "remote_agent_session";
+
+export type TargetTrustTier =
+  | "TIER_1_FACTORY_MANAGED"
+  | "TIER_2_USER_MANAGED"
+  | "TIER_3_PROVIDER_VM"
+  | "TIER_4_REMOTE_SESSION";
+
+export type AgentOrgRole =
+  | "PLANNER"
+  | "DEVELOPER"
+  | "REVIEWER_READONLY"
+  | "VERIFIER";
+
+export interface AgentOrganizationProfileRecord {
+  readonly profile_id: string;
+  readonly project_id: string;
+  readonly profile_key: string;
+  readonly role: AgentOrgRole;
+  readonly principal_id: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly execution_target_type: ExecutionTargetType;
+  readonly trust_tier: TargetTrustTier;
+  readonly target_locator: string | null;
+  readonly capabilities_json: Readonly<Record<string, unknown>>;
+  readonly is_active: boolean;
+  readonly created_by_principal_id: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface TrustedAcceptanceTestSpec {
+  readonly ac_id: string;
+  readonly req_id: string;
+  readonly given: string;
+  readonly when: string;
+  readonly then: string;
+  readonly test_file_path: string;
+  readonly component_ids: readonly string[];
+  readonly expected_deliverables: readonly string[];
+}
+
+export interface ProjectBootstrapRecord {
+  readonly bootstrap_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly repo_path: string;
+  readonly trusted_acceptance_dir: string;
+  readonly base_main_commit_hash: string;
+  readonly protected_paths: readonly string[];
+  readonly trusted_policy_sha256: string;
+  readonly generated_files: readonly string[];
+  readonly acceptance_tests: readonly TrustedAcceptanceTestSpec[];
+  readonly bootstrap_sha256: string;
+  readonly created_by_principal_id: string;
+  readonly created_at: string;
+}
+
+export interface DevMilestoneRecord {
+  readonly milestone_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly milestone_key: string;
+  readonly title: string;
+  readonly description: string;
+  readonly sequence_order: number;
+  readonly created_at: string;
+}
+
+export interface DevEpicRecord {
+  readonly epic_id: string;
+  readonly project_id: string;
+  readonly milestone_id: string;
+  readonly epic_key: string;
+  readonly title: string;
+  readonly description: string;
+  readonly sequence_order: number;
+  readonly created_at: string;
+}
+
+export interface DevUserStoryRecord {
+  readonly story_id: string;
+  readonly project_id: string;
+  readonly epic_id: string;
+  readonly story_key: string;
+  readonly title: string;
+  readonly description: string;
+  readonly requirement_ids: readonly string[];
+  readonly ac_ids: readonly string[];
+  readonly sequence_order: number;
+  readonly created_at: string;
+}
+
+export interface PlannedCommandSpec {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd?: string;
+}
+
+export interface PlannedTaskSpec {
+  readonly task_key: string;
+  readonly story_key: string;
+  readonly title: string;
+  readonly description: string;
+  readonly requirement_ids: readonly string[];
+  readonly ac_ids: readonly string[];
+  readonly allowed_files: readonly string[];
+  readonly depends_on_task_keys: readonly string[];
+  readonly developer_profile_key?: string;
+  readonly verification_tier1_command?: PlannedCommandSpec;
+}
+
+export interface Stage7PlanningOutput {
+  readonly milestones: ReadonlyArray<{
+    readonly milestone_key: string;
+    readonly title: string;
+    readonly description: string;
+  }>;
+  readonly epics: ReadonlyArray<{
+    readonly epic_key: string;
+    readonly milestone_key: string;
+    readonly title: string;
+    readonly description: string;
+  }>;
+  readonly stories: ReadonlyArray<{
+    readonly story_key: string;
+    readonly epic_key: string;
+    readonly title: string;
+    readonly description: string;
+    readonly requirement_ids: readonly string[];
+    readonly ac_ids: readonly string[];
+  }>;
+  readonly tasks: readonly PlannedTaskSpec[];
+  readonly planning_notes: string;
+}
+
+export interface TaskPlanLinkRecord {
+  readonly link_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly bootstrap_id: string | null;
+  readonly story_id: string | null;
+  readonly task_id: string;
+  readonly cr_id: string | null;
+  readonly requirement_ids: readonly string[];
+  readonly ac_ids: readonly string[];
+  readonly assigned_profile_id: string | null;
+  readonly created_at: string;
+}
+
+export interface Stage7DevelopmentPlanBundle {
+  readonly milestones: readonly DevMilestoneRecord[];
+  readonly epics: readonly DevEpicRecord[];
+  readonly stories: readonly DevUserStoryRecord[];
+  readonly taskLinks: readonly TaskPlanLinkRecord[];
+  readonly tasks: readonly TaskRecord[];
+}
+
+export type ChangeRequestStatus =
+  | "PENDING_APPROVAL"
+  | "APPROVED"
+  | "REJECTED"
+  | "APPLIED";
+
+export interface ChangeRequestProposedTaskSpec {
+  readonly task_key: string;
+  readonly story_id?: string | null;
+  readonly title: string;
+  readonly description: string;
+  readonly requirement_ids: readonly string[];
+  readonly ac_ids: readonly string[];
+  readonly allowed_files: readonly string[];
+  readonly developer_profile_id?: string | null;
+}
+
+export interface ChangeRequestRecord {
+  readonly cr_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly cr_key: string;
+  readonly title: string;
+  readonly rationale: string;
+  readonly impacted_requirement_ids: readonly string[];
+  readonly impacted_component_ids: readonly string[];
+  readonly proposed_tasks: readonly ChangeRequestProposedTaskSpec[];
+  readonly status: ChangeRequestStatus;
+  readonly requested_by_principal_id: string;
+  readonly decided_by_principal_id: string | null;
+  readonly decision_rationale: string | null;
+  readonly decided_at: string | null;
+  readonly applied_by_principal_id: string | null;
+  readonly applied_at: string | null;
+  readonly cr_sha256: string;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface TraceabilityStage8TaskLineage {
+  readonly task_id: string;
+  readonly title: string;
+  readonly status: TaskStatus;
+  readonly cr_id: string | null;
+  readonly trusted_policy_sha256: string | null;
+  readonly lease_ids: readonly string[];
+  readonly import_ids: readonly string[];
+  readonly merge_candidate_ids: readonly string[];
+  readonly verification_run_ids: readonly string[];
+  readonly review_session_ids: readonly string[];
+  readonly review_artifact_ids: readonly string[];
+  readonly approval_request_ids: readonly string[];
+  readonly approval_decision_ids: readonly string[];
+  readonly merged_commit_hash: string | null;
+  readonly main_reachable: boolean;
+}
+
+export interface TraceabilityRequirementRow {
+  readonly req_id: string;
+  readonly title: string;
+  readonly stage1_item_ids: readonly string[];
+  readonly ac_ids: readonly string[];
+  readonly stage3_component_ids: readonly string[];
+  readonly stage3_erd_tables: readonly string[];
+  readonly stage3_api_endpoints: readonly string[];
+  readonly stage3_security_controls: readonly string[];
+  readonly stage3_adr_ids: readonly string[];
+  readonly bootstrap_id: string | null;
+  readonly trusted_acceptance_test_files: readonly string[];
+  readonly milestone_ids: readonly string[];
+  readonly epic_ids: readonly string[];
+  readonly story_ids: readonly string[];
+  readonly task_ids: readonly string[];
+  readonly applied_cr_ids: readonly string[];
+  readonly stage8_lineage: readonly TraceabilityStage8TaskLineage[];
+  readonly complete: boolean;
+  readonly missing_links: readonly string[];
+}
+
+export interface TraceabilityMissingLink {
+  readonly req_id: string;
+  readonly stage: string;
+  readonly reason: string;
+}
+
+export interface TraceabilityOrphanLink {
+  readonly entity_type: string;
+  readonly entity_id: string;
+  readonly reason: string;
+}
+
+export interface BidirectionalTraceabilityMatrix {
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly generated_at: string;
+  readonly total_requirements: number;
+  readonly covered_requirements: number;
+  readonly coverage_percent: number;
+  readonly complete: boolean;
+  readonly requirement_rows: readonly TraceabilityRequirementRow[];
+  readonly forward_index: Readonly<Record<string, TraceabilityRequirementRow>>;
+  readonly backward_index: {
+    readonly stage1_items: Readonly<Record<string, readonly string[]>>;
+    readonly stage2_ac_ids: Readonly<Record<string, readonly string[]>>;
+    readonly stage3_components: Readonly<Record<string, readonly string[]>>;
+    readonly trusted_acceptance_tests: Readonly<Record<string, readonly string[]>>;
+    readonly stories: Readonly<Record<string, readonly string[]>>;
+    readonly tasks: Readonly<Record<string, readonly string[]>>;
+    readonly change_requests: Readonly<Record<string, readonly string[]>>;
+    readonly merged_commits: Readonly<Record<string, readonly string[]>>;
+  };
+  readonly missing_links: readonly TraceabilityMissingLink[];
+  readonly orphan_links: readonly TraceabilityOrphanLink[];
+  readonly traceability_sha256: string;
+}
+
+export interface ReleaseAcceptancePackageRecord {
+  readonly release_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline_id: string;
+  readonly traceability_sha256: string;
+  readonly coverage_percent: number;
+  readonly complete: boolean;
+  readonly total_requirements: number;
+  readonly merged_task_ids: readonly string[];
+  readonly applied_cr_ids: readonly string[];
+  readonly main_head_commit_hash: string;
+  readonly summary_markdown: string;
+  readonly package_json: Readonly<Record<string, unknown>>;
+  readonly package_sha256: string;
+  readonly accepted_by_principal_id: string;
+  readonly accepted_at: string;
+}
+
+export interface M6BStages5To9Bundle {
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly baseline: BaselineSpecFreezeRecord;
+  readonly bootstrap: ProjectBootstrapRecord | null;
+  readonly agent_profiles: readonly AgentOrganizationProfileRecord[];
+  readonly stage7_plan: Stage7DevelopmentPlanBundle;
+  readonly change_requests: readonly ChangeRequestRecord[];
+  readonly traceability: BidirectionalTraceabilityMatrix;
+  readonly release_packages: readonly ReleaseAcceptancePackageRecord[];
+}
+
 
