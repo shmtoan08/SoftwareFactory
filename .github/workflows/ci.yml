@@ -74,6 +74,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
           psql -v ON_ERROR_STOP=1 <<'SQL'
           DO $$
@@ -1753,6 +1757,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
           # 4. Assert upgraded constraints actually replaced the old definitions
@@ -2066,6 +2074,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
           # 4. Assert M6A-FIX-01..03, 07, Minor Notes 1, 5, 6, 7, 8, 17, 18 & M6B 0008 on upgraded DB
@@ -2354,6 +2366,10 @@ jobs:
           # 3. Apply HEAD 0008_m6b_stages_5_9_and_traceability.sql twice (upgrade + idempotency) + 0002 RLS matrix
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 
           # 4. Assert M6B schema, FORCE RLS, triggers, CHECK constraints & full Stage 5-9 runtime workflow

@@ -13,6 +13,11 @@ Deterministic, lease-coordinated AI Software Factory Control Plane with 4-tier P
 - **Milestone `M6A` (Model Provider Adapter v2, Cost Guard `AC-12b` & Stages 1–4 Product Pipeline):** Completed (`test:m6a` 7 acceptance suites `M6A-AC1..M6A-AC7`, review-hardening `M6A-FIX-01..10`, PostgreSQL `0006`/`0007` 7-table `FORCE RLS`, `AC-10` triggers & `86076639`/`8044774` upgrade paths passing)
 - **Milestone `M6B` (Stages 5–9 Software Development Lifecycle, Multi-Target Execution Profiles, Post-Freeze CR & `AC-11b` Bidirectional Traceability):** Completed (`test:m6b` 8 acceptance suites `M6B-AC1..M6B-AC7b`, PostgreSQL `0008` 8-table `FORCE RLS`, `chk_aop_target_tier_mapping`, `chk_rap_complete_100`, `trg_cr_transitions`/`trg_tpl_invariants` triggers & `6f1faa8`/`8044774`/`86076639` upgrade paths passing)
 
+- **Slice `M6C-1` (Parallel Core, Serialized CAS Queue, Budget Auto-Pause `AC-12c`, Telemetry):** Implemented; `test:m6c` covers concurrent DAG/path-safe dispatch, real Git FIFO merge/crash recovery/rebase, project/task budgets, HTTP RBAC, trace propagation, OTLP export and real PostgreSQL `0009` RLS. Local M6C gate: **8/8 passing on PostgreSQL 17**. Linux isolation remains covered by the Linux CI matrix.
+- **M6C-1 validation (2026-11-12):** Earlier full PostgreSQL regression **102/102 passing**, followed by final M6C glob regression **8/8 passing**; details and limits: [M6C-1 validation report](./m6c1-validation-report.md).
+- **Slice `M6C-2` (Second Runtime & Extended Imports):** Codex CLI adapter, WNA runtime selection, Bundle/Patch/Artifact normalization, lease-fenced immutable receipts and candidate-bound provenance implemented. Final M6C-2 **9/9**, native sandbox/WNA **2/2**; full regression **108/111**, with the three M5 failures passing an isolated **3/3** rerun. Validation and limits: [M6C-2 report](./m6c2-validation-report.md).
+- **Slice `M6C-3`:** Pending (external target connectors, kernel-isolated verifier, Lima/WSL2 and production deployment approval). **M6C / G7 is not yet complete.**
+
 ## Quick Start
 
 Requires **Node.js >= 22.18.0** (verified on Node `v26.3.0` with native TypeScript execution).
@@ -37,7 +42,7 @@ PostgreSQL wire TLS & authentication defaults:
 - Defaults to `sslmode=require` on non-loopback hosts (`prefer` on loopback; remote `sslmode=disable` rejected unless `PG_ALLOW_INSECURE_REMOTE_DISABLE_SSL=1`). Supports `sslmode=disable|prefer|require|verify-ca|verify-full` and `PGSSLROOTCERT` / `?sslrootcert=`.
 - Enforces `SCRAM-SHA-256` authentication (cleartext/MD5 rejected unless explicitly opted in via `PG_ALLOW_INSECURE_CLEARTEXT_AUTH=1` / `PG_ALLOW_LEGACY_MD5_AUTH=1`), bounded query/acquire/socket timeouts (`PGQUERY_TIMEOUT_MS`, `PGACQUIRE_TIMEOUT_MS`, `PGSOCKET_TIMEOUT_MS`), frame buffer caps (`PGMAX_RECV_BUFFER_BYTES`), and SCRAM iteration caps (`PGMAX_SCRAM_ITERATIONS`).
 - [`CoreApiHttpServer`](./apps/core-api/src/http-server.ts) disables `POST /cas-merge` crash fault injection (`enableTestFaultInjection: false`) and restricts `POST /verify` to allowlisted binaries/images/env keys with Docker isolation enforced by default.
-- **Web Console Security Boundary (`M6A-FU-06`):** [`WebApprovalConsoleHttpServer`](./apps/web/src/index.ts) (`/m6a`, `/m6b`, Stage forms) accepts raw provider `apiKey` fields inside `model_config` for interactive operator workflows and **MUST only be deployed on trusted loopback or private internal networks** (or behind an authenticated zero-trust internal proxy — never exposed directly to public/untrusted networks). Loopback `http://127.0.0.1` model endpoints require `allowInsecureHttpBaseUrl: true` (`classifyHost` treats `127.0.0.1` as private); real model credentials should be injected via server/gateway environment secrets wherever possible.
+- **Web Console Security Boundary (`M6A-FU-06`):** [`WebApprovalConsoleHttpServer`](./apps/web/src/index.ts) (`/m6a`, `/m6b`, Stage forms) accepts raw provider `apiKey` fields inside `model_config` for interactive operator workflows and **MUST only be deployed on trusted loopback or private internal networks** (or behind an authenticated zero-trust internal proxy — never exposed directly to public/untrusted networks). Loopback `http://127.0.0.1` (exact IPv4 loopback), `http://[::1]`, and `http://localhost` model endpoints are classified as `loopback` by `classifyHost` and permitted over HTTP without `allowInsecureHttpBaseUrl`, whereas `WebApprovalConsoleHttpServer` sets `allowInsecureHttpBaseUrl: false` so non-`127.0.0.1` `127.x.x.x` addresses, RFC1918 private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and CGNAT endpoints are rejected over plaintext HTTP; real model credentials should be injected via server/gateway environment secrets wherever possible.
 
 To verify the real PostgreSQL 4-tier RLS SQL migrations, M3/M4/M5/M6A/M6B additive schema & hardening constraints (`0005` `resource_usage_metrics`, `projects.main_ref_commit_hash`, `verified_code_imports.recovered_by_reconciler`; `0006`/`0007` Cost Guard `AC-12b`, `usage_estimated`, `fk_mcs_pipeline_session`, `AC-10` triggers & freeze locks; `0008` Stages 5–9 `project_bootstraps`, `agent_organization_profiles`, `dev_milestones`, `dev_epics`, `dev_user_stories`, `change_requests`, `task_plan_links`, `release_acceptance_packages`), and isolation test matrix (`RLS-T1..RLS-T8`) against a PostgreSQL 16+ instance:
 
@@ -49,6 +54,8 @@ psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0005_m5_resource_metrics
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0006_m6a_model_cost_guard_and_stages_1_4.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 ```
 
@@ -58,6 +65,7 @@ Run M5/M6A/M6B live PostgreSQL tests against a migrated PostgreSQL 16+ database 
 npm run test:m5
 npm run test:m6a
 npm run test:m6b
+npm run test:m6c
 ```
 
 ## Monorepo Structure
@@ -70,7 +78,7 @@ SoftwareFactory/
 │   └── web/                # Live WebApprovalConsoleHttpServer + unified stack bootstrap (createControlPlaneStackRuntime/main.ts), 8-field lock, Candidate-Bound Lineage / telemetry, M6A Stages 1–4 Workbench & M6B `/m6b`, `/traceability` & `/agent-profiles` UI
 ├── packages/
 │   ├── adapter-sdk/        # AgentRuntimeAdapter, Model Provider Adapter v2 (PromptRegistry, StructuredJsonSchema fail-closed validator, AC-12b micro-USD CostGuard & ManagedModelProviderExecutor), LiveModelProviderClient, WorkspaceCodingAgentAdapter & ClaudeCodeCliAdapter
-│   ├── database/           # PostgreSQL 4-tier RLS SQL migrations (`0001`..`0008`), PostgresRuntimePool (wire v3 + TLS SSLRequest + SCRAM-SHA-256 + SET LOCAL + DISCARD ALL), PostgresControlPlaneRepository, createControlPlaneStoreFromEnv, M6A/M6B validators & in-memory harness
+│   ├── database/           # PostgreSQL 4-tier RLS SQL migrations (`0001`..`0010`), PostgresRuntimePool (wire v3 + TLS SSLRequest + SCRAM-SHA-256 + SET LOCAL + DISCARD ALL), PostgresControlPlaneRepository, createControlPlaneStoreFromEnv, M6A/M6B validators & in-memory harness
 │   ├── product-pipeline/   # M6A Stages 1–4 orchestration (ProductPipelineService), PromptRegistry templates (`1.0.0`), AC-10 3-layer enforcement, CrossArtifactConsistencyChecker (`CHK-01..CHK-05`), & M6B Stages 5–9 (Stage 5 Bootstrapper, Stage 6 Profiles & 3D Check, Stage 7 Planner, Stage 9 CR & Release Package, AC-11b Bidirectional Traceability)
 │   ├── reviewer/           # IndependentReviewerService (Context Firewall, read-only WORM sandbox, TypeScript AST Tier-3 test inspection, diff/scope analysis)
 │   ├── shared-types/       # Canonical 11-state TaskStatus transition matrix, M4 review/approval/merge records, M5 ResourceUsageMetricRecord/M5EvidenceBundle, M6A/M6B records + BigInt micro-USD helpers & canonical JSON SHA-256 helpers
@@ -130,3 +138,48 @@ Running `npm test` executes [`m1-acceptance.test.ts`](./packages/test-harness/sr
    - `M6B-AC7` / `M6B-AC7b` (Live PostgreSQL 16/17 `0008` RLS, Triggers, Grants & Upgrade Paths): `FORCE ROW LEVEL SECURITY` on all 8 M6B tables, `42501` append-only & column-level `UPDATE` GRANT enforcement, `chk_aop_target_tier_mapping`, `chk_rap_complete_100`, `trg_cr_transitions`, `trg_tpl_invariants`, `trg_*_frozen_anchor`, `DISCARD ALL` isolation, live PG17 E2E Stage 1–9 -> `ReleaseAcceptancePackage`, and upgrade paths from `6f1faa8`, `8044774`, and `86076639` (skips cleanly when `PGHOST`/`DATABASE_URL` is unset).
 9. **Explicitly scoped runtime & platform telemetry honesty:** Non-Linux workstations (e.g., macOS without Docker Desktop) honestly report host fallback telemetry (`metricsSource: "process-rusage"` / `"wall-clock-only"`, `isDockerIsolated: false`) while Linux CI runners execute real `cgroup v2` / `sf_sandbox_supervisor.c` / Docker `node:22-alpine` isolation and live PostgreSQL 16 & 17 (`M5-PG`, `M6A-AC7`, `M6A-AC7b`, `M6B-AC7`, `M6B-AC7b`) verification.
 
+
+## M6C-1 Control APIs
+
+All routes use the existing signed core API authentication and project membership checks.
+
+| Method | `/api/v1/projects/:projectId` route | Authorization / behavior |
+|---|---|---|
+| GET / POST | `/task-dependencies` | Read / mutation roles; tenant-scoped acyclic dependencies |
+| POST | `/scheduler/dispatch` | Mutation roles; `{ worker_id, max_tasks? }`; dispatches only independent, non-overlapping tasks within capacity |
+| GET / POST | `/merge-queue` | Read / mutation roles; enqueue `{ task_id, merge_candidate_id, approval_id }` |
+| POST | `/merge-queue/drain` | Mutation roles; processes one FIFO entry against real Git; rebase requires fresh verification, review and approval |
+| GET / POST | `/budget` | Read / approval roles; cumulative usage or project policy update |
+| POST | `/tasks/:taskId/budget` | Approval roles; task limits override project defaults |
+| POST | `/budget/resume`, `/tasks/:taskId/budget/resume` | Approval roles; `reason` plus explicit ceiling above observed spend for the paused scope |
+
+`AUTO_PAUSED` blocks new dispatch and model preflight with `402 ERR_BUDGET_AUTO_PAUSED`. Updating a policy does not resume it. Known in-flight provider calls can still complete; their actual cost is recorded. An autonomous denial transaction persists pause + audit when its parent rows are committed; if the caller itself owns conflicting row locks or uncommitted policy/parent rows, accounting falls back to the outer transaction to avoid self-deadlock.
+
+`CoreApiService.telemetry` supports an in-memory collector; set `OTEL_EXPORTER_OTLP_ENDPOINT` (and optionally `OTEL_SERVICE_NAME`) for OTLP/HTTP JSON trace/metric export. HTTP server/client trace context is propagated; authorization headers, credentials and raw request bodies are not recorded. Export transport failures do not fail task operations.
+
+## M6C-2 Runtime & Import API
+
+Apply migration `0010` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
+
+Configure the WNA operator environment with `SF_AGENT_RUNTIME=codex-cli`, an explicit `SF_AGENT_MODEL`, and an invocation-scoped `SF_CODEX_API_KEY`. Optional settings are `SF_AGENT_BINARY` and positive `SF_AGENT_TIMEOUT_MS`. An explicitly supplied adapter takes precedence. Unknown runtimes and missing Codex configuration fail closed. Codex requires a detached linked WNA worktree at the pinned base. Its permission profile extends `:workspace` and grants write access only to that worktree's Git metadata and shared objects, so commits work while common refs/config remain read-only. The adapter disables ambient user configuration/rules and validates the actual Git commit rather than accepting hashes printed by the agent. See the [Codex non-interactive documentation](https://learn.chatgpt.com/docs/non-interactive-mode) and [permission profiles](https://learn.chatgpt.com/docs/permissions).
+
+`POST /api/v1/projects/:projectId/tasks/:taskId/imports` requires signed authentication, project mutation permission and a current lease:
+
+```json
+{
+  "lease_id": "<lease UUID>",
+  "lease_epoch": 1,
+  "submission": {
+    "kind": "artifact",
+    "files": [{ "action": "write", "path": "src/example.txt", "content_base64": "aGVsbG8K" }]
+  }
+}
+```
+
+Other submission forms are `{ "kind": "patch", "patch": "<unified diff>" }` and `{ "kind": "bundle", "bundle_base64": "<base64 Git bundle>", "agent_commit_hash": "<40-hex commit>" }`. Artifacts support explicit `delete` operations and regular-file modes `100644` / `100755`. Limits: 2 MiB decoded payload, 256 artifact operations, plus the existing 4 MiB HTTP request cap and task-specific limits. Bundle submissions advertise exactly one branch, whose commit has the pinned task base as its sole parent.
+
+The service normalizes imports in a private Git quarantine, uses the shared six-step validator, and publishes only the lease-bound Verify ref. Patch/artifact commits are deterministic. The response is an immutable receipt bound to the source digest, lease/epoch, commit, tree and staging ref; exact retries return it, while a different payload for that lease returns `409`. Candidate lineage includes the receipt. Imports continue through the existing verifier, independent review, human approval and serialized CAS queue.
+
+Local tests use a Codex CLI emulator with real Git/WNA execution; no live Codex provider call has been made. Opaque coding-CLI provider calls are not individually metered through the managed model Cost Guard. M6C-3 and the G7 release gate remain pending.
+
+For a provider-free native sandbox smoke, set `SF_TEST_CODEX_SANDBOX_BINARY` to the installed Codex executable and run `node --test --test-name-pattern='Codex adapter contract' packages/test-harness/src/m6c-import-adapters.test.ts`. This runs the emulator inside the actual Codex sandbox, verifies commit creation and checks that common Git refs remain unwritable. Tested CLI version: `0.167.2`.

@@ -11,6 +11,7 @@ import {
 } from "@software-factory/adapter-sdk";
 import {
   Ac10ViolationError,
+  BudgetAutoPausedError,
   type ControlPlaneStore,
   PostgresRlsError,
   validateStage2Ac10References,
@@ -588,7 +589,7 @@ export class ProductPipelineService {
         }
       );
     } catch (error) {
-      if (error instanceof CostBudgetExceededError) {
+      if (error instanceof CostBudgetExceededError || error instanceof BudgetAutoPausedError) {
         throw error;
       }
       const isValidation =
@@ -765,7 +766,7 @@ export class ProductPipelineService {
         }
       );
     } catch (error) {
-      if (error instanceof CostBudgetExceededError) {
+      if (error instanceof CostBudgetExceededError || error instanceof BudgetAutoPausedError) {
         throw error;
       }
       const isValidation =
@@ -923,7 +924,7 @@ export class ProductPipelineService {
         }
       );
     } catch (error) {
-      if (error instanceof CostBudgetExceededError) {
+      if (error instanceof CostBudgetExceededError || error instanceof BudgetAutoPausedError) {
         throw error;
       }
       const isValidation =

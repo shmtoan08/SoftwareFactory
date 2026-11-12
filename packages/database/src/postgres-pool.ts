@@ -9,9 +9,15 @@ import {
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
   type BaselineSpecFreezeRecord,
+  type BudgetPauseEventRecord,
+  type BudgetPauseEventType,
+  type BudgetPauseScope,
+  type BudgetPauseStatus,
+  type BudgetUsageSummary,
   type CandidateBoundLineage,
   type ChangeRequestProposedTaskSpec,
   type ChangeRequestRecord,
+  type CodeImportSubmissionRecord,
   type CostPreflightCheckInput,
   type CostPreflightCheckResult,
   type CostSessionRecord,
@@ -24,6 +30,8 @@ import {
   type LeaseSyncStatusResponse,
   type MergeCandidateRecord,
   type MergeOperationRecord,
+  type MergeQueueEntryRecord,
+  type MergeQueueEntryStatus,
   type ModelCallLedgerRecord,
   type ModelCallStatus,
   type ModelProviderName,
@@ -34,6 +42,8 @@ import {
   type ProductPipelineBundle,
   type ProductPipelineSessionRecord,
   type ProjectBootstrapRecord,
+  type ProjectBudgetPolicyRecord,
+  type ProjectBudgetSnapshot,
   type ReleaseAcceptancePackageRecord,
   type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
@@ -50,6 +60,9 @@ import {
   type StageArtifactKind,
   type StageArtifactRecord,
   type TargetTrustTier,
+  type TaskBudgetPolicyRecord,
+  type TaskDependencyKind,
+  type TaskDependencyRecord,
   type TaskLeaseRecord,
   type TaskPlanLinkRecord,
   type TaskRecord,
@@ -71,13 +84,17 @@ import {
   type GitTreeChangeEntry,
   type GitTreeImportCandidateInput,
   type TaskContractSpec,
+  doTaskAllowedFilesIntersect,
   validateGitTreeImport,
 } from "@software-factory/task-contract";
 import {
   Ac10ViolationError,
+  type AddTaskDependencyInput,
   type ApplyChangeRequestStoreInput,
   ApprovalExpiredOrStaleError,
+  BudgetAutoPausedError,
   type CasMergeResult,
+  type CompleteMergeQueueEntryInput,
   type ControlPlaneStore,
   type CreateChangeRequestStoreInput,
   type CreateCostSessionInput,
@@ -86,6 +103,7 @@ import {
   type CreateStage1DiscoveryItemsInput,
   type CreateStage7DevelopmentPlanInput,
   type DecideChangeRequestStoreInput,
+  type EnqueueMergeCandidateInput,
   type FreezeBaselineSpecInput,
   PostgresRlsError,
   type ProjectMemberRole,
@@ -96,9 +114,14 @@ import {
   type RecordStageApprovalGateInput,
   type RecordStageArtifactInput,
   type ResolveStage1DiscoveryItemInput,
+  type ResumeProjectBudgetInput,
+  type ResumeTaskBudgetInput,
   type RlsSessionContext,
   SimulatedPostMergeCrashError,
+  TaskDependencyBlockedError,
   type UpsertAgentOrganizationProfileInput,
+  type UpsertProjectBudgetPolicyInput,
+  type UpsertTaskBudgetPolicyInput,
 } from "./types.ts";
 import {
   buildProductPipelineBundle,
@@ -1475,7 +1498,9 @@ function mapPgError(error: unknown): never {
   if (
     error instanceof PostgresRlsError ||
     error instanceof ApprovalExpiredOrStaleError ||
-    error instanceof SimulatedPostMergeCrashError
+    error instanceof SimulatedPostMergeCrashError ||
+    error instanceof BudgetAutoPausedError ||
+    error instanceof TaskDependencyBlockedError
   ) {
     throw error;
   }
@@ -2198,6 +2223,137 @@ function mapReleaseAcceptancePackageRow(
   return record;
 }
 
+function toNullableSafeInt(value: unknown, fieldName: string): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return toSafeInt(value, fieldName);
+}
+
+function mapCodeImportSubmissionRow(row: Record<string, unknown>): CodeImportSubmissionRecord {
+  return { submission_id: String(row.submission_id), project_id: String(row.project_id), task_id: String(row.task_id),
+    lease_id: String(row.lease_id), lease_epoch: toSafeInt(row.lease_epoch, "lease_epoch"), import_id: String(row.import_id),
+    source_type: String(row.source_type) as CodeImportSubmissionRecord["source_type"], payload_sha256: String(row.payload_sha256).trim(),
+    agent_commit_hash: String(row.agent_commit_hash).trim(), verified_tree_hash: String(row.verified_tree_hash).trim(),
+    staging_ref: String(row.staging_ref), submitted_by_principal_id: String(row.submitted_by_principal_id), created_at: String(row.created_at) };
+}
+
+function mapTaskDependencyRow(row: Record<string, unknown>): TaskDependencyRecord {
+  return {
+    project_id: String(row.project_id),
+    task_id: String(row.task_id),
+    depends_on_task_id: String(row.depends_on_task_id),
+    dependency_kind: String(row.dependency_kind) as TaskDependencyKind,
+    created_at: String(row.created_at),
+  };
+}
+
+function mapMergeQueueEntryRow(row: Record<string, unknown>): MergeQueueEntryRecord {
+  return {
+    queue_entry_id: String(row.queue_entry_id),
+    project_id: String(row.project_id),
+    task_id: String(row.task_id),
+    merge_candidate_id: String(row.merge_candidate_id),
+    approval_id: String(row.approval_id),
+    queue_position: toSafeInt(row.queue_position, "queue_position"),
+    status: String(row.status) as MergeQueueEntryStatus,
+    attempt_count: toSafeInt(row.attempt_count, "attempt_count"),
+    rebased_from_candidate_id: row.rebased_from_candidate_id
+      ? String(row.rebased_from_candidate_id)
+      : null,
+    rebased_to_candidate_id: row.rebased_to_candidate_id
+      ? String(row.rebased_to_candidate_id)
+      : null,
+    merged_commit_hash: row.merged_commit_hash
+      ? String(row.merged_commit_hash).trimEnd()
+      : null,
+    last_error: row.last_error ? String(row.last_error) : null,
+    enqueued_at: String(row.enqueued_at),
+    started_at: row.started_at ? String(row.started_at) : null,
+    completed_at: row.completed_at ? String(row.completed_at) : null,
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapProjectBudgetPolicyRow(row: Record<string, unknown>): ProjectBudgetPolicyRecord {
+  return {
+    project_id: String(row.project_id),
+    max_project_tokens: toNullableSafeInt(row.max_project_tokens, "max_project_tokens"),
+    max_project_cost_micro_usd: toNullableSafeInt(
+      row.max_project_cost_micro_usd,
+      "max_project_cost_micro_usd"
+    ),
+    max_project_wall_time_ms: toNullableSafeInt(
+      row.max_project_wall_time_ms,
+      "max_project_wall_time_ms"
+    ),
+    default_task_max_tokens: toNullableSafeInt(
+      row.default_task_max_tokens,
+      "default_task_max_tokens"
+    ),
+    default_task_max_cost_micro_usd: toNullableSafeInt(
+      row.default_task_max_cost_micro_usd,
+      "default_task_max_cost_micro_usd"
+    ),
+    default_task_max_wall_time_ms: toNullableSafeInt(
+      row.default_task_max_wall_time_ms,
+      "default_task_max_wall_time_ms"
+    ),
+    max_concurrent_tasks: toSafeInt(row.max_concurrent_tasks, "max_concurrent_tasks"),
+    status: String(row.status) as BudgetPauseStatus,
+    pause_scope: row.pause_scope ? (String(row.pause_scope) as BudgetPauseScope) : null,
+    paused_task_id: row.paused_task_id ? String(row.paused_task_id) : null,
+    pause_reason: row.pause_reason ? String(row.pause_reason) : null,
+    paused_at: row.paused_at ? String(row.paused_at) : null,
+    resumed_by_principal_id: row.resumed_by_principal_id
+      ? String(row.resumed_by_principal_id)
+      : null,
+    resumed_at: row.resumed_at ? String(row.resumed_at) : null,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapTaskBudgetPolicyRow(row: Record<string, unknown>): TaskBudgetPolicyRecord {
+  return {
+    project_id: String(row.project_id),
+    task_id: String(row.task_id),
+    max_task_tokens: toNullableSafeInt(row.max_task_tokens, "max_task_tokens"),
+    max_task_cost_micro_usd: toNullableSafeInt(
+      row.max_task_cost_micro_usd,
+      "max_task_cost_micro_usd"
+    ),
+    max_task_wall_time_ms: toNullableSafeInt(row.max_task_wall_time_ms, "max_task_wall_time_ms"),
+    status: String(row.status) as BudgetPauseStatus,
+    pause_scope: row.pause_scope ? (String(row.pause_scope) as BudgetPauseScope) : null,
+    pause_reason: row.pause_reason ? String(row.pause_reason) : null,
+    paused_at: row.paused_at ? String(row.paused_at) : null,
+    resumed_by_principal_id: row.resumed_by_principal_id
+      ? String(row.resumed_by_principal_id)
+      : null,
+    resumed_at: row.resumed_at ? String(row.resumed_at) : null,
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapBudgetPauseEventRow(row: Record<string, unknown>): BudgetPauseEventRecord {
+  return {
+    event_id: String(row.event_id),
+    project_id: String(row.project_id),
+    task_id: row.task_id ? String(row.task_id) : null,
+    event_type: String(row.event_type) as BudgetPauseEventType,
+    pause_scope: row.pause_scope ? (String(row.pause_scope) as BudgetPauseScope) : null,
+    reason: String(row.reason),
+    observed_tokens: toSafeInt(row.observed_tokens, "observed_tokens"),
+    observed_cost_micro_usd: toSafeInt(row.observed_cost_micro_usd, "observed_cost_micro_usd"),
+    observed_wall_time_ms: toSafeInt(row.observed_wall_time_ms, "observed_wall_time_ms"),
+    limit_value: toNullableSafeInt(row.limit_value, "limit_value"),
+    actor_principal_id: row.actor_principal_id ? String(row.actor_principal_id) : null,
+    created_at: String(row.created_at),
+  };
+}
+
 /**
  * Live PostgreSQL Control Plane Repository backed by `PostgresRuntimePool`.
  * Executes parameterized SQL statements inside `BEGIN; SET LOCAL ROLE app_runtime; ... COMMIT; DISCARD ALL;`
@@ -2403,6 +2559,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     task_contract: TaskContractSpec;
     base_main_commit_hash?: string;
     max_rework_cycles?: number;
+    depends_on_task_ids?: readonly string[];
   }): Promise<TaskRecord> {
     const taskId = input.task_id ?? randomUUID();
     const maxReworkCycles = input.max_rework_cycles ?? 3;
@@ -2420,6 +2577,20 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         RETURNING *;`,
         [taskId, input.project_id, input.title, input.task_contract, baseMain, maxReworkCycles]
       );
+      if (input.depends_on_task_ids && input.depends_on_task_ids.length > 0) {
+        const seenDeps = new Set<string>();
+        for (const rawDepId of input.depends_on_task_ids) {
+          const depId = rawDepId.trim();
+          if (!depId || seenDeps.has(depId)) continue;
+          seenDeps.add(depId);
+          await this.insertTaskDependencySql({
+            project_id: input.project_id,
+            task_id: taskId,
+            depends_on_task_id: depId,
+            dependency_kind: "MANUAL",
+          });
+        }
+      }
       return mapTaskRow(res.rows[0]!);
     } catch (error) {
       mapPgError(error);
@@ -2485,6 +2656,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     worker_id: string;
     heartbeat_interval_ms?: number;
     lease_ttl_ms?: number;
+    reject_overlapping_active_files?: boolean;
   }): Promise<TaskLeaseRecord> {
     return this.withExistingOrRlsTransaction(
       {
@@ -2494,6 +2666,32 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       },
       async () => {
         try {
+          {
+            await this.pool.queryInActiveTx(
+              "SELECT pg_advisory_xact_lock(hashtext('lease-dispatch:' || $1::text));",
+              [input.project_id]
+            );
+          }
+
+          const taskExistsRes = await this.pool.queryInActiveTx(
+            "SELECT 1 FROM tasks WHERE task_id = $1::uuid AND project_id = $2::uuid LIMIT 1;",
+            [input.task_id, input.project_id]
+          );
+          if (taskExistsRes.rowCount === 0) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task ${input.task_id} not found in project ${input.project_id}`
+            );
+          }
+
+          // Canonical lock order: project_budget_policies -> task_budget_policies -> tasks
+          await this.assertBudgetAllowsExecutionSql({
+            project_id: input.project_id,
+            task_id: input.task_id,
+            projected_tokens: 0,
+            projected_cost_micro_usd: 0,
+          });
+
           const taskRes = await this.pool.queryInActiveTx(
             "SELECT * FROM tasks WHERE task_id = $1::uuid AND project_id = $2::uuid FOR UPDATE;",
             [input.task_id, input.project_id]
@@ -2506,8 +2704,63 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             );
           }
           const task = mapTaskRow(taskRow);
+
+          const blockingDepsRes = await this.pool.queryInActiveTx<{ depends_on_task_id: string }>(
+            `SELECT td.depends_on_task_id
+             FROM task_dependencies td
+             JOIN tasks up ON up.task_id = td.depends_on_task_id AND up.project_id = td.project_id
+             WHERE td.project_id = $1::uuid
+               AND td.task_id = $2::uuid
+               AND up.status <> 'MergedAndCompleted'
+             ORDER BY td.depends_on_task_id ASC;`,
+            [input.project_id, task.task_id]
+          );
+          if (blockingDepsRes.rows.length > 0) {
+            const blockingIds = blockingDepsRes.rows.map((r) => String(r.depends_on_task_id));
+            throw new TaskDependencyBlockedError({
+              message: `Cannot grant lease for task ${task.task_id}: upstream dependencies are not MergedAndCompleted (${blockingIds.join(", ")})`,
+              projectId: input.project_id,
+              taskId: task.task_id,
+              blockingTaskIds: blockingIds,
+            });
+          }
+
+          if (input.reject_overlapping_active_files) {
+            const activeTasksRes = await this.pool.queryInActiveTx<{
+              task_id: string;
+              task_contract_json: Record<string, unknown>;
+            }>(
+              `SELECT task_id, task_contract_json
+               FROM tasks
+               WHERE project_id = $1::uuid
+                 AND task_id <> $2::uuid
+                 AND status IN (
+                   'Leased', 'ExecutingInTarget', 'BuildingMergeCandidate',
+                   'VerifyingInDocker', 'UnderIndependentReview',
+                   'AwaitingHumanApproval', 'AtomicCasMerge'
+                 )
+               ORDER BY created_at ASC;`,
+              [input.project_id, task.task_id]
+            );
+            const capRes = await this.pool.queryInActiveTx("SELECT max_concurrent_tasks FROM project_budget_policies WHERE project_id = $1::uuid;", [input.project_id]);
+            const cap = Number(capRes.rows[0]?.max_concurrent_tasks ?? 4);
+            if (activeTasksRes.rows.length >= cap) throw new PostgresRlsError("23514", "Project concurrency limit reached");
+            for (const otherRow of activeTasksRes.rows) {
+              const overlap = doTaskAllowedFilesIntersect(
+                task.task_contract_json as unknown as TaskContractSpec,
+                otherRow.task_contract_json as unknown as TaskContractSpec
+              );
+              if (overlap.intersects) {
+                throw new PostgresRlsError(
+                  "23514",
+                  `Cannot grant lease for task ${task.task_id}: allowed_files overlaps with active task ${String(otherRow.task_id)} (witness: ${overlap.details[0]?.witnessPath ?? "unknown"})`
+                );
+              }
+            }
+          }
+
           if (task.status !== "Ready" && task.status !== "ReworkRequired") {
-            throw new Error(`Cannot grant lease when task is in status ${task.status}`);
+            throw new PostgresRlsError("23514", `Cannot grant lease when task is in status ${task.status}`);
           }
 
           let nextReworkCount = task.rework_count;
@@ -2527,6 +2780,9 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
 
           const hbMs = input.heartbeat_interval_ms ?? 10_000;
           const ttlMs = input.lease_ttl_ms ?? 35_000;
+          if (ttlMs < hbMs * 3) {
+            throw new PostgresRlsError("23514", "lease_ttl_ms must be >= heartbeat_interval_ms * 3");
+          }
           const nextAttemptNo = task.current_attempt_no + 1;
           const nextEpoch = task.active_lease_epoch + 1;
           const leaseId = randomUUID();
@@ -3573,6 +3829,35 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       [taskId]
     );
     return res.rows.map(mapVerifiedImportRow);
+  }
+
+  public async withTaskLeaseLock<T>(projectId: string, taskId: string, leaseId: string, fn: () => Promise<T>): Promise<T> {
+    const result = await this.pool.queryInActiveTx(
+      `SELECT l.lease_id FROM task_leases l JOIN tasks t ON t.project_id = l.project_id AND t.task_id = l.task_id
+       WHERE l.project_id = $1::uuid AND l.task_id = $2::uuid AND l.lease_id = $3::uuid FOR UPDATE OF l, t;`,
+      [projectId, taskId, leaseId]);
+    if (!result.rowCount) throw new PostgresRlsError("23503", "Lease not found in current project");
+    return fn();
+  }
+
+  public async getCodeImportSubmission(leaseId: string): Promise<CodeImportSubmissionRecord | null> {
+    const result = await this.pool.queryInActiveTx("SELECT * FROM code_import_submissions WHERE lease_id = $1::uuid;", [leaseId]);
+    return result.rows[0] ? mapCodeImportSubmissionRow(result.rows[0]) : null;
+  }
+
+  public async recordCodeImportSubmission(input: Omit<CodeImportSubmissionRecord, "submission_id" | "created_at">): Promise<CodeImportSubmissionRecord> {
+    try {
+      const result = await this.pool.queryInActiveTx(
+        `INSERT INTO code_import_submissions (project_id, task_id, lease_id, lease_epoch, import_id, source_type,
+          payload_sha256, agent_commit_hash, verified_tree_hash, staging_ref, submitted_by_principal_id)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::bigint, $5::uuid, $6::text, $7::text, $8::text, $9::text, $10::text, $11::text) RETURNING *;`,
+        [input.project_id, input.task_id, input.lease_id, input.lease_epoch, input.import_id, input.source_type,
+          input.payload_sha256, input.agent_commit_hash, input.verified_tree_hash, input.staging_ref, input.submitted_by_principal_id]);
+      const record = mapCodeImportSubmissionRow(result.rows[0]!);
+      await this.insertOutboxEventSql(input.project_id, "code_import_submission", record.submission_id, "code_import.accepted",
+        { task_id: input.task_id, lease_id: input.lease_id, source_type: input.source_type, import_id: input.import_id });
+      return record;
+    } catch (error) { mapPgError(error); }
   }
 
   public async recordVerifiedCodeImport(input: {
@@ -5032,6 +5317,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
               };
             }
           }
+          // Serialize spend ingestion before aggregation so concurrent task metrics
+          // cannot each miss the other's uncommitted wall-time.
+          await this.pool.queryInActiveTx("SELECT 1 FROM project_budget_policies WHERE project_id = $1::uuid FOR UPDATE;", [input.project_id]);
+          await this.pool.queryInActiveTx("SELECT 1 FROM task_budget_policies WHERE project_id = $1::uuid AND task_id = $2::uuid FOR UPDATE;", [input.project_id, input.task_id]);
           const normalized = validateAndNormalizeResourceUsageMetricInput(input, taskDefaults);
 
           const res = await this.pool.queryInActiveTx(
@@ -5058,7 +5347,12 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
               input.metrics_source,
             ]
           );
-          return mapResourceMetricRow(res.rows[0]!);
+          const metric = mapResourceMetricRow(res.rows[0]!);
+          await this.evaluatePostSpendBudgetPauseSql({
+            project_id: input.project_id,
+            task_id: input.task_id,
+          });
+          return metric;
         } catch (error) {
           mapPgError(error);
         }
@@ -5193,12 +5487,13 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public async preflightCheckCostSession(
     input: CostPreflightCheckInput
   ): Promise<CostPreflightCheckResult> {
-    const insertBlockedPreflight = async (
-      session: CostSessionRecord,
-      violation: NonNullable<ReturnType<typeof evaluatePreflightLimits>>
-    ): Promise<CostPreflightCheckResult> => {
+    const projectedTokens = input.estimated_input_tokens + input.reserved_output_tokens;
+    const insertBlockedPreflightRow = async (params: {
+      readonly session: CostSessionRecord;
+      readonly blockReason: string;
+      readonly errorMessage: string;
+    }): Promise<ModelCallLedgerRecord> => {
       const callId = randomUUID();
-      const blockReason = `${violation.limitScope}: ${violation.reason}`;
       const ledgerRes = await this.pool.queryInActiveTx(
         `INSERT INTO model_call_ledgers (
           call_id, project_id, cost_session_id, pipeline_session_id, task_id,
@@ -5219,8 +5514,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
           callId,
           input.project_id,
           input.cost_session_id,
-          input.pipeline_session_id ?? session.pipeline_session_id,
-          input.task_id ?? session.task_id,
+          input.pipeline_session_id ?? params.session.pipeline_session_id,
+          input.task_id ?? params.session.task_id,
           input.stage,
           input.provider,
           input.model,
@@ -5231,21 +5526,91 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
           input.estimated_input_tokens,
           input.reserved_output_tokens,
           input.estimated_cost_micro_usd,
-          blockReason,
-          violation.reason,
+          params.blockReason,
+          params.errorMessage,
         ]
       );
+      return mapModelCallLedgerRow(ledgerRes.rows[0]!);
+    };
+
+    const insertBlockedPreflight = async (
+      session: CostSessionRecord,
+      violation: NonNullable<ReturnType<typeof evaluatePreflightLimits>>
+    ): Promise<CostPreflightCheckResult> => {
+      const blockedLedger = await insertBlockedPreflightRow({
+        session,
+        blockReason: `${violation.limitScope}: ${violation.reason}`,
+        errorMessage: violation.reason,
+      });
       return {
         allowed: false,
         limitScope: violation.limitScope,
         reason: violation.reason,
         session,
-        blockedLedger: mapModelCallLedgerRow(ledgerRes.rows[0]!),
+        blockedLedger,
       };
     };
 
-    const runLockedInCurrentTx = async (): Promise<CostPreflightCheckResult> => {
+    const checkBudgetForSession = async (session: CostSessionRecord): Promise<void> => {
+      const targetPipelineId = input.pipeline_session_id ?? session.pipeline_session_id;
+      const targetTaskId = input.task_id ?? session.task_id;
+      await this.assertBudgetAllowsExecutionSql({
+        project_id: input.project_id,
+        task_id: targetTaskId,
+        projected_tokens: projectedTokens,
+        projected_cost_micro_usd: input.estimated_cost_micro_usd,
+        verifyParentsCommittedSql: async () => {
+          const csCheck = await this.pool.queryInActiveTx(
+            `SELECT 1 FROM model_cost_sessions
+             WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
+             LIMIT 1 FOR KEY SHARE NOWAIT;`,
+            [input.cost_session_id, input.project_id]
+          );
+          if (csCheck.rowCount === 0) {
+            return false;
+          }
+          if (targetPipelineId) {
+            const psCheck = await this.pool.queryInActiveTx(
+              `SELECT 1 FROM product_pipeline_sessions
+               WHERE pipeline_session_id = $1::uuid AND project_id = $2::uuid
+               LIMIT 1;`,
+              [targetPipelineId, input.project_id]
+            );
+            if (psCheck.rowCount === 0) {
+              return false;
+            }
+          }
+          return true;
+        },
+        onBlockedSql: async (pauseScope, reason) => {
+          await insertBlockedPreflightRow({
+            session,
+            blockReason: `${pauseScope}: ${reason}`,
+            errorMessage: reason,
+          });
+        },
+      });
+    };
+
+    const runLockedInCurrentTx = async (
+      alreadyCheckedBudget = false
+    ): Promise<CostPreflightCheckResult> => {
       try {
+        if (!alreadyCheckedBudget) {
+          const probeRes = await this.pool.queryInActiveTx(
+            `SELECT * FROM model_cost_sessions
+             WHERE cost_session_id = $1::uuid AND project_id = $2::uuid;`,
+            [input.cost_session_id, input.project_id]
+          );
+          const probeRow = probeRes.rows[0];
+          if (!probeRow) {
+            throw new PostgresRlsError(
+              "23503",
+              `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+            );
+          }
+          await checkBudgetForSession(mapCostSessionRow(probeRow));
+        }
         const sessRes = await this.pool.queryInActiveTx(
           `SELECT * FROM model_cost_sessions
            WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
@@ -5278,7 +5643,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
           currentPrincipalId: "core_api_service",
           currentRole: "core_api_service",
         },
-        runLockedInCurrentTx
+        () => runLockedInCurrentTx(false)
       );
     }
 
@@ -5300,6 +5665,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         );
       }
       const probeSession = mapCostSessionRow(probeRow);
+      await checkBudgetForSession(probeSession);
       const probeViolation = evaluatePreflightLimits(probeSession, input);
       if (!probeViolation) {
         return { allowed: true, session: probeSession };
@@ -5358,7 +5724,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         });
       } catch (autoErr) {
         if (autoErr === fallbackSentinel) {
-          return await runLockedInCurrentTx();
+          return await runLockedInCurrentTx(true);
         }
         throw autoErr;
       }
@@ -5395,10 +5761,28 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     }
 
     const executeLockedFinalize = async (useNoWait: boolean): Promise<FinalizeModelCallResult> => {
+      const lockClause = useNoWait ? "FOR UPDATE NOWAIT" : "FOR UPDATE";
+      const scopeProbe = await this.pool.queryInActiveTx("SELECT task_id FROM model_cost_sessions WHERE cost_session_id = $1::uuid AND project_id = $2::uuid;", [input.cost_session_id, input.project_id]);
+      const budgetTaskId = input.task_id ?? (scopeProbe.rows[0]?.task_id ? String(scopeProbe.rows[0].task_id) : null);
+      // Canonical lock order: project_budget_policies -> task_budget_policies -> model_cost_sessions
+      await this.pool.queryInActiveTx(
+        `SELECT 1 FROM project_budget_policies
+         WHERE project_id = $1::uuid
+         ${lockClause};`,
+        [input.project_id]
+      );
+      if (budgetTaskId) {
+        await this.pool.queryInActiveTx(
+          `SELECT 1 FROM task_budget_policies
+           WHERE project_id = $1::uuid AND task_id = $2::uuid
+           ${lockClause};`,
+          [input.project_id, budgetTaskId]
+        );
+      }
       const sessRes = await this.pool.queryInActiveTx(
         `SELECT * FROM model_cost_sessions
          WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
-         ${useNoWait ? "FOR UPDATE NOWAIT" : "FOR UPDATE"};`,
+         ${lockClause};`,
         [input.cost_session_id, input.project_id]
       );
       const sessRow = sessRes.rows[0];
@@ -5409,6 +5793,15 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         );
       }
       const session = mapCostSessionRow(sessRow);
+      const resolvedTaskId = input.task_id ?? session.task_id;
+      if (resolvedTaskId && !input.task_id) {
+        await this.pool.queryInActiveTx(
+          `SELECT 1 FROM task_budget_policies
+           WHERE project_id = $1::uuid AND task_id = $2::uuid
+           ${lockClause};`,
+          [input.project_id, resolvedTaskId]
+        );
+      }
       const evalRes = evaluatePostcallLimits(
         session,
         actualTotalTokens,
@@ -5468,7 +5861,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
           input.project_id,
           input.cost_session_id,
           input.pipeline_session_id ?? session.pipeline_session_id,
-          input.task_id ?? session.task_id,
+          resolvedTaskId,
           input.stage,
           input.provider,
           input.model,
@@ -5491,6 +5884,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         ]
       );
       const ledger = mapModelCallLedgerRow(ledgerRes.rows[0]!);
+      await this.evaluatePostSpendBudgetPauseSql({
+        project_id: input.project_id,
+        task_id: resolvedTaskId,
+      });
       return {
         allowed: !evalRes.exceeded,
         ...(evalRes.exceeded
@@ -5550,21 +5947,13 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
 
       try {
         return await this.pool.runAutonomousRlsTransaction(active, async () => {
-          let sessRes2;
-          try {
-            sessRes2 = await this.pool.queryInActiveTx(
-              `SELECT * FROM model_cost_sessions
-               WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
-               FOR UPDATE NOWAIT;`,
-              [input.cost_session_id, input.project_id]
-            );
-          } catch (lockErr) {
-            if (lockErr instanceof PostgresQueryError && lockErr.sqlState === "55P03") {
-              throw fallbackSentinel;
-            }
-            throw lockErr;
-          }
-          const sessRow2 = sessRes2.rows[0];
+          const sessCheck = await this.pool.queryInActiveTx(
+            `SELECT * FROM model_cost_sessions
+             WHERE cost_session_id = $1::uuid AND project_id = $2::uuid
+             LIMIT 1;`,
+            [input.cost_session_id, input.project_id]
+          );
+          const sessRow2 = sessCheck.rows[0];
           if (!sessRow2) {
             throw fallbackSentinel;
           }
@@ -5593,7 +5982,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
               throw fallbackSentinel;
             }
           }
-          return await executeLockedFinalize(false);
+          try {
+            return await executeLockedFinalize(true);
+          } catch (lockErr) {
+            if (lockErr instanceof PostgresQueryError && lockErr.sqlState === "55P03") {
+              throw fallbackSentinel;
+            }
+            throw lockErr;
+          }
         });
       } catch (autoErr) {
         if (autoErr === fallbackSentinel) {
@@ -6656,6 +7052,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
           }
 
+          await this.persistMaterializedDependenciesSql(input.project_id, input.tasks, tasks);
+
           await this.insertOutboxEventSql(
             input.project_id,
             "product_pipeline",
@@ -6988,6 +7386,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             taskLinks.push(mapTaskPlanLinkRow(linkRes.rows[0]!));
           }
 
+          await this.persistMaterializedDependenciesSql(input.project_id, existing.proposed_tasks, tasks);
+
           const updRes = await this.pool.queryInActiveTx(
             `UPDATE change_requests
              SET status = 'APPLIED',
@@ -7113,6 +7513,354 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     );
     return res.rows.map(mapReleaseAcceptancePackageRow);
   }
+  // M6C-1 operations share the caller's tenant transaction. All SQL identifiers below
+  // are selected from fixed internal lists, never supplied by HTTP clients.
+  private async lockM6CProject(projectId: string): Promise<void> {
+    const result = await this.pool.queryInActiveTx(
+      "SELECT project_id FROM projects WHERE project_id = $1::uuid FOR UPDATE;", [projectId]
+    );
+    if (!result.rowCount) throw new PostgresRlsError("23503", "Project not found in current scope");
+  }
+
+  public async withProjectMergeQueueLock<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    await this.lockM6CProject(projectId);
+    return fn();
+  }
+
+  public async listProjectTaskDependencies(): Promise<TaskDependencyRecord[]> {
+    const result = await this.pool.queryInActiveTx(
+      "SELECT * FROM task_dependencies ORDER BY created_at, task_id, depends_on_task_id;"
+    );
+    return result.rows.map(mapTaskDependencyRow);
+  }
+
+  public async addTaskDependency(input: AddTaskDependencyInput): Promise<TaskDependencyRecord> {
+    return this.insertTaskDependencySql(input);
+  }
+
+  private async persistMaterializedDependenciesSql(projectId: string,
+    specs: readonly { task_key?: string; depends_on_task_keys?: readonly string[]; depends_on_task_ids?: readonly string[] }[],
+    tasks: readonly TaskRecord[]): Promise<void> {
+    const byKey = new Map<string, string>();
+    for (let i = 0; i < specs.length; i++) {
+      const key = specs[i]!.task_key?.trim();
+      if (key) {
+        if (byKey.has(key)) throw new PostgresRlsError("23514", "Duplicate task_key");
+        byKey.set(key, tasks[i]!.task_id);
+      }
+    }
+    for (let i = 0; i < specs.length; i++) {
+      const spec = specs[i]!;
+      const ids = new Set(spec.depends_on_task_ids ?? []);
+      for (const key of spec.depends_on_task_keys ?? []) {
+        const id = byKey.get(key.trim());
+        if (!id) throw new PostgresRlsError("23514", `Unknown dependency task_key '${key}'`);
+        ids.add(id);
+      }
+      for (const id of ids) await this.insertTaskDependencySql({ project_id: projectId,
+        task_id: tasks[i]!.task_id, depends_on_task_id: id, dependency_kind: "PLAN_DAG" });
+    }
+  }
+
+  private async insertTaskDependencySql(input: AddTaskDependencyInput): Promise<TaskDependencyRecord> {
+    await this.pool.queryInActiveTx("SELECT pg_advisory_xact_lock(hashtext('lease-dispatch:' || $1::text));", [input.project_id]);
+    try {
+      const result = await this.pool.queryInActiveTx(
+        `INSERT INTO task_dependencies (project_id, task_id, depends_on_task_id, dependency_kind)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::text) RETURNING *;`,
+        [input.project_id, input.task_id, input.depends_on_task_id, input.dependency_kind ?? "MANUAL"]
+      );
+      return mapTaskDependencyRow(result.rows[0]!);
+    } catch (error) { mapPgError(error); }
+  }
+
+  public async enqueueMergeCandidate(input: EnqueueMergeCandidateInput): Promise<MergeQueueEntryRecord> {
+    await this.lockM6CProject(input.project_id);
+    try {
+      const result = await this.pool.queryInActiveTx(
+        `INSERT INTO merge_queue_entries
+          (project_id, task_id, merge_candidate_id, approval_id, rebased_from_candidate_id)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid) RETURNING *;`,
+        [input.project_id, input.task_id, input.merge_candidate_id, input.approval_id,
+          input.rebased_from_candidate_id ?? null]
+      );
+      const entry = mapMergeQueueEntryRow(result.rows[0]!);
+      await this.insertOutboxEventSql(input.project_id, "merge_queue_entry", entry.queue_entry_id,
+        "merge_queue.enqueued", { queue_entry_id: entry.queue_entry_id, task_id: input.task_id });
+      return entry;
+    } catch (error) { mapPgError(error); }
+  }
+
+  public async claimNextMergeQueueEntry(projectId: string): Promise<MergeQueueEntryRecord | null> {
+    await this.lockM6CProject(projectId);
+    const result = await this.pool.queryInActiveTx(
+      `UPDATE merge_queue_entries SET status = 'PROCESSING', attempt_count = attempt_count + 1,
+         started_at = clock_timestamp(), updated_at = clock_timestamp()
+       WHERE queue_entry_id = (
+         SELECT queue_entry_id FROM merge_queue_entries
+         WHERE project_id = $1::uuid AND status = 'QUEUED'
+           AND NOT EXISTS (SELECT 1 FROM merge_queue_entries WHERE project_id = $1::uuid AND status = 'PROCESSING')
+         ORDER BY queue_position LIMIT 1
+       ) RETURNING *;`, [projectId]
+    );
+    return result.rows[0] ? mapMergeQueueEntryRow(result.rows[0]) : null;
+  }
+
+  public async completeMergeQueueEntry(input: CompleteMergeQueueEntryInput): Promise<MergeQueueEntryRecord> {
+    if (!["MERGED", "REBASED_NEEDS_REVERIFY", "FAILED", "CANCELLED"].includes(input.status)) {
+      throw new PostgresRlsError("23514", "Invalid terminal merge queue status");
+    }
+    await this.lockM6CProject(input.project_id);
+    const result = await this.pool.queryInActiveTx(
+      `UPDATE merge_queue_entries SET status = $3::text,
+         rebased_to_candidate_id = $4::uuid, merged_commit_hash = $5::text, last_error = $6::text,
+         completed_at = clock_timestamp(), updated_at = clock_timestamp()
+       WHERE project_id = $1::uuid AND queue_entry_id = $2::uuid AND status = 'PROCESSING' RETURNING *;`,
+      [input.project_id, input.queue_entry_id, input.status, input.rebased_to_candidate_id ?? null,
+        input.merged_commit_hash ?? null, input.last_error ?? null]
+    );
+    if (!result.rows[0]) throw new PostgresRlsError("23514", "Merge queue entry is not processing");
+    const entry = mapMergeQueueEntryRow(result.rows[0]);
+    await this.insertOutboxEventSql(input.project_id, "merge_queue_entry", entry.queue_entry_id,
+      "merge_queue.completed", { queue_entry_id: entry.queue_entry_id, status: entry.status });
+    return entry;
+  }
+
+  public async listMergeQueueEntries(): Promise<MergeQueueEntryRecord[]> {
+    const result = await this.pool.queryInActiveTx("SELECT * FROM merge_queue_entries ORDER BY queue_position;");
+    return result.rows.map(mapMergeQueueEntryRow);
+  }
+
+  private async budgetUsageSql(projectId: string, taskId?: string | null): Promise<BudgetUsageSummary> {
+    const result = await this.pool.queryInActiveTx(
+      `SELECT
+       (SELECT COALESCE(sum(actual_total_tokens), 0) FROM model_call_ledgers
+        WHERE project_id = $1::uuid AND ($2::uuid IS NULL OR task_id = $2::uuid)) AS tokens_used,
+       (SELECT COALESCE(sum(actual_cost_micro_usd), 0) FROM model_call_ledgers
+        WHERE project_id = $1::uuid AND ($2::uuid IS NULL OR task_id = $2::uuid)) AS cost_micro_usd,
+       (SELECT COALESCE(sum(wall_time_ms), 0) FROM resource_usage_metrics
+        WHERE project_id = $1::uuid AND ($2::uuid IS NULL OR task_id = $2::uuid)) AS wall_time_ms;`,
+      [projectId, taskId ?? null]
+    );
+    const row = result.rows[0]!;
+    return { tokens_used: toSafeInt(row.tokens_used, "tokens_used"),
+      cost_micro_usd: toSafeInt(row.cost_micro_usd, "cost_micro_usd"),
+      wall_time_ms: toSafeInt(row.wall_time_ms, "wall_time_ms") };
+  }
+
+  public async getProjectBudgetSnapshot(projectId: string): Promise<ProjectBudgetSnapshot> {
+    const policy = await this.pool.queryInActiveTx("SELECT * FROM project_budget_policies WHERE project_id = $1::uuid;", [projectId]);
+    const tasks = await this.pool.queryInActiveTx("SELECT task_id FROM tasks WHERE project_id = $1::uuid;", [projectId]);
+    const policies = await this.pool.queryInActiveTx("SELECT * FROM task_budget_policies WHERE project_id = $1::uuid ORDER BY task_id;", [projectId]);
+    const taskUsage: Record<string, BudgetUsageSummary> = {};
+    for (const row of tasks.rows) taskUsage[String(row.task_id)] = await this.budgetUsageSql(projectId, String(row.task_id));
+    return { project_id: projectId, policy: policy.rows[0] ? mapProjectBudgetPolicyRow(policy.rows[0]) : null,
+      usage: await this.budgetUsageSql(projectId), task_policies: policies.rows.map(mapTaskBudgetPolicyRow),
+      task_usage: taskUsage, events: await this.listBudgetPauseEvents(projectId) };
+  }
+
+  public async listBudgetPauseEvents(projectId?: string): Promise<BudgetPauseEventRecord[]> {
+    const result = await this.pool.queryInActiveTx(
+      "SELECT * FROM budget_pause_events WHERE ($1::uuid IS NULL OR project_id = $1::uuid) ORDER BY created_at, event_id;",
+      [projectId ?? null]
+    );
+    return result.rows.map(mapBudgetPauseEventRow);
+  }
+
+  private async budgetEventSql(projectId: string, taskId: string | null, eventType: BudgetPauseEventType,
+    reason: string, scope: BudgetPauseScope | null = null, limit: number | null = null,
+    actor: string | null = null, usage?: BudgetUsageSummary): Promise<void> {
+    const observed = usage ?? await this.budgetUsageSql(projectId, taskId);
+    await this.pool.queryInActiveTx(
+      `INSERT INTO budget_pause_events (project_id, task_id, event_type, pause_scope, reason,
+        observed_tokens, observed_cost_micro_usd, observed_wall_time_ms, limit_value, actor_principal_id)
+       VALUES ($1::uuid, $2::uuid, $3::text, $4::text, $5::text, $6::bigint, $7::bigint, $8::bigint, $9::bigint, $10::text);`,
+      [projectId, taskId, eventType, scope, reason, observed.tokens_used, observed.cost_micro_usd,
+        observed.wall_time_ms, limit, actor]
+    );
+    if (eventType !== "BUDGET_UPDATED") await this.insertOutboxEventSql(projectId,
+      taskId ? "task_budget_policy" : "project_budget_policy", taskId ?? projectId,
+      eventType === "RESUMED" ? "budget.resumed" : "budget.auto_paused",
+      { project_id: projectId, task_id: taskId, pause_scope: scope, reason });
+  }
+
+  private async writeBudgetPolicySql(
+    input: UpsertProjectBudgetPolicyInput | UpsertTaskBudgetPolicyInput,
+    resume?: { actor_principal_id: string; reason: string }
+  ): Promise<ProjectBudgetPolicyRecord | TaskBudgetPolicyRecord> {
+    const taskId = "task_id" in input ? input.task_id : null;
+    const table = taskId ? "task_budget_policies" : "project_budget_policies";
+    const fields = taskId
+      ? ["max_task_tokens", "max_task_cost_micro_usd", "max_task_wall_time_ms"]
+      : ["max_project_tokens", "max_project_cost_micro_usd", "max_project_wall_time_ms",
+        "default_task_max_tokens", "default_task_max_cost_micro_usd", "default_task_max_wall_time_ms", "max_concurrent_tasks"];
+    const values = input as unknown as Record<string, unknown>;
+    for (const field of fields) {
+      const value = values[field];
+      if (value !== undefined && value !== null && (!Number.isSafeInteger(value) || Number(value) <= 0 ||
+        (field === "max_concurrent_tasks" && Number(value) > 128))) {
+        throw new PostgresRlsError("23514", `${field} must be a positive safe integer`);
+      }
+      if (field === "max_concurrent_tasks" && value === null) throw new PostgresRlsError("23514", "max_concurrent_tasks cannot be null");
+    }
+    await this.lockM6CProject(input.project_id);
+    const keyParams = taskId ? [input.project_id, taskId] : [input.project_id];
+    const predicate = taskId ? "project_id = $1::uuid AND task_id = $2::uuid" : "project_id = $1::uuid";
+    const existing = (await this.pool.queryInActiveTx(`SELECT * FROM ${table} WHERE ${predicate} FOR UPDATE;`, keyParams)).rows[0];
+    if (resume) {
+      if (!resume.actor_principal_id.trim() || !resume.reason.trim()) throw new PostgresRlsError("23514", "Actor and reason required");
+      if (!existing) throw new PostgresRlsError("23503", "Budget policy not found");
+      if (existing.status !== "AUTO_PAUSED") throw new PostgresRlsError("23514", "Budget is not paused");
+      const scopeField: Record<string, string> = { PROJECT_TOKENS: "max_project_tokens", PROJECT_COST: "max_project_cost_micro_usd", PROJECT_WALL_TIME: "max_project_wall_time_ms", TASK_TOKENS: "max_task_tokens", TASK_COST: "max_task_cost_micro_usd", TASK_WALL_TIME: "max_task_wall_time_ms" };
+      const breachedField = scopeField[String(existing.pause_scope)];
+      if (!breachedField || typeof values[breachedField] !== "number") throw new PostgresRlsError("23514", "Resume requires an explicit raised ceiling for the paused budget");
+      const usage = await this.budgetUsageSql(input.project_id, taskId);
+      const projectPolicy = taskId ? (await this.pool.queryInActiveTx("SELECT * FROM project_budget_policies WHERE project_id = $1::uuid;", [input.project_id])).rows[0] : null;
+      const defaultFields = ["default_task_max_tokens", "default_task_max_cost_micro_usd", "default_task_max_wall_time_ms"];
+      const usageFields = ["tokens_used", "cost_micro_usd", "wall_time_ms"] as const;
+      for (let i = 0; i < 3; i++) {
+        const field = fields[i]!;
+        const configuredLimit = values[field] !== undefined ? values[field] : existing[field];
+        const limit = configuredLimit ?? projectPolicy?.[defaultFields[i]!] ?? null;
+        // A paused ceiling must be raised, not removed through resume.
+        if ((existing.pause_scope && values[field] === null && existing[field] !== null) ||
+          (limit !== null && usage[usageFields[i]!] >= Number(limit))) {
+          throw new PostgresRlsError("23514", "New budget ceiling must be strictly above observed spend");
+        }
+      }
+    }
+    const supplied = fields.filter((field) => values[field] !== undefined);
+    let row: Record<string, unknown>;
+    if (!existing) {
+      const columns = [...(taskId ? ["project_id", "task_id"] : ["project_id"]), ...supplied];
+      const params = [...keyParams, ...supplied.map((field) => values[field])];
+      row = (await this.pool.queryInActiveTx(
+        `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${params.map((_, i) => `$${i + 1}`).join(", ")}) RETURNING *;`, params
+      )).rows[0]!;
+    } else {
+      const params: unknown[] = [...keyParams];
+      const assignments = supplied.map((field) => { params.push(values[field]); return `${field} = $${params.length}`; });
+      if (resume) {
+        params.push(resume.actor_principal_id);
+        assignments.push(`status = 'ACTIVE', pause_scope = NULL, pause_reason = NULL, resumed_at = clock_timestamp(), resumed_by_principal_id = $${params.length}`);
+        if (!taskId) assignments.push("paused_task_id = NULL");
+      }
+      row = (await this.pool.queryInActiveTx(
+        `UPDATE ${table} SET ${[...assignments, "updated_at = clock_timestamp()"].join(", ")} WHERE ${predicate} RETURNING *;`, params
+      )).rows[0]!;
+    }
+    await this.budgetEventSql(input.project_id, taskId, resume ? "RESUMED" : "BUDGET_UPDATED",
+      resume?.reason ?? "Budget policy updated", null, null, resume?.actor_principal_id ?? input.actor_principal_id ?? null);
+    return taskId ? mapTaskBudgetPolicyRow(row) : mapProjectBudgetPolicyRow(row);
+  }
+
+  public async upsertProjectBudgetPolicy(input: UpsertProjectBudgetPolicyInput): Promise<ProjectBudgetPolicyRecord> {
+    return await this.writeBudgetPolicySql(input) as ProjectBudgetPolicyRecord;
+  }
+  public async upsertTaskBudgetPolicy(input: UpsertTaskBudgetPolicyInput): Promise<TaskBudgetPolicyRecord> {
+    return await this.writeBudgetPolicySql(input) as TaskBudgetPolicyRecord;
+  }
+  public async resumeProjectBudget(input: ResumeProjectBudgetInput): Promise<ProjectBudgetPolicyRecord> {
+    return await this.writeBudgetPolicySql(input, input) as ProjectBudgetPolicyRecord;
+  }
+  public async resumeTaskBudget(input: ResumeTaskBudgetInput): Promise<TaskBudgetPolicyRecord> {
+    return await this.writeBudgetPolicySql(input, input) as TaskBudgetPolicyRecord;
+  }
+
+  private async detectBudgetViolationSql(input: {
+    project_id: string; task_id?: string | null; projected_tokens?: number; projected_cost_micro_usd?: number;
+  }): Promise<{ scope: BudgetPauseScope; limit: number | null; taskId: string | null; reason: string; usage: BudgetUsageSummary; paused: boolean } | null> {
+    const pRow = (await this.pool.queryInActiveTx("SELECT * FROM project_budget_policies WHERE project_id = $1::uuid;", [input.project_id])).rows[0];
+    const tRow = input.task_id ? (await this.pool.queryInActiveTx("SELECT * FROM task_budget_policies WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, input.task_id])).rows[0] : undefined;
+    const p = pRow ? mapProjectBudgetPolicyRow(pRow) : null;
+    const t = tRow ? mapTaskBudgetPolicyRow(tRow) : null;
+    for (const taskScope of [false, true]) {
+      if (taskScope && !input.task_id) continue;
+      const policy = taskScope ? t : p;
+      const usage = await this.budgetUsageSql(input.project_id, taskScope ? input.task_id : null);
+      if (policy?.status === "AUTO_PAUSED") return {
+        scope: policy.pause_scope ?? (taskScope ? "TASK_COST" : "PROJECT_COST"), limit: null,
+        taskId: taskScope ? input.task_id! : null, reason: policy.pause_reason ?? "Budget is AUTO_PAUSED", usage, paused: true
+      };
+      const limits = taskScope
+        ? [t?.max_task_tokens ?? p?.default_task_max_tokens, t?.max_task_cost_micro_usd ?? p?.default_task_max_cost_micro_usd, t?.max_task_wall_time_ms ?? p?.default_task_max_wall_time_ms]
+        : [p?.max_project_tokens, p?.max_project_cost_micro_usd, p?.max_project_wall_time_ms];
+      const observed = [usage.tokens_used, usage.cost_micro_usd, usage.wall_time_ms];
+      const projected = [input.projected_tokens ?? 0, input.projected_cost_micro_usd ?? 0, 0];
+      const scopes: BudgetPauseScope[] = taskScope ? ["TASK_TOKENS", "TASK_COST", "TASK_WALL_TIME"] : ["PROJECT_TOKENS", "PROJECT_COST", "PROJECT_WALL_TIME"];
+      for (let i = 0; i < 3; i++) {
+        const limit = limits[i];
+        if (limit != null && (observed[i]! >= limit || observed[i]! + projected[i]! > limit)) {
+          return { scope: scopes[i]!, limit, taskId: taskScope ? input.task_id! : null,
+            reason: `${scopes[i]} budget ceiling reached or projected spend exceeds limit (${limit})`, usage, paused: false };
+        }
+      }
+    }
+    return null;
+  }
+
+  private async persistBudgetViolationSql(projectId: string,
+    violation: NonNullable<Awaited<ReturnType<PostgresControlPlaneRepository["detectBudgetViolationSql"]>>>): Promise<void> {
+    if (violation.paused) return;
+    const taskId = violation.taskId;
+    if (taskId) await this.pool.queryInActiveTx(
+      "INSERT INTO task_budget_policies (project_id, task_id) VALUES ($1::uuid, $2::uuid) ON CONFLICT DO NOTHING;", [projectId, taskId]);
+    const result = await this.pool.queryInActiveTx(taskId
+      ? `UPDATE task_budget_policies SET status = 'AUTO_PAUSED', pause_scope = $3::text, pause_reason = $4::text,
+          paused_at = clock_timestamp(), updated_at = clock_timestamp()
+         WHERE project_id = $1::uuid AND task_id = $2::uuid AND status = 'ACTIVE' RETURNING project_id;`
+      : `UPDATE project_budget_policies SET status = 'AUTO_PAUSED', pause_scope = $3::text, pause_reason = $4::text,
+          paused_task_id = $2::uuid, paused_at = clock_timestamp(), updated_at = clock_timestamp()
+         WHERE project_id = $1::uuid AND status = 'ACTIVE' RETURNING project_id;`,
+      [projectId, taskId, violation.scope, violation.reason]);
+    if (result.rowCount) await this.budgetEventSql(projectId, taskId, "AUTO_PAUSED", violation.reason,
+      violation.scope, violation.limit, null, violation.usage);
+  }
+
+  private async assertBudgetAllowsExecutionSql(input: {
+    project_id: string; task_id?: string | null; projected_tokens: number; projected_cost_micro_usd: number;
+    verifyParentsCommittedSql?: () => Promise<boolean>;
+    onBlockedSql?: (scope: BudgetPauseScope, reason: string) => Promise<void>;
+  }): Promise<void> {
+    const violation = await this.detectBudgetViolationSql(input);
+    if (!violation) return;
+    const active = this.pool.getActiveTxSession();
+    const outerProjectPolicy = (await this.pool.queryInActiveTx("SELECT 1 FROM project_budget_policies WHERE project_id = $1::uuid;", [input.project_id])).rowCount > 0;
+    const outerTaskPolicy = input.task_id ? (await this.pool.queryInActiveTx("SELECT 1 FROM task_budget_policies WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, input.task_id])).rowCount > 0 : false;
+    const fallback = new Error("BUDGET_PARENT_UNCOMMITTED_OR_LOCKED");
+    let shouldBlock = true;
+    let blocked = violation;
+    try {
+      await this.pool.runAutonomousRlsTransaction(active ?? { currentProjectId: input.project_id, currentRole: "core_api_service" }, async () => {
+        if (input.verifyParentsCommittedSql && !await input.verifyParentsCommittedSql()) throw fallback;
+        const project = await this.pool.queryInActiveTx("SELECT 1 FROM projects WHERE project_id = $1::uuid;", [input.project_id]);
+        const task = input.task_id ? await this.pool.queryInActiveTx("SELECT 1 FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, input.task_id]) : null;
+        if (!project.rowCount || (task && !task.rowCount)) throw fallback;
+        // NOWAIT prevents self-deadlock when a caller modified its policy in the outer transaction.
+        const committedProjectPolicy = await this.pool.queryInActiveTx("SELECT 1 FROM project_budget_policies WHERE project_id = $1::uuid FOR UPDATE NOWAIT;", [input.project_id]);
+        const committedTaskPolicy = input.task_id ? await this.pool.queryInActiveTx("SELECT 1 FROM task_budget_policies WHERE project_id = $1::uuid AND task_id = $2::uuid FOR UPDATE NOWAIT;", [input.project_id, input.task_id]) : null;
+        if ((outerProjectPolicy && !committedProjectPolicy.rowCount) || (outerTaskPolicy && !committedTaskPolicy?.rowCount)) throw fallback;
+        const currentViolation = await this.detectBudgetViolationSql(input);
+        if (!currentViolation) { shouldBlock = false; return; }
+        blocked = currentViolation;
+        await this.persistBudgetViolationSql(input.project_id, currentViolation);
+        await input.onBlockedSql?.(currentViolation.scope, currentViolation.reason);
+      });
+    } catch (error) {
+      if (error !== fallback && !(error instanceof PostgresQueryError && error.sqlState === "55P03")) throw error;
+      await this.persistBudgetViolationSql(input.project_id, violation);
+      await input.onBlockedSql?.(violation.scope, violation.reason);
+    }
+    if (!shouldBlock) return;
+    throw new BudgetAutoPausedError({ message: blocked.reason, projectId: input.project_id,
+      taskId: input.task_id, pauseScope: blocked.scope });
+  }
+
+  private async evaluatePostSpendBudgetPauseSql(input: { project_id: string; task_id?: string | null }): Promise<void> {
+    const violation = await this.detectBudgetViolationSql(input);
+    if (violation) await this.persistBudgetViolationSql(input.project_id, violation);
+  }
+
 }
 
 export function validateAndNormalizeResourceUsageMetricInput(

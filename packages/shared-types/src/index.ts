@@ -494,6 +494,7 @@ export interface ResourceUsageMetricRecord {
  * Milestone M5: Complete End-to-End Task Lineage (`AC-11a` & `M5-AC8`)
  */
 export interface CandidateBoundLineage {
+  readonly codeImportSubmission?: CodeImportSubmissionRecord | null;
   readonly projectId: string;
   readonly taskId: string;
   readonly mainHeadCommitHash: string | null;
@@ -1427,6 +1428,8 @@ export interface ChangeRequestProposedTaskSpec {
   readonly requirement_ids: readonly string[];
   readonly ac_ids: readonly string[];
   readonly allowed_files: readonly string[];
+  readonly depends_on_task_keys?: readonly string[];
+  readonly depends_on_task_ids?: readonly string[];
   readonly developer_profile_id?: string | null;
 }
 
@@ -1562,4 +1565,180 @@ export interface M6BStages5To9Bundle {
   readonly release_packages: readonly ReleaseAcceptancePackageRecord[];
 }
 
+// =============================================================================
+// Milestone M6C-1: Parallel DAG Scheduler, CAS Merge Queue & Budgets (AC-12c)
+// =============================================================================
 
+export type TaskDependencyKind = "PLAN_DAG" | "PATH_OVERLAP_SERIALIZED" | "MANUAL";
+
+export interface TaskDependencyRecord {
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly depends_on_task_id: string;
+  readonly dependency_kind: TaskDependencyKind;
+  readonly created_at: string;
+}
+
+export type MergeQueueEntryStatus =
+  | "QUEUED"
+  | "PROCESSING"
+  | "MERGED"
+  | "REBASED_NEEDS_REVERIFY"
+  | "FAILED"
+  | "CANCELLED";
+
+export interface MergeQueueEntryRecord {
+  readonly queue_entry_id: string;
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly merge_candidate_id: string;
+  readonly approval_id: string;
+  readonly queue_position: number;
+  readonly status: MergeQueueEntryStatus;
+  readonly attempt_count: number;
+  readonly rebased_from_candidate_id: string | null;
+  readonly rebased_to_candidate_id: string | null;
+  readonly merged_commit_hash: string | null;
+  readonly last_error: string | null;
+  readonly enqueued_at: string;
+  readonly started_at: string | null;
+  readonly completed_at: string | null;
+  readonly updated_at: string;
+}
+
+export type BudgetPauseStatus = "ACTIVE" | "AUTO_PAUSED";
+
+export type BudgetPauseScope =
+  | "PROJECT_TOKENS"
+  | "PROJECT_COST"
+  | "PROJECT_WALL_TIME"
+  | "TASK_TOKENS"
+  | "TASK_COST"
+  | "TASK_WALL_TIME";
+
+export type BudgetPauseEventType = "AUTO_PAUSED" | "BUDGET_UPDATED" | "RESUMED";
+
+export interface ProjectBudgetPolicyRecord {
+  readonly project_id: string;
+  readonly max_project_tokens: number | null;
+  readonly max_project_cost_micro_usd: number | null;
+  readonly max_project_wall_time_ms: number | null;
+  readonly default_task_max_tokens: number | null;
+  readonly default_task_max_cost_micro_usd: number | null;
+  readonly default_task_max_wall_time_ms: number | null;
+  readonly max_concurrent_tasks: number;
+  readonly status: BudgetPauseStatus;
+  readonly pause_scope: BudgetPauseScope | null;
+  readonly paused_task_id: string | null;
+  readonly pause_reason: string | null;
+  readonly paused_at: string | null;
+  readonly resumed_by_principal_id: string | null;
+  readonly resumed_at: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface TaskBudgetPolicyRecord {
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly max_task_tokens: number | null;
+  readonly max_task_cost_micro_usd: number | null;
+  readonly max_task_wall_time_ms: number | null;
+  readonly status: BudgetPauseStatus;
+  readonly pause_scope: BudgetPauseScope | null;
+  readonly pause_reason: string | null;
+  readonly paused_at: string | null;
+  readonly resumed_by_principal_id: string | null;
+  readonly resumed_at: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface BudgetPauseEventRecord {
+  readonly event_id: string;
+  readonly project_id: string;
+  readonly task_id: string | null;
+  readonly event_type: BudgetPauseEventType;
+  readonly pause_scope: BudgetPauseScope | null;
+  readonly reason: string;
+  readonly observed_tokens: number;
+  readonly observed_cost_micro_usd: number;
+  readonly observed_wall_time_ms: number;
+  readonly limit_value: number | null;
+  readonly actor_principal_id: string | null;
+  readonly created_at: string;
+}
+
+export interface BudgetUsageSummary {
+  readonly tokens_used: number;
+  readonly cost_micro_usd: number;
+  readonly wall_time_ms: number;
+}
+
+export interface ProjectBudgetSnapshot {
+  readonly project_id: string;
+  readonly policy: ProjectBudgetPolicyRecord | null;
+  readonly usage: BudgetUsageSummary;
+  readonly task_policies: readonly TaskBudgetPolicyRecord[];
+  readonly task_usage: Readonly<Record<string, BudgetUsageSummary>>;
+  readonly events: readonly BudgetPauseEventRecord[];
+}
+
+export type ScheduledTaskRejectionReason =
+  | "DEPENDENCY_NOT_MERGED"
+  | "FILE_CONFLICT_IN_FLIGHT"
+  | "FILE_CONFLICT_BATCH"
+  | "BUDGET_AUTO_PAUSED"
+  | "MAX_CONCURRENCY_REACHED";
+
+export interface ParallelDispatchOutcome {
+  readonly project_id: string;
+  readonly dispatched: ReadonlyArray<{
+    readonly task: TaskRecord;
+    readonly lease: TaskLeaseRecord;
+    readonly worktreePath?: string;
+  }>;
+  readonly blocked: ReadonlyArray<{
+    readonly task_id: string;
+    readonly reason: ScheduledTaskRejectionReason;
+    readonly detail: string;
+    readonly blocking_task_ids?: readonly string[];
+    readonly conflicting_witness_path?: string;
+  }>;
+}
+
+export interface MergeQueueDrainItemResult {
+  readonly queue_entry_id: string;
+  readonly task_id: string;
+  readonly merge_candidate_id: string;
+  readonly status: MergeQueueEntryStatus;
+  readonly cas_status?: string;
+  readonly merged_commit_hash?: string | null;
+  readonly rebased_merge_candidate_id?: string | null;
+  readonly conflicted_files?: readonly string[];
+  readonly error?: string | null;
+}
+
+export interface MergeQueueDrainOutcome {
+  readonly project_id: string;
+  readonly processed: readonly MergeQueueDrainItemResult[];
+  readonly remaining_queued: number;
+  readonly main_ref_commit_hash: string | null;
+}
+
+/** Immutable M6C-2 receipt: one accepted payload per lease, retried by canonical SHA-256. */
+export interface CodeImportSubmissionRecord {
+  readonly submission_id: string;
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly lease_id: string;
+  readonly lease_epoch: number;
+  readonly import_id: string;
+  readonly source_type: "bundle" | "patch" | "artifact";
+  readonly payload_sha256: string;
+  readonly agent_commit_hash: string;
+  readonly verified_tree_hash: string;
+  readonly staging_ref: string;
+  readonly submitted_by_principal_id: string;
+  readonly created_at: string;
+}

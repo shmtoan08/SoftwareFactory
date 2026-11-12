@@ -1,3 +1,4 @@
+import { FactoryTelemetry, extractHttpTraceContext, formatTraceparent } from "@software-factory/observability";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   CostBudgetExceededError,
@@ -15,6 +16,8 @@ import type {
 } from "@software-factory/agent-gateway";
 import {
   Ac10ViolationError,
+  BudgetAutoPausedError,
+  TaskDependencyBlockedError,
   ApprovalExpiredOrStaleError,
   type CasMergeResult,
   type ControlPlaneStore,
@@ -65,6 +68,7 @@ import type {
   VerificationRunRecord,
   VerifiedCodeImportRecord,
 } from "@software-factory/shared-types";
+import { CodeImportError, validateCodeImportSubmission } from "@software-factory/task-contract";
 import type { GitTreeImportCandidateInput, TaskContractSpec } from "@software-factory/task-contract";
 import type {
   Docker3TierVerifier,
@@ -211,7 +215,17 @@ export class CoreApiHttpServer {
       throw new Error("CoreApiHttpServer already started");
     }
     this.server = createServer((req, res) => {
-      void this.handleRequest(req, res);
+      const parent = extractHttpTraceContext(req.headers);
+      const span = this.coreApi.telemetry.startSpan({ name: "http.server.request", kind: "SERVER", parentContext: parent,
+        attributes: { "http.request.method": req.method ?? "GET" } });
+      res.setHeader("traceparent", formatTraceparent(span.context));
+      res.once("finish", () => {
+        span.setAttribute("http.response.status_code", res.statusCode);
+        span.setStatus(res.statusCode >= 500 ? "ERROR" : "OK");
+        this.coreApi.telemetry.recordCounter("http.server.requests", 1, { status: res.statusCode });
+        span.end();
+      });
+      void this.coreApi.telemetry.runWithTraceContext(span.context, () => this.handleRequest(req, res));
     });
     await new Promise<void>((resolve, reject) => {
       this.server!.once("error", reject);
@@ -279,6 +293,13 @@ export class CoreApiHttpServer {
   }
 
   private sendError(res: ServerResponse, err: unknown): void {
+    if (err instanceof CodeImportError) {
+      this.sendJson(res, err.httpStatus, { error_code: err.code, reason: err.message }); return;
+    }
+    if (err instanceof BudgetAutoPausedError || err instanceof TaskDependencyBlockedError) {
+      this.sendJson(res, err.httpStatus, { error_code: err.code, reason: err.message });
+      return;
+    }
     if (err instanceof BadRequestHttpError) {
       this.sendJson(res, 400, {
         error_code: "ERR_BAD_REQUEST",
@@ -423,6 +444,83 @@ export class CoreApiHttpServer {
         return;
       }
 
+      const budgetRoute = pathname.match(/^\/api\/v1\/projects\/([^/]+)(?:\/tasks\/([^/]+))?\/budget(?:\/(resume))?$/);
+      if (budgetRoute?.[1]) {
+        const projectId = decodeURIComponent(budgetRoute[1]);
+        const taskId = budgetRoute[2] ? decodeURIComponent(budgetRoute[2]) : null;
+        if (method === "GET" && !taskId && !budgetRoute[3]) {
+          this.sendJson(res, 200, await this.coreApi.getBudgetSnapshot(projectId, auth)); return;
+        }
+        if (method === "POST") {
+          const body = await this.readJsonBody<Record<string, unknown>>(req);
+          if (!body || typeof body !== "object" || Array.isArray(body)) throw new BadRequestHttpError("Budget body must be an object");
+          const fields = taskId ? ["max_task_tokens", "max_task_cost_micro_usd", "max_task_wall_time_ms"]
+            : ["max_project_tokens", "max_project_cost_micro_usd", "max_project_wall_time_ms", "default_task_max_tokens", "default_task_max_cost_micro_usd", "default_task_max_wall_time_ms", "max_concurrent_tasks"];
+          const limits: Record<string, number | null> = {};
+          for (const field of fields) {
+            const value = body[field];
+            if (value === undefined) continue;
+            if (value !== null && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1))
+              throw new BadRequestHttpError(`${field} must be a positive safe integer or null`);
+            limits[field] = value as number | null;
+          }
+          const result = budgetRoute[3]
+            ? (typeof body.reason !== "string" || !body.reason.trim()
+              ? (() => { throw new BadRequestHttpError("reason required to resume budget"); })()
+              : taskId ? await this.coreApi.resumeTaskBudget(projectId, auth, { ...limits, task_id: taskId, reason: body.reason })
+                : await this.coreApi.resumeBudget(projectId, auth, { ...limits, reason: body.reason }))
+            : taskId ? await this.coreApi.updateTaskBudget(projectId, auth, { ...limits, task_id: taskId })
+              : await this.coreApi.updateProjectBudget(projectId, auth, limits);
+          this.sendJson(res, 200, result); return;
+        }
+      }
+
+      const depsRoute = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/task-dependencies$/);
+      if (depsRoute?.[1]) {
+        const projectId = decodeURIComponent(depsRoute[1]);
+        if (method === "GET") { this.sendJson(res, 200, { dependencies: await this.coreApi.listTaskDependencies(projectId, auth) }); return; }
+        if (method === "POST") {
+          const body = await this.readJsonBody<{ task_id: string; depends_on_task_id: string }>(req);
+          if (typeof body?.task_id !== "string" || typeof body.depends_on_task_id !== "string") throw new BadRequestHttpError("task_id and depends_on_task_id required");
+          this.sendJson(res, 201, await this.coreApi.addTaskDependency(projectId, auth, {
+            task_id: body.task_id, depends_on_task_id: body.depends_on_task_id, dependency_kind: "MANUAL" })); return;
+        }
+      }
+      const schedulerRoute = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/scheduler\/dispatch$/);
+      if (method === "POST" && schedulerRoute?.[1]) {
+        const body = await this.readJsonBody<{ worker_id: string; max_tasks?: number }>(req);
+        this.sendJson(res, 200, await this.coreApi.scheduleReadyTasks(decodeURIComponent(schedulerRoute[1]), auth,
+          { worker_id: body?.worker_id, max_tasks: body?.max_tasks })); return;
+      }
+      const queueRoute = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/merge-queue(?:\/(drain))?$/);
+      if (queueRoute?.[1]) {
+        const projectId = decodeURIComponent(queueRoute[1]);
+        if (method === "GET" && !queueRoute[2]) {
+          this.sendJson(res, 200, { entries: await this.coreApi.listMergeQueue(projectId, auth) }); return;
+        }
+        if (method === "POST" && queueRoute[2]) {
+          this.sendJson(res, 200, { entry: await this.coreApi.drainMergeQueue(projectId, auth, { require_real_git: true }) }); return;
+        }
+        if (method === "POST") {
+          const body = await this.readJsonBody<{ task_id: string; merge_candidate_id: string; approval_id: string }>(req);
+          if (typeof body?.task_id !== "string" || typeof body.merge_candidate_id !== "string" || typeof body.approval_id !== "string") throw new BadRequestHttpError("task_id, merge_candidate_id and approval_id required");
+          this.sendJson(res, 201, await this.coreApi.enqueueMerge(projectId, auth, {
+            task_id: body.task_id, merge_candidate_id: body.merge_candidate_id, approval_id: body.approval_id })); return;
+        }
+      }
+
+      const importsRoute = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/tasks\/([^/]+)\/imports$/);
+      if (method === "POST" && importsRoute?.[1] && importsRoute[2]) {
+        const body = await this.readJsonBody<{ lease_id: string; lease_epoch: number; submission: unknown }>(req);
+        if (typeof body?.lease_id !== "string" || !/^[0-9a-f-]{36}$/i.test(body.lease_id) || !Number.isSafeInteger(body.lease_epoch) || body.lease_epoch < 1)
+          throw new BadRequestHttpError("lease_id and a positive integer lease_epoch required");
+        const receipt = await this.coreApi.submitCodeImport(decodeURIComponent(importsRoute[1]), auth, {
+          task_id: decodeURIComponent(importsRoute[2]), lease_id: body.lease_id, lease_epoch: body.lease_epoch,
+          submission: validateCodeImportSubmission(body.submission),
+        });
+        this.sendJson(res, 200, receipt); return;
+      }
+
       const tasksCollection = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/tasks$/);
       if (tasksCollection?.[1]) {
         const projectId = decodeURIComponent(tasksCollection[1]);
@@ -432,9 +530,13 @@ export class CoreApiHttpServer {
             task_contract: TaskContractSpec;
             base_main_commit_hash?: string;
             max_rework_cycles?: number;
+            depends_on_task_ids?: readonly string[];
           }>(req);
           if (!body.title || !body.task_contract) {
             throw new BadRequestHttpError("title and task_contract are required");
+          }
+          if (body.depends_on_task_ids !== undefined && (!Array.isArray(body.depends_on_task_ids) || body.depends_on_task_ids.some((id) => typeof id !== "string"))) {
+            throw new BadRequestHttpError("depends_on_task_ids must be an array of task IDs");
           }
           const created = await this.coreApi.createTask(projectId, auth, body);
           this.sendJson(res, 201, created);
@@ -1441,8 +1543,46 @@ export class HttpCoreApiError extends Error {
 export class HttpCoreApiClient {
   private readonly baseUrl: string;
 
-  constructor(baseUrl: string) {
+  private readonly telemetry: FactoryTelemetry;
+
+  constructor(baseUrl: string, telemetry = new FactoryTelemetry({ serviceName: "core-api-client" })) {
+    this.telemetry = telemetry;
     this.baseUrl = baseUrl.replace(/\/+$/, "");
+  }
+
+  public async submitCodeImport(projectId: string, auth: CoreApiAuthContext,
+    input: Parameters<CoreApiService["submitCodeImport"]>[2]) {
+    return (await this.requestJson<Awaited<ReturnType<CoreApiService["submitCodeImport"]>>>("POST",
+      `/api/v1/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(input.task_id)}/imports`, auth,
+      { lease_id: input.lease_id, lease_epoch: input.lease_epoch, submission: input.submission })).data;
+  }
+
+  public async getBudgetSnapshot(projectId: string, auth: CoreApiAuthContext) {
+    return (await this.requestJson<Awaited<ReturnType<CoreApiService["getBudgetSnapshot"]>>>("GET", `/api/v1/projects/${encodeURIComponent(projectId)}/budget`, auth)).data;
+  }
+
+  public async scheduleReadyTasks(projectId: string, auth: CoreApiAuthContext,
+    input: Parameters<CoreApiService["scheduleReadyTasks"]>[2]) {
+    return (await this.requestJson<Awaited<ReturnType<CoreApiService["scheduleReadyTasks"]>>>("POST", `/api/v1/projects/${encodeURIComponent(projectId)}/scheduler/dispatch`, auth, input)).data;
+  }
+
+  public async updateProjectBudget(projectId: string, auth: CoreApiAuthContext,
+    input: Parameters<CoreApiService["updateProjectBudget"]>[2]) {
+    return (await this.requestJson<Awaited<ReturnType<CoreApiService["updateProjectBudget"]>>>("POST", `/api/v1/projects/${encodeURIComponent(projectId)}/budget`, auth, input)).data;
+  }
+
+  public async resumeBudget(projectId: string, auth: CoreApiAuthContext,
+    input: Parameters<CoreApiService["resumeBudget"]>[2]) {
+    return (await this.requestJson<Awaited<ReturnType<CoreApiService["resumeBudget"]>>>("POST", `/api/v1/projects/${encodeURIComponent(projectId)}/budget/resume`, auth, input)).data;
+  }
+
+  public async enqueueMerge(projectId: string, auth: CoreApiAuthContext,
+    input: Parameters<CoreApiService["enqueueMerge"]>[2]) {
+    return (await this.requestJson<Awaited<ReturnType<CoreApiService["enqueueMerge"]>>>("POST", `/api/v1/projects/${encodeURIComponent(projectId)}/merge-queue`, auth, input)).data;
+  }
+
+  public async drainMergeQueue(projectId: string, auth: CoreApiAuthContext) {
+    return (await this.requestJson<{ entry: Awaited<ReturnType<CoreApiService["drainMergeQueue"]>> }>("POST", `/api/v1/projects/${encodeURIComponent(projectId)}/merge-queue/drain`, auth)).data.entry;
   }
 
   private async requestJson<T>(
@@ -1452,25 +1592,28 @@ export class HttpCoreApiClient {
     body?: unknown,
     acceptedStatuses: readonly number[] = [200, 201]
   ): Promise<{ status: number; data: T }> {
-    const resp = await fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers: {
-        ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-        [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(auth),
-      },
-      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    return this.telemetry.withSpan("http.client.request", { kind: "CLIENT", attributes: { "http.request.method": method } }, async (span) => {
+      const resp = await fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers: this.telemetry.injectHttpTraceHeaders({
+          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+          [CORE_API_AUTH_HEADER]: encodeCoreApiAuthHeader(auth),
+        }),
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+      span.setAttribute("http.response.status_code", resp.status);
+      const parsed = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!acceptedStatuses.includes(resp.status)) {
+        throw new HttpCoreApiError(
+          resp.status,
+          parsed,
+          `CoreApi HTTP ${resp.status} on ${method} ${path}: ${String(
+            parsed.reason ?? JSON.stringify(parsed)
+          )}`
+        );
+      }
+      return { status: resp.status, data: parsed as T };
     });
-    const parsed = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
-    if (!acceptedStatuses.includes(resp.status)) {
-      throw new HttpCoreApiError(
-        resp.status,
-        parsed,
-        `CoreApi HTTP ${resp.status} on ${method} ${path}: ${String(
-          parsed.reason ?? JSON.stringify(parsed)
-        )}`
-      );
-    }
-    return { status: resp.status, data: parsed as T };
   }
 
   public async createTask(
@@ -1481,6 +1624,7 @@ export class HttpCoreApiClient {
       task_contract: TaskContractSpec;
       base_main_commit_hash?: string;
       max_rework_cycles?: number;
+      depends_on_task_ids?: readonly string[];
     }
   ): Promise<TaskRecord> {
     const res = await this.requestJson<TaskRecord>(

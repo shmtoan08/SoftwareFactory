@@ -3,6 +3,7 @@ import {
   type ManagedModelProviderExecutor,
 } from "@software-factory/adapter-sdk";
 import {
+  BudgetAutoPausedError,
   type ControlPlaneStore,
   PostgresRlsError,
   validateStage6DeveloperReviewerPair,
@@ -345,6 +346,7 @@ export async function runStage7DevelopmentPlan(
               ? validated.profileByKey.get(t.developer_profile_key)
               : undefined;
             return {
+              task_key: t.task_key,
               story_key: t.story_key,
               title: t.title,
               task_contract: {
@@ -354,6 +356,7 @@ export async function runStage7DevelopmentPlan(
               },
               requirement_ids: t.requirement_ids,
               ac_ids: t.ac_ids,
+              depends_on_task_keys: t.depends_on_task_keys,
               assigned_profile_id: prof?.profile_id ?? null,
               max_rework_cycles: input.max_rework_cycles,
             };
@@ -368,7 +371,10 @@ export async function runStage7DevelopmentPlan(
       }
     );
   } catch (persistErr: unknown) {
-    if (persistErr instanceof CostBudgetExceededError) {
+    if (
+      persistErr instanceof CostBudgetExceededError ||
+      persistErr instanceof BudgetAutoPausedError
+    ) {
       throw persistErr;
     }
     const isValidation =

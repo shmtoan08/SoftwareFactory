@@ -1063,18 +1063,24 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         (err: unknown) => err instanceof HttpCoreApiError && err.statusCode === 403
       );
 
-      const bootOutcome = await client.bootstrapPipelineProject(
-        proj.project_id,
-        authApprover,
-        frozen.sessionId,
-        {
+      // M6C-1 / 038d19a: simultaneous bootstrap attempts must reserve the trusted
+      // directory atomically; the loser must not remove the winner's policy or Git ref.
+      const bootstrapAttempts = await Promise.allSettled(Array.from({ length: 2 }, () =>
+        client.bootstrapPipelineProject(proj.project_id, authApprover, frozen.sessionId, {
           repo_path: repoBarePath,
           trusted_acceptance_dir: trustedDir,
           extra_protected_paths: ["config/locked.json"],
           scaffold_files: { "src/.gitkeep": "" },
           acceptance_specs: acceptanceSpecs,
-        }
-      );
+        })
+      ));
+      assert.equal(bootstrapAttempts.filter((attempt) => attempt.status === "fulfilled").length, 1);
+      const winningBootstrap = bootstrapAttempts.find((attempt) => attempt.status === "fulfilled");
+      const losingBootstrap = bootstrapAttempts.find((attempt) => attempt.status === "rejected");
+      assert.ok(winningBootstrap?.status === "fulfilled");
+      assert.ok(losingBootstrap?.status === "rejected");
+      assert.ok(losingBootstrap.reason instanceof HttpCoreApiError && losingBootstrap.reason.statusCode === 409);
+      const bootOutcome = winningBootstrap.value;
 
       const boot = bootOutcome.bootstrap;
       assert.equal(boot.baseline_id, frozen.baseline.baseline_id);
@@ -3875,6 +3881,10 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
 
       runPsql(db6f, headSql("packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0010_m6c_extended_code_import_submissions.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0010_m6c_extended_code_import_submissions.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0002_rls_verification_matrix.sql"));
 
       const pool6f = new PostgresRuntimePool({ ...pgConfig, database: db6f, maxConnections: 2 });
@@ -3914,6 +3924,10 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         "packages/database/migrations/0007_m6a_review_fixes.sql",
         "packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql",
         "packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql",
+        "packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql",
+        "packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql",
+        "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
+        "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
         "packages/database/migrations/0002_rls_verification_matrix.sql",
       ]) {
         runPsql(db80, headSql(mig));
@@ -3938,6 +3952,10 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         "packages/database/migrations/0007_m6a_review_fixes.sql",
         "packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql",
         "packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql",
+        "packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql",
+        "packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql",
+        "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
+        "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
         "packages/database/migrations/0002_rls_verification_matrix.sql",
       ]) {
         runPsql(db86, headSql(mig));
@@ -3960,10 +3978,12 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
                    'dev_user_stories',
                    'change_requests',
                    'task_plan_links',
-                   'release_acceptance_packages'
+                   'release_acceptance_packages',
+                   'task_dependencies', 'merge_queue_entries', 'project_budget_policies',
+                   'task_budget_policies', 'budget_pause_events', 'code_import_submissions'
                  );`
             );
-            assert.equal(cntRes.rows[0]!.cnt, "8");
+            assert.equal(cntRes.rows[0]!.cnt, "14");
           });
         } finally {
           await p.close();
@@ -4739,7 +4759,7 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         trust_tier: "TIER_3_PROVIDER_VM",
       });
 
-      // 6. M6B-FIX-08: Stage 7 BLOCKED_POSTCALL (402 + EXHAUSTED + 0 tasks) & TX2 persistence compensation
+      // 6. M6A-FU-02 & M6B-FIX-08: Stage 7 BLOCKED_POSTCALL (402 + EXHAUSTED + 0 tasks) & TX2 persistence compensation
       const postcallCost = await coreClient.createCostSession(proj.project_id, authDev, {
         pipeline_session_id: frozen.sessionId,
         max_tokens_per_request: 100_000,
@@ -5678,7 +5698,7 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         }
       );
 
-      // 3. M6B-FIX-08 on live PG: Stage 7 BLOCKED_POSTCALL (402 + EXHAUSTED + 0 rows)
+      // 3. M6A-FU-02 & M6B-FIX-08 on live PG: Stage 7 BLOCKED_POSTCALL (402 + EXHAUSTED + 0 rows)
       const pgPostcallCost = await coreClient.createCostSession(projA.project_id, authDev, {
         pipeline_session_id: frozen.sessionId,
         max_tokens_per_request: 100_000,

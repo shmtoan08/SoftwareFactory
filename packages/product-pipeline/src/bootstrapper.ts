@@ -1,14 +1,18 @@
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
+  closeSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -328,6 +332,47 @@ interface PreparedBaselineGitCommit {
   cleanup(): void;
 }
 
+export function pruneStalePendingBootstrapRefs(
+  repoPath: string,
+  maxAgeMs = 3_600_000,
+  nowMs = Date.now()
+): number {
+  const absRepo = resolve(repoPath);
+  const refsRaw = tryRunGit(absRepo, [
+    "for-each-ref",
+    "--format=%(refname)\t%(committerdate:unix)",
+    "refs/sf/pending-bootstrap",
+  ]);
+  if (!refsRaw) {
+    return 0;
+  }
+  let removed = 0;
+  const cutoffMs = nowMs - Math.max(0, maxAgeMs);
+  for (const line of refsRaw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const [refName, unixSecRaw] = trimmed.split("\t");
+    if (!refName) continue;
+    const commitMs = Number(unixSecRaw ?? 0) * 1000;
+    if (!Number.isFinite(commitMs) || commitMs <= cutoffMs) {
+      if (tryRunGit(absRepo, ["update-ref", "-d", refName]) !== null) {
+        removed += 1;
+      }
+    }
+  }
+  return removed;
+}
+
+function assertCleanNonBareWorkingTree(absRepo: string): void {
+  const dirty = runGit(absRepo, ["status", "--porcelain"]);
+  if (dirty.length > 0) {
+    throw new PostgresRlsError(
+      "23514",
+      `Repository '${absRepo}' has uncommitted working tree changes; aborting Stage 5 checkout without discarding local modifications`
+    );
+  }
+}
+
 function prepareBaselineGitCommit(input: {
   readonly baselineId: string;
   readonly repoPath: string;
@@ -355,11 +400,14 @@ function prepareBaselineGitCommit(input: {
     );
   }
   const isBare = isBareRaw === "true";
+  if (!isBare) {
+    assertCleanNonBareWorkingTree(absRepo);
+  }
   const existingMainSha = tryRunGit(absRepo, ["rev-parse", "--verify", "refs/heads/main"]);
 
   // Build commit in an isolated scratch clone so refs/heads/main is untouched until TX2 succeeds
   const scratchDir = mkdtempSync(join(tmpdir(), "sf-stage5-bootstrap-"));
-  const pendingRef = `refs/sf/pending-bootstrap/${input.baselineId}-${Date.now()}`;
+  const pendingRef = `refs/sf/pending-bootstrap/${input.baselineId}-${Date.now()}-${randomUUID()}`;
   let pendingRefWritten = false;
   try {
     if (existingMainSha) {
@@ -385,6 +433,9 @@ function prepareBaselineGitCommit(input: {
     return {
       baseMainCommitHash: newMainSha,
       finalizeGitMainRef: () => {
+        if (!isBare) {
+          assertCleanNonBareWorkingTree(absRepo);
+        }
         if (existingMainSha) {
           runGit(absRepo, ["update-ref", "refs/heads/main", newMainSha, existingMainSha]);
         } else {
@@ -392,7 +443,7 @@ function prepareBaselineGitCommit(input: {
         }
         tryRunGit(absRepo, ["symbolic-ref", "HEAD", "refs/heads/main"]);
         if (!isBare) {
-          runGit(absRepo, ["checkout", "-f", "main"]);
+          runGit(absRepo, ["checkout", "main"]);
         }
         tryRunGit(absRepo, ["update-ref", "-d", pendingRef]);
         pendingRefWritten = false;
@@ -526,59 +577,84 @@ export async function runStage5ProjectBootstrap(
       `trusted_acceptance_dir (${trustedAcceptanceDir}) must reside outside repo_path (${repoPath}) so agents cannot read or tamper with it`
     );
   }
-
-  // Reject pre-existing symlinks, files, or non-empty trusted_acceptance_dir
-  if (existsSync(trustedAcceptanceDir)) {
-    const stat = lstatSync(trustedAcceptanceDir);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-      throw new PostgresRlsError(
-        "23514",
-        `trusted_acceptance_dir (${trustedAcceptanceDir}) must be an empty directory, not a file or symlink`
-      );
-    }
-    const existingFiles = readdirSync(trustedAcceptanceDir);
-    if (existingFiles.length > 0) {
-      throw new PostgresRlsError(
-        "23514",
-        `trusted_acceptance_dir (${trustedAcceptanceDir}) must be empty prior to Stage 5 bootstrap (found ${existingFiles.length} leftover entries)`
-      );
-    }
+  if (trustedReal === parse(trustedReal).root) {
+    throw new PostgresRlsError(
+      "23514",
+      `trusted_acceptance_dir (${trustedAcceptanceDir}) cannot be a filesystem root`
+    );
   }
 
-  const overrides = input.acceptance_specs ?? {};
-  const acceptanceTests: TrustedAcceptanceTestSpec[] = [];
-  for (const req of reqs) {
-    if (req.acceptance_criteria.length === 0) {
+  // Reserve canonical trusted_acceptance_dir exclusively across concurrent processes/baselines (M6B review Minor Note #3)
+  mkdirSync(dirname(trustedReal), { recursive: true });
+  const bootstrapLockPath = `${trustedReal}.sf-bootstrap.lock`;
+  let bootstrapLockAcquired = false;
+  try {
+    const lockFd = openSync(bootstrapLockPath, "wx");
+    closeSync(lockFd);
+    bootstrapLockAcquired = true;
+  } catch (lockErr: unknown) {
+    const code = (lockErr as NodeJS.ErrnoException)?.code;
+    if (code === "EEXIST") {
       throw new PostgresRlsError(
-        "23514",
-        `Requirement ${req.req_id} has zero acceptance_criteria; cannot synthesize Trusted Acceptance Tests`
+        "23505",
+        `Concurrent Stage 5 bootstrap already reserves trusted_acceptance_dir (${trustedReal})`
       );
     }
-    const compIds = designIndex.componentsByReqId.get(req.req_id) ?? [];
-    for (const ac of req.acceptance_criteria) {
-      const ov = overrides[ac.ac_id];
-      const defaultDeliverable =
-        compIds.length > 0
-          ? `src/components/${slugifyIdentifier(compIds[0]!)}.mjs`
-          : `src/requirements/${slugifyIdentifier(req.req_id)}.mjs`;
-      const targetDeliverable = ov?.target_file ?? defaultDeliverable;
-      acceptanceTests.push({
-        ac_id: ac.ac_id,
-        req_id: req.req_id,
-        given: ac.given,
-        when: ac.when,
-        then: ac.then,
-        test_file_path: "acceptance.test.mjs",
-        component_ids: [...compIds],
-        expected_deliverables: [targetDeliverable],
-      });
-    }
+    throw lockErr;
   }
 
-  // Stage Trusted Acceptance Tests in isolated temporary directory before DB TX2
   const stagingTrustedDir = mkdtempSync(join(tmpdir(), "sf-stage5-trusted-"));
   let preparedGit: PreparedBaselineGitCommit | null = null;
   try {
+    // Reject pre-existing symlinks, files, or non-empty trusted_acceptance_dir
+    if (existsSync(trustedAcceptanceDir)) {
+      const stat = lstatSync(trustedAcceptanceDir);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) {
+        throw new PostgresRlsError(
+          "23514",
+          `trusted_acceptance_dir (${trustedAcceptanceDir}) must be an empty directory, not a file or symlink`
+        );
+      }
+      const existingFiles = readdirSync(trustedAcceptanceDir);
+      if (existingFiles.length > 0) {
+        throw new PostgresRlsError(
+          "23514",
+          `trusted_acceptance_dir (${trustedAcceptanceDir}) must be empty prior to Stage 5 bootstrap (found ${existingFiles.length} leftover entries)`
+        );
+      }
+    }
+
+    const overrides = input.acceptance_specs ?? {};
+    const acceptanceTests: TrustedAcceptanceTestSpec[] = [];
+    for (const req of reqs) {
+      if (req.acceptance_criteria.length === 0) {
+        throw new PostgresRlsError(
+          "23514",
+          `Requirement ${req.req_id} has zero acceptance_criteria; cannot synthesize Trusted Acceptance Tests`
+        );
+      }
+      const compIds = designIndex.componentsByReqId.get(req.req_id) ?? [];
+      for (const ac of req.acceptance_criteria) {
+        const ov = overrides[ac.ac_id];
+        const defaultDeliverable =
+          compIds.length > 0
+            ? `src/components/${slugifyIdentifier(compIds[0]!)}.mjs`
+            : `src/requirements/${slugifyIdentifier(req.req_id)}.mjs`;
+        const targetDeliverable = ov?.target_file ?? defaultDeliverable;
+        acceptanceTests.push({
+          ac_id: ac.ac_id,
+          req_id: req.req_id,
+          given: ac.given,
+          when: ac.when,
+          then: ac.then,
+          test_file_path: "acceptance.test.mjs",
+          component_ids: [...compIds],
+          expected_deliverables: [targetDeliverable],
+        });
+      }
+    }
+
+    // Stage Trusted Acceptance Tests in isolated temporary directory before DB TX2
     const trustedManifest = canonicalizeJson({
       baseline_id: pre.baseline.baseline_id,
       pipeline_session_id: pre.session.pipeline_session_id,
@@ -664,7 +740,7 @@ export async function runStage5ProjectBootstrap(
     });
     const baseMainCommitHash = preparedGit.baseMainCommitHash;
 
-    // Short TX2: enforce DB UNIQUE (project_id, baseline_id) BEFORE publishing refs/heads/main or trusted dir
+    // Short TX2: enforce DB UNIQUE (project_id, baseline_id) & trusted_acceptance_dir BEFORE publishing
     const bootstrap = await store.withRlsTransaction(
       {
         currentProjectId: input.project_id,
@@ -681,7 +757,7 @@ export async function runStage5ProjectBootstrap(
           pipeline_session_id: input.pipeline_session_id,
           baseline_id: pre.baseline.baseline_id,
           repo_path: repoPath,
-          trusted_acceptance_dir: trustedAcceptanceDir,
+          trusted_acceptance_dir: trustedReal,
           base_main_commit_hash: baseMainCommitHash,
           protected_paths: protectedPaths,
           trusted_policy_sha256: trustedPolicySha256,
@@ -703,5 +779,12 @@ export async function runStage5ProjectBootstrap(
   } finally {
     rmSync(stagingTrustedDir, { recursive: true, force: true });
     preparedGit?.cleanup();
+    if (bootstrapLockAcquired) {
+      try {
+        unlinkSync(bootstrapLockPath);
+      } catch {
+        // ignore lock cleanup failure
+      }
+    }
   }
 }

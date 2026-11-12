@@ -891,6 +891,7 @@ export function validateCreateChangeRequestAgainstBaseline(input: {
 
   const seenKeys = new Set<string>();
   const proposedTaskCoveredReqs = new Set<string>();
+  const depsByKey = new Map<string, string[]>();
   for (const pt of request.proposed_tasks) {
     const key = pt.task_key.trim();
     if (!key || !pt.title.trim() || seenKeys.has(key)) {
@@ -948,6 +949,76 @@ export function validateCreateChangeRequestAgainstBaseline(input: {
       protectedPaths: input.protectedPaths,
       contextLabel: `Change Request task '${key}'`,
     });
+
+    const cleanKeyDeps: string[] = [];
+    for (const rawDep of pt.depends_on_task_keys ?? []) {
+      const dep = rawDep.trim();
+      if (!dep) {
+        throw new PostgresRlsError(
+          "23514",
+          `Proposed CR task '${key}' contains blank dependency key`
+        );
+      }
+      if (dep === key) {
+        throw new PostgresRlsError(
+          "23514",
+          `Proposed CR task '${key}' cannot depend on itself`
+        );
+      }
+      if (!cleanKeyDeps.includes(dep)) {
+        cleanKeyDeps.push(dep);
+      }
+    }
+    depsByKey.set(key, cleanKeyDeps);
+
+    for (const rawId of pt.depends_on_task_ids ?? []) {
+      if (!rawId.trim()) {
+        throw new PostgresRlsError(
+          "23514",
+          `Proposed CR task '${key}' contains blank dependency task_id`
+        );
+      }
+    }
+  }
+
+  const crInDegree = new Map<string, number>();
+  const crDependents = new Map<string, string[]>();
+  for (const key of seenKeys) {
+    crInDegree.set(key, 0);
+    crDependents.set(key, []);
+  }
+  for (const [key, deps] of depsByKey.entries()) {
+    for (const dep of deps) {
+      if (!seenKeys.has(dep)) {
+        throw new PostgresRlsError(
+          "23514",
+          `Proposed CR task '${key}' depends on unknown task_key '${dep}'`
+        );
+      }
+      crDependents.get(dep)!.push(key);
+      crInDegree.set(key, (crInDegree.get(key) ?? 0) + 1);
+    }
+  }
+  const crQueue: string[] = [];
+  for (const [k, deg] of crInDegree.entries()) {
+    if (deg === 0) crQueue.push(k);
+  }
+  let crVisited = 0;
+  while (crQueue.length > 0) {
+    const cur = crQueue.shift()!;
+    crVisited += 1;
+    for (const nxt of crDependents.get(cur) ?? []) {
+      const rem = (crInDegree.get(nxt) ?? 0) - 1;
+      crInDegree.set(nxt, rem);
+      if (rem === 0) crQueue.push(nxt);
+    }
+  }
+  if (crVisited !== seenKeys.size) {
+    const cycleNode = [...crInDegree.entries()].find(([, deg]) => deg > 0)?.[0] ?? "unknown";
+    throw new PostgresRlsError(
+      "23514",
+      `Proposed CR task dependency cycle detected involving '${cycleNode}'`
+    );
   }
 
   const uncoveredImpacted = request.impacted_requirement_ids.filter(

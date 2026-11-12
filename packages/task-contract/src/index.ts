@@ -196,6 +196,7 @@ export interface GitTreeImportCandidateInput {
   readonly parent_commit_hashes: readonly string[];
   readonly expected_base_main_commit_hash: string;
   readonly changes: readonly GitTreeChangeEntry[];
+  readonly tree_entries?: readonly { readonly path: string; readonly mode: string }[];
   readonly contract: TaskContractSpec;
 }
 
@@ -245,6 +246,14 @@ export function validateGitTreeImport(
       error_code: "ERR_IMPORT_LINEAGE_MISMATCH",
       message: `Expected single parent ${input.expected_base_main_commit_hash}, got [${input.parent_commit_hashes.join(", ")}]`,
     };
+  }
+
+  const wholeTreePaths = new Set<string>();
+  for (const entry of input.tree_entries ?? []) {
+    // Modes are checked on changed entries below; inherited baseline symlinks
+    // remain subject to the verifier's structured snapshot rejection.
+    if (!isSafeRelativePosixPath(entry.path) || wholeTreePaths.has(entry.path.toLowerCase())) return { valid: false, error_code: "ERR_IMPORT_PATH_TRAVERSAL_OR_COLLISION", message: "Unsafe or case-colliding Git tree path", offending_path: entry.path };
+    wholeTreePaths.add(entry.path.toLowerCase());
   }
 
   const maxChangedFiles = input.contract.max_changed_files ?? DEFAULT_MAX_CHANGED_FILES;
@@ -374,34 +383,6 @@ export function validateGitTreeImport(
   };
 }
 
-function parseNumstatPath(rawPath: string): { oldPath?: string; newPath: string } {
-  // Case 1: prefix{old => new}suffix or {old => new}
-  const braceMatch = rawPath.match(/^(.*?)\{(.*?)\s*=>\s*(.*?)\}(.*)$/);
-  if (braceMatch) {
-    const prefix = braceMatch[1]!;
-    const oldPart = braceMatch[2]!;
-    const newPart = braceMatch[3]!;
-    const suffix = braceMatch[4]!;
-    return {
-      oldPath: `${prefix}${oldPart}${suffix}`.replace(/\/+/g, "/").replace(/^\/+/, ""),
-      newPath: `${prefix}${newPart}${suffix}`.replace(/\/+/g, "/").replace(/^\/+/, ""),
-    };
-  }
-  // Case 2: old => new
-  const arrowMatch = rawPath.match(/^(.*?)\s*=>\s*(.*?)$/);
-  if (arrowMatch) {
-    return {
-      oldPath: arrowMatch[1]!.trim().replace(/^\/+/, ""),
-      newPath: arrowMatch[2]!.trim().replace(/^\/+/, ""),
-    };
-  }
-  return { newPath: rawPath.trim().replace(/^\/+/, "") };
-}
-
-/**
- * Inspects a real Git repository on disk (`git rev-list`, `git rev-parse`, `git diff-tree`)
- * and constructs a `GitTreeImportCandidateInput` for `validateGitTreeImport` (Milestone M2).
- */
 export function inspectRealGitCommitForImport(options: {
   repoPath: string;
   expectedBaseMainCommitHash: string;
@@ -410,157 +391,381 @@ export function inspectRealGitCommitForImport(options: {
   gitDir?: string;
   gitObjectDirectory?: string;
   gitAlternateObjectDirectories?: string;
+  gitEnvironment?: NodeJS.ProcessEnv;
 }): GitTreeImportCandidateInput {
-  const gitEnv: NodeJS.ProcessEnv = { ...process.env };
-  if (options.gitDir) {
-    gitEnv.GIT_DIR = options.gitDir;
+  if (!/^[0-9a-f]{40}$/i.test(options.agentCommitHash) || !/^[0-9a-f]{40}$/i.test(options.expectedBaseMainCommitHash)) {
+    throw new Error("ERR_IMPORT_INVALID_COMMIT_HASH");
   }
-  if (options.gitObjectDirectory) {
-    gitEnv.GIT_OBJECT_DIRECTORY = options.gitObjectDirectory;
+  const gitEnv: NodeJS.ProcessEnv = { ...(options.gitEnvironment ?? process.env), GIT_NO_REPLACE_OBJECTS: "1" };
+  if (options.gitDir) gitEnv.GIT_DIR = options.gitDir;
+  if (options.gitObjectDirectory) gitEnv.GIT_OBJECT_DIRECTORY = options.gitObjectDirectory;
+  if (options.gitAlternateObjectDirectories) gitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES = options.gitAlternateObjectDirectories;
+  const git = (args: string[], input?: string): string => new TextDecoder("utf-8", { fatal: true }).decode(execFileSync("git", ["--no-pager", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
+    cwd: options.repoPath, env: gitEnv, timeout: 10_000, maxBuffer: 16 * 1024 * 1024,
+    stdio: input !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"], input,
+  }));
+  const parentCommitHashes = git(["rev-list", "--parents", "-n", "1", options.agentCommitHash]).trim().split(/\s+/).slice(1);
+  const verifiedTreeHash = git(["rev-parse", `${options.agentCommitHash}^{tree}`]).trim();
+  const numstat = git(["diff-tree", "--no-commit-id", "-r", "-M", "--no-ext-diff", "--no-textconv", "--numstat", "-z",
+    options.expectedBaseMainCommitHash, options.agentCommitHash]).split("\0");
+  const stats = new Map<string, { added: number; deleted: number; binary: boolean }>();
+  for (let i = 0; i < numstat.length; i++) {
+    const token = numstat[i]!;
+    if (!token) continue;
+    const firstTab = token.indexOf("\t"); const secondTab = token.indexOf("\t", firstTab + 1);
+    if (firstTab < 0 || secondTab < 0) throw new Error("ERR_IMPORT_INVALID_NUMSTAT");
+    const added = token.slice(0, firstTab); const deleted = token.slice(firstTab + 1, secondTab);
+    const stat = { added: added === "-" ? 0 : Number(added), deleted: deleted === "-" ? 0 : Number(deleted), binary: added === "-" || deleted === "-" };
+    const target = token.slice(secondTab + 1);
+    if (target) stats.set(target, stat);
+    else { stats.set(numstat[++i]!, stat); stats.set(numstat[++i]!, stat); }
   }
-  if (options.gitAlternateObjectDirectories) {
-    gitEnv.GIT_ALTERNATE_OBJECT_DIRECTORIES = options.gitAlternateObjectDirectories;
-  }
-
-  const git = (args: string[], inputStdin?: string): string =>
-    execFileSync("git", args, {
-      cwd: options.repoPath,
-      env: gitEnv,
-      encoding: "utf8",
-      stdio: inputStdin !== undefined ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
-      input: inputStdin,
-      timeout: 10_000,
-    }).trim();
-
-  // 1. Extract commit + parents (`<commit> <parent1> ...`)
-  const revListLine = git(["rev-list", "--parents", "-n", "1", options.agentCommitHash]);
-  const parts = revListLine.split(/\s+/).filter(Boolean);
-  const parentCommitHashes = parts.slice(1);
-
-  // 2. Extract tree SHA
-  const verifiedTreeHash = git(["rev-parse", `${options.agentCommitHash}^{tree}`]);
-
-  // 3. Extract raw mode/blob changes (`git diff-tree --no-commit-id -r -M --raw`)
-  const rawOutput = git([
-    "diff-tree",
-    "--no-commit-id",
-    "-r",
-    "-M",
-    "--raw",
-    options.expectedBaseMainCommitHash,
-    options.agentCommitHash,
-  ]);
-  const numstatOutput = git([
-    "diff-tree",
-    "--no-commit-id",
-    "-r",
-    "-M",
-    "--numstat",
-    options.expectedBaseMainCommitHash,
-    options.agentCommitHash,
-  ]);
-
-  const numstatByPath = new Map<string, { added: number; deleted: number; isBinary: boolean }>();
-  for (const line of numstatOutput.split("\n").filter(Boolean)) {
-    const cols = line.split("\t");
-    if (cols.length >= 3) {
-      const addedRaw = cols[0]!;
-      const deletedRaw = cols[1]!;
-      const rawPath = cols[cols.length - 1]!;
-      const isBinary = addedRaw === "-" || deletedRaw === "-";
-      const statObj = {
-        added: isBinary ? 0 : Number.parseInt(addedRaw, 10) || 0,
-        deleted: isBinary ? 0 : Number.parseInt(deletedRaw, 10) || 0,
-        isBinary,
-      };
-      numstatByPath.set(rawPath, statObj);
-      const parsed = parseNumstatPath(rawPath);
-      numstatByPath.set(parsed.newPath, statObj);
-      if (parsed.oldPath) {
-        numstatByPath.set(parsed.oldPath, statObj);
-      }
-    }
-  }
-
-  // Pre-fetch all blob sizes in one batch with `git cat-file --batch-check`
-  const rawLines = rawOutput.split("\n").filter(Boolean);
-  const blobShasToQuery: string[] = [];
-  for (const line of rawLines) {
-    const [metaPart] = line.split("\t");
-    if (!metaPart) continue;
-    const metaTokens = metaPart.replace(/^:/, "").split(/\s+/);
-    const newMode = metaTokens[1] ?? "100644";
-    const newBlobSha = metaTokens[3] ?? "0000000000000000000000000000000000000000";
-    if (newMode !== "000000" && newMode !== "160000" && !/^0+$/.test(newBlobSha)) {
-      blobShasToQuery.push(newBlobSha);
-    }
-  }
-
-  const blobSizeBySha = new Map<string, number>();
-  if (blobShasToQuery.length > 0) {
-    try {
-      const batchCheckOut = git(["cat-file", "--batch-check"], blobShasToQuery.join("\n") + "\n");
-      for (const line of batchCheckOut.split("\n").filter(Boolean)) {
-        const tokens = line.split(" ");
-        if (tokens.length >= 3) {
-          const sha = tokens[0]!;
-          const size = Number.parseInt(tokens[2]!, 10) || 0;
-          blobSizeBySha.set(sha, size);
-        }
-      }
-    } catch {
-      // Fallback on single cat-file if batch-check fails
-    }
-  }
-
+  const raw = git(["diff-tree", "--no-commit-id", "-r", "-M", "--no-ext-diff", "--no-textconv", "--raw", "--no-abbrev", "-z",
+    options.expectedBaseMainCommitHash, options.agentCommitHash]).split("\0");
   const changes: GitTreeChangeEntry[] = [];
-  for (const line of rawLines) {
-    const [metaPart, ...pathParts] = line.split("\t");
-    if (!metaPart || pathParts.length === 0) {
+  for (let i = 0; i < raw.length; i++) {
+    if (!raw[i]) continue;
+    const meta = raw[i]!.replace(/^:/, "").split(" ");
+    const oldMode = meta[0]!; const newMode = meta[1]!; const blob = meta[3]!; const status = meta[4]!;
+    const source = raw[++i]!;
+    const renamed = status.startsWith("R") || status.startsWith("C");
+    const target = renamed ? raw[++i]! : source;
+    const stat = stats.get(target) ?? stats.get(source) ?? { added: 0, deleted: 0, binary: false };
+    const size = newMode === "000000" || newMode === "160000" ? 0 : Number(git(["cat-file", "-s", blob]).trim());
+    changes.push({ path: target, ...(renamed ? { old_path: source } : {}), mode: newMode === "000000" ? oldMode : newMode,
+      size_bytes: size, is_binary: stat.binary, added_lines: stat.added, deleted_lines: stat.deleted, blob_sha: blob });
+  }
+  const treeEntries = git(["ls-tree", "-r", "-z", options.agentCommitHash]).split("\0").filter(Boolean).map((entry) => {
+    const tab = entry.indexOf("\t");
+    if (tab < 0) throw new Error("ERR_IMPORT_INVALID_TREE_ENTRY");
+    return { mode: entry.slice(0, tab).split(" ")[0]!, path: entry.slice(tab + 1) };
+  });
+  return { agent_commit_hash: options.agentCommitHash, verified_tree_hash: verifiedTreeHash,
+    parent_commit_hashes: parentCommitHashes, expected_base_main_commit_hash: options.expectedBaseMainCommitHash,
+    changes, tree_entries: treeEntries, contract: options.contract };
+}
+
+export interface GlobIntersectionResult {
+  readonly intersects: boolean;
+  readonly witnessPath?: string;
+}
+
+export interface TaskAllowedFilesIntersectionDetail {
+  readonly patternA: string;
+  readonly patternB: string;
+  readonly witnessPath: string;
+}
+
+export interface TaskAllowedFilesIntersectionResult {
+  readonly intersects: boolean;
+  readonly details: readonly TaskAllowedFilesIntersectionDetail[];
+}
+
+interface GlobNfaEdge {
+  readonly kind: "ANY" | "NON_SLASH" | "LITERAL";
+  readonly ch?: string;
+  readonly target: number;
+}
+
+interface CompiledGlobNfa {
+  readonly acceptState: number;
+  readonly numStates: number;
+  readonly epsilons: readonly number[][];
+  readonly edges: readonly GlobNfaEdge[][];
+  readonly literals: readonly string[];
+}
+
+function compileGlobPatternToNfa(globPattern: string): CompiledGlobNfa {
+  const normalized = globPattern.replace(/\\/g, "/").replace(/^\/+/, "");
+  const epsilons: number[][] = [];
+  const edges: GlobNfaEdge[][] = [];
+  const literalSet = new Set<string>();
+
+  const addState = (): number => {
+    const id = epsilons.length;
+    epsilons.push([]);
+    edges.push([]);
+    return id;
+  };
+
+  let cur = addState();
+  let i = 0;
+  while (i < normalized.length) {
+    const ch = normalized[i]!;
+    if (ch === "*") {
+      if (normalized[i + 1] === "*") {
+        if (normalized[i + 2] === "/") {
+          // `(?:.+/)?`
+          const p1 = addState();
+          const p2 = addState();
+          const next = addState();
+          epsilons[cur]!.push(next);
+          epsilons[cur]!.push(p1);
+          edges[p1]!.push({ kind: "ANY", target: p2 });
+          edges[p2]!.push({ kind: "ANY", target: p2 });
+          edges[p2]!.push({ kind: "LITERAL", ch: "/", target: next });
+          cur = next;
+          i += 3;
+          continue;
+        }
+        // `.*`
+        const next = addState();
+        edges[cur]!.push({ kind: "ANY", target: cur });
+        epsilons[cur]!.push(next);
+        cur = next;
+        i += 2;
+        continue;
+      }
+      // `[^/]*`
+      const next = addState();
+      edges[cur]!.push({ kind: "NON_SLASH", target: cur });
+      epsilons[cur]!.push(next);
+      cur = next;
+      i += 1;
       continue;
     }
-    const metaTokens = metaPart.replace(/^:/, "").split(/\s+/);
-    const oldMode = metaTokens[0] ?? "100644";
-    const newMode = metaTokens[1] ?? "100644";
-    const newBlobSha = metaTokens[3] ?? "0000000000000000000000000000000000000000";
-    const statusToken = metaTokens[4] ?? "M";
-
-    const isRenameOrCopy = statusToken.startsWith("R") || statusToken.startsWith("C");
-    const oldPath = isRenameOrCopy && pathParts.length >= 2 ? pathParts[0] : undefined;
-    const targetPath = isRenameOrCopy && pathParts.length >= 2 ? pathParts[1]! : pathParts[0]!;
-
-    const effectiveMode = newMode === "000000" ? oldMode : newMode;
-    let sizeBytes = 0;
-    if (newMode !== "000000" && newMode !== "160000" && !/^0+$/.test(newBlobSha)) {
-      sizeBytes =
-        blobSizeBySha.get(newBlobSha) ??
-        (Number.parseInt(git(["cat-file", "-s", newBlobSha]), 10) || 0);
+    if (ch === "?") {
+      // `[^/]`
+      const next = addState();
+      edges[cur]!.push({ kind: "NON_SLASH", target: next });
+      cur = next;
+      i += 1;
+      continue;
     }
-
-    const stat =
-      numstatByPath.get(targetPath) ??
-      (oldPath ? numstatByPath.get(oldPath) : undefined) ??
-      { added: 0, deleted: 0, isBinary: false };
-
-    changes.push({
-      path: targetPath,
-      ...(oldPath !== undefined ? { old_path: oldPath } : {}),
-      mode: effectiveMode,
-      size_bytes: sizeBytes,
-      is_binary: stat.isBinary,
-      added_lines: stat.added,
-      deleted_lines: stat.deleted,
-      blob_sha: newBlobSha,
-    });
+    const next = addState();
+    edges[cur]!.push({ kind: "LITERAL", ch, target: next });
+    if (ch !== "/") {
+      literalSet.add(ch);
+    }
+    cur = next;
+    i += 1;
   }
 
   return {
-    agent_commit_hash: options.agentCommitHash,
-    verified_tree_hash: verifiedTreeHash,
-    parent_commit_hashes: parentCommitHashes,
-    expected_base_main_commit_hash: options.expectedBaseMainCommitHash,
-    changes,
-    contract: options.contract,
+    acceptState: cur,
+    numStates: epsilons.length,
+    epsilons,
+    edges,
+    literals: [...literalSet],
   };
 }
 
+function computeEpsilonClosure(nfa: CompiledGlobNfa): number[][] {
+  const closures: number[][] = [];
+  for (let start = 0; start < nfa.numStates; start += 1) {
+    const seen = new Set<number>([start]);
+    const stack = [start];
+    while (stack.length > 0) {
+      const s = stack.pop()!;
+      for (const next of nfa.epsilons[s]!) {
+        if (!seen.has(next)) {
+          seen.add(next);
+          stack.push(next);
+        }
+      }
+    }
+    closures.push([...seen]);
+  }
+  return closures;
+}
+
+const SEG_START = 0;
+const SEG_DOT1 = 1;
+const SEG_DOT2 = 2;
+const SEG_OK = 3;
+
+function stepSafePathSegDfa(segState: number, ch: string): number {
+  if (ch === "/") {
+    return segState === SEG_OK ? SEG_START : -1;
+  }
+  if (ch === ".") {
+    if (segState === SEG_START) return SEG_DOT1;
+    if (segState === SEG_DOT1) return SEG_DOT2;
+    return SEG_OK;
+  }
+  return SEG_OK;
+}
+
+function chooseWildcardRepresentativeChars(excludedLiterals: Set<string>): string[] {
+  const candidates = "xabcdefyzghijklmnopqrstuvw0123456789_-";
+  const picks: string[] = [];
+  for (let i = 0; i < candidates.length; i += 1) {
+    const ch = candidates[i]!;
+    if (!excludedLiterals.has(ch) && ch !== "/" && ch !== "." && ch !== "*" && ch !== "?") {
+      picks.push(ch);
+      if (picks.length >= 2) {
+        return picks;
+      }
+    }
+  }
+  for (let code = 0x20; code <= 0xffff && picks.length < 2; code += 1) {
+    const ch = String.fromCharCode(code);
+    if (code !== 0x7f && ch !== "\\" && ch !== "/" && ch !== "." && !excludedLiterals.has(ch)) {
+      picks.push(ch);
+    }
+  }
+  return picks.length > 0 ? picks : ["x"];
+}
+
+function extractLiteralsFromPatterns(patterns: readonly string[]): string[] {
+  const out = new Set<string>();
+  for (const pat of patterns) {
+    const normalized = pat.replace(/\\/g, "/").replace(/^\/+/, "");
+    for (let i = 0; i < normalized.length; i += 1) {
+      const ch = normalized[i]!;
+      if (ch !== "*" && ch !== "?" && ch !== "/" && ch !== "\\") {
+        const code = ch.charCodeAt(0);
+        if (code > 0x1f && code !== 0x7f) {
+          out.add(ch);
+        }
+      }
+    }
+  }
+  return [...out];
+}
+
+interface ExcludedGlobPattern {
+  readonly pattern: string;
+  readonly caseInsensitive: boolean;
+}
+
+function findGlobIntersectionWitness(
+  patternA: string,
+  patternB: string,
+  excludedPatterns: readonly ExcludedGlobPattern[] = []
+): string | null {
+  // Determinize *all* languages in the search state. Tracking only allowed NFA
+  // states and rejecting one witness afterwards loses valid alternate paths.
+  const machines = [patternA, patternB, ...excludedPatterns.map((p) => p.pattern)].map(compileGlobPatternToNfa);
+  const closures = machines.map(computeEpsilonClosure);
+  const insensitive = [false, false, ...excludedPatterns.map((p) => p.caseInsensitive)];
+  const literals = new Set<string>(extractLiteralsFromPatterns([
+    patternA, patternB, ...excludedPatterns.map((p) => p.pattern),
+  ]));
+  for (const literal of [...literals]) {
+    if (literal.toUpperCase().length === 1) literals.add(literal.toUpperCase());
+    if (literal.toLowerCase().length === 1) literals.add(literal.toLowerCase());
+  }
+  const alphabet = [...new Set([...chooseWildcardRepresentativeChars(literals), ...literals, "/", "."])]
+    .filter((ch) => ch !== "\\" && ch.charCodeAt(0) > 0x1f && ch.charCodeAt(0) !== 0x7f);
+  const literalRegexes = new Map<string, RegExp>();
+  const caseMatches = (literal: string, ch: string): boolean => {
+    let regex = literalRegexes.get(literal);
+    if (!regex) {
+      regex = new RegExp(`^${literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+      literalRegexes.set(literal, regex);
+    }
+    return regex.test(ch);
+  };
+  const transitionCaches = machines.map(() => new Map<string, number[]>());
+  const step = (machineIndex: number, states: readonly number[], ch: string): number[] => {
+    const cacheKey = `${states.join(",")}:${ch}`;
+    const cached = transitionCaches[machineIndex]!.get(cacheKey);
+    if (cached) return cached;
+    const nfa = machines[machineIndex]!;
+    const next = new Set<number>();
+    for (const state of states) for (const edge of nfa.edges[state]!) {
+      const matches = edge.kind === "ANY" ? !["\n", "\r", "\u2028", "\u2029"].includes(ch)
+        : edge.kind === "NON_SLASH" ? ch !== "/"
+          : edge.ch === ch || (insensitive[machineIndex] && caseMatches(edge.ch!, ch));
+      if (matches) for (const target of closures[machineIndex]![edge.target]!) next.add(target);
+    }
+    const result = [...next].sort((a, b) => a - b);
+    transitionCaches[machineIndex]!.set(cacheKey, result);
+    return result;
+  };
+  interface SearchState { readonly states: readonly number[][]; readonly segment: number; readonly parent: number; readonly ch: string }
+  const initial: SearchState = { states: closures.map((closure) => [...closure[0]!].sort((a, b) => a - b)), segment: SEG_START, parent: -1, ch: "" };
+  const queue: SearchState[] = [initial];
+  const keyOf = (states: readonly number[][], segment: number) => `${segment}|${states.map((set) => set.join(",")).join("|")}`;
+  const visited = new Set([keyOf(initial.states, initial.segment)]);
+  const reconstruct = (index: number): string => {
+    const chars: string[] = [];
+    while (index >= 0) { const node = queue[index]!; chars.push(node.ch); index = node.parent; }
+    return chars.reverse().join("");
+  };
+  for (let head = 0; head < queue.length; head++) {
+    const current = queue[head]!;
+    if (current.segment === SEG_OK && current.states[0]!.includes(machines[0]!.acceptState) &&
+      current.states[1]!.includes(machines[1]!.acceptState) &&
+      !current.states.slice(2).some((states, i) => states.includes(machines[i + 2]!.acceptState))) {
+      return reconstruct(head);
+    }
+    for (const ch of alphabet) {
+      const segment = stepSafePathSegDfa(current.segment, ch);
+      if (segment < 0) continue;
+      const a = step(0, current.states[0]!, ch);
+      if (!a.length) continue;
+      const b = step(1, current.states[1]!, ch);
+      if (!b.length) continue;
+      const states = [a, b, ...current.states.slice(2).map((set, i) => step(i + 2, set, ch))];
+      const key = keyOf(states, segment);
+      if (visited.has(key)) continue;
+      // An adversarially complex glob must deny dispatch, never be classified disjoint.
+      if (queue.length >= 50_000) throw new Error("ERR_GLOB_INTERSECTION_COMPLEXITY: refusing unsafe dispatch");
+      visited.add(key);
+      queue.push({ states, segment, parent: head, ch });
+    }
+  }
+  return null;
+}
+
+/**
+ * Sound NFA-product intersection check between two POSIX glob patterns matching
+ * `globToRegExp(..., false)` semantics over valid safe relative POSIX paths.
+ */
+export function doGlobPatternsIntersect(
+  patternA: string,
+  patternB: string
+): GlobIntersectionResult {
+  const witness = findGlobIntersectionWitness(patternA, patternB);
+  if (witness === null) {
+    return { intersects: false };
+  }
+  return {
+    intersects: true,
+    witnessPath: witness,
+  };
+}
+
+/**
+ * Sound overlap check between two `TaskContractSpec` instances. Returns all overlapping
+ * `(patternA, patternB)` pairs whose intersecting paths are permitted by both contracts'
+ * path precedence rules (not blocked by `forbidden_paths` or `protected_paths`).
+ */
+export function doTaskAllowedFilesIntersect(
+  contractA: TaskContractSpec,
+  contractB: TaskContractSpec
+): TaskAllowedFilesIntersectionResult {
+  const extraProtectedAndForbidden: ExcludedGlobPattern[] = [
+    ...[...DEFAULT_SYSTEM_FORBIDDEN_PATHS, ...(contractA.forbidden_paths ?? []), ...(contractB.forbidden_paths ?? [])]
+      .map((pattern) => ({ pattern, caseInsensitive: true })),
+    ...[...(contractA.protected_paths ?? []), ...(contractB.protected_paths ?? [])]
+      .map((pattern) => ({ pattern, caseInsensitive: false })),
+  ];
+  const details: TaskAllowedFilesIntersectionDetail[] = [];
+
+  for (const patternA of contractA.allowed_files) {
+    for (const patternB of contractB.allowed_files) {
+      const witness = findGlobIntersectionWitness(
+        patternA,
+        patternB,
+        extraProtectedAndForbidden
+      );
+      if (witness !== null) {
+        details.push({
+          patternA,
+          patternB,
+          witnessPath: witness,
+        });
+      }
+    }
+  }
+
+  return {
+    intersects: details.length > 0,
+    details,
+  };
+}
+
+export * from "./code-import.ts";

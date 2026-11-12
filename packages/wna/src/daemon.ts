@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { loadAgentRuntimeAdapterFromEnv } from "@software-factory/adapter-sdk";
 import type {
   AgentExecutionResult,
   AgentRuntimeAdapter,
@@ -90,6 +91,8 @@ export interface WnaWorkerDaemonOptions {
   readonly worktreeBaseDir: string;
   readonly outboxDir: string;
   readonly sandboxBackend?: LinuxCgroupV2SandboxBackend;
+  readonly runtimeAdapter?: AgentRuntimeAdapter;
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 export interface WnaLeaseExecutionInput {
@@ -98,7 +101,7 @@ export interface WnaLeaseExecutionInput {
   readonly repoBarePath: string;
   readonly gitPushToken: string;
   readonly preReceiveUrl?: string;
-  readonly adapter: AgentRuntimeAdapter;
+  readonly adapter?: AgentRuntimeAdapter;
   readonly modelProviderConfig?: AgentTaskContext["modelProviderConfig"];
   readonly previousFailureFeedbackMd?: string | null;
   readonly stagingRefKind?: "verify" | "staging";
@@ -150,10 +153,14 @@ export class WnaWorkerDaemon {
   private readonly gateway: AgentGatewayTransportClient;
   private readonly worktreeBaseDir: string;
   private readonly outboxDir: string;
+  private readonly runtimeAdapter?: AgentRuntimeAdapter;
+  private readonly runtimeEnv: NodeJS.ProcessEnv;
   public readonly sandboxBackend: LinuxCgroupV2SandboxBackend;
 
   constructor(options: WnaWorkerDaemonOptions) {
     this.gateway = options.gateway;
+    this.runtimeAdapter = options.runtimeAdapter;
+    this.runtimeEnv = options.env ?? process.env;
     this.worktreeBaseDir = resolve(options.worktreeBaseDir);
     this.outboxDir = resolve(options.outboxDir);
     this.sandboxBackend = options.sandboxBackend ?? new LinuxCgroupV2SandboxBackend();
@@ -231,6 +238,8 @@ export class WnaWorkerDaemon {
     let pushStdout = "";
     let currentPhase = "worktree_prepare";
     let terminalEventEnqueued = false;
+    let invocationContext: AgentTaskContext | undefined;
+    let invocationAdapter: AgentRuntimeAdapter | undefined;
 
     const reportDeveloperMetric = async (
       snap: SandboxResourceMetricsSnapshot | null,
@@ -352,7 +361,12 @@ export class WnaWorkerDaemon {
       };
 
       currentPhase = "agent_prepare";
-      const plan = await input.adapter.prepareInvocation(agentCtx);
+      const adapter = input.adapter ?? this.runtimeAdapter ??
+        (this.runtimeEnv.SF_AGENT_RUNTIME ? loadAgentRuntimeAdapterFromEnv(this.runtimeEnv) : undefined);
+      if (!adapter) throw new Error("ERR_AGENT_RUNTIME_NOT_CONFIGURED: provide an adapter or SF_AGENT_RUNTIME");
+      invocationContext = agentCtx;
+      invocationAdapter = adapter;
+      const plan = await adapter.prepareInvocation(agentCtx);
       currentPhase = "sandbox_spawn";
       const spawnRes = this.sandboxBackend.spawnRealProcessInSandbox({
         taskId: task.task_id,
@@ -393,7 +407,7 @@ export class WnaWorkerDaemon {
         cleanupEvidence = await this.sandboxBackend.killAndVerifyClean(task.task_id, lease.lease_epoch);
       }
 
-      agentExecution = await input.adapter.parseExecutionResult(
+      agentExecution = await adapter.parseExecutionResult(
         agentCtx,
         exitRes.code ?? 1,
         exitRes.stdoutTail ?? "",
@@ -609,6 +623,9 @@ export class WnaWorkerDaemon {
       } catch {
         // best-effort cleanup
       }
+      try {
+        if (invocationContext) await invocationAdapter?.cleanupInvocation?.(invocationContext);
+      } catch { /* worktree cleanup must still run if runtime state cleanup fails */ }
       try {
         execFileSync("git", ["worktree", "remove", "--force", worktreePath], {
           cwd: input.repoBarePath,

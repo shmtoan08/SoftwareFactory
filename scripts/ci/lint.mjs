@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 const rootDir = process.cwd();
 
 function getTrackedFiles() {
-  const out = execFileSync("git", ["ls-files"], { cwd: rootDir, encoding: "utf8" });
+  const out = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard"], { cwd: rootDir, encoding: "utf8" });
   return out
     .split("\n")
     .map((s) => s.trim())
@@ -68,4 +68,4 @@ if (violations.length > 0) {
   process.exit(1);
 }
 
-console.log(`Lint PASSED (${files.length} tracked files checked, strict tsc & bash -n clean).`);
+console.log(`Lint PASSED (${files.length} source files checked, strict tsc & bash -n clean).`);

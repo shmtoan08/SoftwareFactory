@@ -10,6 +10,7 @@
     "paths": {
       "@software-factory/shared-types": ["packages/shared-types/src/index.ts"],
       "@software-factory/task-contract": ["packages/task-contract/src/index.ts"],
+      "@software-factory/observability": ["packages/observability/src/index.ts"],
       "@software-factory/adapter-sdk": ["packages/adapter-sdk/src/index.ts"],
       "@software-factory/database": ["packages/database/src/index.ts"],
       "@software-factory/wna": ["packages/wna/src/index.ts"],

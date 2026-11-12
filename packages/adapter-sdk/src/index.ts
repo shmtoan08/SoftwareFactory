@@ -16,6 +16,7 @@ export * from "./model-providers.ts";
 export * from "./prompt-registry.ts";
 export * from "./structured-output.ts";
 export * from "./cost-guard.ts";
+export * from "./codex-cli.ts";
 
 /**
  * AgentRuntimeAdapter Interface (MVP-SPEC-03 Section 4.4 & Roadmap M2/M5)
@@ -55,11 +56,12 @@ export interface AgentExecutionResult {
 }
 
 export interface AgentRuntimeAdapter {
-  readonly runtimeId: "claude-code-cli" | "fake-agent-harness" | "workspace-coding-agent";
+  readonly runtimeId: "claude-code-cli" | "codex-cli" | "fake-agent-harness" | "workspace-coding-agent";
   readonly writerProvider: string;
   readonly writerModel: string;
 
   prepareInvocation(ctx: AgentTaskContext): Promise<AgentInvocationPlan>;
+  cleanupInvocation?(ctx: AgentTaskContext): void | Promise<void>;
   parseExecutionResult(
     ctx: AgentTaskContext,
     rawExitCode: number,
@@ -80,6 +82,7 @@ export const FORBIDDEN_SANDBOX_ENV_PATTERNS: readonly RegExp[] = [
   /^AWS_/i,
   /^GITHUB_TOKEN$/i,
   /^OPENAI_API_KEY$/i,
+  /^CODEX_(?:API_KEY|HOME)$/i,
   /^ANTHROPIC_API_KEY$/i,
   /^GOOGLE_API_KEY$/i,
 ];
@@ -565,3 +568,5 @@ export function applyWorkspaceEditsSync(
   }).trim();
   return { commitHash, treeHash };
 }
+
+export * from "./runtime-adapters.ts";

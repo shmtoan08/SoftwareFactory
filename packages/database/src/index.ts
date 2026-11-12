@@ -1,13 +1,20 @@
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import path from "node:path";
 import {
   type AgentOrgRole,
   type AgentOrganizationProfileRecord,
   type ApprovalDecisionRecord,
   type ApprovalRequestRecord,
   type BaselineSpecFreezeRecord,
+  type BudgetPauseEventRecord,
+  type BudgetPauseScope,
+  type BudgetUsageSummary,
   type CandidateBoundLineage,
   type ChangeRequestRecord,
+  type CodeImportSubmissionRecord,
   type CostPreflightCheckInput,
   type CostPreflightCheckResult,
   type CostSessionRecord,
@@ -19,6 +26,7 @@ import {
   type LeaseSyncStatusResponse,
   type MergeCandidateRecord,
   type MergeOperationRecord,
+  type MergeQueueEntryRecord,
   type ModelCallLedgerRecord,
   type ModelCallStatus,
   type OutboxEventRecord,
@@ -26,6 +34,8 @@ import {
   type ProductPipelineBundle,
   type ProductPipelineSessionRecord,
   type ProjectBootstrapRecord,
+  type ProjectBudgetPolicyRecord,
+  type ProjectBudgetSnapshot,
   type ReleaseAcceptancePackageRecord,
   type ResourceUsageMetricRecord,
   type ReviewArtifactRecord,
@@ -38,6 +48,9 @@ import {
   type Stage7DevelopmentPlanBundle,
   type StageApprovalGateRecord,
   type StageArtifactRecord,
+  type TaskBudgetPolicyRecord,
+  type TaskDependencyKind,
+  type TaskDependencyRecord,
   type TaskLeaseRecord,
   type TaskPlanLinkRecord,
   type TaskRecord,
@@ -58,12 +71,16 @@ import {
   type GitTreeChangeEntry,
   type GitTreeImportCandidateInput,
   type TaskContractSpec,
+  doTaskAllowedFilesIntersect,
   validateGitTreeImport,
 } from "@software-factory/task-contract";
 import {
+  type AddTaskDependencyInput,
   type ApplyChangeRequestStoreInput,
   ApprovalExpiredOrStaleError,
+  BudgetAutoPausedError,
   type CasMergeResult,
+  type CompleteMergeQueueEntryInput,
   type ControlPlaneStore,
   type CreateChangeRequestStoreInput,
   type CreateCostSessionInput,
@@ -72,6 +89,7 @@ import {
   type CreateStage1DiscoveryItemsInput,
   type CreateStage7DevelopmentPlanInput,
   type DecideChangeRequestStoreInput,
+  type EnqueueMergeCandidateInput,
   type FreezeBaselineSpecInput,
   PostgresRlsError,
   type ProjectMemberRole,
@@ -82,9 +100,14 @@ import {
   type RecordStageApprovalGateInput,
   type RecordStageArtifactInput,
   type ResolveStage1DiscoveryItemInput,
+  type ResumeProjectBudgetInput,
+  type ResumeTaskBudgetInput,
   type RlsSessionContext,
   SimulatedPostMergeCrashError,
+  TaskDependencyBlockedError,
   type UpsertAgentOrganizationProfileInput,
+  type UpsertProjectBudgetPolicyInput,
+  type UpsertTaskBudgetPolicyInput,
 } from "./types.ts";
 import {
   buildProductPipelineBundle,
@@ -116,6 +139,16 @@ export * from "./types.ts";
 export * from "./m6a-validation.ts";
 export * from "./m6b-validation.ts";
 export * from "./postgres-pool.ts";
+
+const ACTIVE_IN_FLIGHT_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
+  "Leased",
+  "ExecutingInTarget",
+  "BuildingMergeCandidate",
+  "VerifyingInDocker",
+  "UnderIndependentReview",
+  "AwaitingHumanApproval",
+  "AtomicCasMerge",
+]);
 
 /**
  * SoftwareFactoryControlPlaneStore implements the PostgreSQL 4-Tier RLS Engine,
@@ -174,6 +207,13 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   private taskPlanLinks: Map<string, TaskPlanLinkRecord> = new Map();
   private changeRequests: Map<string, ChangeRequestRecord> = new Map();
   private releaseAcceptancePackages: Map<string, ReleaseAcceptancePackageRecord> = new Map();
+  private codeImportSubmissions = new Map<string, CodeImportSubmissionRecord>();
+  private taskDependencies: Map<string, TaskDependencyRecord> = new Map();
+  private mergeQueueEntries: Map<string, MergeQueueEntryRecord> = new Map();
+  private mergeQueueSeqCounter = 0;
+  private projectBudgetPolicies: Map<string, ProjectBudgetPolicyRecord> = new Map();
+  private taskBudgetPolicies: Map<string, TaskBudgetPolicyRecord> = new Map();
+  private budgetPauseEvents: Map<string, BudgetPauseEventRecord> = new Map();
 
   // Simulated bare Git repository state per project: ref -> commit_hash, and commit_hash -> metadata
   private gitRefsByProject: Map<string, Map<string, string>> = new Map();
@@ -503,6 +543,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     task_contract: TaskContractSpec;
     base_main_commit_hash?: string;
     max_rework_cycles?: number;
+    depends_on_task_ids?: readonly string[];
   }): TaskRecord {
     this.assertWritePermissionForProject(input.project_id);
     const project = this.projects.get(input.project_id);
@@ -513,28 +554,47 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     if (!Number.isInteger(maxReworkCycles) || maxReworkCycles < 1) {
       throw new PostgresRlsError("23514", "max_rework_cycles must be >= 1");
     }
-    const now = this.clockTimestampIso();
     const task_id = input.task_id ?? randomUUID();
-    const record: TaskRecord = {
-      task_id,
-      project_id: input.project_id,
-      title: input.title,
-      task_contract_json: input.task_contract as unknown as Record<string, unknown>,
-      status: "Ready",
-      base_main_commit_hash: input.base_main_commit_hash ?? project.main_ref_commit_hash,
-      current_attempt_no: 0,
-      rework_count: 0,
-      max_rework_cycles: maxReworkCycles,
-      active_lease_id: null,
-      active_lease_epoch: 0,
-      active_merge_candidate_id: null,
-      merged_commit_hash: null,
-      merged_at: null,
-      created_at: now,
-      updated_at: now,
-    };
-    this.setInMap(this.tasks, task_id, record);
-    return { ...record };
+    if (this.tasks.has(task_id)) {
+      throw new PostgresRlsError("23505", `Task ${task_id} already exists`);
+    }
+    return this.withRollbackBoundarySync(() => {
+      const now = this.clockTimestampIso();
+      const record: TaskRecord = {
+        task_id,
+        project_id: input.project_id,
+        title: input.title,
+        task_contract_json: input.task_contract as unknown as Record<string, unknown>,
+        status: "Ready",
+        base_main_commit_hash: input.base_main_commit_hash ?? project.main_ref_commit_hash,
+        current_attempt_no: 0,
+        rework_count: 0,
+        max_rework_cycles: maxReworkCycles,
+        active_lease_id: null,
+        active_lease_epoch: 0,
+        active_merge_candidate_id: null,
+        merged_commit_hash: null,
+        merged_at: null,
+        created_at: now,
+        updated_at: now,
+      };
+      this.setInMap(this.tasks, task_id, record);
+      if (input.depends_on_task_ids && input.depends_on_task_ids.length > 0) {
+        const seenDeps = new Set<string>();
+        for (const rawDepId of input.depends_on_task_ids) {
+          const depId = rawDepId.trim();
+          if (!depId || seenDeps.has(depId)) continue;
+          seenDeps.add(depId);
+          this.insertTaskDependencySync({
+            project_id: input.project_id,
+            task_id,
+            depends_on_task_id: depId,
+            dependency_kind: "MANUAL",
+          });
+        }
+      }
+      return { ...record };
+    });
   }
 
   /**
@@ -617,19 +677,79 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     worker_id: string;
     heartbeat_interval_ms?: number;
     lease_ttl_ms?: number;
+    reject_overlapping_active_files?: boolean;
   }): Promise<TaskLeaseRecord> {
     this.assertWritePermissionForProject(input.project_id);
-    const task = this.tasks.get(input.task_id);
-    if (!task || task.project_id !== input.project_id) {
+    const taskCheck = this.tasks.get(input.task_id);
+    if (!taskCheck || taskCheck.project_id !== input.project_id) {
       throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project ${input.project_id}`);
     }
 
-    return this.withSerializedLock(`task:${task.task_id}`, () => {
-      if (task.status !== "Ready" && task.status !== "ReworkRequired") {
-        throw new Error(`Cannot grant lease when task is in status ${task.status}`);
-      }
-      if (task.status === "ReworkRequired") {
-        if (task.rework_count >= task.max_rework_cycles) {
+    return this.withSerializedLock(`budget:${input.project_id}`, () =>
+      this.withSerializedLock(`task:${input.task_id}`, () => {
+        const task = this.tasks.get(input.task_id);
+        if (!task || task.project_id !== input.project_id) {
+          throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project ${input.project_id}`);
+        }
+
+        // AC-12c: Fail closed when project or task budget is AUTO_PAUSED or cumulative spend hit ceiling.
+        // Persist newly detected AUTO_PAUSED outside tx undo boundary unless task/budget row itself is uncommitted.
+        this.assertBudgetAllowsExecutionSync({
+          project_id: input.project_id,
+          task_id: input.task_id,
+          projected_tokens: 0,
+          projected_cost_micro_usd: 0,
+        });
+
+        // Enforce persisted Task DAG dependencies (every upstream dependency must be MergedAndCompleted).
+        const blockingDeps: string[] = [];
+        for (const dep of this.taskDependencies.values()) {
+          if (dep.project_id === input.project_id && dep.task_id === task.task_id) {
+            const upstream = this.tasks.get(dep.depends_on_task_id);
+            if (!upstream || upstream.project_id !== input.project_id || upstream.status !== "MergedAndCompleted") {
+              blockingDeps.push(dep.depends_on_task_id);
+            }
+          }
+        }
+        if (blockingDeps.length > 0) {
+          blockingDeps.sort();
+          throw new TaskDependencyBlockedError({
+            message: `Cannot grant lease for task ${task.task_id}: upstream dependencies are not MergedAndCompleted (${blockingDeps.join(", ")})`,
+            projectId: input.project_id,
+            taskId: task.task_id,
+            blockingTaskIds: blockingDeps,
+          });
+        }
+
+        if (input.reject_overlapping_active_files) {
+          const cap = this.projectBudgetPolicies.get(input.project_id)?.max_concurrent_tasks ?? 4;
+          const activeCount = [...this.tasks.values()].filter((other) => other.project_id === input.project_id && ACTIVE_IN_FLIGHT_TASK_STATUSES.has(other.status)).length;
+          if (activeCount >= cap) throw new PostgresRlsError("23514", "Project concurrency limit reached");
+        }
+
+        // Optional sound allowed_files overlap guard against active in-flight tasks in the same project.
+        if (input.reject_overlapping_active_files) {
+          for (const other of this.tasks.values()) {
+            if (
+              other.project_id === input.project_id &&
+              other.task_id !== task.task_id &&
+              ACTIVE_IN_FLIGHT_TASK_STATUSES.has(other.status)
+            ) {
+              const overlap = doTaskAllowedFilesIntersect(task.task_contract_json as unknown as TaskContractSpec, other.task_contract_json as unknown as TaskContractSpec);
+              if (overlap.intersects) {
+                throw new PostgresRlsError(
+                  "23514",
+                  `Cannot grant lease for task ${task.task_id}: allowed_files overlaps with active task ${other.task_id} (witness: ${overlap.details[0]?.witnessPath ?? "unknown"})`
+                );
+              }
+            }
+          }
+        }
+
+        if (task.status !== "Ready" && task.status !== "ReworkRequired") {
+          throw new PostgresRlsError("23514", `Cannot grant lease when task is in status ${task.status}`);
+        }
+        if (task.status === "ReworkRequired" && task.rework_count >= task.max_rework_cycles) {
           task.status = "ManualIntervention";
           task.updated_at = this.clockTimestampIso();
           throw new PostgresRlsError(
@@ -637,68 +757,71 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
             `Max rework cycles (${task.max_rework_cycles}) exceeded for task ${task.task_id}; moved to ManualIntervention`
           );
         }
-        task.rework_count += 1;
-      }
-      // Enforce uq_one_active_lease_per_task
-      for (const l of this.taskLeases.values()) {
-        if (l.task_id === task.task_id && l.status === "ACTIVE") {
-          throw new PostgresRlsError("23505", `Active lease already exists for task ${task.task_id}`);
+        // Enforce uq_one_active_lease_per_task
+        for (const l of this.taskLeases.values()) {
+          if (l.task_id === task.task_id && l.status === "ACTIVE") {
+            throw new PostgresRlsError("23505", `Active lease already exists for task ${task.task_id}`);
+          }
         }
-      }
 
-      const nowDate = this.clockFn();
-      const nowIso = nowDate.toISOString();
-      const heartbeatIntervalMs = input.heartbeat_interval_ms ?? 10_000;
-      const leaseTtlMs = input.lease_ttl_ms ?? 35_000;
-      if (leaseTtlMs < heartbeatIntervalMs * 3) {
-        throw new PostgresRlsError("23514", "lease_ttl_ms must be >= heartbeat_interval_ms * 3");
-      }
+        const heartbeatIntervalMs = input.heartbeat_interval_ms ?? 10_000;
+        const leaseTtlMs = input.lease_ttl_ms ?? 35_000;
+        if (leaseTtlMs < heartbeatIntervalMs * 3) {
+          throw new PostgresRlsError("23514", "lease_ttl_ms must be >= heartbeat_interval_ms * 3");
+        }
 
-      const nextAttemptNo = task.current_attempt_no + 1;
-      const nextEpoch = task.active_lease_epoch + 1;
-      const lease_id = randomUUID();
-      const expiresAtIso = new Date(nowDate.getTime() + leaseTtlMs).toISOString();
+        if (task.status === "ReworkRequired") {
+          task.rework_count += 1;
+        }
 
-      const lease: TaskLeaseRecord = {
-        lease_id,
-        project_id: input.project_id,
-        task_id: input.task_id,
-        attempt_no: nextAttemptNo,
-        lease_epoch: nextEpoch,
-        worker_id: input.worker_id,
-        status: "ACTIVE",
-        task_execution_idempotency_key: computeTaskExecutionIdempotencyKey(
-          input.project_id,
-          input.task_id,
-          nextAttemptNo
-        ),
-        last_processed_seq: 0,
-        heartbeat_interval_ms: heartbeatIntervalMs,
-        lease_ttl_ms: leaseTtlMs,
-        leased_at: nowIso,
-        last_heartbeat_at: nowIso,
-        expires_at: expiresAtIso,
-        revoked_at: null,
-        revoke_reason: null,
-        completed_at: null,
-      };
+        const nowDate = this.clockFn();
+        const nowIso = nowDate.toISOString();
+        const nextAttemptNo = task.current_attempt_no + 1;
+        const nextEpoch = task.active_lease_epoch + 1;
+        const lease_id = randomUUID();
+        const expiresAtIso = new Date(nowDate.getTime() + leaseTtlMs).toISOString();
 
-      this.taskLeases.set(lease_id, lease);
-      task.status = "Leased";
-      task.current_attempt_no = nextAttemptNo;
-      task.active_lease_id = lease_id;
-      task.active_lease_epoch = nextEpoch;
-      task.updated_at = nowIso;
+        const lease: TaskLeaseRecord = {
+          lease_id,
+          project_id: input.project_id,
+          task_id: input.task_id,
+          attempt_no: nextAttemptNo,
+          lease_epoch: nextEpoch,
+          worker_id: input.worker_id,
+          status: "ACTIVE",
+          task_execution_idempotency_key: computeTaskExecutionIdempotencyKey(
+            input.project_id,
+            input.task_id,
+            nextAttemptNo
+          ),
+          last_processed_seq: 0,
+          heartbeat_interval_ms: heartbeatIntervalMs,
+          lease_ttl_ms: leaseTtlMs,
+          leased_at: nowIso,
+          last_heartbeat_at: nowIso,
+          expires_at: expiresAtIso,
+          revoked_at: null,
+          revoke_reason: null,
+          completed_at: null,
+        };
 
-      this.insertOutboxEventInternal(input.project_id, "task_lease", lease_id, "lease.granted", {
-        task_id: task.task_id,
-        lease_id,
-        lease_epoch: nextEpoch,
-        worker_id: input.worker_id,
-      });
+        this.taskLeases.set(lease_id, lease);
+        task.status = "Leased";
+        task.current_attempt_no = nextAttemptNo;
+        task.active_lease_id = lease_id;
+        task.active_lease_epoch = nextEpoch;
+        task.updated_at = nowIso;
 
-      return { ...lease };
-    });
+        this.insertOutboxEventInternal(input.project_id, "task_lease", lease_id, "lease.granted", {
+          task_id: task.task_id,
+          lease_id,
+          lease_epoch: nextEpoch,
+          worker_id: input.worker_id,
+        });
+
+        return { ...lease };
+      })
+    );
   }
 
   public getLeaseById(leaseId: string): TaskLeaseRecord | null {
@@ -1265,13 +1388,23 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
 
     let latest: VerifiedCodeImportRecord | undefined;
     for (const rec of this.verifiedCodeImports.values()) {
+      let liveCommit = refs.get(rec.staging_ref);
+      const diskRepoPath = this.projects.get(input.projectId)?.repo_bare_path;
+      if (rec.project_id === input.projectId && diskRepoPath && existsSync(diskRepoPath)) {
+        try {
+          liveCommit = execFileSync("git", ["rev-parse", "--verify", rec.staging_ref], {
+            cwd: diskRepoPath, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"],
+            env: { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_REPLACE_OBJECTS: "1" },
+          }).trim();
+        } catch { liveCommit = undefined; }
+      }
       if (
         rec.project_id === input.projectId &&
         rec.task_id === input.taskId &&
         rec.lease_id === input.leaseId &&
         rec.lease_epoch === input.leaseEpoch &&
         (rec.staging_ref === expectedStagingRef || rec.staging_ref === expectedVerifyAlias) &&
-        refs.get(rec.staging_ref) === rec.agent_commit_hash
+        liveCommit === rec.agent_commit_hash
       ) {
         if (
           !latest ||
@@ -1519,6 +1652,40 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   // Import, Candidate, Verifier, 3D Reviewer, 8-Field Approval & CAS Merge
   // ===========================================================================
 
+  public withTaskLeaseLock<T>(projectId: string, taskId: string, leaseId: string, fn: () => Promise<T>): Promise<T> {
+    this.assertCoreApiWritePermissionForProject(projectId);
+    const lease = this.taskLeases.get(leaseId);
+    if (!lease || lease.project_id !== projectId || lease.task_id !== taskId) throw new PostgresRlsError("23503", "Lease not found in project");
+    return this.withSerializedLock(`task:${taskId}`, fn);
+  }
+
+  public getCodeImportSubmission(leaseId: string): CodeImportSubmissionRecord | null {
+    const record = this.codeImportSubmissions.get(leaseId);
+    return record && record.project_id === this.requireCurrentProjectId() ? { ...record } : null;
+  }
+
+  public recordCodeImportSubmission(input: Omit<CodeImportSubmissionRecord, "submission_id" | "created_at">): CodeImportSubmissionRecord {
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    if (this.codeImportSubmissions.has(input.lease_id)) throw new PostgresRlsError("23505", "Lease already has an import submission");
+    const imp = this.verifiedCodeImports.get(input.import_id);
+    for (const field of ["project_id", "task_id", "lease_id", "lease_epoch", "agent_commit_hash", "verified_tree_hash", "staging_ref"] as const) {
+      if (!imp || imp[field] !== input[field]) throw new PostgresRlsError("23503", "Submission does not match verified import");
+    }
+    const lease = this.taskLeases.get(input.lease_id);
+    const task = this.tasks.get(input.task_id);
+    if (!lease || !task || lease.status !== "ACTIVE" || lease.revoked_at || lease.lease_epoch !== input.lease_epoch ||
+      Date.parse(lease.expires_at) <= this.clockFn().getTime() || task.active_lease_id !== input.lease_id ||
+      !["Leased", "ExecutingInTarget"].includes(task.status) || !["bundle", "patch", "artifact"].includes(input.source_type) ||
+      !/^[0-9a-f]{64}$/.test(input.payload_sha256) || !input.submitted_by_principal_id.trim()) {
+      throw new PostgresRlsError("23514", "Submission requires current active lease and valid immutable metadata");
+    }
+    const record: CodeImportSubmissionRecord = { ...input, submission_id: randomUUID(), created_at: this.clockTimestampIso() };
+    this.setInMap(this.codeImportSubmissions, input.lease_id, record);
+    this.insertOutboxEventInternal(input.project_id, "code_import_submission", record.submission_id, "code_import.accepted",
+      { task_id: input.task_id, lease_id: input.lease_id, source_type: input.source_type, import_id: input.import_id });
+    return { ...record };
+  }
+
   public recordVerifiedCodeImport(input: {
     project_id: string;
     task_id: string;
@@ -1637,7 +1804,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       recovered_by_reconciler: false,
       created_at: nowIso,
     };
-    this.verifiedCodeImports.set(record.import_id, record);
+    this.setInMap(this.verifiedCodeImports, record.import_id, record);
     return { ...record };
   }
 
@@ -3414,6 +3581,12 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       recorded_at: this.clockTimestampIso(),
     };
     this.resourceUsageMetrics.set(record.metric_id, record);
+    this.evaluatePostSpendBudgetPauseSync({
+      project_id: input.project_id,
+      task_id: input.task_id,
+      persistDirectly: !this.hasUncommittedBudgetParent(input.project_id, input.task_id),
+      nowIso: record.recorded_at,
+    });
     return { ...record };
   }
 
@@ -3554,86 +3727,131 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   ): Promise<CostPreflightCheckResult> {
     const run = (): Promise<CostPreflightCheckResult> => {
       this.assertWritePermissionForProject(input.project_id);
-      return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () => {
-        const session = this.costSessions.get(input.cost_session_id);
-        if (!session || session.project_id !== input.project_id) {
-          throw new PostgresRlsError(
-            "23503",
-            `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
-          );
-        }
-        const resolvedPipelineId = input.pipeline_session_id ?? session.pipeline_session_id;
-        if (resolvedPipelineId) {
-          const ps = this.pipelineSessions.get(resolvedPipelineId);
-          if (!ps || ps.project_id !== input.project_id) {
+      return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () =>
+        this.withSerializedLock(`budget:${input.project_id}`, () => {
+          const session = this.costSessions.get(input.cost_session_id);
+          if (!session || session.project_id !== input.project_id) {
             throw new PostgresRlsError(
               "23503",
-              `Pipeline session ${resolvedPipelineId} not found for project ${input.project_id}`
+              `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
             );
           }
-        }
-        const resolvedTaskId = input.task_id ?? session.task_id;
-        if (resolvedTaskId) {
-          const task = this.tasks.get(resolvedTaskId);
-          if (!task || task.project_id !== input.project_id) {
-            throw new PostgresRlsError(
-              "23503",
-              `Task ${resolvedTaskId} not found for project ${input.project_id}`
-            );
+          const resolvedPipelineId = input.pipeline_session_id ?? session.pipeline_session_id;
+          if (resolvedPipelineId) {
+            const ps = this.pipelineSessions.get(resolvedPipelineId);
+            if (!ps || ps.project_id !== input.project_id) {
+              throw new PostgresRlsError(
+                "23503",
+                `Pipeline session ${resolvedPipelineId} not found for project ${input.project_id}`
+              );
+            }
           }
-        }
+          const resolvedTaskId = input.task_id ?? session.task_id;
+          if (resolvedTaskId) {
+            const task = this.tasks.get(resolvedTaskId);
+            if (!task || task.project_id !== input.project_id) {
+              throw new PostgresRlsError(
+                "23503",
+                `Task ${resolvedTaskId} not found for project ${input.project_id}`
+              );
+            }
+          }
 
-        const violation = evaluatePreflightLimits(session, input);
-        if (!violation) {
-          return { allowed: true, session: { ...session } };
-        }
+          const hasUncommittedParent =
+            this.isTouchedInCurrentTx(this.costSessions, session.cost_session_id) ||
+            (resolvedPipelineId !== null &&
+              this.isCreatedInCurrentTx(this.pipelineSessions, resolvedPipelineId)) ||
+            (resolvedTaskId !== null && this.isCreatedInCurrentTx(this.tasks, resolvedTaskId));
 
-        const nowIso = this.clockTimestampIso();
-        const blockedLedger: ModelCallLedgerRecord = {
-          call_id: randomUUID(),
-          project_id: input.project_id,
-          cost_session_id: input.cost_session_id,
-          pipeline_session_id: resolvedPipelineId,
-          task_id: resolvedTaskId,
-          stage: input.stage,
-          provider: input.provider,
-          model: input.model,
-          prompt_id: input.prompt_id,
-          prompt_version: input.prompt_version,
-          prompt_sha256: input.prompt_sha256,
-          request_sha256: input.request_sha256,
-          estimated_input_tokens: input.estimated_input_tokens,
-          reserved_output_tokens: input.reserved_output_tokens,
-          actual_input_tokens: 0,
-          actual_output_tokens: 0,
-          actual_total_tokens: 0,
-          estimated_cost_micro_usd: input.estimated_cost_micro_usd,
-          actual_cost_micro_usd: 0,
-          status: "BLOCKED_PREFLIGHT",
-          usage_estimated: false,
-          block_reason: `${violation.limitScope}: ${violation.reason}`,
-          error_message: violation.reason,
-          latency_ms: 0,
-          created_at: nowIso,
-        };
-        const hasUncommittedParent =
-          this.isTouchedInCurrentTx(this.costSessions, session.cost_session_id) ||
-          (resolvedPipelineId !== null &&
-            this.isCreatedInCurrentTx(this.pipelineSessions, resolvedPipelineId)) ||
-          (resolvedTaskId !== null && this.isCreatedInCurrentTx(this.tasks, resolvedTaskId));
-        if (hasUncommittedParent) {
-          this.setInMap(this.modelCallLedgers, blockedLedger.call_id, blockedLedger);
-        } else {
-          this.modelCallLedgers.set(blockedLedger.call_id, blockedLedger);
-        }
-        return {
-          allowed: false,
-          limitScope: violation.limitScope,
-          reason: violation.reason,
-          session: { ...session },
-          blockedLedger: { ...blockedLedger },
-        };
-      });
+          const projectedTokens = input.estimated_input_tokens + input.reserved_output_tokens;
+          this.assertBudgetAllowsExecutionSync({
+            project_id: input.project_id,
+            task_id: resolvedTaskId,
+            projected_tokens: projectedTokens,
+            projected_cost_micro_usd: input.estimated_cost_micro_usd,
+            onBlocked: (pauseScope, reason) => {
+              const blockedLedger: ModelCallLedgerRecord = {
+                call_id: randomUUID(),
+                project_id: input.project_id,
+                cost_session_id: input.cost_session_id,
+                pipeline_session_id: resolvedPipelineId,
+                task_id: resolvedTaskId,
+                stage: input.stage,
+                provider: input.provider,
+                model: input.model,
+                prompt_id: input.prompt_id,
+                prompt_version: input.prompt_version,
+                prompt_sha256: input.prompt_sha256,
+                request_sha256: input.request_sha256,
+                estimated_input_tokens: input.estimated_input_tokens,
+                reserved_output_tokens: input.reserved_output_tokens,
+                actual_input_tokens: 0,
+                actual_output_tokens: 0,
+                actual_total_tokens: 0,
+                estimated_cost_micro_usd: input.estimated_cost_micro_usd,
+                actual_cost_micro_usd: 0,
+                status: "BLOCKED_PREFLIGHT",
+                usage_estimated: false,
+                block_reason: `${pauseScope}: ${reason}`,
+                error_message: reason,
+                latency_ms: 0,
+                created_at: this.clockTimestampIso(),
+              };
+              if (hasUncommittedParent) {
+                this.setInMap(this.modelCallLedgers, blockedLedger.call_id, blockedLedger);
+              } else {
+                this.modelCallLedgers.set(blockedLedger.call_id, blockedLedger);
+              }
+            },
+          });
+
+          const violation = evaluatePreflightLimits(session, input);
+          if (!violation) {
+            return { allowed: true, session: { ...session } };
+          }
+
+          const nowIso = this.clockTimestampIso();
+          const blockedLedger: ModelCallLedgerRecord = {
+            call_id: randomUUID(),
+            project_id: input.project_id,
+            cost_session_id: input.cost_session_id,
+            pipeline_session_id: resolvedPipelineId,
+            task_id: resolvedTaskId,
+            stage: input.stage,
+            provider: input.provider,
+            model: input.model,
+            prompt_id: input.prompt_id,
+            prompt_version: input.prompt_version,
+            prompt_sha256: input.prompt_sha256,
+            request_sha256: input.request_sha256,
+            estimated_input_tokens: input.estimated_input_tokens,
+            reserved_output_tokens: input.reserved_output_tokens,
+            actual_input_tokens: 0,
+            actual_output_tokens: 0,
+            actual_total_tokens: 0,
+            estimated_cost_micro_usd: input.estimated_cost_micro_usd,
+            actual_cost_micro_usd: 0,
+            status: "BLOCKED_PREFLIGHT",
+            usage_estimated: false,
+            block_reason: `${violation.limitScope}: ${violation.reason}`,
+            error_message: violation.reason,
+            latency_ms: 0,
+            created_at: nowIso,
+          };
+          if (hasUncommittedParent) {
+            this.setInMap(this.modelCallLedgers, blockedLedger.call_id, blockedLedger);
+          } else {
+            this.modelCallLedgers.set(blockedLedger.call_id, blockedLedger);
+          }
+          return {
+            allowed: false,
+            limitScope: violation.limitScope,
+            reason: violation.reason,
+            session: { ...session },
+            blockedLedger: { ...blockedLedger },
+          };
+        })
+      );
     };
 
     if (this.asyncLocalStorage.getStore() !== undefined) {
@@ -3675,115 +3893,124 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
 
     const run = (): Promise<FinalizeModelCallResult> => {
       this.assertWritePermissionForProject(input.project_id);
-      return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () => {
-        const session = this.costSessions.get(input.cost_session_id);
-        if (!session || session.project_id !== input.project_id) {
-          throw new PostgresRlsError(
-            "23503",
-            `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+      return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () =>
+        this.withSerializedLock(`budget:${input.project_id}`, () => {
+          const session = this.costSessions.get(input.cost_session_id);
+          if (!session || session.project_id !== input.project_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Cost session ${input.cost_session_id} not found for project ${input.project_id}`
+            );
+          }
+          const resolvedPipelineId = input.pipeline_session_id ?? session.pipeline_session_id;
+          if (resolvedPipelineId) {
+            const ps = this.pipelineSessions.get(resolvedPipelineId);
+            if (!ps || ps.project_id !== input.project_id) {
+              throw new PostgresRlsError(
+                "23503",
+                `Pipeline session ${resolvedPipelineId} not found for project ${input.project_id}`
+              );
+            }
+          }
+          const resolvedTaskId = input.task_id ?? session.task_id;
+          if (resolvedTaskId) {
+            const task = this.tasks.get(resolvedTaskId);
+            if (!task || task.project_id !== input.project_id) {
+              throw new PostgresRlsError(
+                "23503",
+                `Task ${resolvedTaskId} not found for project ${input.project_id}`
+              );
+            }
+          }
+
+          const nowIso = this.clockTimestampIso();
+          const evalRes = evaluatePostcallLimits(
+            session,
+            actualTotalTokens,
+            input.actual_cost_micro_usd
           );
-        }
-        const resolvedPipelineId = input.pipeline_session_id ?? session.pipeline_session_id;
-        if (resolvedPipelineId) {
-          const ps = this.pipelineSessions.get(resolvedPipelineId);
-          if (!ps || ps.project_id !== input.project_id) {
-            throw new PostgresRlsError(
-              "23503",
-              `Pipeline session ${resolvedPipelineId} not found for project ${input.project_id}`
-            );
+
+          const hasUncommittedParent =
+            this.isTouchedInCurrentTx(this.costSessions, session.cost_session_id) ||
+            (resolvedPipelineId !== null &&
+              this.isCreatedInCurrentTx(this.pipelineSessions, resolvedPipelineId)) ||
+            (resolvedTaskId !== null && this.isCreatedInCurrentTx(this.tasks, resolvedTaskId));
+          const useTx = (!evalRes.exceeded && input.outcome === "ALLOWED") || hasUncommittedParent;
+
+          let updatedSession: CostSessionRecord = session;
+          if (session.status === "ACTIVE") {
+            updatedSession = {
+              ...session,
+              tokens_used_total: evalRes.nextTokensUsedTotal,
+              cost_used_micro_usd: evalRes.nextCostUsedMicroUsd,
+              status: evalRes.nextStatus,
+              updated_at: nowIso,
+            };
+            if (useTx) {
+              this.setInMap(this.costSessions, session.cost_session_id, updatedSession);
+            } else {
+              this.costSessions.set(session.cost_session_id, updatedSession);
+            }
           }
-        }
-        const resolvedTaskId = input.task_id ?? session.task_id;
-        if (resolvedTaskId) {
-          const task = this.tasks.get(resolvedTaskId);
-          if (!task || task.project_id !== input.project_id) {
-            throw new PostgresRlsError(
-              "23503",
-              `Task ${resolvedTaskId} not found for project ${input.project_id}`
-            );
-          }
-        }
 
-        const nowIso = this.clockTimestampIso();
-        const evalRes = evaluatePostcallLimits(
-          session,
-          actualTotalTokens,
-          input.actual_cost_micro_usd
-        );
-
-        const hasUncommittedParent =
-          this.isTouchedInCurrentTx(this.costSessions, session.cost_session_id) ||
-          (resolvedPipelineId !== null &&
-            this.isCreatedInCurrentTx(this.pipelineSessions, resolvedPipelineId)) ||
-          (resolvedTaskId !== null && this.isCreatedInCurrentTx(this.tasks, resolvedTaskId));
-        const useTx = (!evalRes.exceeded && input.outcome === "ALLOWED") || hasUncommittedParent;
-
-        let updatedSession: CostSessionRecord = session;
-        if (session.status === "ACTIVE") {
-          updatedSession = {
-            ...session,
-            tokens_used_total: evalRes.nextTokensUsedTotal,
-            cost_used_micro_usd: evalRes.nextCostUsedMicroUsd,
-            status: evalRes.nextStatus,
-            updated_at: nowIso,
+          const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
+          const errorMessage = evalRes.exceeded
+            ? input.error_message && input.outcome !== "ALLOWED"
+              ? `${evalRes.exceeded.reason}; upstream error: ${input.error_message}`
+              : evalRes.exceeded.reason
+            : input.error_message ?? null;
+          const ledger: ModelCallLedgerRecord = {
+            call_id: randomUUID(),
+            project_id: input.project_id,
+            cost_session_id: input.cost_session_id,
+            pipeline_session_id: resolvedPipelineId,
+            task_id: resolvedTaskId,
+            stage: input.stage,
+            provider: input.provider,
+            model: input.model,
+            prompt_id: input.prompt_id,
+            prompt_version: input.prompt_version,
+            prompt_sha256: input.prompt_sha256,
+            request_sha256: input.request_sha256,
+            estimated_input_tokens: input.estimated_input_tokens,
+            reserved_output_tokens: input.reserved_output_tokens,
+            actual_input_tokens: input.actual_input_tokens,
+            actual_output_tokens: input.actual_output_tokens,
+            actual_total_tokens: actualTotalTokens,
+            estimated_cost_micro_usd: input.estimated_cost_micro_usd,
+            actual_cost_micro_usd: input.actual_cost_micro_usd,
+            status,
+            usage_estimated: Boolean(input.usage_estimated),
+            block_reason: evalRes.exceeded
+              ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
+              : null,
+            error_message: errorMessage,
+            latency_ms: Math.max(0, Math.trunc(input.latency_ms)),
+            created_at: nowIso,
           };
           if (useTx) {
-            this.setInMap(this.costSessions, session.cost_session_id, updatedSession);
+            this.setInMap(this.modelCallLedgers, ledger.call_id, ledger);
           } else {
-            this.costSessions.set(session.cost_session_id, updatedSession);
+            this.modelCallLedgers.set(ledger.call_id, ledger);
           }
-        }
 
-        const status: ModelCallStatus = evalRes.exceeded ? "BLOCKED_POSTCALL" : input.outcome;
-        const errorMessage = evalRes.exceeded
-          ? input.error_message && input.outcome !== "ALLOWED"
-            ? `${evalRes.exceeded.reason}; upstream error: ${input.error_message}`
-            : evalRes.exceeded.reason
-          : input.error_message ?? null;
-        const ledger: ModelCallLedgerRecord = {
-          call_id: randomUUID(),
-          project_id: input.project_id,
-          cost_session_id: input.cost_session_id,
-          pipeline_session_id: resolvedPipelineId,
-          task_id: resolvedTaskId,
-          stage: input.stage,
-          provider: input.provider,
-          model: input.model,
-          prompt_id: input.prompt_id,
-          prompt_version: input.prompt_version,
-          prompt_sha256: input.prompt_sha256,
-          request_sha256: input.request_sha256,
-          estimated_input_tokens: input.estimated_input_tokens,
-          reserved_output_tokens: input.reserved_output_tokens,
-          actual_input_tokens: input.actual_input_tokens,
-          actual_output_tokens: input.actual_output_tokens,
-          actual_total_tokens: actualTotalTokens,
-          estimated_cost_micro_usd: input.estimated_cost_micro_usd,
-          actual_cost_micro_usd: input.actual_cost_micro_usd,
-          status,
-          usage_estimated: Boolean(input.usage_estimated),
-          block_reason: evalRes.exceeded
-            ? `${evalRes.exceeded.limitScope}: ${evalRes.exceeded.reason}`
-            : null,
-          error_message: errorMessage,
-          latency_ms: Math.max(0, Math.trunc(input.latency_ms)),
-          created_at: nowIso,
-        };
-        if (useTx) {
-          this.setInMap(this.modelCallLedgers, ledger.call_id, ledger);
-        } else {
-          this.modelCallLedgers.set(ledger.call_id, ledger);
-        }
+          this.evaluatePostSpendBudgetPauseSync({
+            project_id: input.project_id,
+            task_id: resolvedTaskId,
+            persistDirectly: !useTx && !this.hasUncommittedBudgetParent(input.project_id, resolvedTaskId),
+            nowIso,
+          });
 
-        return {
-          allowed: !evalRes.exceeded,
-          ...(evalRes.exceeded
-            ? { limitScope: evalRes.exceeded.limitScope, reason: evalRes.exceeded.reason }
-            : {}),
-          session: { ...updatedSession },
-          ledger: { ...ledger },
-        };
-      });
+          return {
+            allowed: !evalRes.exceeded,
+            ...(evalRes.exceeded
+              ? { limitScope: evalRes.exceeded.limitScope, reason: evalRes.exceeded.reason }
+              : {}),
+            session: { ...updatedSession },
+            ledger: { ...ledger },
+          };
+        })
+      );
     };
 
     if (this.asyncLocalStorage.getStore() !== undefined) {
@@ -4440,11 +4667,21 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         if (freeze.status !== "FROZEN") {
           throw new PostgresRlsError("23514", `Baseline ${input.baseline_id} must be FROZEN`);
         }
+        const resolvedTrustedDir = path.resolve(input.trusted_acceptance_dir);
         for (const existing of this.projectBootstraps.values()) {
           if (existing.project_id === input.project_id && existing.baseline_id === input.baseline_id) {
             throw new PostgresRlsError(
               "23505",
               `Project bootstrap already exists for project ${input.project_id} and baseline ${input.baseline_id}`
+            );
+          }
+          if (
+            existing.trusted_acceptance_dir === input.trusted_acceptance_dir ||
+            path.resolve(existing.trusted_acceptance_dir) === resolvedTrustedDir
+          ) {
+            throw new PostgresRlsError(
+              "23505",
+              `trusted_acceptance_dir '${resolvedTrustedDir}' is already bound to bootstrap ${existing.bootstrap_id}`
             );
           }
         }
@@ -4740,6 +4977,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           preStoryIds.set(s.story_key, storyId);
         }
         const seenTaskIds = new Set<string>();
+        const seenTaskKeys = new Set<string>();
+        const taskKeyDeps = new Map<string, string[]>();
         for (const t of input.tasks) {
           if (!preStoryIds.has(t.story_key)) {
             throw new PostgresRlsError("23503", `Story key '${t.story_key}' not found`);
@@ -4749,6 +4988,83 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
               throw new PostgresRlsError("23505", `Task ${t.task_id} already exists`);
             }
             seenTaskIds.add(t.task_id);
+          }
+          if (t.task_key !== undefined) {
+            const trimmedKey = t.task_key.trim();
+            if (!trimmedKey || seenTaskKeys.has(trimmedKey)) {
+              throw new PostgresRlsError(
+                "23514",
+                `Invalid or duplicate task_key '${t.task_key}' in Stage 7 development plan`
+              );
+            }
+            seenTaskKeys.add(trimmedKey);
+            if (t.depends_on_task_keys && t.depends_on_task_keys.length > 0) {
+              const deps: string[] = [];
+              for (const rawDep of t.depends_on_task_keys) {
+                const dep = rawDep.trim();
+                if (!dep) {
+                  throw new PostgresRlsError(
+                    "23514",
+                    `Stage 7 task '${trimmedKey}' has blank depends_on_task_keys entry`
+                  );
+                }
+                if (dep === trimmedKey) {
+                  throw new PostgresRlsError(
+                    "23514",
+                    `Stage 7 task '${trimmedKey}' cannot depend on itself`
+                  );
+                }
+                if (!deps.includes(dep)) {
+                  deps.push(dep);
+                }
+              }
+              taskKeyDeps.set(trimmedKey, deps);
+            }
+          } else if (t.depends_on_task_keys && t.depends_on_task_keys.length > 0) {
+            throw new PostgresRlsError(
+              "23514",
+              `Stage 7 task '${t.title}' specifies depends_on_task_keys without task_key`
+            );
+          }
+        }
+        if (taskKeyDeps.size > 0) {
+          const inDegree = new Map<string, number>();
+          const dependents = new Map<string, string[]>();
+          for (const key of seenTaskKeys) {
+            inDegree.set(key, 0);
+            dependents.set(key, []);
+          }
+          for (const [key, deps] of taskKeyDeps.entries()) {
+            for (const dep of deps) {
+              if (!seenTaskKeys.has(dep)) {
+                throw new PostgresRlsError(
+                  "23514",
+                  `Stage 7 task '${key}' depends on unknown task_key '${dep}'`
+                );
+              }
+              dependents.get(dep)!.push(key);
+              inDegree.set(key, (inDegree.get(key) ?? 0) + 1);
+            }
+          }
+          const queue: string[] = [];
+          for (const [k, deg] of inDegree.entries()) {
+            if (deg === 0) queue.push(k);
+          }
+          let visited = 0;
+          while (queue.length > 0) {
+            const cur = queue.shift()!;
+            visited += 1;
+            for (const nxt of dependents.get(cur) ?? []) {
+              const rem = (inDegree.get(nxt) ?? 0) - 1;
+              inDegree.set(nxt, rem);
+              if (rem === 0) queue.push(nxt);
+            }
+          }
+          if (visited !== seenTaskKeys.size) {
+            throw new PostgresRlsError(
+              "23514",
+              "Stage 7 task dependency cycle detected in depends_on_task_keys"
+            );
           }
         }
 
@@ -4811,6 +5127,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
 
         const createdTasks: TaskRecord[] = [];
         const taskLinks: TaskPlanLinkRecord[] = [];
+        const taskIdByKey = new Map<string, string>();
         for (const t of input.tasks) {
           const storyId = preStoryIds.get(t.story_key)!;
           const taskRec = this.createTask({
@@ -4822,6 +5139,9 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
             max_rework_cycles: t.max_rework_cycles,
           });
           createdTasks.push(taskRec);
+          if (t.task_key !== undefined) {
+            taskIdByKey.set(t.task_key.trim(), taskRec.task_id);
+          }
           const link: TaskPlanLinkRecord = {
             link_id: randomUUID(),
             project_id: input.project_id,
@@ -4838,6 +5158,19 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           };
           this.setInMap(this.taskPlanLinks, link.link_id, link);
           taskLinks.push({ ...link });
+        }
+
+        for (const [key, deps] of taskKeyDeps.entries()) {
+          const taskId = taskIdByKey.get(key)!;
+          for (const depKey of deps) {
+            const depTaskId = taskIdByKey.get(depKey)!;
+            this.insertTaskDependencySync({
+              project_id: input.project_id,
+              task_id: taskId,
+              depends_on_task_id: depTaskId,
+              dependency_kind: "PLAN_DAG",
+            });
+          }
         }
 
         this.insertOutboxEventInternal(
@@ -5174,6 +5507,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         const normalizedPolicySha = input.trusted_policy_sha256.toLowerCase();
         const tasks: TaskRecord[] = [];
         const taskLinks: TaskPlanLinkRecord[] = [];
+        const taskIdByKey = new Map<string, string>();
         for (const pt of existing.proposed_tasks) {
           const contract: TaskContractSpec = {
             allowed_files: [...pt.allowed_files],
@@ -5187,6 +5521,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
             base_main_commit_hash: normalizedBaseMain,
           });
           tasks.push(taskRec);
+          taskIdByKey.set(pt.task_key.trim(), taskRec.task_id);
           const link: TaskPlanLinkRecord = {
             link_id: randomUUID(),
             project_id: input.project_id,
@@ -5203,6 +5538,37 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           };
           this.setInMap(this.taskPlanLinks, link.link_id, link);
           taskLinks.push({ ...link });
+        }
+
+        for (const pt of existing.proposed_tasks) {
+          const taskId = taskIdByKey.get(pt.task_key.trim())!;
+          for (const rawKey of pt.depends_on_task_keys ?? []) {
+            const depKey = rawKey.trim();
+            if (!depKey) continue;
+            const depTaskId = taskIdByKey.get(depKey);
+            if (!depTaskId) {
+              throw new PostgresRlsError(
+                "23514",
+                `Proposed CR task '${pt.task_key}' depends on unknown task_key '${depKey}'`
+              );
+            }
+            this.insertTaskDependencySync({
+              project_id: input.project_id,
+              task_id: taskId,
+              depends_on_task_id: depTaskId,
+              dependency_kind: "PLAN_DAG",
+            });
+          }
+          for (const rawId of pt.depends_on_task_ids ?? []) {
+            const depId = rawId.trim();
+            if (!depId) continue;
+            this.insertTaskDependencySync({
+              project_id: input.project_id,
+              task_id: taskId,
+              depends_on_task_id: depId,
+              dependency_kind: "PLAN_DAG",
+            });
+          }
         }
 
         const updated: ChangeRequestRecord = {
@@ -5331,6 +5697,1400 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     }
     out.sort((a, b) => b.accepted_at.localeCompare(a.accepted_at));
     return out;
+  }
+
+  // ===========================================================================
+  // Milestone M6C-1: Task DAG Dependencies, Serialized CAS Merge Queue & Budgets (AC-12c)
+  // ===========================================================================
+
+  public withProjectMergeQueueLock<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
+    this.assertCoreApiWritePermissionForProject(projectId);
+    return this.withSerializedLock(`project-merge-queue:${projectId}`, fn);
+  }
+
+  public listProjectTaskDependencies(): TaskDependencyRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const out: TaskDependencyRecord[] = [];
+    for (const dep of this.taskDependencies.values()) {
+      if (dep.project_id === currentProjectId) {
+        out.push({ ...dep });
+      }
+    }
+    out.sort(
+      (a, b) =>
+        a.created_at.localeCompare(b.created_at) ||
+        a.task_id.localeCompare(b.task_id) ||
+        a.depends_on_task_id.localeCompare(b.depends_on_task_id)
+    );
+    return out;
+  }
+
+  public addTaskDependency(input: AddTaskDependencyInput): TaskDependencyRecord {
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    return this.withRollbackBoundarySync(() =>
+      this.insertTaskDependencySync({
+        project_id: input.project_id,
+        task_id: input.task_id,
+        depends_on_task_id: input.depends_on_task_id,
+        dependency_kind: input.dependency_kind ?? "MANUAL",
+      })
+    );
+  }
+
+  public async enqueueMergeCandidate(
+    input: EnqueueMergeCandidateInput
+  ): Promise<MergeQueueEntryRecord> {
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    return this.withSerializedLock(`merge-queue:${input.project_id}`, () =>
+      this.withRollbackBoundarySync(() => {
+        const task = this.tasks.get(input.task_id);
+        if (!task || task.project_id !== input.project_id) {
+          throw new PostgresRlsError(
+            "23503",
+            `Task ${input.task_id} not found for project ${input.project_id}`
+          );
+        }
+        const mc = this.mergeCandidates.get(input.merge_candidate_id);
+        if (!mc || mc.project_id !== input.project_id || mc.task_id !== input.task_id) {
+          throw new PostgresRlsError(
+            "23503",
+            `MergeCandidate ${input.merge_candidate_id} not found for task ${input.task_id}`
+          );
+        }
+        const approval = this.approvalDecisions.get(input.approval_id);
+        if (
+          !approval ||
+          approval.project_id !== input.project_id ||
+          approval.task_id !== input.task_id ||
+          approval.merge_candidate_id !== input.merge_candidate_id
+        ) {
+          throw new PostgresRlsError(
+            "23503",
+            `Approval ${input.approval_id} not found for task ${input.task_id} and candidate ${input.merge_candidate_id}`
+          );
+        }
+        if (approval.decision !== "APPROVED" || approval.status !== "ACTIVE") {
+          throw new PostgresRlsError(
+            "23514",
+            `Cannot enqueue merge candidate ${input.merge_candidate_id}: approval ${input.approval_id} has decision=${approval.decision} status=${approval.status}`
+          );
+        }
+        if (input.rebased_from_candidate_id) {
+          const prevMc = this.mergeCandidates.get(input.rebased_from_candidate_id);
+          if (!prevMc || prevMc.project_id !== input.project_id || prevMc.task_id !== input.task_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Previous merge candidate ${input.rebased_from_candidate_id} not found for task ${input.task_id}`
+            );
+          }
+        }
+        for (const existing of this.mergeQueueEntries.values()) {
+          if (
+            existing.project_id === input.project_id &&
+            existing.task_id === input.task_id &&
+            (existing.status === "QUEUED" || existing.status === "PROCESSING")
+          ) {
+            throw new PostgresRlsError(
+              "23505",
+              `Task ${input.task_id} already has an active merge queue entry (${existing.queue_entry_id})`
+            );
+          }
+        }
+        const nowIso = this.clockTimestampIso();
+        this.mergeQueueSeqCounter += 1;
+        const entry: MergeQueueEntryRecord = {
+          queue_entry_id: randomUUID(),
+          project_id: input.project_id,
+          task_id: input.task_id,
+          merge_candidate_id: input.merge_candidate_id,
+          approval_id: input.approval_id,
+          queue_position: this.mergeQueueSeqCounter,
+          status: "QUEUED",
+          attempt_count: 0,
+          rebased_from_candidate_id: input.rebased_from_candidate_id ?? null,
+          rebased_to_candidate_id: null,
+          merged_commit_hash: null,
+          last_error: null,
+          enqueued_at: nowIso,
+          started_at: null,
+          completed_at: null,
+          updated_at: nowIso,
+        };
+        this.setInMap(this.mergeQueueEntries, entry.queue_entry_id, entry);
+        this.insertOutboxEventInternal(
+          input.project_id,
+          "merge_queue_entry",
+          entry.queue_entry_id,
+          "merge_queue.enqueued",
+          {
+            queue_entry_id: entry.queue_entry_id,
+            task_id: entry.task_id,
+            merge_candidate_id: entry.merge_candidate_id,
+            queue_position: entry.queue_position,
+          }
+        );
+        return structuredClone(entry);
+      })
+    );
+  }
+
+  public async claimNextMergeQueueEntry(projectId: string): Promise<MergeQueueEntryRecord | null> {
+    this.assertCoreApiWritePermissionForProject(projectId);
+    return this.withSerializedLock(`merge-queue:${projectId}`, () =>
+      this.withRollbackBoundarySync(() => {
+        const queued: MergeQueueEntryRecord[] = [];
+        for (const entry of this.mergeQueueEntries.values()) {
+          if (entry.project_id !== projectId) continue;
+          if (entry.status === "PROCESSING") {
+            return null;
+          }
+          if (entry.status === "QUEUED") {
+            queued.push(entry);
+          }
+        }
+        if (queued.length === 0) {
+          return null;
+        }
+        queued.sort((a, b) => a.queue_position - b.queue_position);
+        const target = queued[0]!;
+        const nowIso = this.clockTimestampIso();
+        const claimed: MergeQueueEntryRecord = {
+          ...target,
+          status: "PROCESSING",
+          attempt_count: target.attempt_count + 1,
+          started_at: nowIso,
+          updated_at: nowIso,
+        };
+        this.setInMap(this.mergeQueueEntries, claimed.queue_entry_id, claimed);
+        return structuredClone(claimed);
+      })
+    );
+  }
+
+  public async completeMergeQueueEntry(
+    input: CompleteMergeQueueEntryInput
+  ): Promise<MergeQueueEntryRecord> {
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    if (
+      input.status !== "MERGED" &&
+      input.status !== "REBASED_NEEDS_REVERIFY" &&
+      input.status !== "FAILED" &&
+      input.status !== "CANCELLED"
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        `Invalid terminal merge queue status '${String(input.status)}'`
+      );
+    }
+    if (input.merged_commit_hash && !/^[0-9a-f]{40}$/i.test(input.merged_commit_hash)) {
+      throw new PostgresRlsError(
+        "23514",
+        `merged_commit_hash '${input.merged_commit_hash}' must be a 40-hex commit hash`
+      );
+    }
+    return this.withSerializedLock(`merge-queue:${input.project_id}`, () =>
+      this.withRollbackBoundarySync(() => {
+        const existing = this.mergeQueueEntries.get(input.queue_entry_id);
+        if (!existing || existing.project_id !== input.project_id) {
+          throw new PostgresRlsError(
+            "23503",
+            `MergeQueueEntry ${input.queue_entry_id} not found for project ${input.project_id}`
+          );
+        }
+        if (existing.status !== "PROCESSING") throw new PostgresRlsError("23514", "Merge queue entry is not processing");
+        if (input.rebased_to_candidate_id) {
+          const nextMc = this.mergeCandidates.get(input.rebased_to_candidate_id);
+          if (
+            !nextMc ||
+            nextMc.project_id !== input.project_id ||
+            nextMc.task_id !== existing.task_id
+          ) {
+            throw new PostgresRlsError(
+              "23503",
+              `Rebased merge candidate ${input.rebased_to_candidate_id} not found for task ${existing.task_id}`
+            );
+          }
+        }
+        const nowIso = this.clockTimestampIso();
+        const updated: MergeQueueEntryRecord = {
+          ...existing,
+          status: input.status,
+          rebased_to_candidate_id:
+            input.rebased_to_candidate_id !== undefined
+              ? input.rebased_to_candidate_id
+              : existing.rebased_to_candidate_id,
+          merged_commit_hash:
+            input.merged_commit_hash !== undefined
+              ? input.merged_commit_hash?.toLowerCase() ?? null
+              : existing.merged_commit_hash,
+          last_error:
+            input.last_error !== undefined ? input.last_error : existing.last_error,
+          completed_at: nowIso,
+          updated_at: nowIso,
+        };
+        this.setInMap(this.mergeQueueEntries, updated.queue_entry_id, updated);
+        this.insertOutboxEventInternal(
+          input.project_id,
+          "merge_queue_entry",
+          updated.queue_entry_id,
+          "merge_queue.completed",
+          {
+            queue_entry_id: updated.queue_entry_id,
+            task_id: updated.task_id,
+            status: updated.status,
+            merged_commit_hash: updated.merged_commit_hash,
+            rebased_to_candidate_id: updated.rebased_to_candidate_id,
+          }
+        );
+        return structuredClone(updated);
+      })
+    );
+  }
+
+  public listMergeQueueEntries(): MergeQueueEntryRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    const out: MergeQueueEntryRecord[] = [];
+    for (const entry of this.mergeQueueEntries.values()) {
+      if (entry.project_id === currentProjectId) {
+        out.push(structuredClone(entry));
+      }
+    }
+    out.sort((a, b) => a.queue_position - b.queue_position);
+    return out;
+  }
+
+  public async upsertProjectBudgetPolicy(
+    input: UpsertProjectBudgetPolicyInput
+  ): Promise<ProjectBudgetPolicyRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    this.validatePositiveBudgetLimit(input.max_project_tokens, "max_project_tokens");
+    this.validatePositiveBudgetLimit(
+      input.max_project_cost_micro_usd,
+      "max_project_cost_micro_usd"
+    );
+    this.validatePositiveBudgetLimit(input.max_project_wall_time_ms, "max_project_wall_time_ms");
+    this.validatePositiveBudgetLimit(input.default_task_max_tokens, "default_task_max_tokens");
+    this.validatePositiveBudgetLimit(
+      input.default_task_max_cost_micro_usd,
+      "default_task_max_cost_micro_usd"
+    );
+    this.validatePositiveBudgetLimit(
+      input.default_task_max_wall_time_ms,
+      "default_task_max_wall_time_ms"
+    );
+    if (
+      input.max_concurrent_tasks !== undefined &&
+      (!Number.isSafeInteger(input.max_concurrent_tasks) ||
+        input.max_concurrent_tasks < 1 ||
+        input.max_concurrent_tasks > 128)
+    ) {
+      throw new PostgresRlsError(
+        "23514",
+        "max_concurrent_tasks must be an integer between 1 and 128"
+      );
+    }
+
+    return this.withSerializedLock(`budget:${input.project_id}`, () =>
+      this.withRollbackBoundarySync(() => {
+        if (!this.projects.has(input.project_id)) {
+          throw new PostgresRlsError("23503", `Project ${input.project_id} does not exist`);
+        }
+        const nowIso = this.clockTimestampIso();
+        const existing = this.projectBudgetPolicies.get(input.project_id);
+        const record: ProjectBudgetPolicyRecord = existing
+          ? {
+              ...existing,
+              max_project_tokens:
+                input.max_project_tokens !== undefined
+                  ? input.max_project_tokens
+                  : existing.max_project_tokens,
+              max_project_cost_micro_usd:
+                input.max_project_cost_micro_usd !== undefined
+                  ? input.max_project_cost_micro_usd
+                  : existing.max_project_cost_micro_usd,
+              max_project_wall_time_ms:
+                input.max_project_wall_time_ms !== undefined
+                  ? input.max_project_wall_time_ms
+                  : existing.max_project_wall_time_ms,
+              default_task_max_tokens:
+                input.default_task_max_tokens !== undefined
+                  ? input.default_task_max_tokens
+                  : existing.default_task_max_tokens,
+              default_task_max_cost_micro_usd:
+                input.default_task_max_cost_micro_usd !== undefined
+                  ? input.default_task_max_cost_micro_usd
+                  : existing.default_task_max_cost_micro_usd,
+              default_task_max_wall_time_ms:
+                input.default_task_max_wall_time_ms !== undefined
+                  ? input.default_task_max_wall_time_ms
+                  : existing.default_task_max_wall_time_ms,
+              max_concurrent_tasks:
+                input.max_concurrent_tasks !== undefined
+                  ? input.max_concurrent_tasks
+                  : existing.max_concurrent_tasks,
+              updated_at: nowIso,
+            }
+          : {
+              project_id: input.project_id,
+              max_project_tokens: input.max_project_tokens ?? null,
+              max_project_cost_micro_usd: input.max_project_cost_micro_usd ?? null,
+              max_project_wall_time_ms: input.max_project_wall_time_ms ?? null,
+              default_task_max_tokens: input.default_task_max_tokens ?? null,
+              default_task_max_cost_micro_usd: input.default_task_max_cost_micro_usd ?? null,
+              default_task_max_wall_time_ms: input.default_task_max_wall_time_ms ?? null,
+              max_concurrent_tasks: input.max_concurrent_tasks ?? 4,
+              status: "ACTIVE",
+              pause_scope: null,
+              paused_task_id: null,
+              pause_reason: null,
+              paused_at: null,
+              resumed_by_principal_id: null,
+              resumed_at: null,
+              created_at: nowIso,
+              updated_at: nowIso,
+            };
+
+        this.setInMap(this.projectBudgetPolicies, input.project_id, record);
+        const usage = this.computeProjectUsageSummary(input.project_id);
+        const evt: BudgetPauseEventRecord = {
+          event_id: randomUUID(),
+          project_id: input.project_id,
+          task_id: null,
+          event_type: "BUDGET_UPDATED",
+          pause_scope: null,
+          reason: "Project budget policy updated",
+          observed_tokens: usage.tokens_used,
+          observed_cost_micro_usd: usage.cost_micro_usd,
+          observed_wall_time_ms: usage.wall_time_ms,
+          limit_value: null,
+          actor_principal_id: input.actor_principal_id?.trim() ?? null,
+          created_at: nowIso,
+        };
+        this.setInMap(this.budgetPauseEvents, evt.event_id, evt);
+        return structuredClone(record);
+      })
+    );
+  }
+
+  public async upsertTaskBudgetPolicy(
+    input: UpsertTaskBudgetPolicyInput
+  ): Promise<TaskBudgetPolicyRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    this.validatePositiveBudgetLimit(input.max_task_tokens, "max_task_tokens");
+    this.validatePositiveBudgetLimit(input.max_task_cost_micro_usd, "max_task_cost_micro_usd");
+    this.validatePositiveBudgetLimit(input.max_task_wall_time_ms, "max_task_wall_time_ms");
+
+    return this.withSerializedLock(`budget:${input.project_id}`, () =>
+      this.withSerializedLock(`task:${input.task_id}`, () =>
+        this.withRollbackBoundarySync(() => {
+          const task = this.tasks.get(input.task_id);
+          if (!task || task.project_id !== input.project_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task ${input.task_id} not found for project ${input.project_id}`
+            );
+          }
+          const key = `${input.project_id}:${input.task_id}`;
+          const nowIso = this.clockTimestampIso();
+          const existing = this.taskBudgetPolicies.get(key);
+          const record: TaskBudgetPolicyRecord = existing
+            ? {
+                ...existing,
+                max_task_tokens:
+                  input.max_task_tokens !== undefined
+                    ? input.max_task_tokens
+                    : existing.max_task_tokens,
+                max_task_cost_micro_usd:
+                  input.max_task_cost_micro_usd !== undefined
+                    ? input.max_task_cost_micro_usd
+                    : existing.max_task_cost_micro_usd,
+                max_task_wall_time_ms:
+                  input.max_task_wall_time_ms !== undefined
+                    ? input.max_task_wall_time_ms
+                    : existing.max_task_wall_time_ms,
+                updated_at: nowIso,
+              }
+            : {
+                project_id: input.project_id,
+                task_id: input.task_id,
+                max_task_tokens: input.max_task_tokens ?? null,
+                max_task_cost_micro_usd: input.max_task_cost_micro_usd ?? null,
+                max_task_wall_time_ms: input.max_task_wall_time_ms ?? null,
+                status: "ACTIVE",
+                pause_scope: null,
+                pause_reason: null,
+                paused_at: null,
+                resumed_by_principal_id: null,
+                resumed_at: null,
+                created_at: nowIso,
+                updated_at: nowIso,
+              };
+          this.setInMap(this.taskBudgetPolicies, key, record);
+          const usage = this.computeTaskUsageSummary(input.project_id, input.task_id);
+          const evt: BudgetPauseEventRecord = {
+            event_id: randomUUID(),
+            project_id: input.project_id,
+            task_id: input.task_id,
+            event_type: "BUDGET_UPDATED",
+            pause_scope: null,
+            reason: "Task budget policy updated",
+            observed_tokens: usage.tokens_used,
+            observed_cost_micro_usd: usage.cost_micro_usd,
+            observed_wall_time_ms: usage.wall_time_ms,
+            limit_value: null,
+            actor_principal_id: input.actor_principal_id?.trim() ?? null,
+            created_at: nowIso,
+          };
+          this.setInMap(this.budgetPauseEvents, evt.event_id, evt);
+          return structuredClone(record);
+        })
+      )
+    );
+  }
+
+  public getProjectBudgetSnapshot(projectId: string): ProjectBudgetSnapshot {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId || currentProjectId !== projectId) {
+      return {
+        project_id: projectId,
+        policy: null,
+        usage: { tokens_used: 0, cost_micro_usd: 0, wall_time_ms: 0 },
+        task_policies: [],
+        task_usage: {},
+        events: [],
+      };
+    }
+    const policy = this.projectBudgetPolicies.get(projectId) ?? null;
+    const usage = this.computeProjectUsageSummary(projectId);
+    const taskPolicies: TaskBudgetPolicyRecord[] = [];
+    for (const tp of this.taskBudgetPolicies.values()) {
+      if (tp.project_id === projectId) {
+        taskPolicies.push(structuredClone(tp));
+      }
+    }
+    taskPolicies.sort((a, b) => a.task_id.localeCompare(b.task_id));
+
+    const taskUsage: Record<string, BudgetUsageSummary> = {};
+    for (const t of this.tasks.values()) {
+      if (t.project_id === projectId) {
+        taskUsage[t.task_id] = this.computeTaskUsageSummary(projectId, t.task_id);
+      }
+    }
+
+    const events = this.listBudgetPauseEvents(projectId);
+    return {
+      project_id: projectId,
+      policy: policy ? structuredClone(policy) : null,
+      usage,
+      task_policies: taskPolicies,
+      task_usage: taskUsage,
+      events,
+    };
+  }
+
+  public async resumeProjectBudget(
+    input: ResumeProjectBudgetInput
+  ): Promise<ProjectBudgetPolicyRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!input.actor_principal_id.trim() || !input.reason.trim()) {
+      throw new PostgresRlsError(
+        "23514",
+        "actor_principal_id and reason are required to resume project budget"
+      );
+    }
+    this.validatePositiveBudgetLimit(input.max_project_tokens, "max_project_tokens");
+    this.validatePositiveBudgetLimit(
+      input.max_project_cost_micro_usd,
+      "max_project_cost_micro_usd"
+    );
+    this.validatePositiveBudgetLimit(input.max_project_wall_time_ms, "max_project_wall_time_ms");
+    this.validatePositiveBudgetLimit(input.default_task_max_tokens, "default_task_max_tokens");
+    this.validatePositiveBudgetLimit(
+      input.default_task_max_cost_micro_usd,
+      "default_task_max_cost_micro_usd"
+    );
+    this.validatePositiveBudgetLimit(
+      input.default_task_max_wall_time_ms,
+      "default_task_max_wall_time_ms"
+    );
+
+    return this.withSerializedLock(`budget:${input.project_id}`, () =>
+      this.withRollbackBoundarySync(() => {
+        const existing = this.projectBudgetPolicies.get(input.project_id);
+        if (!existing) {
+          throw new PostgresRlsError(
+            "23503",
+            `Project budget policy not found for project ${input.project_id}`
+          );
+        }
+        if (existing.status !== "AUTO_PAUSED") throw new PostgresRlsError("23514", "Budget is not paused");
+        const breachedField = { PROJECT_TOKENS: "max_project_tokens", PROJECT_COST: "max_project_cost_micro_usd", PROJECT_WALL_TIME: "max_project_wall_time_ms" }[existing.pause_scope as "PROJECT_TOKENS" | "PROJECT_COST" | "PROJECT_WALL_TIME"];
+        if (!breachedField || typeof (input as unknown as Record<string, unknown>)[breachedField] !== "number") throw new PostgresRlsError("23514", "Resume requires an explicit raised ceiling for the paused budget");
+        const nextMaxTokens =
+          input.max_project_tokens !== undefined
+            ? input.max_project_tokens
+            : existing.max_project_tokens;
+        const nextMaxCost =
+          input.max_project_cost_micro_usd !== undefined
+            ? input.max_project_cost_micro_usd
+            : existing.max_project_cost_micro_usd;
+        const nextMaxWall =
+          input.max_project_wall_time_ms !== undefined
+            ? input.max_project_wall_time_ms
+            : existing.max_project_wall_time_ms;
+
+        if ((existing.pause_scope === "PROJECT_TOKENS" && nextMaxTokens === null) ||
+            (existing.pause_scope === "PROJECT_COST" && nextMaxCost === null) ||
+            (existing.pause_scope === "PROJECT_WALL_TIME" && nextMaxWall === null)) {
+          throw new PostgresRlsError("23514", "A paused budget ceiling must be raised, not removed");
+        }
+        const usage = this.computeProjectUsageSummary(input.project_id);
+        if (nextMaxTokens !== null && usage.tokens_used >= nextMaxTokens) {
+          throw new PostgresRlsError(
+            "23514",
+            `Cannot resume project budget: new max_project_tokens (${nextMaxTokens}) must be strictly greater than current tokens_used (${usage.tokens_used})`
+          );
+        }
+        if (nextMaxCost !== null && usage.cost_micro_usd >= nextMaxCost) {
+          throw new PostgresRlsError(
+            "23514",
+            `Cannot resume project budget: new max_project_cost_micro_usd (${nextMaxCost}) must be strictly greater than current cost_micro_usd (${usage.cost_micro_usd})`
+          );
+        }
+        if (nextMaxWall !== null && usage.wall_time_ms >= nextMaxWall) {
+          throw new PostgresRlsError(
+            "23514",
+            `Cannot resume project budget: new max_project_wall_time_ms (${nextMaxWall}) must be strictly greater than current wall_time_ms (${usage.wall_time_ms})`
+          );
+        }
+
+        const nowIso = this.clockTimestampIso();
+        const actor = input.actor_principal_id.trim();
+        const reason = input.reason.trim();
+        const updated: ProjectBudgetPolicyRecord = {
+          ...existing,
+          max_project_tokens: nextMaxTokens,
+          max_project_cost_micro_usd: nextMaxCost,
+          max_project_wall_time_ms: nextMaxWall,
+          default_task_max_tokens:
+            input.default_task_max_tokens !== undefined
+              ? input.default_task_max_tokens
+              : existing.default_task_max_tokens,
+          default_task_max_cost_micro_usd:
+            input.default_task_max_cost_micro_usd !== undefined
+              ? input.default_task_max_cost_micro_usd
+              : existing.default_task_max_cost_micro_usd,
+          default_task_max_wall_time_ms:
+            input.default_task_max_wall_time_ms !== undefined
+              ? input.default_task_max_wall_time_ms
+              : existing.default_task_max_wall_time_ms,
+          status: "ACTIVE",
+          pause_scope: null,
+          paused_task_id: null,
+          pause_reason: null,
+          resumed_by_principal_id: actor,
+          resumed_at: nowIso,
+          updated_at: nowIso,
+        };
+        this.setInMap(this.projectBudgetPolicies, input.project_id, updated);
+
+        const evt: BudgetPauseEventRecord = {
+          event_id: randomUUID(),
+          project_id: input.project_id,
+          task_id: existing.paused_task_id,
+          event_type: "RESUMED",
+          pause_scope: existing.pause_scope,
+          reason,
+          observed_tokens: usage.tokens_used,
+          observed_cost_micro_usd: usage.cost_micro_usd,
+          observed_wall_time_ms: usage.wall_time_ms,
+          limit_value: null,
+          actor_principal_id: actor,
+          created_at: nowIso,
+        };
+        this.setInMap(this.budgetPauseEvents, evt.event_id, evt);
+        this.insertOutboxEventInternal(
+          input.project_id,
+          "project_budget_policy",
+          input.project_id,
+          "budget.resumed",
+          {
+            project_id: input.project_id,
+            task_id: null,
+            actor_principal_id: actor,
+            reason,
+          }
+        );
+        return structuredClone(updated);
+      })
+    );
+  }
+
+  public async resumeTaskBudget(input: ResumeTaskBudgetInput): Promise<TaskBudgetPolicyRecord> {
+    this.assertWritePermissionForProject(input.project_id);
+    if (!input.actor_principal_id.trim() || !input.reason.trim()) {
+      throw new PostgresRlsError(
+        "23514",
+        "actor_principal_id and reason are required to resume task budget"
+      );
+    }
+    this.validatePositiveBudgetLimit(input.max_task_tokens, "max_task_tokens");
+    this.validatePositiveBudgetLimit(input.max_task_cost_micro_usd, "max_task_cost_micro_usd");
+    this.validatePositiveBudgetLimit(input.max_task_wall_time_ms, "max_task_wall_time_ms");
+
+    return this.withSerializedLock(`budget:${input.project_id}`, () =>
+      this.withSerializedLock(`task:${input.task_id}`, () =>
+        this.withRollbackBoundarySync(() => {
+          const task = this.tasks.get(input.task_id);
+          if (!task || task.project_id !== input.project_id) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task ${input.task_id} not found for project ${input.project_id}`
+            );
+          }
+          const key = `${input.project_id}:${input.task_id}`;
+          const existing = this.taskBudgetPolicies.get(key);
+          const projectPolicy = this.projectBudgetPolicies.get(input.project_id);
+          if (!existing && !projectPolicy) {
+            throw new PostgresRlsError(
+              "23503",
+              `Task budget policy not found for project ${input.project_id} task ${input.task_id}`
+            );
+          }
+
+          if (existing?.status !== "AUTO_PAUSED") throw new PostgresRlsError("23514", "Budget is not paused");
+          const breachedField = { TASK_TOKENS: "max_task_tokens", TASK_COST: "max_task_cost_micro_usd", TASK_WALL_TIME: "max_task_wall_time_ms" }[existing.pause_scope as "TASK_TOKENS" | "TASK_COST" | "TASK_WALL_TIME"];
+          if (!breachedField || typeof (input as unknown as Record<string, unknown>)[breachedField] !== "number") throw new PostgresRlsError("23514", "Resume requires an explicit raised ceiling for the paused budget");
+          const nextMaxTokens =
+            input.max_task_tokens !== undefined
+              ? input.max_task_tokens
+              : existing?.max_task_tokens ?? null;
+          const nextMaxCost =
+            input.max_task_cost_micro_usd !== undefined
+              ? input.max_task_cost_micro_usd
+              : existing?.max_task_cost_micro_usd ?? null;
+          const nextMaxWall =
+            input.max_task_wall_time_ms !== undefined
+              ? input.max_task_wall_time_ms
+              : existing?.max_task_wall_time_ms ?? null;
+
+          const effMaxTokens = nextMaxTokens ?? projectPolicy?.default_task_max_tokens ?? null;
+          const effMaxCost = nextMaxCost ?? projectPolicy?.default_task_max_cost_micro_usd ?? null;
+          const effMaxWall = nextMaxWall ?? projectPolicy?.default_task_max_wall_time_ms ?? null;
+
+          const usage = this.computeTaskUsageSummary(input.project_id, input.task_id);
+          if (effMaxTokens !== null && usage.tokens_used >= effMaxTokens) {
+            throw new PostgresRlsError(
+              "23514",
+              `Cannot resume task budget: effective max_task_tokens (${effMaxTokens}) must be strictly greater than current task tokens_used (${usage.tokens_used})`
+            );
+          }
+          if (effMaxCost !== null && usage.cost_micro_usd >= effMaxCost) {
+            throw new PostgresRlsError(
+              "23514",
+              `Cannot resume task budget: effective max_task_cost_micro_usd (${effMaxCost}) must be strictly greater than current task cost_micro_usd (${usage.cost_micro_usd})`
+            );
+          }
+          if (effMaxWall !== null && usage.wall_time_ms >= effMaxWall) {
+            throw new PostgresRlsError(
+              "23514",
+              `Cannot resume task budget: effective max_task_wall_time_ms (${effMaxWall}) must be strictly greater than current task wall_time_ms (${usage.wall_time_ms})`
+            );
+          }
+
+          const nowIso = this.clockTimestampIso();
+          const actor = input.actor_principal_id.trim();
+          const reason = input.reason.trim();
+          const updated: TaskBudgetPolicyRecord = {
+            project_id: input.project_id,
+            task_id: input.task_id,
+            max_task_tokens: nextMaxTokens,
+            max_task_cost_micro_usd: nextMaxCost,
+            max_task_wall_time_ms: nextMaxWall,
+            status: "ACTIVE",
+            pause_scope: null,
+            pause_reason: null,
+            paused_at: existing?.paused_at ?? null,
+            resumed_by_principal_id: actor,
+            resumed_at: nowIso,
+            created_at: existing?.created_at ?? nowIso,
+            updated_at: nowIso,
+          };
+          this.setInMap(this.taskBudgetPolicies, key, updated);
+
+          const evt: BudgetPauseEventRecord = {
+            event_id: randomUUID(),
+            project_id: input.project_id,
+            task_id: input.task_id,
+            event_type: "RESUMED",
+            pause_scope: existing?.pause_scope ?? null,
+            reason,
+            observed_tokens: usage.tokens_used,
+            observed_cost_micro_usd: usage.cost_micro_usd,
+            observed_wall_time_ms: usage.wall_time_ms,
+            limit_value: null,
+            actor_principal_id: actor,
+            created_at: nowIso,
+          };
+          this.setInMap(this.budgetPauseEvents, evt.event_id, evt);
+          this.insertOutboxEventInternal(
+            input.project_id,
+            "task_budget_policy",
+            input.task_id,
+            "budget.resumed",
+            {
+              project_id: input.project_id,
+              task_id: input.task_id,
+              actor_principal_id: actor,
+              reason,
+            }
+          );
+          return structuredClone(updated);
+        })
+      )
+    );
+  }
+
+  public listBudgetPauseEvents(projectId?: string): BudgetPauseEventRecord[] {
+    const currentProjectId = this.requireCurrentProjectId();
+    if (!currentProjectId) {
+      return [];
+    }
+    if (projectId && projectId !== currentProjectId) {
+      return [];
+    }
+    const out: BudgetPauseEventRecord[] = [];
+    for (const evt of this.budgetPauseEvents.values()) {
+      if (evt.project_id === currentProjectId) {
+        out.push(structuredClone(evt));
+      }
+    }
+    out.sort((a, b) => b.created_at.localeCompare(a.created_at));
+    return out;
+  }
+
+  private hasUncommittedBudgetParent(
+    projectId: string,
+    taskId: string | null | undefined
+  ): boolean {
+    return (
+      this.isCreatedInCurrentTx(this.projects, projectId) ||
+      (Boolean(taskId) && this.isCreatedInCurrentTx(this.tasks, taskId!))
+    );
+  }
+
+  private validatePositiveBudgetLimit(value: number | null | undefined, fieldName: string): void {
+    if (value !== undefined && value !== null) {
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+        throw new PostgresRlsError(
+          "23514",
+          `${fieldName} must be a positive safe integer or null`
+        );
+      }
+    }
+  }
+
+  private computeProjectUsageSummary(projectId: string): BudgetUsageSummary {
+    let tokensUsed = 0;
+    let costMicroUsd = 0;
+    let wallTimeMs = 0;
+    for (const ledger of this.modelCallLedgers.values()) {
+      if (ledger.project_id === projectId) {
+        tokensUsed += ledger.actual_total_tokens;
+        costMicroUsd += ledger.actual_cost_micro_usd;
+      }
+    }
+    for (const metric of this.resourceUsageMetrics.values()) {
+      if (metric.project_id === projectId) {
+        wallTimeMs += metric.wall_time_ms;
+      }
+    }
+    return {
+      tokens_used: tokensUsed,
+      cost_micro_usd: costMicroUsd,
+      wall_time_ms: wallTimeMs,
+    };
+  }
+
+  private computeTaskUsageSummary(projectId: string, taskId: string): BudgetUsageSummary {
+    let tokensUsed = 0;
+    let costMicroUsd = 0;
+    let wallTimeMs = 0;
+    for (const ledger of this.modelCallLedgers.values()) {
+      if (ledger.project_id === projectId && ledger.task_id === taskId) {
+        tokensUsed += ledger.actual_total_tokens;
+        costMicroUsd += ledger.actual_cost_micro_usd;
+      }
+    }
+    for (const metric of this.resourceUsageMetrics.values()) {
+      if (metric.project_id === projectId && metric.task_id === taskId) {
+        wallTimeMs += metric.wall_time_ms;
+      }
+    }
+    return {
+      tokens_used: tokensUsed,
+      cost_micro_usd: costMicroUsd,
+      wall_time_ms: wallTimeMs,
+    };
+  }
+
+  private insertTaskDependencySync(input: {
+    readonly project_id: string;
+    readonly task_id: string;
+    readonly depends_on_task_id: string;
+    readonly dependency_kind: TaskDependencyKind;
+  }): TaskDependencyRecord {
+    if (input.task_id === input.depends_on_task_id) {
+      throw new PostgresRlsError("23514", `Task ${input.task_id} cannot depend on itself`);
+    }
+    const task = this.tasks.get(input.task_id);
+    if (!task || task.project_id !== input.project_id) {
+      throw new PostgresRlsError(
+        "23503",
+        `Task ${input.task_id} not found for project ${input.project_id}`
+      );
+    }
+    if (task && !["Ready", "ReworkRequired"].includes(task.status)) throw new PostgresRlsError("23514", "Dependencies can only be added before task dispatch");
+    const upstream = this.tasks.get(input.depends_on_task_id);
+    if (!upstream || upstream.project_id !== input.project_id) {
+      throw new PostgresRlsError(
+        "23503",
+        `Dependency task ${input.depends_on_task_id} not found for project ${input.project_id}`
+      );
+    }
+    const key = `${input.project_id}:${input.task_id}:${input.depends_on_task_id}`;
+    if (this.taskDependencies.has(key)) {
+      throw new PostgresRlsError(
+        "23505",
+        `Task dependency (${input.task_id} -> ${input.depends_on_task_id}) already exists`
+      );
+    }
+
+    const visited = new Set<string>([input.depends_on_task_id]);
+    const queue: string[] = [input.depends_on_task_id];
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      for (const dep of this.taskDependencies.values()) {
+        if (dep.project_id === input.project_id && dep.task_id === cur) {
+          if (dep.depends_on_task_id === input.task_id) {
+            throw new PostgresRlsError(
+              "23514",
+              `Task dependency edge (${input.task_id} -> ${input.depends_on_task_id}) creates a dependency cycle`
+            );
+          }
+          if (!visited.has(dep.depends_on_task_id)) {
+            visited.add(dep.depends_on_task_id);
+            queue.push(dep.depends_on_task_id);
+          }
+        }
+      }
+    }
+
+    const record: TaskDependencyRecord = {
+      project_id: input.project_id,
+      task_id: input.task_id,
+      depends_on_task_id: input.depends_on_task_id,
+      dependency_kind: input.dependency_kind,
+      created_at: this.clockTimestampIso(),
+    };
+    this.setInMap(this.taskDependencies, key, record);
+    return { ...record };
+  }
+
+  private writeOutboxDirectOrTx(
+    persistDirectly: boolean,
+    projectId: string,
+    aggregateType: string,
+    aggregateId: string,
+    eventType: string,
+    payload: Record<string, unknown>,
+    nowIso: string
+  ): void {
+    const outboxId = randomUUID();
+    const record: OutboxEventRecord = {
+      outbox_id: outboxId,
+      project_id: projectId,
+      aggregate_type: aggregateType,
+      aggregate_id: aggregateId,
+      event_type: eventType,
+      payload_json: structuredClone(payload),
+      published_at: null,
+      created_at: nowIso,
+    };
+    if (persistDirectly) {
+      this.outboxEvents.set(outboxId, record);
+    } else {
+      this.setInMap(this.outboxEvents, outboxId, record);
+    }
+  }
+
+  private pauseProjectBudgetInternal(input: {
+    readonly project_id: string;
+    readonly task_id?: string | null;
+    readonly pause_scope: BudgetPauseScope;
+    readonly reason: string;
+    readonly observed: BudgetUsageSummary;
+    readonly limit_value: number;
+    readonly persistDirectly: boolean;
+    readonly nowIso: string;
+  }): ProjectBudgetPolicyRecord {
+    const existing = this.projectBudgetPolicies.get(input.project_id);
+    const updated: ProjectBudgetPolicyRecord = {
+      project_id: input.project_id,
+      max_project_tokens: existing?.max_project_tokens ?? null,
+      max_project_cost_micro_usd: existing?.max_project_cost_micro_usd ?? null,
+      max_project_wall_time_ms: existing?.max_project_wall_time_ms ?? null,
+      default_task_max_tokens: existing?.default_task_max_tokens ?? null,
+      default_task_max_cost_micro_usd: existing?.default_task_max_cost_micro_usd ?? null,
+      default_task_max_wall_time_ms: existing?.default_task_max_wall_time_ms ?? null,
+      max_concurrent_tasks: existing?.max_concurrent_tasks ?? 4,
+      status: "AUTO_PAUSED",
+      pause_scope: input.pause_scope,
+      paused_task_id: input.task_id ?? null,
+      pause_reason: input.reason,
+      paused_at: input.nowIso,
+      resumed_by_principal_id: existing?.resumed_by_principal_id ?? null,
+      resumed_at: existing?.resumed_at ?? null,
+      created_at: existing?.created_at ?? input.nowIso,
+      updated_at: input.nowIso,
+    };
+    const evt: BudgetPauseEventRecord = {
+      event_id: randomUUID(),
+      project_id: input.project_id,
+      task_id: input.task_id ?? null,
+      event_type: "AUTO_PAUSED",
+      pause_scope: input.pause_scope,
+      reason: input.reason,
+      observed_tokens: input.observed.tokens_used,
+      observed_cost_micro_usd: input.observed.cost_micro_usd,
+      observed_wall_time_ms: input.observed.wall_time_ms,
+      limit_value: input.limit_value,
+      actor_principal_id: null,
+      created_at: input.nowIso,
+    };
+    if (input.persistDirectly) {
+      this.projectBudgetPolicies.set(input.project_id, updated);
+      this.budgetPauseEvents.set(evt.event_id, evt);
+    } else {
+      this.setInMap(this.projectBudgetPolicies, input.project_id, updated);
+      this.setInMap(this.budgetPauseEvents, evt.event_id, evt);
+    }
+    this.writeOutboxDirectOrTx(
+      input.persistDirectly,
+      input.project_id,
+      "project_budget_policy",
+      input.project_id,
+      "budget.auto_paused",
+      {
+        project_id: input.project_id,
+        task_id: input.task_id ?? null,
+        pause_scope: input.pause_scope,
+        reason: input.reason,
+        limit_value: input.limit_value,
+      },
+      input.nowIso
+    );
+    return updated;
+  }
+
+  private pauseTaskBudgetInternal(input: {
+    readonly project_id: string;
+    readonly task_id: string;
+    readonly pause_scope: Extract<BudgetPauseScope, "TASK_TOKENS" | "TASK_COST" | "TASK_WALL_TIME">;
+    readonly reason: string;
+    readonly observed: BudgetUsageSummary;
+    readonly limit_value: number;
+    readonly persistDirectly: boolean;
+    readonly nowIso: string;
+  }): TaskBudgetPolicyRecord {
+    const key = `${input.project_id}:${input.task_id}`;
+    const existing = this.taskBudgetPolicies.get(key);
+    const updated: TaskBudgetPolicyRecord = {
+      project_id: input.project_id,
+      task_id: input.task_id,
+      max_task_tokens: existing?.max_task_tokens ?? null,
+      max_task_cost_micro_usd: existing?.max_task_cost_micro_usd ?? null,
+      max_task_wall_time_ms: existing?.max_task_wall_time_ms ?? null,
+      status: "AUTO_PAUSED",
+      pause_scope: input.pause_scope,
+      pause_reason: input.reason,
+      paused_at: input.nowIso,
+      resumed_by_principal_id: existing?.resumed_by_principal_id ?? null,
+      resumed_at: existing?.resumed_at ?? null,
+      created_at: existing?.created_at ?? input.nowIso,
+      updated_at: input.nowIso,
+    };
+    const evt: BudgetPauseEventRecord = {
+      event_id: randomUUID(),
+      project_id: input.project_id,
+      task_id: input.task_id,
+      event_type: "AUTO_PAUSED",
+      pause_scope: input.pause_scope,
+      reason: input.reason,
+      observed_tokens: input.observed.tokens_used,
+      observed_cost_micro_usd: input.observed.cost_micro_usd,
+      observed_wall_time_ms: input.observed.wall_time_ms,
+      limit_value: input.limit_value,
+      actor_principal_id: null,
+      created_at: input.nowIso,
+    };
+    if (input.persistDirectly) {
+      this.taskBudgetPolicies.set(key, updated);
+      this.budgetPauseEvents.set(evt.event_id, evt);
+    } else {
+      this.setInMap(this.taskBudgetPolicies, key, updated);
+      this.setInMap(this.budgetPauseEvents, evt.event_id, evt);
+    }
+    this.writeOutboxDirectOrTx(
+      input.persistDirectly,
+      input.project_id,
+      "task_budget_policy",
+      input.task_id,
+      "budget.auto_paused",
+      {
+        project_id: input.project_id,
+        task_id: input.task_id,
+        pause_scope: input.pause_scope,
+        reason: input.reason,
+        limit_value: input.limit_value,
+      },
+      input.nowIso
+    );
+    return updated;
+  }
+
+  private assertBudgetAllowsExecutionSync(input: {
+    readonly project_id: string;
+    readonly task_id: string | null | undefined;
+    readonly projected_tokens: number;
+    readonly projected_cost_micro_usd: number;
+    readonly onBlocked?: (pauseScope: BudgetPauseScope, reason: string) => void;
+  }): void {
+    const nowIso = this.clockTimestampIso();
+    const persistDirectly = !this.hasUncommittedBudgetParent(input.project_id, input.task_id);
+    const projectPolicy = this.projectBudgetPolicies.get(input.project_id);
+
+    if (projectPolicy?.status === "AUTO_PAUSED") {
+      const scope = projectPolicy.pause_scope ?? "PROJECT_COST";
+      const reason =
+        projectPolicy.pause_reason ??
+        `Project ${input.project_id} budget is AUTO_PAUSED (${scope})`;
+      input.onBlocked?.(scope, reason);
+      throw new BudgetAutoPausedError({
+        message: reason,
+        projectId: input.project_id,
+        taskId: input.task_id ?? projectPolicy.paused_task_id,
+        pauseScope: scope,
+      });
+    }
+
+    if (projectPolicy) {
+      const projectUsage = this.computeProjectUsageSummary(input.project_id);
+      if (
+        projectPolicy.max_project_tokens !== null &&
+        (projectUsage.tokens_used >= projectPolicy.max_project_tokens ||
+          (input.projected_tokens > 0 &&
+            projectUsage.tokens_used + input.projected_tokens > projectPolicy.max_project_tokens))
+      ) {
+        const reason =
+          input.projected_tokens > 0 &&
+          projectUsage.tokens_used < projectPolicy.max_project_tokens
+            ? `Project tokens (${projectUsage.tokens_used}) + projected (${input.projected_tokens}) exceeds max_project_tokens (${projectPolicy.max_project_tokens})`
+            : `Project tokens (${projectUsage.tokens_used}) reached max_project_tokens (${projectPolicy.max_project_tokens})`;
+        this.pauseProjectBudgetInternal({
+          project_id: input.project_id,
+          task_id: input.task_id ?? null,
+          pause_scope: "PROJECT_TOKENS",
+          reason,
+          observed: projectUsage,
+          limit_value: projectPolicy.max_project_tokens,
+          persistDirectly,
+          nowIso,
+        });
+        input.onBlocked?.("PROJECT_TOKENS", reason);
+        throw new BudgetAutoPausedError({
+          message: reason,
+          projectId: input.project_id,
+          taskId: input.task_id ?? null,
+          pauseScope: "PROJECT_TOKENS",
+        });
+      }
+      if (
+        projectPolicy.max_project_cost_micro_usd !== null &&
+        (projectUsage.cost_micro_usd >= projectPolicy.max_project_cost_micro_usd ||
+          (input.projected_cost_micro_usd > 0 &&
+            projectUsage.cost_micro_usd + input.projected_cost_micro_usd >
+              projectPolicy.max_project_cost_micro_usd))
+      ) {
+        const reason =
+          input.projected_cost_micro_usd > 0 &&
+          projectUsage.cost_micro_usd < projectPolicy.max_project_cost_micro_usd
+            ? `Project cost (${projectUsage.cost_micro_usd} micro-USD) + projected (${input.projected_cost_micro_usd} micro-USD) exceeds max_project_cost_micro_usd (${projectPolicy.max_project_cost_micro_usd} micro-USD)`
+            : `Project cost (${projectUsage.cost_micro_usd} micro-USD) reached max_project_cost_micro_usd (${projectPolicy.max_project_cost_micro_usd} micro-USD)`;
+        this.pauseProjectBudgetInternal({
+          project_id: input.project_id,
+          task_id: input.task_id ?? null,
+          pause_scope: "PROJECT_COST",
+          reason,
+          observed: projectUsage,
+          limit_value: projectPolicy.max_project_cost_micro_usd,
+          persistDirectly,
+          nowIso,
+        });
+        input.onBlocked?.("PROJECT_COST", reason);
+        throw new BudgetAutoPausedError({
+          message: reason,
+          projectId: input.project_id,
+          taskId: input.task_id ?? null,
+          pauseScope: "PROJECT_COST",
+        });
+      }
+      if (
+        projectPolicy.max_project_wall_time_ms !== null &&
+        projectUsage.wall_time_ms >= projectPolicy.max_project_wall_time_ms
+      ) {
+        const reason = `Project wall-time (${projectUsage.wall_time_ms} ms) reached max_project_wall_time_ms (${projectPolicy.max_project_wall_time_ms} ms)`;
+        this.pauseProjectBudgetInternal({
+          project_id: input.project_id,
+          task_id: input.task_id ?? null,
+          pause_scope: "PROJECT_WALL_TIME",
+          reason,
+          observed: projectUsage,
+          limit_value: projectPolicy.max_project_wall_time_ms,
+          persistDirectly,
+          nowIso,
+        });
+        input.onBlocked?.("PROJECT_WALL_TIME", reason);
+        throw new BudgetAutoPausedError({
+          message: reason,
+          projectId: input.project_id,
+          taskId: input.task_id ?? null,
+          pauseScope: "PROJECT_WALL_TIME",
+        });
+      }
+    }
+
+    if (input.task_id) {
+      const taskPolicy = this.taskBudgetPolicies.get(`${input.project_id}:${input.task_id}`);
+      if (taskPolicy?.status === "AUTO_PAUSED") {
+        const scope = taskPolicy.pause_scope ?? "TASK_COST";
+        const reason =
+          taskPolicy.pause_reason ?? `Task ${input.task_id} budget is AUTO_PAUSED (${scope})`;
+        input.onBlocked?.(scope, reason);
+        throw new BudgetAutoPausedError({
+          message: reason,
+          projectId: input.project_id,
+          taskId: input.task_id,
+          pauseScope: scope,
+        });
+      }
+
+      const maxTokens =
+        taskPolicy?.max_task_tokens ?? projectPolicy?.default_task_max_tokens ?? null;
+      const maxCost =
+        taskPolicy?.max_task_cost_micro_usd ??
+        projectPolicy?.default_task_max_cost_micro_usd ??
+        null;
+      const maxWall =
+        taskPolicy?.max_task_wall_time_ms ??
+        projectPolicy?.default_task_max_wall_time_ms ??
+        null;
+
+      if (maxTokens !== null || maxCost !== null || maxWall !== null) {
+        const taskUsage = this.computeTaskUsageSummary(input.project_id, input.task_id);
+        if (
+          maxTokens !== null &&
+          (taskUsage.tokens_used >= maxTokens ||
+            (input.projected_tokens > 0 &&
+              taskUsage.tokens_used + input.projected_tokens > maxTokens))
+        ) {
+          const reason =
+            input.projected_tokens > 0 && taskUsage.tokens_used < maxTokens
+              ? `Task ${input.task_id} tokens (${taskUsage.tokens_used}) + projected (${input.projected_tokens}) exceeds max_task_tokens (${maxTokens})`
+              : `Task ${input.task_id} tokens (${taskUsage.tokens_used}) reached max_task_tokens (${maxTokens})`;
+          this.pauseTaskBudgetInternal({
+            project_id: input.project_id,
+            task_id: input.task_id,
+            pause_scope: "TASK_TOKENS",
+            reason,
+            observed: taskUsage,
+            limit_value: maxTokens,
+            persistDirectly,
+            nowIso,
+          });
+          input.onBlocked?.("TASK_TOKENS", reason);
+          throw new BudgetAutoPausedError({
+            message: reason,
+            projectId: input.project_id,
+            taskId: input.task_id,
+            pauseScope: "TASK_TOKENS",
+          });
+        }
+        if (
+          maxCost !== null &&
+          (taskUsage.cost_micro_usd >= maxCost ||
+            (input.projected_cost_micro_usd > 0 &&
+              taskUsage.cost_micro_usd + input.projected_cost_micro_usd > maxCost))
+        ) {
+          const reason =
+            input.projected_cost_micro_usd > 0 && taskUsage.cost_micro_usd < maxCost
+              ? `Task ${input.task_id} cost (${taskUsage.cost_micro_usd} micro-USD) + projected (${input.projected_cost_micro_usd} micro-USD) exceeds max_task_cost_micro_usd (${maxCost} micro-USD)`
+              : `Task ${input.task_id} cost (${taskUsage.cost_micro_usd} micro-USD) reached max_task_cost_micro_usd (${maxCost} micro-USD)`;
+          this.pauseTaskBudgetInternal({
+            project_id: input.project_id,
+            task_id: input.task_id,
+            pause_scope: "TASK_COST",
+            reason,
+            observed: taskUsage,
+            limit_value: maxCost,
+            persistDirectly,
+            nowIso,
+          });
+          input.onBlocked?.("TASK_COST", reason);
+          throw new BudgetAutoPausedError({
+            message: reason,
+            projectId: input.project_id,
+            taskId: input.task_id,
+            pauseScope: "TASK_COST",
+          });
+        }
+        if (maxWall !== null && taskUsage.wall_time_ms >= maxWall) {
+          const reason = `Task ${input.task_id} wall-time (${taskUsage.wall_time_ms} ms) reached max_task_wall_time_ms (${maxWall} ms)`;
+          this.pauseTaskBudgetInternal({
+            project_id: input.project_id,
+            task_id: input.task_id,
+            pause_scope: "TASK_WALL_TIME",
+            reason,
+            observed: taskUsage,
+            limit_value: maxWall,
+            persistDirectly,
+            nowIso,
+          });
+          input.onBlocked?.("TASK_WALL_TIME", reason);
+          throw new BudgetAutoPausedError({
+            message: reason,
+            projectId: input.project_id,
+            taskId: input.task_id,
+            pauseScope: "TASK_WALL_TIME",
+          });
+        }
+      }
+    }
+  }
+
+  private evaluatePostSpendBudgetPauseSync(input: {
+    readonly project_id: string;
+    readonly task_id: string | null | undefined;
+    readonly persistDirectly: boolean;
+    readonly nowIso: string;
+  }): void {
+    const projectPolicy = this.projectBudgetPolicies.get(input.project_id);
+    if (projectPolicy && projectPolicy.status === "ACTIVE") {
+      const usage = this.computeProjectUsageSummary(input.project_id);
+      if (
+        projectPolicy.max_project_tokens !== null &&
+        usage.tokens_used >= projectPolicy.max_project_tokens
+      ) {
+        this.pauseProjectBudgetInternal({
+          project_id: input.project_id,
+          task_id: input.task_id ?? null,
+          pause_scope: "PROJECT_TOKENS",
+          reason: `Project tokens (${usage.tokens_used}) reached max_project_tokens (${projectPolicy.max_project_tokens})`,
+          observed: usage,
+          limit_value: projectPolicy.max_project_tokens,
+          persistDirectly: input.persistDirectly,
+          nowIso: input.nowIso,
+        });
+      } else if (
+        projectPolicy.max_project_cost_micro_usd !== null &&
+        usage.cost_micro_usd >= projectPolicy.max_project_cost_micro_usd
+      ) {
+        this.pauseProjectBudgetInternal({
+          project_id: input.project_id,
+          task_id: input.task_id ?? null,
+          pause_scope: "PROJECT_COST",
+          reason: `Project cost (${usage.cost_micro_usd} micro-USD) reached max_project_cost_micro_usd (${projectPolicy.max_project_cost_micro_usd} micro-USD)`,
+          observed: usage,
+          limit_value: projectPolicy.max_project_cost_micro_usd,
+          persistDirectly: input.persistDirectly,
+          nowIso: input.nowIso,
+        });
+      } else if (
+        projectPolicy.max_project_wall_time_ms !== null &&
+        usage.wall_time_ms >= projectPolicy.max_project_wall_time_ms
+      ) {
+        this.pauseProjectBudgetInternal({
+          project_id: input.project_id,
+          task_id: input.task_id ?? null,
+          pause_scope: "PROJECT_WALL_TIME",
+          reason: `Project wall-time (${usage.wall_time_ms} ms) reached max_project_wall_time_ms (${projectPolicy.max_project_wall_time_ms} ms)`,
+          observed: usage,
+          limit_value: projectPolicy.max_project_wall_time_ms,
+          persistDirectly: input.persistDirectly,
+          nowIso: input.nowIso,
+        });
+      }
+    }
+
+    if (input.task_id) {
+      const key = `${input.project_id}:${input.task_id}`;
+      const taskPolicy = this.taskBudgetPolicies.get(key);
+      if ((taskPolicy?.status ?? "ACTIVE") === "ACTIVE") {
+        const maxTokens =
+          taskPolicy?.max_task_tokens ?? projectPolicy?.default_task_max_tokens ?? null;
+        const maxCost =
+          taskPolicy?.max_task_cost_micro_usd ??
+          projectPolicy?.default_task_max_cost_micro_usd ??
+          null;
+        const maxWall =
+          taskPolicy?.max_task_wall_time_ms ??
+          projectPolicy?.default_task_max_wall_time_ms ??
+          null;
+        if (maxTokens !== null || maxCost !== null || maxWall !== null) {
+          const taskUsage = this.computeTaskUsageSummary(input.project_id, input.task_id);
+          if (maxTokens !== null && taskUsage.tokens_used >= maxTokens) {
+            this.pauseTaskBudgetInternal({
+              project_id: input.project_id,
+              task_id: input.task_id,
+              pause_scope: "TASK_TOKENS",
+              reason: `Task ${input.task_id} tokens (${taskUsage.tokens_used}) reached max_task_tokens (${maxTokens})`,
+              observed: taskUsage,
+              limit_value: maxTokens,
+              persistDirectly: input.persistDirectly,
+              nowIso: input.nowIso,
+            });
+          } else if (maxCost !== null && taskUsage.cost_micro_usd >= maxCost) {
+            this.pauseTaskBudgetInternal({
+              project_id: input.project_id,
+              task_id: input.task_id,
+              pause_scope: "TASK_COST",
+              reason: `Task ${input.task_id} cost (${taskUsage.cost_micro_usd} micro-USD) reached max_task_cost_micro_usd (${maxCost} micro-USD)`,
+              observed: taskUsage,
+              limit_value: maxCost,
+              persistDirectly: input.persistDirectly,
+              nowIso: input.nowIso,
+            });
+          } else if (maxWall !== null && taskUsage.wall_time_ms >= maxWall) {
+            this.pauseTaskBudgetInternal({
+              project_id: input.project_id,
+              task_id: input.task_id,
+              pause_scope: "TASK_WALL_TIME",
+              reason: `Task ${input.task_id} wall-time (${taskUsage.wall_time_ms} ms) reached max_task_wall_time_ms (${maxWall} ms)`,
+              observed: taskUsage,
+              limit_value: maxWall,
+              persistDirectly: input.persistDirectly,
+              nowIso: input.nowIso,
+            });
+          }
+        }
+      }
+    }
   }
 
   private insertOutboxEventInternal(

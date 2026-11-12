@@ -4,9 +4,12 @@ import type {
   ApprovalDecisionRecord,
   ApprovalRequestRecord,
   BaselineSpecFreezeRecord,
+  BudgetPauseEventRecord,
+  BudgetPauseScope,
   CandidateBoundLineage,
   ChangeRequestProposedTaskSpec,
   ChangeRequestRecord,
+  CodeImportSubmissionRecord,
   CostPreflightCheckInput,
   CostPreflightCheckResult,
   CostSessionRecord,
@@ -19,6 +22,8 @@ import type {
   LeaseSyncStatusResponse,
   MergeCandidateRecord,
   MergeOperationRecord,
+  MergeQueueEntryRecord,
+  MergeQueueEntryStatus,
   ModelCallLedgerRecord,
   ModelProviderName,
   OutboxEventRecord,
@@ -27,6 +32,8 @@ import type {
   ProductPipelineBundle,
   ProductPipelineSessionRecord,
   ProjectBootstrapRecord,
+  ProjectBudgetPolicyRecord,
+  ProjectBudgetSnapshot,
   ReleaseAcceptancePackageRecord,
   ResourceUsageMetricRecord,
   ResourceUsageMetricsSource,
@@ -45,6 +52,9 @@ import type {
   StageArtifactKind,
   StageArtifactRecord,
   TargetTrustTier,
+  TaskBudgetPolicyRecord,
+  TaskDependencyKind,
+  TaskDependencyRecord,
   TaskLeaseRecord,
   TaskPlanLinkRecord,
   TaskRecord,
@@ -131,6 +141,50 @@ export class SimulatedPostMergeCrashError extends Error {
     super(message);
     this.name = "SimulatedPostMergeCrashError";
     this.mergeOpId = mergeOpId;
+  }
+}
+
+export class BudgetAutoPausedError extends Error {
+  public readonly code = "ERR_BUDGET_AUTO_PAUSED" as const;
+  public readonly sqlState = "23514" as const;
+  public readonly httpStatus = 402 as const;
+  public readonly pauseScope: BudgetPauseScope | null;
+  public readonly projectId: string;
+  public readonly taskId: string | null;
+
+  constructor(input: {
+    readonly message: string;
+    readonly projectId: string;
+    readonly taskId?: string | null;
+    readonly pauseScope?: BudgetPauseScope | null;
+  }) {
+    super(input.message);
+    this.name = "BudgetAutoPausedError";
+    this.projectId = input.projectId;
+    this.taskId = input.taskId ?? null;
+    this.pauseScope = input.pauseScope ?? null;
+  }
+}
+
+export class TaskDependencyBlockedError extends Error {
+  public readonly code = "ERR_TASK_DEPENDENCY_BLOCKED" as const;
+  public readonly sqlState = "23514" as const;
+  public readonly httpStatus = 409 as const;
+  public readonly projectId: string;
+  public readonly taskId: string;
+  public readonly blockingTaskIds: readonly string[];
+
+  constructor(input: {
+    readonly message: string;
+    readonly projectId: string;
+    readonly taskId: string;
+    readonly blockingTaskIds: readonly string[];
+  }) {
+    super(input.message);
+    this.name = "TaskDependencyBlockedError";
+    this.projectId = input.projectId;
+    this.taskId = input.taskId;
+    this.blockingTaskIds = [...input.blockingTaskIds];
   }
 }
 
@@ -329,14 +383,83 @@ export interface CreateStage7DevelopmentPlanInput {
   }>;
   readonly tasks: ReadonlyArray<{
     readonly task_id?: string;
+    readonly task_key?: string;
     readonly story_key: string;
     readonly title: string;
     readonly task_contract: TaskContractSpec;
     readonly requirement_ids: readonly string[];
     readonly ac_ids: readonly string[];
+    readonly depends_on_task_keys?: readonly string[];
     readonly assigned_profile_id?: string | null;
     readonly max_rework_cycles?: number;
   }>;
+}
+
+export interface AddTaskDependencyInput {
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly depends_on_task_id: string;
+  readonly dependency_kind?: TaskDependencyKind;
+}
+
+export interface EnqueueMergeCandidateInput {
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly merge_candidate_id: string;
+  readonly approval_id: string;
+  readonly rebased_from_candidate_id?: string | null;
+}
+
+export interface CompleteMergeQueueEntryInput {
+  readonly project_id: string;
+  readonly queue_entry_id: string;
+  readonly status: Exclude<MergeQueueEntryStatus, "QUEUED" | "PROCESSING">;
+  readonly rebased_to_candidate_id?: string | null;
+  readonly merged_commit_hash?: string | null;
+  readonly last_error?: string | null;
+}
+
+export interface UpsertProjectBudgetPolicyInput {
+  readonly project_id: string;
+  readonly max_project_tokens?: number | null;
+  readonly max_project_cost_micro_usd?: number | null;
+  readonly max_project_wall_time_ms?: number | null;
+  readonly default_task_max_tokens?: number | null;
+  readonly default_task_max_cost_micro_usd?: number | null;
+  readonly default_task_max_wall_time_ms?: number | null;
+  readonly max_concurrent_tasks?: number;
+  readonly actor_principal_id?: string | null;
+}
+
+export interface UpsertTaskBudgetPolicyInput {
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly max_task_tokens?: number | null;
+  readonly max_task_cost_micro_usd?: number | null;
+  readonly max_task_wall_time_ms?: number | null;
+  readonly actor_principal_id?: string | null;
+}
+
+export interface ResumeProjectBudgetInput {
+  readonly project_id: string;
+  readonly actor_principal_id: string;
+  readonly reason: string;
+  readonly max_project_tokens?: number | null;
+  readonly max_project_cost_micro_usd?: number | null;
+  readonly max_project_wall_time_ms?: number | null;
+  readonly default_task_max_tokens?: number | null;
+  readonly default_task_max_cost_micro_usd?: number | null;
+  readonly default_task_max_wall_time_ms?: number | null;
+}
+
+export interface ResumeTaskBudgetInput {
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly actor_principal_id: string;
+  readonly reason: string;
+  readonly max_task_tokens?: number | null;
+  readonly max_task_cost_micro_usd?: number | null;
+  readonly max_task_wall_time_ms?: number | null;
 }
 
 export interface CreateChangeRequestStoreInput {
@@ -425,6 +548,7 @@ export interface ControlPlaneStore {
     task_contract: TaskContractSpec;
     base_main_commit_hash?: string;
     max_rework_cycles?: number;
+    depends_on_task_ids?: readonly string[];
   }): TaskRecord | Promise<TaskRecord>;
   selectVisibleTasks(): TaskRecord[] | Promise<TaskRecord[]>;
   getTaskById(taskId: string): TaskRecord | null | Promise<TaskRecord | null>;
@@ -434,6 +558,7 @@ export interface ControlPlaneStore {
     worker_id: string;
     heartbeat_interval_ms?: number;
     lease_ttl_ms?: number;
+    reject_overlapping_active_files?: boolean;
   }): Promise<TaskLeaseRecord>;
   getLeaseById(leaseId: string): TaskLeaseRecord | null | Promise<TaskLeaseRecord | null>;
   listTaskLeasesForTask(taskId: string): TaskLeaseRecord[] | Promise<TaskLeaseRecord[]>;
@@ -500,6 +625,9 @@ export interface ControlPlaneStore {
   getVerifiedImportsForTask(
     taskId: string
   ): VerifiedCodeImportRecord[] | Promise<VerifiedCodeImportRecord[]>;
+  withTaskLeaseLock<T>(projectId: string, taskId: string, leaseId: string, fn: () => Promise<T>): Promise<T>;
+  getCodeImportSubmission(leaseId: string): CodeImportSubmissionRecord | null | Promise<CodeImportSubmissionRecord | null>;
+  recordCodeImportSubmission(input: Omit<CodeImportSubmissionRecord, "submission_id" | "created_at">): CodeImportSubmissionRecord | Promise<CodeImportSubmissionRecord>;
   recordVerifiedCodeImport(input: {
     project_id: string;
     task_id: string;
@@ -826,4 +954,41 @@ export interface ControlPlaneStore {
   listReleaseAcceptancePackages(
     pipelineSessionId: string
   ): ReleaseAcceptancePackageRecord[] | Promise<ReleaseAcceptancePackageRecord[]>;
+
+  // Milestone M6C-1: Task DAG Dependencies, Serialized CAS Merge Queue & Budgets (AC-12c)
+  withProjectMergeQueueLock<T>(projectId: string, fn: () => Promise<T>): Promise<T>;
+  listProjectTaskDependencies(): TaskDependencyRecord[] | Promise<TaskDependencyRecord[]>;
+  addTaskDependency(
+    input: AddTaskDependencyInput
+  ): TaskDependencyRecord | Promise<TaskDependencyRecord>;
+
+  enqueueMergeCandidate(
+    input: EnqueueMergeCandidateInput
+  ): MergeQueueEntryRecord | Promise<MergeQueueEntryRecord>;
+  claimNextMergeQueueEntry(
+    projectId: string
+  ): MergeQueueEntryRecord | null | Promise<MergeQueueEntryRecord | null>;
+  completeMergeQueueEntry(
+    input: CompleteMergeQueueEntryInput
+  ): MergeQueueEntryRecord | Promise<MergeQueueEntryRecord>;
+  listMergeQueueEntries(): MergeQueueEntryRecord[] | Promise<MergeQueueEntryRecord[]>;
+
+  upsertProjectBudgetPolicy(
+    input: UpsertProjectBudgetPolicyInput
+  ): ProjectBudgetPolicyRecord | Promise<ProjectBudgetPolicyRecord>;
+  upsertTaskBudgetPolicy(
+    input: UpsertTaskBudgetPolicyInput
+  ): TaskBudgetPolicyRecord | Promise<TaskBudgetPolicyRecord>;
+  getProjectBudgetSnapshot(
+    projectId: string
+  ): ProjectBudgetSnapshot | Promise<ProjectBudgetSnapshot>;
+  resumeProjectBudget(
+    input: ResumeProjectBudgetInput
+  ): ProjectBudgetPolicyRecord | Promise<ProjectBudgetPolicyRecord>;
+  resumeTaskBudget(
+    input: ResumeTaskBudgetInput
+  ): TaskBudgetPolicyRecord | Promise<TaskBudgetPolicyRecord>;
+  listBudgetPauseEvents(
+    projectId?: string
+  ): BudgetPauseEventRecord[] | Promise<BudgetPauseEventRecord[]>;
 }

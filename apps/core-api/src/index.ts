@@ -12,6 +12,7 @@ import {
   type CandidateBoundLineage,
   type ChangeRequestProposedTaskSpec,
   type ChangeRequestRecord,
+  type CodeImportSubmissionRecord,
   type CostSessionRecord,
   type ExecutionTargetType,
   type M5AcceptanceCriterionReport,
@@ -53,6 +54,12 @@ import {
   type GitTreeImportCandidateInput,
   type TaskContractSpec,
   inspectRealGitCommitForImport,
+  type CodeImportSubmission,
+  CodeImportError,
+  validateCodeImportSubmission,
+  prepareCodeImport,
+  codeImportPayloadSha256,
+  codeImportGitEnvironment,
 } from "@software-factory/task-contract";
 import {
   type CasMergeResult,
@@ -89,6 +96,9 @@ import type {
   AgentGatewayService,
   IssuedReviewerSessionCredential,
 } from "@software-factory/agent-gateway";
+import { FactoryTelemetry, createFactoryTelemetryFromEnv } from "@software-factory/observability";
+import type { UpsertProjectBudgetPolicyInput, UpsertTaskBudgetPolicyInput, ResumeProjectBudgetInput, ResumeTaskBudgetInput, EnqueueMergeCandidateInput, AddTaskDependencyInput } from "@software-factory/database";
+import { BudgetAutoPausedError, TaskDependencyBlockedError } from "@software-factory/database";
 import { LinuxCgroupV2SandboxBackend } from "@software-factory/wna";
 
 export interface CoreApiWarning {
@@ -353,6 +363,7 @@ export class CoreApiTokenAuthenticator {
  */
 export class CoreApiService {
   private readonly store: ControlPlaneStore;
+  public readonly telemetry: FactoryTelemetry;
   public readonly authenticator: CoreApiTokenAuthenticator;
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
   public readonly pipelineService: ProductPipelineService;
@@ -362,6 +373,7 @@ export class CoreApiService {
   constructor(
     store: ControlPlaneStore,
     options?: {
+      telemetry?: FactoryTelemetry;
       authenticator?: CoreApiTokenAuthenticator;
       authSigningSecret?: string;
       clockFn?: () => Date;
@@ -376,6 +388,7 @@ export class CoreApiService {
     }
   ) {
     this.store = store;
+    this.telemetry = options?.telemetry ?? createFactoryTelemetryFromEnv(options?.env ?? process.env);
     this.snapshotStore = options?.snapshotStore ?? null;
     this.onWarning = options?.onWarning;
     this.authenticator =
@@ -579,6 +592,7 @@ export class CoreApiService {
       task_contract: TaskContractSpec;
       base_main_commit_hash?: string;
       max_rework_cycles?: number;
+      depends_on_task_ids?: readonly string[];
     }
   ): Promise<TaskRecord> {
     return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
@@ -588,6 +602,7 @@ export class CoreApiService {
         task_contract: input.task_contract,
         base_main_commit_hash: input.base_main_commit_hash,
         max_rework_cycles: input.max_rework_cycles,
+        depends_on_task_ids: input.depends_on_task_ids,
       })
     );
   }
@@ -600,6 +615,136 @@ export class CoreApiService {
     return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES, () =>
       this.store.getTaskById(taskId)
     );
+  }
+
+  public getBudgetSnapshot(projectId: string, auth: CoreApiAuthContext) {
+    return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES,
+      () => this.store.getProjectBudgetSnapshot(projectId));
+  }
+
+  public async updateProjectBudget(projectId: string, auth: CoreApiAuthContext,
+    input: Omit<UpsertProjectBudgetPolicyInput, "project_id" | "actor_principal_id">) {
+    const actor = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.telemetry.withSpan("budget.update", () => this.withAuthorizedRlsTransaction(auth, projectId, APPROVAL_ROLES,
+      () => this.store.upsertProjectBudgetPolicy({ ...input, project_id: projectId, actor_principal_id: actor.principalId })));
+  }
+
+  public async updateTaskBudget(projectId: string, auth: CoreApiAuthContext,
+    input: Omit<UpsertTaskBudgetPolicyInput, "project_id" | "actor_principal_id">) {
+    const actor = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.withAuthorizedRlsTransaction(auth, projectId, APPROVAL_ROLES,
+      () => this.store.upsertTaskBudgetPolicy({ ...input, project_id: projectId, actor_principal_id: actor.principalId }));
+  }
+
+  public async resumeBudget(projectId: string, auth: CoreApiAuthContext,
+    input: Omit<ResumeProjectBudgetInput, "project_id" | "actor_principal_id">) {
+    const actor = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.telemetry.withSpan("budget.resume", async () => {
+      const result = await this.withAuthorizedRlsTransaction(auth, projectId, APPROVAL_ROLES,
+        () => this.store.resumeProjectBudget({ ...input, project_id: projectId, actor_principal_id: actor.principalId }));
+      this.telemetry.recordCounter("budget.resumed");
+      return result;
+    });
+  }
+
+  public async resumeTaskBudget(projectId: string, auth: CoreApiAuthContext,
+    input: Omit<ResumeTaskBudgetInput, "project_id" | "actor_principal_id">) {
+    const actor = await this.authorize(auth, projectId, APPROVAL_ROLES);
+    return this.withAuthorizedRlsTransaction(auth, projectId, APPROVAL_ROLES,
+      () => this.store.resumeTaskBudget({ ...input, project_id: projectId, actor_principal_id: actor.principalId }));
+  }
+
+  public listTaskDependencies(projectId: string, auth: CoreApiAuthContext) {
+    return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES,
+      () => this.store.listProjectTaskDependencies());
+  }
+
+  public addTaskDependency(projectId: string, auth: CoreApiAuthContext,
+    input: Omit<AddTaskDependencyInput, "project_id">) {
+    return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES,
+      () => this.store.addTaskDependency({ ...input, project_id: projectId }));
+  }
+
+  public async scheduleReadyTasks(projectId: string, auth: CoreApiAuthContext, input: {
+    worker_id: string; max_tasks?: number; heartbeat_interval_ms?: number; lease_ttl_ms?: number;
+  }): Promise<{ leases: TaskLeaseRecord[]; blocked: { task_id: string; reason: string }[] }> {
+    await this.authorize(auth, projectId, MUTATION_ROLES);
+    if (typeof input.worker_id !== "string" || !input.worker_id.trim() || (input.max_tasks !== undefined &&
+      (!Number.isSafeInteger(input.max_tasks) || input.max_tasks < 1 || input.max_tasks > 128))) {
+      throw new PostgresRlsError("23514", "worker_id and max_tasks between 1 and 128 required");
+    }
+    return this.telemetry.withSpan("scheduler.dispatch", async () => {
+      const tasks = (await this.listTasks(projectId, auth)).filter((task) => task.status === "Ready" || task.status === "ReworkRequired")
+        .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.task_id.localeCompare(b.task_id));
+      const leases: TaskLeaseRecord[] = [];
+      const blocked: { task_id: string; reason: string }[] = [];
+      for (const task of tasks) {
+        if (leases.length >= (input.max_tasks ?? 128)) break;
+        try {
+          // Each grant is a short transaction. The repository rechecks dependencies,
+          // capacity and file conflicts under a shared project dispatch lock.
+          leases.push(await this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES,
+            () => this.store.grantTaskLease({ project_id: projectId, task_id: task.task_id,
+              worker_id: input.worker_id, reject_overlapping_active_files: true,
+              heartbeat_interval_ms: input.heartbeat_interval_ms, lease_ttl_ms: input.lease_ttl_ms })));
+          this.telemetry.recordCounter("scheduler.dispatched");
+        } catch (error) {
+          if (error instanceof BudgetAutoPausedError) this.telemetry.recordCounter("budget.dispatch_blocked");
+          if (!(error instanceof BudgetAutoPausedError) && !(error instanceof TaskDependencyBlockedError) &&
+            !(error instanceof PostgresRlsError && error.sqlState === "23514")) throw error;
+          blocked.push({ task_id: task.task_id, reason: error.message });
+          this.telemetry.recordCounter("scheduler.blocked");
+        }
+      }
+      return { leases, blocked };
+    });
+  }
+
+  public listMergeQueue(projectId: string, auth: CoreApiAuthContext) {
+    return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES,
+      () => this.store.listMergeQueueEntries());
+  }
+
+  public enqueueMerge(projectId: string, auth: CoreApiAuthContext,
+    input: Omit<EnqueueMergeCandidateInput, "project_id">) {
+    return this.telemetry.withSpan("merge_queue.enqueue", () =>
+      this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES,
+        () => this.store.enqueueMergeCandidate({ ...input, project_id: projectId })));
+  }
+
+  public async drainMergeQueue(projectId: string, auth: CoreApiAuthContext, input: {
+    auto_rebase_on_conflict?: boolean; require_real_git?: boolean;
+    simulateCrashAfterGitUpdateRef?: boolean;
+  } = {}) {
+    // Claim and complete in one transaction: a crash rolls the claim back to QUEUED.
+    // Git may already have advanced; the existing idempotent reconciler handles retry.
+    return this.telemetry.withSpan("merge_queue.drain", () =>
+      this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
+        this.store.withProjectMergeQueueLock(projectId, async () => {
+          const entry = await this.store.claimNextMergeQueueEntry(projectId);
+          if (!entry) return null;
+          const merged = await this.executeCasMerge(projectId, auth, {
+            task_id: entry.task_id, merge_candidate_id: entry.merge_candidate_id,
+            approval_id: entry.approval_id, require_real_git: input.require_real_git,
+            simulateCrashAfterGitUpdateRef: input.simulateCrashAfterGitUpdateRef,
+          });
+          if (merged.status === "MERGED_BY_CAS" || merged.status === "RECONCILED_ALREADY_MERGED") {
+            this.telemetry.recordCounter("merge_queue.merged");
+            return this.store.completeMergeQueueEntry({ project_id: projectId, queue_entry_id: entry.queue_entry_id,
+              status: "MERGED", merged_commit_hash: merged.merged_commit_hash });
+          }
+          if (merged.status === "CAS_CONFLICT_NEEDS_REBASE" && input.auto_rebase_on_conflict !== false) {
+            const rebuilt = await this.rebuildMergeCandidateAfterCasConflict(projectId, auth, { task_id: entry.task_id });
+            this.telemetry.recordCounter("merge_queue.rebased");
+            return this.store.completeMergeQueueEntry({ project_id: projectId, queue_entry_id: entry.queue_entry_id,
+              status: rebuilt.ok ? "REBASED_NEEDS_REVERIFY" : "FAILED",
+              rebased_to_candidate_id: rebuilt.ok ? rebuilt.mergeCandidate.merge_candidate_id : null,
+              last_error: rebuilt.ok ? null : rebuilt.conflictSummary });
+          }
+          return this.store.completeMergeQueueEntry({ project_id: projectId, queue_entry_id: entry.queue_entry_id,
+            status: "CANCELLED", last_error: merged.status });
+        })
+      ));
   }
 
   public listTasks(projectId: string, auth: CoreApiAuthContext): Promise<TaskRecord[]> {
@@ -642,6 +787,107 @@ export class CoreApiService {
         ...input,
       })
     );
+  }
+
+  public async submitCodeImport(projectId: string, auth: CoreApiAuthContext, input: {
+    task_id: string; lease_id: string; lease_epoch: number; submission: CodeImportSubmission;
+  }): Promise<CodeImportSubmissionRecord> {
+    const actor = await this.authorize(auth, projectId, MUTATION_ROLES);
+    const submission = validateCodeImportSubmission(input.submission);
+    if (!Number.isSafeInteger(input.lease_epoch) || input.lease_epoch < 1) throw new CodeImportError("ERR_IMPORT_INVALID_LEASE", "Invalid lease epoch", 400);
+    const payloadSha = codeImportPayloadSha256(submission);
+    const context = { currentProjectId: projectId, currentPrincipalId: actor.principalId, currentRole: "core_api_service" as const };
+    const validateReceipt = (receipt: CodeImportSubmissionRecord) => {
+      if (receipt.project_id !== projectId || receipt.task_id !== input.task_id || receipt.lease_epoch !== input.lease_epoch ||
+        receipt.payload_sha256 !== payloadSha) throw new CodeImportError("ERR_IMPORT_PAYLOAD_CONFLICT", "Lease already accepted a different submission", 409);
+      return receipt;
+    };
+    const assertLease = async () => {
+      const task = await this.store.getTaskById(input.task_id);
+      const lease = (await this.store.listTaskLeasesForTask(input.task_id)).find((candidate) => candidate.lease_id === input.lease_id);
+      if (!task || task.project_id !== projectId || !lease || lease.project_id !== projectId || lease.lease_epoch !== input.lease_epoch ||
+        lease.status !== "ACTIVE" || lease.revoked_at || Date.parse(lease.expires_at) <= Date.parse(await this.store.clockTimestampIso()) ||
+        task.active_lease_id !== input.lease_id || !["Leased", "ExecutingInTarget"].includes(task.status)) {
+        throw new CodeImportError("ERR_IMPORT_STALE_LEASE", "Import requires the current active, unexpired task lease", 409);
+      }
+      return task;
+    };
+    const pre = await this.store.withRlsTransaction(context, async () => {
+      const receipt = await this.store.getCodeImportSubmission(input.lease_id);
+      if (receipt) return { receipt: validateReceipt(receipt) };
+      const task = await assertLease();
+      const project = await this.store.getProjectById(projectId);
+      if (!project || !this.isRealGitRepoOnDisk(project.repo_bare_path)) throw new CodeImportError("ERR_IMPORT_REPOSITORY_UNAVAILABLE", "Project Git repository unavailable", 409);
+      return { task, repoPath: project.repo_bare_path };
+    });
+    if (pre.receipt) return pre.receipt;
+    const pinnedContract = structuredClone(pre.task!.task_contract_json) as unknown as TaskContractSpec;
+    const pinnedContractJson = canonicalizeJson(pinnedContract);
+    const prepared = prepareCodeImport({ repoPath: pre.repoPath!, baseCommitHash: pre.task!.base_main_commit_hash,
+      taskId: input.task_id, leaseEpoch: input.lease_epoch, contract: pinnedContract, submission });
+    const stagingRef = `refs/factory/Verify/${input.task_id}/${input.lease_epoch}`;
+    const candidateHash = prepared.candidate.agent_commit_hash;
+    let oldRef: string | null = null;
+    let published = false;
+    const git = (args: string[]) => execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], {
+      cwd: pre.repoPath, env: codeImportGitEnvironment(), encoding: "utf8", timeout: 10_000,
+      stdio: ["ignore", "pipe", "pipe"], maxBuffer: 2 * 1024 * 1024,
+    }).trim();
+    try {
+      // Object transfer has no ref side effects. Lease authority is rechecked under
+      // the canonical lock immediately before recording and publishing the isolated ref.
+      prepared.copyObjectsTo(pre.repoPath!);
+      return await this.telemetry.withSpan("code_import.submit", () => this.store.withRlsTransaction(context, () =>
+        this.store.withTaskLeaseLock(projectId, input.task_id, input.lease_id, async () => {
+          const receipt = await this.store.getCodeImportSubmission(input.lease_id);
+          if (receipt) return validateReceipt(receipt);
+          const task = await assertLease();
+          if (task.base_main_commit_hash !== prepared.candidate.expected_base_main_commit_hash ||
+            canonicalizeJson(task.task_contract_json) !== pinnedContractJson) {
+            throw new CodeImportError("ERR_IMPORT_STALE_CONTRACT", "Task contract or base changed during import", 409);
+          }
+          const previousImports = (await this.store.getVerifiedImportsForTask(input.task_id)).filter((imp) => imp.lease_id === input.lease_id);
+          if (previousImports.some((imp) => imp.agent_commit_hash !== candidateHash))
+            throw new CodeImportError("ERR_IMPORT_PAYLOAD_CONFLICT", "Lease already imported different code", 409);
+          try { oldRef = git(["rev-parse", "--verify", "--quiet", stagingRef]); } catch { oldRef = null; }
+          if (oldRef && oldRef !== candidateHash) throw new CodeImportError("ERR_IMPORT_REF_CONFLICT", "Isolated ref already contains different code", 409);
+          const imp = await this.store.recordVerifiedCodeImport({ project_id: projectId, task_id: input.task_id,
+            lease_id: input.lease_id, lease_epoch: input.lease_epoch, staging_ref: stagingRef, candidate_input: prepared.candidate });
+          git(["update-ref", stagingRef, candidateHash, oldRef ?? "0".repeat(40)]);
+          published = oldRef !== candidateHash;
+          return this.store.recordCodeImportSubmission({ project_id: projectId, task_id: input.task_id,
+            lease_id: input.lease_id, lease_epoch: input.lease_epoch, import_id: imp.import_id,
+            source_type: submission.kind, payload_sha256: payloadSha, agent_commit_hash: candidateHash,
+            verified_tree_hash: prepared.candidate.verified_tree_hash, staging_ref: stagingRef,
+            submitted_by_principal_id: actor.principalId });
+        })
+      ));
+    } catch (error) {
+      if (published) {
+        // COMMIT may have succeeded despite a lost response. Reconcile before any
+        // compensating Git write; if DB is unreachable preserve the isolated ref.
+        let committedReceipt: CodeImportSubmissionRecord | null = null;
+        try {
+          committedReceipt = await this.store.withRlsTransaction(context, () =>
+            this.store.withTaskLeaseLock(projectId, input.task_id, input.lease_id, async () => {
+              const receipt = await this.store.getCodeImportSubmission(input.lease_id);
+              if (receipt) return receipt;
+              // Keep the receipt check and compensation under the same lock as
+              // publication: a concurrent retry must not lose its committed ref.
+              try {
+                if (oldRef) git(["update-ref", stagingRef, oldRef, candidateHash]);
+                else git(["update-ref", "-d", stagingRef, candidateHash]);
+              } catch {
+                this.emitWarning({ code: "WARN_IMPORT_REF_COMPENSATION_FAILED", message: "Isolated import ref needs reconciliation",
+                  taskId: input.task_id, occurredAt: new Date().toISOString() });
+              }
+              return null;
+            }));
+        } catch { /* retry/reconciler can recover this isolated ref after DB reconnect */ }
+        if (committedReceipt) return validateReceipt(committedReceipt);
+      }
+      throw error;
+    } finally { prepared.dispose(); }
   }
 
   public async importAndBuildCandidate(
@@ -1713,6 +1959,25 @@ export class CoreApiService {
       );
     }
 
+    let agentCommitParentSha: string | null = null;
+    try {
+      agentCommitParentSha =
+        execFileSync("git", ["rev-parse", "--verify", "--quiet", `${verifiedImport.agent_commit_hash}^`], {
+          cwd: repoPath,
+          env: gitEnv,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: 10_000,
+        })
+          .trim()
+          .toLowerCase() || null;
+    } catch {
+      agentCommitParentSha = null;
+    }
+    const baseMovedPastAgentParent = agentCommitParentSha
+      ? buildResult.baseMainCommitHash.toLowerCase() !== agentCommitParentSha
+      : buildResult.baseMainCommitHash.toLowerCase() !== task.base_main_commit_hash.toLowerCase();
+
     try {
       const mergeCandidate = await this.store.withRlsTransaction(
         {
@@ -1728,7 +1993,7 @@ export class CoreApiService {
             base_main_commit_hash: buildResult.baseMainCommitHash,
             merge_candidate_hash: buildResult.mergeCandidateHash,
             verified_tree_hash: buildResult.verifiedTreeHash,
-            allow_rebased_tree_hash: true,
+            allow_rebased_tree_hash: baseMovedPastAgentParent,
             snapshot_path: buildResult.snapshotPath ?? null,
             snapshot_sha256: buildResult.snapshotSha256 ?? null,
             snapshot_size_bytes: buildResult.snapshotSizeBytes ?? null,
@@ -2127,7 +2392,8 @@ export class CoreApiService {
         if (!lineage) {
           throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project ${projectId}`);
         }
-        return lineage;
+        return { ...lineage, codeImportSubmission: lineage.verifiedImport
+          ? await this.store.getCodeImportSubmission(lineage.verifiedImport.lease_id) : null };
       }
     );
   }

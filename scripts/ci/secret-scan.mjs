@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const rootDir = process.cwd();
-const out = execFileSync("git", ["ls-files"], { cwd: rootDir, encoding: "utf8" });
+const out = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard"], { cwd: rootDir, encoding: "utf8" });
 const files = out
   .split("\n")
   .map((s) => s.trim())
@@ -77,4 +77,4 @@ if (findings.length > 0) {
   process.exit(1);
 }
 
-console.log(`Secret scanning PASSED (${scannedCount} tracked files scanned, 0 leaks found).`);
+console.log(`Secret scanning PASSED (${scannedCount} source files scanned, 0 leaks found).`);

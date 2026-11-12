@@ -1,10 +1,10 @@
 # Software Factory — Development Roadmap v1.5
 
-- **Cập nhật:** 2026-11-09 · @toan-hm
+- **Cập nhật:** 2026-11-12 · @toan-hm
 - **Phiên bản:** 1.5 (Cập nhật xử lý toàn bộ 8 nhóm cải thiện `P0-1`→`P0-4` và `P1-5`→`P1-8` từ đợt Review v1.4; tái cấu trúc theo **7 Milestone Gates `M0` → `M6`**)
 - **Tài liệu thiết kế đi kèm:** [Software Factory — System Design Plan v1.5](./software-factory-design-plan.md)
 - **Bộ tài liệu Core Specs `M0.2`:** [`MVP_SCOPE_AND_ARCHITECTURE.md`](./mvp_scope_and_architecture_specification_v1_5.md) · [`MVP_DATABASE_AND_RLS_SPEC.md`](./mvp_database_schema_and_rls_specification_v1_5.md) · [`MVP_LEASE_EVENT_AND_SANDBOX_SPEC.md`](./mvp_lease_event_protocol_sandbox_and_git_import_specification_v1_5.md) · [`MVP_VERIFIER_REVIEWER_AND_RECOVERY_SPEC.md`](./mvp_verifier_3d_reviewer_approval_and_recovery_specification_v1_5.md)
-- **Trạng thái:** Milestone `M0` Gate Locked — Ready for Milestone `M1` Implementation
+- **Trạng thái triển khai:** `M1`–`M5`, `M6A`, `M6B` đã được triển khai theo README/lịch sử Git; `M6C-1` đã triển khai và đạt 8/8 acceptance tests cục bộ trên PostgreSQL 17; `M6C-2` đã triển khai, bằng chứng và giới hạn tại [báo cáo M6C-2](./m6c2-validation-report.md). `M6C-3` chưa triển khai. Chưa nghiệm thu `M6C` / `G7`.
 - **Định hướng:** Pragmatic Single-Path MVP (`M0`–`M5`) · Post-MVP Expansion (`M6`) · Canonical Lock & `clock_timestamp()` Lease Fencing · Lease/Event Gap Replay & Orphaned Push Recovery · Single Controlled Git Push Import (MVP) · 3-Tier Test Docker Verifier · 3D Independent Review · Candidate-Bound Approval & Idempotent Atomic CAS Merge
 
 ---
@@ -252,6 +252,17 @@ Sau khi vòng thực thi cốt lõi đã được chứng minh vững chắc t�
 - **Điều kiện PASS `M6B`:** Hoàn thành trọn vẹn một dự án phần mềm mẫu từ **Stage 1 đến Stage 9**; đạt **100% Traceability (`AC-11b`)** và kiểm chứng luồng `Change Request`.
 
 #### Chặng `M6C` (Phase 8) — Thực thi Song song, Đa Runtime, Mở rộng Đường Import, External Targets & Budget Auto-Pause (`AC-12c`)
+
+Tiến độ ngày **2026-11-12**, theo [M6C-SPEC-01](./m6c_parallel_execution_adapters_imports_targets_v1_5.md):
+
+| Slice | Trạng thái |
+|---|---|
+| `M6C-1` | Đã có DAG persistence, dispatch chống giao cắt file, FIFO CAS queue + crash recovery/rebase, budget auto-pause/resume, HTTP API và telemetry. Acceptance cục bộ: 8/8 trên PostgreSQL 17; CI Linux kiểm tra tiếp trên PG16/17. |
+| `M6C-2` | Đã triển khai Codex CLI adapter + chọn runtime qua WNA; Bundle/Patch/Artifact dùng chung validator, receipt bất biến có ràng buộc lease/epoch, replay và phục hồi lỗi COMMIT. Acceptance 9/9 trên PG17; native sandbox/WNA 2/2. Chưa gọi provider Codex thật; kết quả hồi quy và giới hạn tại báo cáo M6C-2. |
+| `M6C-3` | Chưa triển khai: connectors Tier 2/3/4, verifier cô lập nhân, Lima/WSL2 và production deployment approval. |
+
+Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
+
 - **Triển khai:**
   - **Parallel Execution & Serialized CAS Merge Queue:** Lập lịch chạy song song các Task độc lập (DAG Scheduler) có kiểm tra giao cắt `allowed_files` và đồng bộ hợp nhất qua **Candidate-First Atomic CAS Merge**.
   - **Tích hợp Runtime Adapter thứ hai & Mở rộng các Đường Import phụ (`P1-5`):** Tích hợp coding agent thứ hai; mở thêm các đường nhập code `Git Bundle Upload`, `Unified Diff / Patch Upload` và `Artifact API` đi qua cùng cổng **`Trusted Import Validator`**.
