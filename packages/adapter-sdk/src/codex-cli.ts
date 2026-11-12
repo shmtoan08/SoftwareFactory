@@ -12,7 +12,10 @@ export interface CodexCliAdapterOptions {
   /** Invocation-scoped provider credential, never inherited from the WNA host. */
   readonly apiKey?: string;
   readonly resolveApiKey?: (ctx: AgentTaskContext) => string | Promise<string>;
+  /** Provider-free fixture only. Production remains disabled until trusted metering exists. */
+  readonly testOnlyEmulator?: boolean;
 }
+export const CODEX_EMULATOR_CREDENTIAL = "scoped-provider-test-credential";
 
 /** Headless Codex runtime. JSONL indicates completion; Git is authoritative for code. */
 export class CodexCliAdapter implements AgentRuntimeAdapter {
@@ -33,8 +36,11 @@ export class CodexCliAdapter implements AgentRuntimeAdapter {
   }
 
   public async prepareInvocation(ctx: AgentTaskContext): Promise<AgentInvocationPlan> {
-    const apiKey = (await this.options.resolveApiKey?.(ctx)) ?? this.options.apiKey ??
-      (ctx.modelProviderConfig?.provider === "openai" ? ctx.modelProviderConfig.apiKey : undefined);
+    if (!this.options.testOnlyEmulator || !this.options.binaryPath || this.options.resolveApiKey ||
+      this.options.apiKey !== CODEX_EMULATOR_CREDENTIAL) {
+      throw new Error("ERR_UNMETERED_CODEX_DISABLED: production Codex requires trusted Cost Guard metering");
+    }
+    const apiKey = this.options.apiKey;
     if (typeof apiKey !== "string" || !apiKey.trim() || /[\r\n\0]/.test(apiKey)) {
       throw new Error("ERR_CODEX_CREDENTIAL_REQUIRED: explicitly provision a scoped Codex API key");
     }
@@ -90,9 +96,20 @@ export class CodexCliAdapter implements AgentRuntimeAdapter {
   }
 
   public async parseExecutionResult(ctx: AgentTaskContext, rawExitCode: number, stdout: string, stderr: string): Promise<AgentExecutionResult> {
-    const secret = this.invocationSecrets.get(ctx) ?? this.options.apiKey ?? ctx.modelProviderConfig?.apiKey;
+    const secret = this.invocationSecrets.get(ctx) ?? this.options.apiKey ??
+      (ctx.modelProviderConfig?.provider === "openai" ? ctx.modelProviderConfig.apiKey : undefined);
     this.invocationSecrets.delete(ctx);
-    const redact = (text: string): string => (secret ? text.split(secret).join("[REDACTED]") : text).slice(-2048);
+    const redact = (text: string): string => {
+      if (secret) for (const variant of new Set([secret, encodeURIComponent(secret), Buffer.from(secret).toString("base64"), Buffer.from(secret).toString("base64url")])) {
+        text = text.split(variant).join("[REDACTED]");
+        // A bounded supervisor tail can start/end inside a credential.
+        for (let length = variant.length - 1; length >= 8; length--) {
+          if (text.startsWith(variant.slice(-length))) text = "[REDACTED]" + text.slice(length);
+          if (text.endsWith(variant.slice(0, length))) text = text.slice(0, -length) + "[REDACTED]";
+        }
+      }
+      return text.slice(-2048);
+    };
     const result = { writerProvider: this.writerProvider, writerModel: this.writerModel,
       stdoutTail: redact(stdout), stderrTail: redact(stderr) };
     try {

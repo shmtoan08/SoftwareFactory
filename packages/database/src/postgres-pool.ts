@@ -1,3 +1,4 @@
+import { validateCodeImportReceipt } from "./m6c-validation.ts";
 import { createHash, createHmac, pbkdf2Sync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
@@ -2737,10 +2738,10 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
           const blockingDepsRes = await this.pool.queryInActiveTx<{ depends_on_task_id: string }>(
             `SELECT td.depends_on_task_id
              FROM task_dependencies td
-             JOIN tasks up ON up.task_id = td.depends_on_task_id AND up.project_id = td.project_id
+             LEFT JOIN tasks up ON up.task_id = td.depends_on_task_id AND up.project_id = td.project_id
              WHERE td.project_id = $1::uuid
                AND td.task_id = $2::uuid
-               AND up.status <> 'MergedAndCompleted'
+               AND up.status IS DISTINCT FROM 'MergedAndCompleted'
              ORDER BY td.depends_on_task_id ASC;`,
             [input.project_id, task.task_id]
           );
@@ -3875,6 +3876,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   }
 
   public async recordCodeImportSubmission(input: Omit<CodeImportSubmissionRecord, "submission_id" | "created_at">): Promise<CodeImportSubmissionRecord> {
+    validateCodeImportReceipt(input);
     try {
       const result = await this.pool.queryInActiveTx(
         `INSERT INTO code_import_submissions (project_id, task_id, lease_id, lease_epoch, import_id, source_type,
@@ -5588,6 +5590,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         task_id: targetTaskId,
         projected_tokens: projectedTokens,
         projected_cost_micro_usd: input.estimated_cost_micro_usd,
+        blockedPreflight: { ...input, task_id: targetTaskId, pipeline_session_id: targetPipelineId },
         verifyParentsCommittedSql: async () => {
           const csCheck = await this.pool.queryInActiveTx(
             `SELECT 1 FROM model_cost_sessions
@@ -7642,14 +7645,20 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     if (!["MERGED", "REBASED_NEEDS_REVERIFY", "FAILED", "CANCELLED"].includes(input.status)) {
       throw new PostgresRlsError("23514", "Invalid terminal merge queue status");
     }
+    if (input.merged_commit_hash != null && !/^[0-9a-f]{40}$/i.test(input.merged_commit_hash)) {
+      throw new PostgresRlsError("23514", "merged_commit_hash must be a 40-hex commit hash");
+    }
     await this.lockM6CProject(input.project_id);
     const result = await this.pool.queryInActiveTx(
       `UPDATE merge_queue_entries SET status = $3::text,
-         rebased_to_candidate_id = $4::uuid, merged_commit_hash = $5::text, last_error = $6::text,
+         rebased_to_candidate_id = CASE WHEN $7::boolean THEN $4::uuid ELSE rebased_to_candidate_id END,
+         merged_commit_hash = CASE WHEN $8::boolean THEN $5::text ELSE merged_commit_hash END,
+         last_error = CASE WHEN $9::boolean THEN $6::text ELSE last_error END,
          completed_at = clock_timestamp(), updated_at = clock_timestamp()
        WHERE project_id = $1::uuid AND queue_entry_id = $2::uuid AND status = 'PROCESSING' RETURNING *;`,
       [input.project_id, input.queue_entry_id, input.status, input.rebased_to_candidate_id ?? null,
-        input.merged_commit_hash ?? null, input.last_error ?? null]
+        input.merged_commit_hash?.toLowerCase() ?? null, input.last_error ?? null,
+        input.rebased_to_candidate_id !== undefined, input.merged_commit_hash !== undefined, input.last_error !== undefined]
     );
     if (!result.rows[0]) throw new PostgresRlsError("23514", "Merge queue entry is not processing");
     const entry = mapMergeQueueEntryRow(result.rows[0]);
@@ -7681,6 +7690,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   }
 
   public async getProjectBudgetSnapshot(projectId: string): Promise<ProjectBudgetSnapshot> {
+    await this.recoverBudgetDenials(projectId);
     const policy = await this.pool.queryInActiveTx("SELECT * FROM project_budget_policies WHERE project_id = $1::uuid;", [projectId]);
     const tasks = await this.pool.queryInActiveTx("SELECT task_id FROM tasks WHERE project_id = $1::uuid;", [projectId]);
     const policies = await this.pool.queryInActiveTx("SELECT * FROM task_budget_policies WHERE project_id = $1::uuid ORDER BY task_id;", [projectId]);
@@ -7693,7 +7703,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
 
   public async listBudgetPauseEvents(projectId?: string): Promise<BudgetPauseEventRecord[]> {
     const result = await this.pool.queryInActiveTx(
-      "SELECT * FROM budget_pause_events WHERE ($1::uuid IS NULL OR project_id = $1::uuid) ORDER BY created_at, event_id;",
+      "SELECT * FROM budget_pause_events WHERE ($1::uuid IS NULL OR project_id = $1::uuid) ORDER BY created_at DESC, event_id DESC;",
       [projectId ?? null]
     );
     return result.rows.map(mapBudgetPauseEventRow);
@@ -7801,7 +7811,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
 
   private async detectBudgetViolationSql(input: {
     project_id: string; task_id?: string | null; projected_tokens?: number; projected_cost_micro_usd?: number;
-  }): Promise<{ scope: BudgetPauseScope; limit: number | null; taskId: string | null; reason: string; usage: BudgetUsageSummary; paused: boolean } | null> {
+  }, skipPaused = false): Promise<{ scope: BudgetPauseScope; limit: number | null; taskId: string | null; reason: string; usage: BudgetUsageSummary; paused: boolean } | null> {
     const pRow = (await this.pool.queryInActiveTx("SELECT * FROM project_budget_policies WHERE project_id = $1::uuid;", [input.project_id])).rows[0];
     const tRow = input.task_id ? (await this.pool.queryInActiveTx("SELECT * FROM task_budget_policies WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, input.task_id])).rows[0] : undefined;
     const p = pRow ? mapProjectBudgetPolicyRow(pRow) : null;
@@ -7810,6 +7820,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       if (taskScope && !input.task_id) continue;
       const policy = taskScope ? t : p;
       const usage = await this.budgetUsageSql(input.project_id, taskScope ? input.task_id : null);
+      if (policy?.status === "AUTO_PAUSED" && skipPaused) continue;
       if (policy?.status === "AUTO_PAUSED") return {
         scope: policy.pause_scope ?? (taskScope ? "TASK_COST" : "PROJECT_COST"), limit: null,
         taskId: taskScope ? input.task_id! : null, reason: policy.pause_reason ?? "Budget is AUTO_PAUSED", usage, paused: true
@@ -7853,7 +7864,18 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     project_id: string; task_id?: string | null; projected_tokens: number; projected_cost_micro_usd: number;
     verifyParentsCommittedSql?: () => Promise<boolean>;
     onBlockedSql?: (scope: BudgetPauseScope, reason: string) => Promise<void>;
+    blockedPreflight?: CostPreflightCheckInput;
   }): Promise<void> {
+    if (!this.pool.getActiveTxSession()) return this.pool.withRlsTransaction(
+      { currentProjectId: input.project_id, currentRole: "core_api_service" }, () => this.assertBudgetAllowsExecutionSql(input));
+    const recoverySession = this.pool.getActiveTxSession()!;
+    await this.recoverBudgetDenials(input.project_id);
+    const pending = await this.pool.queryInActiveTx("SELECT payload_json FROM budget_denial_intents WHERE project_id=$1::uuid AND status='PENDING' ORDER BY created_at,intent_id LIMIT 1;", [input.project_id]);
+    if (pending.rowCount) {
+      this.pool.afterTransactionEnd(() => this.recoverBudgetDenials(input.project_id, recoverySession));
+      const saved = pending.rows[0]!.payload_json as { violation: { scope: BudgetPauseScope; reason: string } };
+      throw new BudgetAutoPausedError({ message: saved.violation.reason, projectId: input.project_id, taskId: input.task_id, pauseScope: saved.violation.scope });
+    }
     const violation = await this.detectBudgetViolationSql(input);
     if (!violation) return;
     const active = this.pool.getActiveTxSession();
@@ -7884,55 +7906,96 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       // Wait for its real end before retrying: writing inside it would lose the
       // pause, event and blocked ledger on rollback. Completion work is awaited,
       // uses a fresh tenant TX, and runs after releasing the outer connection.
-      const captured = structuredClone(violation);
-      this.pool.afterTransactionEnd(() => this.pool.withRlsTransaction(
-        active ?? { currentProjectId: input.project_id, currentRole: "core_api_service" }, async () => {
-          const project = await this.pool.queryInActiveTx("SELECT 1 FROM projects WHERE project_id = $1::uuid;", [input.project_id]);
-          // A rolled-back project has no durable domain identity to pause.
-          if (!project.rowCount) return;
-          const task = captured.taskId ? await this.pool.queryInActiveTx(
-            "SELECT 1 FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, captured.taskId]) : null;
-          if (task && !task.rowCount) {
-            // The transient task is gone; retain its denial audit on the project
-            // without inventing a task or violating the audit's composite FK.
-            await this.budgetEventSql(input.project_id, null, "AUTO_PAUSED",
-              `${captured.reason}; rolled-back task ${captured.taskId}`, captured.scope, captured.limit, null, captured.usage);
-            return;
-          }
-          // A policy created in the aborted TX is gone. Preserve the observed
-          // denial ceiling so AUTO_PAUSED remains resumable by an approver.
-          const columns: Record<BudgetPauseScope, string> = {
-            PROJECT_TOKENS: "max_project_tokens", PROJECT_COST: "max_project_cost_micro_usd", PROJECT_WALL_TIME: "max_project_wall_time_ms",
-            TASK_TOKENS: "max_task_tokens", TASK_COST: "max_task_cost_micro_usd", TASK_WALL_TIME: "max_task_wall_time_ms",
-          };
-          const table = captured.taskId ? "task_budget_policies" : "project_budget_policies";
-          const field = columns[captured.scope];
-          if (captured.taskId) await this.pool.queryInActiveTx(
-            `INSERT INTO ${table} (project_id, task_id, ${field}) VALUES ($1::uuid, $2::uuid, $3::bigint) ON CONFLICT DO NOTHING;`,
-            [input.project_id, captured.taskId, captured.limit]);
-          else await this.pool.queryInActiveTx(
-            `INSERT INTO ${table} (project_id, ${field}) VALUES ($1::uuid, $2::bigint) ON CONFLICT DO NOTHING;`,
-            [input.project_id, captured.limit]);
-          await this.persistBudgetViolationSql(input.project_id, { ...captured, paused: false });
-          // A cost session/pipeline created in the aborted TX cannot own a ledger.
-          // Its budget denial audit above still survives; committed parents keep
-          // the usual BLOCKED_PREFLIGHT ledger and exact request binding.
-          const ledgerTask = input.task_id ? await this.pool.queryInActiveTx(
-            "SELECT 1 FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid;", [input.project_id, input.task_id]) : null;
-          if ((!ledgerTask || ledgerTask.rowCount) && (!input.verifyParentsCommittedSql || await input.verifyParentsCommittedSql())) {
-            await input.onBlockedSql?.(captured.scope, captured.reason);
-          }
-        }
-      ));
+      const intentId = randomUUID();
+      const owner = await this.pool.queryInActiveTx("SELECT pg_current_xact_id()::text AS xid;");
+      await this.pool.runAutonomousRlsTransaction(active!, () => this.pool.queryInActiveTx(
+        "INSERT INTO budget_denial_intents(intent_id,project_id,outer_xid,payload_json) VALUES($1::uuid,$2::uuid,$3::xid8,$4::jsonb);",
+        [intentId, input.project_id, owner.rows[0]!.xid, JSON.stringify({ violation, preflight: input.blockedPreflight ?? null })]));
+      this.pool.afterTransactionEnd(() => this.recoverBudgetDenials(input.project_id, active!));
     }
     if (!shouldBlock) return;
     throw new BudgetAutoPausedError({ message: blocked.reason, projectId: input.project_id,
       taskId: input.task_id, pauseScope: blocked.scope });
   }
 
+  public async recoverBudgetDenials(projectId: string, completedSession?: RlsSessionContext): Promise<void> {
+    const ctx = this.pool.getActiveTxSession() ?? completedSession;
+    if (!ctx || ctx.currentProjectId !== projectId || !["core_api_service", "gateway_service"].includes(ctx.currentRole)) return;
+    try {
+      await this.pool.runAutonomousRlsTransaction(ctx, async () => {
+        await this.pool.queryInActiveTx("SET LOCAL lock_timeout = '250ms';");
+        const rows = await this.pool.queryInActiveTx(
+          `SELECT * FROM budget_denial_intents WHERE project_id=$1::uuid AND status='PENDING'
+           AND pg_xact_status(outer_xid) IS DISTINCT FROM 'in progress'
+           ORDER BY created_at,intent_id FOR UPDATE SKIP LOCKED;`, [projectId]);
+        for (const row of rows.rows) {
+          const payload = row.payload_json as { violation: NonNullable<Awaited<ReturnType<PostgresControlPlaneRepository["detectBudgetViolationSql"]>>>; preflight: CostPreflightCheckInput | null };
+          await this.applyBudgetDenialSql(projectId, payload.violation, payload.preflight, String(row.intent_id));
+          await this.pool.queryInActiveTx("UPDATE budget_denial_intents SET status='COMPLETED',completed_at=clock_timestamp() WHERE intent_id=$1::uuid;", [row.intent_id]);
+        }
+      });
+    } catch (error) {
+      // Another active transaction still owns required rows. The durable intent
+      // stays PENDING and all new executions fail closed until replay succeeds.
+      if (!(error instanceof PostgresQueryError && error.sqlState === "55P03")) throw error;
+    }
+  }
+
+  private async applyBudgetDenialSql(projectId: string,
+    captured: NonNullable<Awaited<ReturnType<PostgresControlPlaneRepository["detectBudgetViolationSql"]>>>,
+    preflight: CostPreflightCheckInput | null, intentId: string): Promise<void> {
+    const project = await this.pool.queryInActiveTx("SELECT 1 FROM projects WHERE project_id = $1::uuid;", [projectId]);
+    // A rolled-back project has no durable domain identity to pause.
+    if (!project.rowCount) return;
+    const task = captured.taskId ? await this.pool.queryInActiveTx(
+      "SELECT 1 FROM tasks WHERE project_id = $1::uuid AND task_id = $2::uuid;", [projectId, captured.taskId]) : null;
+    if (task && !task.rowCount) {
+      // The transient task is gone; retain its denial audit on the project
+      // without inventing a task or violating the audit's composite FK.
+      await this.budgetEventSql(projectId, null, "AUTO_PAUSED",
+        `${captured.reason}; rolled-back task ${captured.taskId}`, captured.scope, captured.limit, null, captured.usage);
+      return;
+    }
+    // A policy created in the aborted TX is gone. Preserve the observed
+    // denial ceiling so AUTO_PAUSED remains resumable by an approver.
+    const columns: Record<BudgetPauseScope, string> = {
+      PROJECT_TOKENS: "max_project_tokens", PROJECT_COST: "max_project_cost_micro_usd", PROJECT_WALL_TIME: "max_project_wall_time_ms",
+      TASK_TOKENS: "max_task_tokens", TASK_COST: "max_task_cost_micro_usd", TASK_WALL_TIME: "max_task_wall_time_ms",
+    };
+    const table = captured.taskId ? "task_budget_policies" : "project_budget_policies";
+    const field = columns[captured.scope];
+    if (captured.taskId) await this.pool.queryInActiveTx(
+      `INSERT INTO ${table} (project_id, task_id, ${field}) VALUES ($1::uuid, $2::uuid, $3::bigint) ON CONFLICT DO NOTHING;`,
+      [projectId, captured.taskId, captured.limit]);
+    else await this.pool.queryInActiveTx(
+      `INSERT INTO ${table} (project_id, ${field}) VALUES ($1::uuid, $2::bigint) ON CONFLICT DO NOTHING;`,
+      [projectId, captured.limit]);
+    await this.persistBudgetViolationSql(projectId, { ...captured, paused: false });
+
+    if (!preflight) return;
+    const session = await this.getCostSession(preflight.cost_session_id);
+    if (!session) return;
+    const taskId = preflight.task_id ?? session.task_id;
+    const pipelineId = preflight.pipeline_session_id ?? session.pipeline_session_id;
+    if (taskId && !(await this.pool.queryInActiveTx("SELECT 1 FROM tasks WHERE project_id=$1::uuid AND task_id=$2::uuid;", [projectId,taskId])).rowCount) return;
+    if (pipelineId && !(await this.pool.queryInActiveTx("SELECT 1 FROM product_pipeline_sessions WHERE project_id=$1::uuid AND pipeline_session_id=$2::uuid;", [projectId,pipelineId])).rowCount) return;
+    await this.pool.queryInActiveTx(
+      `INSERT INTO model_call_ledgers(call_id,project_id,cost_session_id,pipeline_session_id,task_id,stage,provider,model,
+        prompt_id,prompt_version,prompt_sha256,request_sha256,estimated_input_tokens,reserved_output_tokens,
+        actual_input_tokens,actual_output_tokens,actual_total_tokens,estimated_cost_micro_usd,actual_cost_micro_usd,status,usage_estimated,block_reason,error_message,latency_ms)
+       VALUES($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7,$8,$9,$10,$11,$12,$13,$14,0,0,0,$15,0,'BLOCKED_PREFLIGHT',false,$16,$16,0)
+       ON CONFLICT (call_id) DO NOTHING;`,
+      [intentId,projectId,preflight.cost_session_id,pipelineId,taskId,preflight.stage,preflight.provider,preflight.model,
+        preflight.prompt_id,preflight.prompt_version,preflight.prompt_sha256,preflight.request_sha256,preflight.estimated_input_tokens,
+        preflight.reserved_output_tokens,preflight.estimated_cost_micro_usd,captured.reason]);
+  }
+
   private async evaluatePostSpendBudgetPauseSql(input: { project_id: string; task_id?: string | null }): Promise<void> {
-    const violation = await this.detectBudgetViolationSql(input);
-    if (violation) await this.persistBudgetViolationSql(input.project_id, violation);
+    for (let i = 0; i < 2; i++) {
+      const violation = await this.detectBudgetViolationSql(input, true);
+      if (!violation) break;
+      await this.persistBudgetViolationSql(input.project_id, violation);
+    }
   }
 
 }

@@ -1991,6 +1991,12 @@ jobs:
           COMMIT;
           SQL
 
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
+
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_upgrade_test;"
 
       - name: Verify Upgrade Path from Initial M6A Schema (8044774 -> HEAD)
@@ -2261,6 +2267,12 @@ jobs:
           $$;
           COMMIT;
           SQL
+
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6a_upgrade_test;"
 
@@ -2611,7 +2623,27 @@ jobs:
           COMMIT;
           SQL
 
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
+
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6b_upgrade_test;"
+
+      - name: Verify M6C review notes schema and constraint definitions
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 5432
+          PGDATABASE: software_factory_test
+          PGUSER: factory_admin
+          PGPASSWORD: factory_secret_password
+        run: |
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
       - name: Prepare Optional Docker Verifier Base Image
         run: docker pull node:22-alpine || true
@@ -2624,3 +2656,18 @@ jobs:
           PGUSER: factory_admin
           PGPASSWORD: factory_secret_password
         run: npm test
+
+  native-codex-sandbox:
+    name: Native Codex sandbox (provider-free)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - run: npm install --global @openai/codex@0.167.2
+      - name: Verify real sandbox commit, common ref denial and worker cleanup
+        run: |
+          SF_TEST_CODEX_SANDBOX_BINARY="$(command -v codex)" node --test --test-name-pattern='Codex adapter contract|Codex runtime passes' packages/test-harness/src/m6c-import-adapters.test.ts

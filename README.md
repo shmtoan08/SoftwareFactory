@@ -57,6 +57,8 @@ psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0007_m6a_review_fixes.sq
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 ```
 
@@ -162,9 +164,9 @@ Both `/scheduler/dispatch` and `/tasks/:taskId/dispatch` enforce project capacit
 
 ## M6C-2 Runtime & Import API
 
-Apply migration `0010` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
+Apply migrations through `0012` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
 
-Configure the WNA operator environment with `SF_AGENT_RUNTIME=codex-cli`, an explicit `SF_AGENT_MODEL`, and an invocation-scoped `SF_CODEX_API_KEY`. Optional settings are `SF_AGENT_BINARY` and positive `SF_AGENT_TIMEOUT_MS`. An explicitly supplied adapter takes precedence. Unknown runtimes and missing Codex configuration fail closed. Codex requires a detached linked WNA worktree at the pinned base. Its permission profile extends `:workspace` and grants write access only to that worktree's Git metadata and shared objects, so commits work while common refs/config remain read-only. The adapter disables ambient user configuration/rules and validates the actual Git commit rather than accepting hashes printed by the agent. See the [Codex non-interactive documentation](https://learn.chatgpt.com/docs/non-interactive-mode) and [permission profiles](https://learn.chatgpt.com/docs/permissions).
+Production `SF_AGENT_RUNTIME=codex-cli` is disabled with `ERR_UNMETERED_CODEX_DISABLED` until trusted Cost Guard metering is integrated (explicit project-owner decision for issue #8 note 9). There is no environment flag to enable unmetered production calls. Provider-free fixtures explicitly pass `testOnlyEmulator: true`, an emulator binary and the fixed `CODEX_EMULATOR_CREDENTIAL`; live credentials and resolver callbacks are rejected in that mode. The detached-worktree permission profile and controlled push remain tested by a mandatory native Codex sandbox CI job. Runtime timeout belongs to WNA, which enforces the adapter's `timeoutMs` and reaps/cleans the invocation. See [remaining-note validation](./m6c-review-notes-validation.md).
 
 `POST /api/v1/projects/:projectId/tasks/:taskId/imports` requires signed authentication, project mutation permission and a current lease:
 
@@ -183,6 +185,12 @@ Other submission forms are `{ "kind": "patch", "patch": "<unified diff>" }` and 
 
 The service normalizes imports in a private Git quarantine, uses the shared six-step validator, and publishes only the lease-bound Verify ref. Patch/artifact commits are deterministic. The response is an immutable receipt bound to the source digest, lease/epoch, commit, tree and staging ref; exact retries return it, while a different payload for that lease returns `409`. Candidate lineage includes the receipt. Imports continue through the existing verifier, independent review, human approval and serialized CAS queue.
 
-Local tests use a Codex CLI emulator with real Git/WNA execution; no live Codex provider call has been made. Opaque coding-CLI provider calls are not individually metered through the managed model Cost Guard. M6C-3 and the G7 release gate remain pending.
+Local tests use a Codex CLI emulator with real Git/WNA execution; no live Codex provider call has been made. Unmetered Codex production calls are blocked; no claim of CLI Cost Guard coverage is made. M6C-3 and the G7 release gate remain pending.
 
 For a provider-free native sandbox smoke, set `SF_TEST_CODEX_SANDBOX_BINARY` to the installed Codex executable and run `node --test --test-name-pattern='Codex adapter contract' packages/test-harness/src/m6c-import-adapters.test.ts`. This runs the emulator inside the actual Codex sandbox, verifies commit creation and checks that common Git refs remain unwritable. Tested CLI version: `0.167.2`.
+
+## Issue #8 remaining notes
+
+See [the remaining-note report](./m6c-review-notes-validation.md) for all 14 follow-ups. The legacy CAS API now uses the FIFO queue and project lock; a request behind older entries must drain the queue first. Budget denials use a durable PostgreSQL intent journal before transaction-end retry; snapshot/dispatch/preflight replay completed-owner intents after a crash. Pending intents block new execution until replay succeeds. Journal payloads contain hashes/usage/request identity, never provider credentials or prompts.
+
+Bootstrap coordination uses a native POSIX `flock` helper (a C compiler is required on the coordinator host). Kernel locks release on helper exit or coordinator EOF. Lock sidecar inodes remain in place intentionally; do not unlink them while a bootstrap is active. Stop pre-upgrade coordinators before switching from the old existence-only lock. Pending-ref cleanup runs during bootstrap and respects live same-host owners and ref creation timestamps. Custom acceptance assertions are parsed/allowlisted/reprinted from AST; executing candidate exports still belongs inside the verifier sandbox.

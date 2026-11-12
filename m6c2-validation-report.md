@@ -1,5 +1,7 @@
 # M6C-2 — Second Runtime & Extended Code Imports
 
+Historical evidence. Subsequent remaining-note changes (including durable denial journaling and the production Codex gate) are recorded in [the remaining-note report](./m6c-review-notes-validation.md).
+
 Date: 2026-11-12 (Asia/Tokyo). Changes remain in the working tree alongside M6C-1.
 
 Historical implementation evidence for review baseline `f941d94d`. Subsequent fixes for issue #8 and their current validation are recorded in [the M6C review-fix report](./m6c-review-fixes-validation.md).

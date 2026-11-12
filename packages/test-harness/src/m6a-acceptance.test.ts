@@ -5176,7 +5176,8 @@ describe("M6A Review Hardening & Regression Suite (M6A-FIX-01..10 + Minor Notes)
       if (psqlBin) {
         execFileSync(psqlBin, ["-v", "ON_ERROR_STOP=1"], {
           cwd: repoRoot,
-          input: `UPDATE stage_artifacts SET content_json = '{"tampered":true}'::jsonb WHERE artifact_id = '${s2Pg.artifact.artifact_id}';`,
+          // Privileged corruption fixture only: retain independent read-time integrity coverage.
+          input: `BEGIN; ALTER TABLE stage_artifacts DISABLE TRIGGER trg_stage_artifact_canonical_sha256; UPDATE stage_artifacts SET content_json = '{"tampered":true}'::jsonb WHERE artifact_id = '${s2Pg.artifact.artifact_id}'; ALTER TABLE stage_artifacts ENABLE TRIGGER trg_stage_artifact_canonical_sha256; COMMIT;`,
           env: {
             ...process.env,
             PGHOST: pgConfig.host,

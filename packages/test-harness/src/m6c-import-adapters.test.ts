@@ -3,7 +3,7 @@ import { describe, it } from "node:test";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync, readdirSync, lstatSync, copyFileSync, existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { CodexCliAdapter, loadAgentRuntimeAdapterFromEnv, type AgentTaskContext } from "@software-factory/adapter-sdk";
 import { CoreApiService, CoreApiHttpServer, HttpCoreApiClient, HttpCoreApiError, CORE_API_AUTH_HEADER, encodeCoreApiAuthHeader } from "@software-factory/core-api";
@@ -274,7 +274,7 @@ describe("M6C-2 runtime adapter and extended controlled imports", () => {
     try {
       const { task, lease } = await f.taskLease(); const executable = writeCodexEmulator(f.root);
       const adapter = loadAgentRuntimeAdapterFromEnv({ SF_AGENT_RUNTIME: "codex-cli", SF_AGENT_MODEL: "codex-test-model",
-        SF_AGENT_BINARY: executable, SF_CODEX_API_KEY: "scoped-provider-test-credential" });
+        SF_AGENT_BINARY: executable, SF_CODEX_API_KEY: "scoped-provider-test-credential" }, { testOnlyEmulator: true });
       const agentWork = join(f.root, "codex-linked-worktree");
       git(f.work, ["worktree", "add", "--detach", agentWork, f.base]);
       const ctx: AgentTaskContext = { projectId: f.projectId, taskId: task.task_id, leaseId: lease.lease_id, leaseEpoch: lease.lease_epoch,
@@ -290,15 +290,16 @@ describe("M6C-2 runtime adapter and extended controlled imports", () => {
       // The real sandbox executes the emulator's edits/commit, not a model call.
       const nativeSandbox = process.env.SF_TEST_CODEX_SANDBOX_BINARY;
       const permissionConfig = plan.args.find((arg) => arg.startsWith("permissions="))!;
+      const nativeEnv = { ...plan.sanitizedEnv, PATH: `${dirname(process.execPath)}:${plan.sanitizedEnv.PATH}` };
       const stdout = nativeSandbox
         ? execFileSync(nativeSandbox, ["sandbox", "-P", "sf-worker", "-C", agentWork, "-c", permissionConfig,
-          "--", plan.binaryPath, ...plan.args], { cwd: agentWork, env: plan.sanitizedEnv, encoding: "utf8", timeout: 30_000 })
+          "--", plan.binaryPath, ...plan.args], { cwd: agentWork, env: nativeEnv, encoding: "utf8", timeout: 30_000 })
         : execFileSync(plan.binaryPath, [...plan.args], { cwd: agentWork, env: plan.sanitizedEnv, encoding: "utf8" });
       if (nativeSandbox) {
         const common = git(agentWork, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
         assert.throws(() => execFileSync(nativeSandbox, ["sandbox", "-P", "sf-worker", "-C", agentWork, "-c", permissionConfig,
           "--", "/usr/bin/touch", join(common, "refs", "forbidden-native-write")], {
-          cwd: agentWork, env: plan.sanitizedEnv, timeout: 30_000, stdio: "pipe",
+          cwd: agentWork, env: nativeEnv, timeout: 30_000, stdio: "pipe",
         }));
         assert.equal(existsSync(join(common, "refs", "forbidden-native-write")), false);
       }
@@ -330,7 +331,7 @@ describe("M6C-2 runtime adapter and extended controlled imports", () => {
       const endpoint = await http.start();
       copyFileSync(resolve("scripts/git-hooks/pre-receive"), join(f.repo, "hooks/pre-receive")); chmodSync(join(f.repo, "hooks/pre-receive"), 0o755);
       const { task, lease } = await f.taskLease(); const executable = writeCodexEmulator(f.root);
-      const daemon = new WnaWorkerDaemon({ gateway: f.gateway, worktreeBaseDir: join(f.root, "worktrees"), outboxDir: join(f.root, "outbox"),
+      const daemon = new WnaWorkerDaemon({ testOnlyEmulator: true, gateway: f.gateway, worktreeBaseDir: join(f.root, "worktrees"), outboxDir: join(f.root, "outbox"),
         env: { SF_AGENT_RUNTIME: "codex-cli", SF_AGENT_MODEL: "test-codex", SF_AGENT_BINARY: executable, SF_CODEX_API_KEY: "scoped-provider-test-credential" } });
       const result = await daemon.executeLease({ task, lease, repoBarePath: f.repo, preReceiveUrl: endpoint.url,
         gitPushToken: tokenService.issueLeasePushToken({ projectId: f.projectId, taskId: task.task_id, leaseId: lease.lease_id,
@@ -342,6 +343,18 @@ describe("M6C-2 runtime adapter and extended controlled imports", () => {
       assert.ok(result.pushedCommitHash); assert.equal(git(f.repo, ["rev-parse", `refs/factory/Verify/${task.task_id}/${lease.lease_epoch}`]), result.pushedCommitHash);
       assert.equal(git(f.repo, ["rev-parse", "main"]), f.base);
       assert.ok(result.cleanupEvidence); assert.equal((await f.core.getTask(f.projectId, f.auth, task.task_id))?.status, "BuildingMergeCandidate");
+      const blocked = await fixture();
+      try {
+        const pending = await blocked.taskLease();
+        const production = new WnaWorkerDaemon({ gateway: blocked.gateway, worktreeBaseDir: join(blocked.root, "worker"), outboxDir: join(blocked.root, "outbox"),
+          runtimeAdapter: new CodexCliAdapter({ writerModel: "test", binaryPath: executable, apiKey: "scoped-provider-test-credential", testOnlyEmulator: true }) });
+        const denied = await production.executeLease({ task: pending.task, lease: pending.lease, repoBarePath: blocked.repo,
+          gitPushToken: "unused-token", requireKernelCgroup: false, requireNamespaceIsolation: false, isolateNamespaces: false, dropPrivileges: false });
+        assert.equal(denied.outcome, "FAILED"); assert.match(denied.error ?? "", /ERR_UNMETERED_CODEX_DISABLED/);
+        assert.equal(denied.agentExecution, null);
+        assert.equal(git(blocked.repo, ["rev-parse", "main"]), blocked.base);
+        assert.throws(() => git(blocked.repo, ["rev-parse", `refs/factory/Verify/${pending.task.task_id}/1`]));
+      } finally { blocked.cleanup(); }
     } finally { await http.close(); f.cleanup(); }
   });
 
@@ -429,7 +442,8 @@ describe("M6C-2 runtime adapter and extended controlled imports", () => {
         const foreignLease = await other.taskLease();
         await assert.rejects(store.withRlsTransaction(scope(other.projectId), () => store.recordCodeImportSubmission({
           ...receipt, project_id: other.projectId, task_id: foreignLease.task.task_id, lease_id: foreignLease.lease.lease_id,
-          lease_epoch: foreignLease.lease.lease_epoch })), (error: unknown) => (error as { sqlState?: string }).sqlState === "23503");
+          lease_epoch: foreignLease.lease.lease_epoch,
+          staging_ref: `refs/factory/Verify/${foreignLease.task.task_id}/${foreignLease.lease.lease_epoch}` })), (error: unknown) => (error as { sqlState?: string }).sqlState === "23503");
         const info = await store.withRlsTransaction(scope(f.projectId), () => pool.queryInActiveTx("SELECT relforcerowsecurity FROM pg_class WHERE relname = 'code_import_submissions';"));
         assert.equal(info.rows[0]?.relforcerowsecurity, true);
       } finally { f.cleanup(); other.cleanup(); }

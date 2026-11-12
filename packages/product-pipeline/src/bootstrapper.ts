@@ -1,21 +1,20 @@
+import { acquireBootstrapLock } from "./bootstrap-lock.ts";
+import { compileAcceptanceAssertions } from "./acceptance-assertions.ts";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-  closeSync,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readdirSync,
   realpathSync,
   renameSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, hostname } from "node:os";
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import {
   type ControlPlaneStore,
@@ -60,11 +59,6 @@ export interface Stage5BootstrapOutcome {
   readonly baseline: BaselineSpecFreezeRecord;
 }
 
-const FORBIDDEN_ASSERTION_PATTERNS: readonly RegExp[] = [
-  /[\r\n]/,
-  /\b(?:process|eval|Function|require|import|child_process|fs|globalThis|global|fetch|Buffer|__dirname|__filename|Reflect|Proxy)\b/,
-  /;/,
-];
 
 function runGit(cwd: string, args: readonly string[]): string {
   return execFileSync("git", args, {
@@ -120,37 +114,6 @@ function isPathSameOrInside(parentReal: string, candidateReal: string): boolean 
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function validateAssertionLines(
-  acId: string,
-  lines: readonly string[] | undefined
-): string[] {
-  const validated: string[] = [];
-  for (const rawLine of lines ?? []) {
-    const trimmed = rawLine.trim().replace(/;+\s*$/, "");
-    if (!trimmed) {
-      throw new PostgresRlsError(
-        "23514",
-        `Stage 5 acceptance_specs['${acId}'] contains blank assertion_line`
-      );
-    }
-    for (const pattern of FORBIDDEN_ASSERTION_PATTERNS) {
-      if (pattern.test(trimmed)) {
-        throw new PostgresRlsError(
-          "23514",
-          `Stage 5 acceptance_specs['${acId}'] assertion_line contains forbidden construct or delimiter`
-        );
-      }
-    }
-    if (!/^(?:const\s+[A-Za-z_$][\w$]*\s*=|assert\.[A-Za-z_$][\w$]*\()/.test(trimmed)) {
-      throw new PostgresRlsError(
-        "23514",
-        `Stage 5 acceptance_specs['${acId}'] assertion_line must be an assert.*(...) call or const binding`
-      );
-    }
-    validated.push(`${trimmed};`);
-  }
-  return validated;
-}
 
 function normalizeExtraProtectedPaths(
   extras: readonly string[] | undefined
@@ -252,7 +215,7 @@ function buildTrustedAcceptanceTestSource(input: {
         `Unsafe target_file '${targetRel}' for acceptance criterion '${spec.ac_id}'`
       );
     }
-    const extraAssertions = validateAssertionLines(spec.ac_id, override?.assertion_lines);
+    const extraAssertions = compileAcceptanceAssertions(spec.ac_id, override?.assertion_lines, override?.export_name);
     const testLabel = `[${spec.req_id}/${spec.ac_id}] Given ${spec.given} When ${spec.when} Then ${spec.then}`;
     lines.push(`test(${JSON.stringify(testLabel)}, async () => {`);
     lines.push(`  const targetPath = join(process.cwd(), ${JSON.stringify(targetRel)});`);
@@ -340,7 +303,7 @@ export function pruneStalePendingBootstrapRefs(
   const absRepo = resolve(repoPath);
   const refsRaw = tryRunGit(absRepo, [
     "for-each-ref",
-    "--format=%(refname)\t%(committerdate:unix)",
+    "--format=%(refname)\t%(objectname)",
     "refs/sf/pending-bootstrap",
   ]);
   if (!refsRaw) {
@@ -351,11 +314,18 @@ export function pruneStalePendingBootstrapRefs(
   for (const line of refsRaw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    const [refName, unixSecRaw] = trimmed.split("\t");
+    const [refName, commitHash] = trimmed.split("\t");
     if (!refName) continue;
-    const commitMs = Number(unixSecRaw ?? 0) * 1000;
-    if (!Number.isFinite(commitMs) || commitMs <= cutoffMs) {
-      if (tryRunGit(absRepo, ["update-ref", "-d", refName]) !== null) {
+    const owner = refName.match(/\/([^/]+)\/(\d+)\/(\d{13})-[^/]+$/);
+    if (owner) {
+      if (owner[1] !== hostname().replace(/[^a-zA-Z0-9-]/g, "-")) continue;
+      try { process.kill(Number(owner[2]), 0); continue; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue;
+      }
+    }
+    const createdMs = Number(owner?.[3] ?? refName.match(/-(\d{13})-/)?.[1]);
+    if (Number.isFinite(createdMs) && createdMs <= cutoffMs) {
+      if (tryRunGit(absRepo, ["update-ref", "-d", refName, commitHash!]) !== null) {
         removed += 1;
       }
     }
@@ -403,11 +373,12 @@ function prepareBaselineGitCommit(input: {
   if (!isBare) {
     assertCleanNonBareWorkingTree(absRepo);
   }
+  pruneStalePendingBootstrapRefs(absRepo);
   const existingMainSha = tryRunGit(absRepo, ["rev-parse", "--verify", "refs/heads/main"]);
 
   // Build commit in an isolated scratch clone so refs/heads/main is untouched until TX2 succeeds
   const scratchDir = mkdtempSync(join(tmpdir(), "sf-stage5-bootstrap-"));
-  const pendingRef = `refs/sf/pending-bootstrap/${input.baselineId}-${Date.now()}-${randomUUID()}`;
+  const pendingRef = `refs/sf/pending-bootstrap/${input.baselineId}/${hostname().replace(/[^a-zA-Z0-9-]/g, "-")}/${process.pid}/${Date.now()}-${randomUUID()}`;
   let pendingRefWritten = false;
   try {
     if (existingMainSha) {
@@ -587,25 +558,12 @@ export async function runStage5ProjectBootstrap(
   // Reserve canonical trusted_acceptance_dir exclusively across concurrent processes/baselines (M6B review Minor Note #3)
   mkdirSync(dirname(trustedReal), { recursive: true });
   const bootstrapLockPath = `${trustedReal}.sf-bootstrap.lock`;
-  let bootstrapLockAcquired = false;
-  try {
-    const lockFd = openSync(bootstrapLockPath, "wx");
-    closeSync(lockFd);
-    bootstrapLockAcquired = true;
-  } catch (lockErr: unknown) {
-    const code = (lockErr as NodeJS.ErrnoException)?.code;
-    if (code === "EEXIST") {
-      throw new PostgresRlsError(
-        "23505",
-        `Concurrent Stage 5 bootstrap already reserves trusted_acceptance_dir (${trustedReal})`
-      );
-    }
-    throw lockErr;
-  }
+  const bootstrapLock = await acquireBootstrapLock(bootstrapLockPath);
 
-  const stagingTrustedDir = mkdtempSync(join(tmpdir(), "sf-stage5-trusted-"));
+  let stagingTrustedDir = "";
   let preparedGit: PreparedBaselineGitCommit | null = null;
   try {
+    stagingTrustedDir = mkdtempSync(join(tmpdir(), "sf-stage5-trusted-"));
     // Reject pre-existing symlinks, files, or non-empty trusted_acceptance_dir
     if (existsSync(trustedAcceptanceDir)) {
       const stat = lstatSync(trustedAcceptanceDir);
@@ -732,6 +690,7 @@ export async function runStage5ProjectBootstrap(
       repoFiles[cleanRel] = content;
     }
 
+    bootstrapLock.assertHeld();
     preparedGit = prepareBaselineGitCommit({
       baselineId: pre.baseline.baseline_id,
       repoPath,
@@ -768,6 +727,7 @@ export async function runStage5ProjectBootstrap(
       }
     );
 
+    bootstrapLock.assertHeld();
     // TX2 committed -> atomically publish trusted acceptance directory and move refs/heads/main
     publishDirectoryAtomically(stagingTrustedDir, trustedAcceptanceDir);
     preparedGit.finalizeGitMainRef();
@@ -777,14 +737,8 @@ export async function runStage5ProjectBootstrap(
       baseline: pre.baseline,
     };
   } finally {
-    rmSync(stagingTrustedDir, { recursive: true, force: true });
+    if (stagingTrustedDir) rmSync(stagingTrustedDir, { recursive: true, force: true });
     preparedGit?.cleanup();
-    if (bootstrapLockAcquired) {
-      try {
-        unlinkSync(bootstrapLockPath);
-      } catch {
-        // ignore lock cleanup failure
-      }
-    }
+    await bootstrapLock.release();
   }
 }

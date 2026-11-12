@@ -1,5 +1,7 @@
 # M6C Review Fixes — Issue #8
 
+Historical evidence. Subsequent remaining-note changes (including durable denial journaling and the production Codex gate) are recorded in [the remaining-note report](./m6c-review-notes-validation.md).
+
 Review baseline: `f941d94da2060ef53a94f92e3572703571b2d2e0`. Fix branch: `review/m6c-1-2`.
 
 This report covers the five requested findings in [issue #8](https://github.com/shmtoan08/SoftwareFactory/issues/8). Acceptance and checklist decisions remain with the reviewer. No merge into `main` or M6C-3 implementation is included.

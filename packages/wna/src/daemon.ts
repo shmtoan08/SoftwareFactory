@@ -92,6 +92,7 @@ export interface WnaWorkerDaemonOptions {
   readonly outboxDir: string;
   readonly sandboxBackend?: LinuxCgroupV2SandboxBackend;
   readonly runtimeAdapter?: AgentRuntimeAdapter;
+  readonly testOnlyEmulator?: boolean;
   readonly env?: NodeJS.ProcessEnv;
 }
 
@@ -154,12 +155,14 @@ export class WnaWorkerDaemon {
   private readonly worktreeBaseDir: string;
   private readonly outboxDir: string;
   private readonly runtimeAdapter?: AgentRuntimeAdapter;
+  private readonly testOnlyEmulator: boolean;
   private readonly runtimeEnv: NodeJS.ProcessEnv;
   public readonly sandboxBackend: LinuxCgroupV2SandboxBackend;
 
   constructor(options: WnaWorkerDaemonOptions) {
     this.gateway = options.gateway;
     this.runtimeAdapter = options.runtimeAdapter;
+    this.testOnlyEmulator = options.testOnlyEmulator === true;
     this.runtimeEnv = options.env ?? process.env;
     this.worktreeBaseDir = resolve(options.worktreeBaseDir);
     this.outboxDir = resolve(options.outboxDir);
@@ -362,8 +365,11 @@ export class WnaWorkerDaemon {
 
       currentPhase = "agent_prepare";
       const adapter = input.adapter ?? this.runtimeAdapter ??
-        (this.runtimeEnv.SF_AGENT_RUNTIME ? loadAgentRuntimeAdapterFromEnv(this.runtimeEnv) : undefined);
+        (this.runtimeEnv.SF_AGENT_RUNTIME ? loadAgentRuntimeAdapterFromEnv(this.runtimeEnv, { testOnlyEmulator: this.testOnlyEmulator }) : undefined);
       if (!adapter) throw new Error("ERR_AGENT_RUNTIME_NOT_CONFIGURED: provide an adapter or SF_AGENT_RUNTIME");
+      if (adapter.runtimeId === "codex-cli" && !this.testOnlyEmulator) {
+        throw new Error("ERR_UNMETERED_CODEX_DISABLED: production Codex requires trusted Cost Guard metering");
+      }
       invocationContext = agentCtx;
       invocationAdapter = adapter;
       const plan = await adapter.prepareInvocation(agentCtx);

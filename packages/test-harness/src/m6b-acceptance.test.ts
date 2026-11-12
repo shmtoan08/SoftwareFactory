@@ -3885,6 +3885,10 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
       runPsql(db6f, headSql("packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0010_m6c_extended_code_import_submissions.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0010_m6c_extended_code_import_submissions.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0011_m6c_review_notes_hardening.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0011_m6c_review_notes_hardening.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0012_durable_budget_denial_journal.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0012_durable_budget_denial_journal.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0002_rls_verification_matrix.sql"));
 
       const pool6f = new PostgresRuntimePool({ ...pgConfig, database: db6f, maxConnections: 2 });
@@ -3928,6 +3932,10 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         "packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql",
         "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
         "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
+        "packages/database/migrations/0011_m6c_review_notes_hardening.sql",
+        "packages/database/migrations/0011_m6c_review_notes_hardening.sql",
+        "packages/database/migrations/0012_durable_budget_denial_journal.sql",
+        "packages/database/migrations/0012_durable_budget_denial_journal.sql",
         "packages/database/migrations/0002_rls_verification_matrix.sql",
       ]) {
         runPsql(db80, headSql(mig));
@@ -3956,6 +3964,10 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         "packages/database/migrations/0009_m6c_parallel_scheduler_cas_queue_and_budgets.sql",
         "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
         "packages/database/migrations/0010_m6c_extended_code_import_submissions.sql",
+        "packages/database/migrations/0011_m6c_review_notes_hardening.sql",
+        "packages/database/migrations/0011_m6c_review_notes_hardening.sql",
+        "packages/database/migrations/0012_durable_budget_denial_journal.sql",
+        "packages/database/migrations/0012_durable_budget_denial_journal.sql",
         "packages/database/migrations/0002_rls_verification_matrix.sql",
       ]) {
         runPsql(db86, headSql(mig));

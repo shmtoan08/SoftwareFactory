@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -363,6 +364,7 @@ export class CoreApiTokenAuthenticator {
  * 8-Field Human Approval, and Atomic CAS Merge + Post-Merge Reconciler.
  */
 export class CoreApiService {
+  private readonly mergeQueueContext = new AsyncLocalStorage<ReadonlySet<string>>();
   private readonly store: ControlPlaneStore;
   public readonly telemetry: FactoryTelemetry;
   public readonly authenticator: CoreApiTokenAuthenticator;
@@ -722,7 +724,7 @@ export class CoreApiService {
     // Git may already have advanced; the existing idempotent reconciler handles retry.
     return this.telemetry.withSpan("merge_queue.drain", () =>
       this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
-        this.store.withProjectMergeQueueLock(projectId, async () => {
+        this.store.withProjectMergeQueueLock(projectId, () => this.mergeQueueContext.run(new Set([projectId]), async () => {
           const entry = await this.store.claimNextMergeQueueEntry(projectId);
           if (!entry) return null;
           const merged = await this.executeCasMerge(projectId, auth, {
@@ -745,7 +747,7 @@ export class CoreApiService {
           }
           return this.store.completeMergeQueueEntry({ project_id: projectId, queue_entry_id: entry.queue_entry_id,
             status: "CANCELLED", last_error: merged.status });
-        })
+        }))
       ));
   }
 
@@ -2262,6 +2264,26 @@ export class CoreApiService {
     }
   ): Promise<CasMergeResult> {
     const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
+    // The legacy API is a queue facade. Only a drain context may execute the
+    // underlying CAS; callers cannot bypass FIFO or project serialization.
+    if (!this.mergeQueueContext.getStore()?.has(projectId)) {
+      return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
+        this.store.withProjectMergeQueueLock(projectId, () => this.mergeQueueContext.run(new Set([projectId]), async () => {
+          const entries = await this.store.listMergeQueueEntries();
+          const prior = entries.find((entry) => entry.task_id === input.task_id && entry.merge_candidate_id === input.merge_candidate_id && entry.approval_id === input.approval_id && entry.status === "MERGED");
+          if (prior) return this.executeCasMerge(projectId, auth, input);
+          const queued = entries.find((entry) => entry.status === "QUEUED" && entry.task_id === input.task_id && entry.merge_candidate_id === input.merge_candidate_id && entry.approval_id === input.approval_id) ?? await this.store.enqueueMergeCandidate({ project_id: projectId, task_id: input.task_id,
+            merge_candidate_id: input.merge_candidate_id, approval_id: input.approval_id });
+          const next = await this.store.claimNextMergeQueueEntry(projectId);
+          if (!next || next.queue_entry_id !== queued.queue_entry_id) throw new PostgresRlsError("23514", "ERR_MERGE_QUEUE_REQUIRED: drain older FIFO entries before this candidate");
+          const result = await this.executeCasMerge(projectId, auth, input);
+          await this.store.completeMergeQueueEntry({ project_id: projectId, queue_entry_id: queued.queue_entry_id,
+            status: result.status === "MERGED_BY_CAS" || result.status === "RECONCILED_ALREADY_MERGED" ? "MERGED" : "CANCELLED",
+            merged_commit_hash: result.status === "MERGED_BY_CAS" || result.status === "RECONCILED_ALREADY_MERGED" ? result.merged_commit_hash : null,
+            last_error: result.status === "CAS_CONFLICT_NEEDS_REBASE" ? result.status : null });
+          return result;
+        })));
+    }
     const snapshotStore = input.snapshot_store ?? this.snapshotStore;
     const { res, snapshotPath, clockIso } = await this.store.withRlsTransaction(
       {

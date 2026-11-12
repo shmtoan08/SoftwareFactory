@@ -1,3 +1,4 @@
+import { validateCodeImportReceipt } from "./m6c-validation.ts";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -1665,6 +1666,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   }
 
   public recordCodeImportSubmission(input: Omit<CodeImportSubmissionRecord, "submission_id" | "created_at">): CodeImportSubmissionRecord {
+    validateCodeImportReceipt(input);
     this.assertCoreApiWritePermissionForProject(input.project_id);
     if (this.codeImportSubmissions.has(input.lease_id)) throw new PostgresRlsError("23505", "Lease already has an import submission");
     const imp = this.verifiedCodeImports.get(input.import_id);
@@ -5885,7 +5887,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         `Invalid terminal merge queue status '${String(input.status)}'`
       );
     }
-    if (input.merged_commit_hash && !/^[0-9a-f]{40}$/i.test(input.merged_commit_hash)) {
+    if (input.merged_commit_hash != null && !/^[0-9a-f]{40}$/i.test(input.merged_commit_hash)) {
       throw new PostgresRlsError(
         "23514",
         `merged_commit_hash '${input.merged_commit_hash}' must be a 40-hex commit hash`
@@ -5931,6 +5933,10 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           completed_at: nowIso,
           updated_at: nowIso,
         };
+        if ((updated.status === "MERGED" && !updated.merged_commit_hash) ||
+          (updated.status === "REBASED_NEEDS_REVERIFY" && !updated.rebased_to_candidate_id)) {
+          throw new PostgresRlsError("23514", "Terminal queue state requires its result binding");
+        }
         this.setInMap(this.mergeQueueEntries, updated.queue_entry_id, updated);
         this.insertOutboxEventInternal(
           input.project_id,
@@ -6471,7 +6477,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         out.push(structuredClone(evt));
       }
     }
-    out.sort((a, b) => b.created_at.localeCompare(a.created_at));
+    out.sort((a, b) => b.created_at.localeCompare(a.created_at) || b.event_id.localeCompare(a.event_id));
     return out;
   }
 
