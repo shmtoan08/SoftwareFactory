@@ -1743,3 +1743,32 @@ export interface CodeImportSubmissionRecord {
   readonly submitted_by_principal_id: string;
   readonly created_at: string;
 }
+
+/** M6C-3: authenticated human approval, bound to one immutable production action. */
+export interface ProductionDeploymentApprovalRecord {
+  readonly approval_id: string;
+  readonly project_id: string;
+  readonly pipeline_session_id: string;
+  readonly release_id: string;
+  readonly release_package_sha256: string;
+  readonly commit_hash: string;
+  readonly artifact_sha256: string;
+  readonly target_key: string;
+  readonly approver_principal_id: string;
+  readonly issued_at: string;
+  readonly expires_at: string;
+  readonly token_sha256: string;
+  readonly status: "ACTIVE" | "CONSUMED" | "REVOKED";
+}
+
+export interface ProductionDeploymentRecord {
+  readonly deployment_id: string;
+  readonly project_id: string;
+  readonly target_key: string;
+  readonly approval_id: string;
+  readonly requested_by_principal_id: string;
+  readonly status: "RUNNING" | "SUCCEEDED" | "UNKNOWN";
+  readonly started_at: string;
+  readonly completed_at: string | null;
+  readonly receipt_sha256: string | null;
+}

@@ -1,3 +1,5 @@
+import { ProductionDeploymentGate, validateProductionId, type ProductionDeploymentConfiguration, type ApproveProductionDeploymentInput, type ExecuteProductionDeploymentInput } from "./production-deployment.ts";
+export * from "./production-deployment.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -371,6 +373,7 @@ export class CoreApiService {
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
   public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
+  private readonly productionDeploymentGate: ProductionDeploymentGate;
   private readonly onWarning?: (warning: CoreApiWarning) => void;
 
   constructor(
@@ -387,10 +390,12 @@ export class CoreApiService {
       defaultModelExecutor?: ManagedModelProviderExecutor;
       modelPricingOverrides?: Readonly<Record<string, ModelPricingRate>>;
       pipelineService?: ProductPipelineService;
+      productionDeployment?: ProductionDeploymentConfiguration;
       env?: NodeJS.ProcessEnv;
     }
   ) {
     this.store = store;
+    this.productionDeploymentGate = new ProductionDeploymentGate(store, options?.productionDeployment);
     this.telemetry = options?.telemetry ?? createFactoryTelemetryFromEnv(options?.env ?? process.env);
     this.snapshotStore = options?.snapshotStore ?? null;
     this.onWarning = options?.onWarning;
@@ -755,6 +760,21 @@ export class CoreApiService {
     return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES, () =>
       this.store.selectVisibleTasks()
     );
+  }
+
+  public async approveProductionDeployment(projectId: string, auth: CoreApiAuthContext, input: ApproveProductionDeploymentInput) {
+    const actor = await this.authorize(auth,projectId,APPROVAL_ROLES);
+    return this.productionDeploymentGate.approve(projectId,actor.principalId,input);
+  }
+  public async executeProductionDeployment(projectId: string, auth: CoreApiAuthContext, input: ExecuteProductionDeploymentInput) {
+    const actor = await this.authorize(auth,projectId,MUTATION_ROLES);
+    return this.productionDeploymentGate.execute(projectId,actor.principalId,input);
+  }
+  public revokeProductionDeploymentApproval(projectId: string, auth: CoreApiAuthContext, approvalId: string): Promise<void> {
+    return this.withAuthorizedRlsTransaction(auth,projectId,APPROVAL_ROLES,()=>{validateProductionId(approvalId);return this.store.revokeProductionDeploymentApproval(projectId,approvalId);});
+  }
+  public getProductionDeployment(projectId: string, auth: CoreApiAuthContext, approvalId: string) {
+    return this.withAuthorizedRlsTransaction(auth,projectId,READ_ROLES,()=>{validateProductionId(approvalId);return this.store.getProductionDeploymentByApproval(approvalId);});
   }
 
   public dispatchTaskLease(

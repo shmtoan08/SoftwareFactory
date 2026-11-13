@@ -1,3 +1,4 @@
+import type { ApproveProductionDeploymentInput, ExecuteProductionDeploymentInput } from "./production-deployment.ts";
 import { FactoryTelemetry, extractHttpTraceContext, formatTraceparent } from "@software-factory/observability";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
@@ -1144,6 +1145,28 @@ export class CoreApiHttpServer {
         });
         this.sendJson(res, 200, matrix);
         return;
+      }
+
+      const deploymentMatch = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/(deployment-approvals|production-deployments)(?:\/([^/]+)(?:\/(revoke))?)?$/);
+      if (deploymentMatch?.[1]) {
+        const projectId = decodeURIComponent(deploymentMatch[1]);
+        const kind = deploymentMatch[2]; const approvalId = deploymentMatch[3] ? decodeURIComponent(deploymentMatch[3]) : undefined;
+        if (method === "POST" && kind === "deployment-approvals" && !approvalId) {
+          const body = await this.readJsonBody<ApproveProductionDeploymentInput>(req);
+          this.sendJson(res,201,await this.coreApi.approveProductionDeployment(projectId,auth,body)); return;
+        }
+        if (method === "POST" && kind === "production-deployments" && !approvalId) {
+          const body = await this.readJsonBody<ExecuteProductionDeploymentInput>(req);
+          this.sendJson(res,200,await this.coreApi.executeProductionDeployment(projectId,auth,body)); return;
+        }
+        if (method === "POST" && kind === "deployment-approvals" && approvalId && deploymentMatch[4] === "revoke") {
+          await this.coreApi.revokeProductionDeploymentApproval(projectId,auth,approvalId);
+          this.sendJson(res,200,{revoked:true}); return;
+        }
+        if (method === "GET" && kind === "production-deployments" && approvalId && !deploymentMatch[4]) {
+          const record = await this.coreApi.getProductionDeployment(projectId,auth,approvalId);
+          this.sendJson(res,record ? 200 : 404,record ?? {error_code:"ERR_NOT_FOUND"}); return;
+        }
       }
 
       const releasePackageMatch = pathname.match(

@@ -1,3 +1,4 @@
+import { validateDeploymentConfiguration, type ProductionDeploymentConfiguration } from "./production-deployment.ts";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -53,6 +54,7 @@ export interface CreateCoreApiRuntimeOptions {
   readonly modelPricingOverrides?: Readonly<Record<string, ModelPricingRate>>;
   readonly clockFn?: () => Date;
   readonly startServer?: boolean;
+  readonly productionDeployment?: ProductionDeploymentConfiguration;
 }
 
 export interface CoreApiRuntime {
@@ -114,6 +116,8 @@ export async function createCoreApiRuntime(
 ): Promise<CoreApiRuntime> {
   const env = options?.env ?? process.env;
   const isolationPolicy = parseVerifierIsolationPolicy(env.SF_VERIFIER_ISOLATION);
+  const productionDeployment = { ...options?.productionDeployment, signingSecret: options?.productionDeployment?.signingSecret ?? env.SF_DEPLOYMENT_APPROVAL_SECRET };
+  validateDeploymentConfiguration(productionDeployment);
   const requirePostgres = options?.requirePostgres ?? env.SF_REQUIRE_POSTGRES === "1";
 
   const ownedHandle = options?.store
@@ -165,6 +169,7 @@ export async function createCoreApiRuntime(
 
   const coreApi = new CoreApiService(store, {
     authenticator,
+    productionDeployment,
     clockFn: options?.clockFn,
     snapshotStore,
     defaultModelConfig: resolvedModelConfig,

@@ -60,6 +60,7 @@ psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_i
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0014_m6c3_production_deployment_gate.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 ```
 
@@ -165,7 +166,7 @@ Both `/scheduler/dispatch` and `/tasks/:taskId/dispatch` enforce project capacit
 
 ## M6C-2 Runtime & Import API
 
-Apply migrations through `0013` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
+Apply migrations through `0014` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
 
 Production `SF_AGENT_RUNTIME=codex-cli` is disabled with `ERR_UNMETERED_CODEX_DISABLED` until trusted Cost Guard metering is integrated (explicit project-owner decision for issue #8 note 9). There is no environment flag to enable unmetered production calls. Provider-free fixtures explicitly pass `testOnlyEmulator: true`, an emulator binary and the fixed `CODEX_EMULATOR_CREDENTIAL`; live credentials and resolver callbacks are rejected in that mode. The detached-worktree permission profile and controlled push remain tested by a mandatory native Codex sandbox CI job. Runtime timeout belongs to WNA, which enforces the adapter's `timeoutMs` and reaps/cleans the invocation. See [remaining-note validation](./m6c-review-notes-validation.md).
 
@@ -207,3 +208,15 @@ Run `npm run test:m6c3` for policy, failure, persistence and RLS checks. `npm ru
 Repository settings verified on 2026-11-13: `main` reports `protected=false`; the branch protection endpoint returns 404 and the effective branch rules list is empty. The gVisor job runs in CI, but no required-check rule currently blocks a merge or direct push. Enabling branch protection/required checks is a separate repository administration change; the existing direct-to-main review workflow remains in effect.
 
 This is the first M6C-3 implementation slice. External target connectors, automatic trust-tier routing, Firecracker, Lima/WSL2 and the signed production deployment gate remain pending; M6C/G7 is not accepted. See [the M6C-3 report](./m6c3-validation-report.md).
+
+### M6C-3 in progress: signed production deployment gate
+
+Migration `0014` adds FORCE-RLS approval/deployment journals. `POST /api/v1/projects/:projectId/deployment-approvals` requires an authenticated `PROJECT_APPROVER` or `ORG_ADMIN` decision for `pipeline_session_id`, `release_id`, `artifact_sha256`, `target_key` and optional `ttl_ms` (default 15 minutes, maximum one hour). The gate validates the accepted release against live Git main and returns an HMAC-signed approval token. The signature binds project, release/package hash, commit, artifact digest, target, principal, approval ID and lifetime; only its hash is stored.
+
+`POST /api/v1/projects/:projectId/production-deployments` accepts exactly `approval_id` and `approval_token`. The gate atomically consumes approval and commits a RUNNING intent before invoking the registered backend. Duplicate requests return existing state; they never invoke the backend again. `GET /api/v1/projects/:projectId/production-deployments/:approvalId` exposes project-scoped audit state, including after token expiry or a newer main commit. Approvers can revoke unused approval with `POST /api/v1/projects/:projectId/deployment-approvals/:approvalId/revoke`.
+
+Production execution is disabled by default. Operators must explicitly inject a `productionDeployment.executors` registry into `createCoreApiRuntime` and configure a stable, random signing secret of at least 32 bytes (`productionDeployment.signingSecret` or `SF_DEPLOYMENT_APPROVAL_SECRET`). HTTP requests cannot select commands, URLs, credentials or backends. Registered executors receive only the immutable approved action and an AbortSignal; they must verify artifact bytes/provenance, deploy the exact digest and honor `deployment_id` as the provider idempotency key. The Factory signature attests an authenticated approver action; it is not a user-held asymmetric signature or a WebAuthn presence check.
+
+A successful executor returns a SHA-256 receipt. Timeout, exception or malformed receipt produces UNKNOWN; raw provider errors are not exposed. RUNNING and UNKNOWN both hold the `(project, target_key)` exclusion lock, so a fresh approval cannot bypass unresolved work. If the process dies or terminal persistence fails, RUNNING survives; there is no automatic retry, unlock or claim of exactly-once external effect. Outcomes require operator investigation. An authenticated reconciliation/unlock workflow and concrete cloud deployment executors remain future work; the gate deliberately stays closed in those recovery cases. Removing/relabeling a target is not a supported recovery mechanism.
+
+`npm run test:m6c3:deployment` covers memory/HTTP/PostgreSQL, signatures/RBAC, exact binding, concurrency, timeout/revoke/expiry, unresolved target holds, commit-before-effect, process death and restart. It uses local test executors only, not production infrastructure. See [deployment validation](./m6c3-deployment-validation.md). External execution connectors, VM backends and M6C/G7 acceptance remain pending.

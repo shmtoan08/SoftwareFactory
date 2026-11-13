@@ -3891,6 +3891,8 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
       runPsql(db6f, headSql("packages/database/migrations/0012_durable_budget_denial_journal.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0014_m6c3_production_deployment_gate.sql"));
+      runPsql(db6f, headSql("packages/database/migrations/0014_m6c3_production_deployment_gate.sql"));
       runPsql(db6f, headSql("packages/database/migrations/0002_rls_verification_matrix.sql"));
 
       const pool6f = new PostgresRuntimePool({ ...pgConfig, database: db6f, maxConnections: 2 });
@@ -3940,6 +3942,8 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         "packages/database/migrations/0012_durable_budget_denial_journal.sql",
         "packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql",
         "packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql",
+        "packages/database/migrations/0014_m6c3_production_deployment_gate.sql",
+        "packages/database/migrations/0014_m6c3_production_deployment_gate.sql",
         "packages/database/migrations/0002_rls_verification_matrix.sql",
       ]) {
         runPsql(db80, headSql(mig));
@@ -3974,6 +3978,8 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         "packages/database/migrations/0012_durable_budget_denial_journal.sql",
         "packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql",
         "packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql",
+        "packages/database/migrations/0014_m6c3_production_deployment_gate.sql",
+        "packages/database/migrations/0014_m6c3_production_deployment_gate.sql",
         "packages/database/migrations/0002_rls_verification_matrix.sql",
       ]) {
         runPsql(db86, headSql(mig));

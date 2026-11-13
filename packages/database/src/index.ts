@@ -1,3 +1,4 @@
+import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
 import { validateVerificationIsolation } from "./m6c3-validation.ts";
 import { validateCodeImportReceipt } from "./m6c-validation.ts";
 import { execFileSync } from "node:child_process";
@@ -33,6 +34,8 @@ import {
   type ModelCallStatus,
   type OutboxEventRecord,
   type ProcessedWorkerEventRecord,
+  type ProductionDeploymentApprovalRecord,
+  type ProductionDeploymentRecord,
   type ProductPipelineBundle,
   type ProductPipelineSessionRecord,
   type ProjectBootstrapRecord,
@@ -208,6 +211,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   private devUserStories: Map<string, DevUserStoryRecord> = new Map();
   private taskPlanLinks: Map<string, TaskPlanLinkRecord> = new Map();
   private changeRequests: Map<string, ChangeRequestRecord> = new Map();
+  private productionApprovals = new Map<string, ProductionDeploymentApprovalRecord>();
+  private productionDeployments = new Map<string, ProductionDeploymentRecord>();
   private releaseAcceptancePackages: Map<string, ReleaseAcceptancePackageRecord> = new Map();
   private codeImportSubmissions = new Map<string, CodeImportSubmissionRecord>();
   private taskDependencies: Map<string, TaskDependencyRecord> = new Map();
@@ -387,6 +392,10 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       currentPrincipalId: null,
       currentRole: "anonymous",
     };
+  }
+
+  public assertOutsideTransaction(): void {
+    if (this.txUndoStorage.getStore()) throw new PostgresRlsError("23514", "Production execution requires its own committed transaction");
   }
 
   public getCurrentRlsSession(): RlsSessionContext {
@@ -5605,6 +5614,62 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         };
       })
     );
+  }
+
+  public createProductionDeploymentApproval(input: ProductionDeploymentApprovalRecord): ProductionDeploymentApprovalRecord {
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    const member = this.getProjectMembership(input.project_id,input.approver_principal_id);
+    if (input.approver_principal_id !== this.getCurrentRlsSession().currentPrincipalId || !member || !["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role)) throw new PostgresRlsError("42501", "Production approval requires the authenticated project approver");
+    validateProductionApproval(input, this.releaseAcceptancePackages.get(input.release_id) ?? null, this.clockTimestampIso());
+    if (this.productionApprovals.has(input.approval_id)) throw new PostgresRlsError("23505", "Deployment approval already exists");
+    const record = structuredClone(input); this.setInMap(this.productionApprovals, record.approval_id, record);
+    this.insertOutboxEventInternal(input.project_id, "production_deployment", record.approval_id, "deployment.approved", { approval_id: record.approval_id, release_id: record.release_id, target_key: record.target_key });
+    return structuredClone(record);
+  }
+
+  public getProductionDeploymentApproval(approvalId: string): ProductionDeploymentApprovalRecord | null {
+    const record = this.productionApprovals.get(approvalId);
+    return record && record.project_id === this.requireCurrentProjectId() ? structuredClone(record) : null;
+  }
+
+  public getProductionDeploymentByApproval(approvalId: string): ProductionDeploymentRecord | null {
+    const record = [...this.productionDeployments.values()].find((d) => d.approval_id === approvalId && d.project_id === this.requireCurrentProjectId());
+    return record ? structuredClone(record) : null;
+  }
+
+  public revokeProductionDeploymentApproval(projectId: string, approvalId: string): void {
+    this.assertCoreApiWritePermissionForProject(projectId); const record = this.getProductionDeploymentApproval(approvalId);
+    if (!record || record.status !== "ACTIVE") throw new PostgresRlsError("23514", "Only active deployment approval can be revoked");
+    this.setInMap(this.productionApprovals, approvalId, { ...record, status: "REVOKED" });
+    this.insertOutboxEventInternal(projectId, "production_deployment", approvalId, "deployment.revoked", { approval_id: approvalId });
+  }
+
+  public async beginProductionDeployment(input: { project_id: string; approval_id: string; token_sha256: string; requested_by_principal_id: string }): Promise<{record: ProductionDeploymentRecord;created: boolean}> {
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    return this.withSerializedLock(`production:${input.project_id}`, () => this.withRollbackBoundarySync(() => {
+      const approval = this.getProductionDeploymentApproval(input.approval_id);
+      if (!approval || approval.token_sha256 !== input.token_sha256 || input.requested_by_principal_id !== this.getCurrentRlsSession().currentPrincipalId || !input.requested_by_principal_id.trim()) throw new PostgresRlsError("42501", "Invalid deployment approval token");
+      const existing = [...this.productionDeployments.values()].find((d) => d.approval_id === approval.approval_id);
+      if (existing) return { record: structuredClone(existing), created: false };
+      if (approval.status !== "ACTIVE" || Date.parse(approval.expires_at) <= Date.parse(this.clockTimestampIso())) throw new PostgresRlsError("42501", "Deployment approval expired, revoked or consumed");
+      if ([...this.productionDeployments.values()].some((d) => d.project_id === input.project_id && d.target_key === approval.target_key && ["RUNNING","UNKNOWN"].includes(d.status))) throw new PostgresRlsError("23505", "Production target already has an unresolved deployment");
+      const record: ProductionDeploymentRecord = { deployment_id: randomUUID(), project_id: input.project_id, approval_id: approval.approval_id, target_key: approval.target_key,
+        requested_by_principal_id: input.requested_by_principal_id, status: "RUNNING", started_at: this.clockTimestampIso(), completed_at: null, receipt_sha256: null };
+      this.setInMap(this.productionApprovals, approval.approval_id, { ...approval, status: "CONSUMED" });
+      this.setInMap(this.productionDeployments, record.deployment_id, record);
+      this.insertOutboxEventInternal(input.project_id, "production_deployment", record.deployment_id, "deployment.started", { deployment_id: record.deployment_id, approval_id: approval.approval_id, target_key: approval.target_key });
+      return { record: structuredClone(record), created: true };
+    }));
+  }
+
+  public completeProductionDeployment(input: {project_id: string; deployment_id: string; status: "SUCCEEDED" | "UNKNOWN"; receipt_sha256: string | null}): ProductionDeploymentRecord {
+    this.assertCoreApiWritePermissionForProject(input.project_id); validateDeploymentCompletion(input.status,input.receipt_sha256);
+    const record = this.productionDeployments.get(input.deployment_id);
+    if (!record || record.project_id !== input.project_id || record.status !== "RUNNING") throw new PostgresRlsError("23514", "Only running deployment can complete");
+    const completed: ProductionDeploymentRecord = { ...record, status: input.status, receipt_sha256: input.receipt_sha256, completed_at: this.clockTimestampIso() };
+    this.setInMap(this.productionDeployments, record.deployment_id, completed);
+    this.insertOutboxEventInternal(input.project_id, "production_deployment", record.deployment_id, "deployment.completed", { deployment_id: record.deployment_id, status: input.status, receipt_sha256: input.receipt_sha256 });
+    return structuredClone(completed);
   }
 
   public async recordReleaseAcceptancePackage(

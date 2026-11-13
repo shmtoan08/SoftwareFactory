@@ -29,6 +29,8 @@ import type {
   OutboxEventRecord,
   PipelineStageName,
   ProcessedWorkerEventRecord,
+  ProductionDeploymentApprovalRecord,
+  ProductionDeploymentRecord,
   ProductPipelineBundle,
   ProductPipelineSessionRecord,
   ProjectBootstrapRecord,
@@ -518,6 +520,7 @@ export interface RecordReleaseAcceptancePackageInput {
  */
 export interface ControlPlaneStore {
   clockTimestampIso(): string | Promise<string>;
+  assertOutsideTransaction(): void;
   withRlsTransaction<T>(
     ctx: Partial<RlsSessionContext>,
     fn: () => Promise<T> | T
@@ -880,6 +883,14 @@ export interface ControlPlaneStore {
   getProductPipelineBundle(
     pipelineSessionId: string
   ): ProductPipelineBundle | null | Promise<ProductPipelineBundle | null>;
+
+  createProductionDeploymentApproval(input: ProductionDeploymentApprovalRecord): ProductionDeploymentApprovalRecord | Promise<ProductionDeploymentApprovalRecord>;
+  getProductionDeploymentApproval(approvalId: string): ProductionDeploymentApprovalRecord | null | Promise<ProductionDeploymentApprovalRecord | null>;
+  getProductionDeploymentByApproval(approvalId: string): ProductionDeploymentRecord | null | Promise<ProductionDeploymentRecord | null>;
+  revokeProductionDeploymentApproval(projectId: string, approvalId: string): void | Promise<void>;
+  beginProductionDeployment(input: { project_id: string; approval_id: string; token_sha256: string; requested_by_principal_id: string }):
+    { record: ProductionDeploymentRecord; created: boolean } | Promise<{ record: ProductionDeploymentRecord; created: boolean }>;
+  completeProductionDeployment(input: { project_id: string; deployment_id: string; status: "SUCCEEDED" | "UNKNOWN"; receipt_sha256: string | null }): ProductionDeploymentRecord | Promise<ProductionDeploymentRecord>;
 
   // Milestone M6B: Stages 5-9 Lifecycle, Multi-Target Profiles, CR & Release Acceptance
   updateProjectMainRefCommitHash(input: {

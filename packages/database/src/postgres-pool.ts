@@ -1,3 +1,4 @@
+import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
 import { validateVerificationIsolation } from "./m6c3-validation.ts";
 import { validateCodeImportReceipt } from "./m6c-validation.ts";
 import { createHash, createHmac, pbkdf2Sync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
@@ -41,6 +42,8 @@ import {
   type PipelineSessionStatus,
   type PipelineStageName,
   type ProcessedWorkerEventRecord,
+  type ProductionDeploymentApprovalRecord,
+  type ProductionDeploymentRecord,
   type ProductPipelineBundle,
   type ProductPipelineSessionRecord,
   type ProjectBootstrapRecord,
@@ -2222,6 +2225,18 @@ function mapChangeRequestRow(row: Record<string, unknown>): ChangeRequestRecord 
     );
   }
   return record;
+}
+
+function mapProductionApproval(row: Record<string, unknown>): ProductionDeploymentApprovalRecord {
+  return { approval_id: String(row.approval_id), project_id: String(row.project_id), pipeline_session_id: String(row.pipeline_session_id),
+    release_id: String(row.release_id), release_package_sha256: String(row.release_package_sha256), commit_hash: String(row.commit_hash), artifact_sha256: String(row.artifact_sha256),
+    target_key: String(row.target_key), approver_principal_id: String(row.approver_principal_id), issued_at: new Date(String(row.issued_at)).toISOString(),
+    expires_at: new Date(String(row.expires_at)).toISOString(), token_sha256: String(row.token_sha256), status: row.status as ProductionDeploymentApprovalRecord["status"] };
+}
+function mapProductionDeployment(row: Record<string, unknown>): ProductionDeploymentRecord {
+  return { deployment_id: String(row.deployment_id), project_id: String(row.project_id), approval_id: String(row.approval_id), target_key: String(row.target_key),
+    requested_by_principal_id: String(row.requested_by_principal_id), status: row.status as ProductionDeploymentRecord["status"], started_at: new Date(String(row.started_at)).toISOString(),
+    completed_at: row.completed_at ? new Date(String(row.completed_at)).toISOString() : null, receipt_sha256: row.receipt_sha256 ? String(row.receipt_sha256) : null };
 }
 
 function mapReleaseAcceptancePackageRow(
@@ -7455,6 +7470,54 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         }
       }
     );
+  }
+
+  public assertOutsideTransaction(): void {
+    if (this.pool.getActiveTxSession()) throw new PostgresRlsError("23514", "Production execution requires its own committed transaction");
+  }
+
+  public async createProductionDeploymentApproval(input: ProductionDeploymentApprovalRecord): Promise<ProductionDeploymentApprovalRecord> {
+    const member = await this.getProjectMembership(input.project_id,input.approver_principal_id);
+    if (input.approver_principal_id !== this.pool.getActiveTxSession()?.currentPrincipalId || !member || !["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role)) throw new PostgresRlsError("42501", "Production approval requires the authenticated project approver");
+    const release = (await this.listReleaseAcceptancePackages(input.pipeline_session_id)).find((r) => r.release_id === input.release_id) ?? null;
+    validateProductionApproval(input,release,await this.clockTimestampIso());
+    const columns = ["approval_id","project_id","pipeline_session_id","release_id","release_package_sha256","commit_hash","artifact_sha256","target_key","approver_principal_id","issued_at","expires_at","token_sha256","status"] as const;
+    const result = await this.pool.queryInActiveTx(`INSERT INTO production_deployment_approvals(${columns.join(",")}) VALUES(${columns.map((_,i)=>`$${i+1}`).join(",")}) RETURNING *;`,columns.map((c)=>input[c]));
+    await this.insertOutboxEventSql(input.project_id,"production_deployment",input.approval_id,"deployment.approved",{approval_id:input.approval_id,release_id:input.release_id,target_key:input.target_key});
+    return mapProductionApproval(result.rows[0]!);
+  }
+  public async getProductionDeploymentApproval(approvalId: string): Promise<ProductionDeploymentApprovalRecord | null> {
+    const result = await this.pool.queryInActiveTx("SELECT * FROM production_deployment_approvals WHERE approval_id=$1::uuid;",[approvalId]);
+    return result.rows[0] ? mapProductionApproval(result.rows[0]) : null;
+  }
+  public async getProductionDeploymentByApproval(approvalId: string): Promise<ProductionDeploymentRecord | null> {
+    const result = await this.pool.queryInActiveTx("SELECT * FROM production_deployments WHERE approval_id=$1::uuid;",[approvalId]);
+    return result.rows[0] ? mapProductionDeployment(result.rows[0]) : null;
+  }
+  public async revokeProductionDeploymentApproval(projectId: string,approvalId: string): Promise<void> {
+    const result=await this.pool.queryInActiveTx("UPDATE production_deployment_approvals SET status='REVOKED' WHERE project_id=$1::uuid AND approval_id=$2::uuid AND status='ACTIVE' RETURNING approval_id;",[projectId,approvalId]);
+    if (!result.rowCount) throw new PostgresRlsError("23514","Only active deployment approval can be revoked");
+    await this.insertOutboxEventSql(projectId,"production_deployment",approvalId,"deployment.revoked",{approval_id:approvalId});
+  }
+  public async beginProductionDeployment(input: {project_id:string;approval_id:string;token_sha256:string;requested_by_principal_id:string}): Promise<{record:ProductionDeploymentRecord;created:boolean}> {
+    const result=await this.pool.queryInActiveTx("SELECT * FROM production_deployment_approvals WHERE project_id=$1::uuid AND approval_id=$2::uuid FOR UPDATE;",[input.project_id,input.approval_id]);
+    if (!result.rows[0]) throw new PostgresRlsError("42501","Invalid deployment approval token");
+    const approval=mapProductionApproval(result.rows[0]);
+    if (approval.token_sha256!==input.token_sha256 || input.requested_by_principal_id!==this.pool.getActiveTxSession()?.currentPrincipalId || !input.requested_by_principal_id.trim()) throw new PostgresRlsError("42501","Invalid deployment approval token");
+    const existing=await this.pool.queryInActiveTx("SELECT * FROM production_deployments WHERE approval_id=$1::uuid;",[input.approval_id]);
+    if(existing.rows[0])return{record:mapProductionDeployment(existing.rows[0]),created:false};
+    if(approval.status!=="ACTIVE" || Date.parse(approval.expires_at)<=Date.parse(await this.clockTimestampIso()))throw new PostgresRlsError("42501","Deployment approval expired, revoked or consumed");
+    const inserted=await this.pool.queryInActiveTx("INSERT INTO production_deployments(project_id,approval_id,target_key,requested_by_principal_id) VALUES($1::uuid,$2::uuid,$3,$4) RETURNING *;",[input.project_id,input.approval_id,approval.target_key,input.requested_by_principal_id]);
+    const record=mapProductionDeployment(inserted.rows[0]!);
+    await this.insertOutboxEventSql(input.project_id,"production_deployment",record.deployment_id,"deployment.started",{deployment_id:record.deployment_id,approval_id:input.approval_id,target_key:approval.target_key});
+    return{record,created:true};
+  }
+  public async completeProductionDeployment(input: {project_id:string;deployment_id:string;status:"SUCCEEDED"|"UNKNOWN";receipt_sha256:string|null}):Promise<ProductionDeploymentRecord>{
+    validateDeploymentCompletion(input.status,input.receipt_sha256);
+    const result=await this.pool.queryInActiveTx("UPDATE production_deployments SET status=$3,receipt_sha256=$4,completed_at=clock_timestamp() WHERE project_id=$1::uuid AND deployment_id=$2::uuid AND status='RUNNING' RETURNING *;",[input.project_id,input.deployment_id,input.status,input.receipt_sha256]);
+    if(!result.rows[0])throw new PostgresRlsError("23514","Only running deployment can complete");
+    await this.insertOutboxEventSql(input.project_id,"production_deployment",input.deployment_id,"deployment.completed",{deployment_id:input.deployment_id,status:input.status,receipt_sha256:input.receipt_sha256});
+    return mapProductionDeployment(result.rows[0]);
   }
 
   public async recordReleaseAcceptancePackage(
