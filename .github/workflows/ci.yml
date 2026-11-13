@@ -2699,6 +2699,8 @@ jobs:
           node-version: 22.x
           cache: npm
       - run: npm ci
+      - name: Verify Lima CLI fixtures and Darwin guards (no VM started)
+        run: npm run test:m6c3:vm-lima
       - run: npm install --global @openai/codex@0.167.2
       - name: Verify real sandbox commit, common ref denial and worker cleanup
         run: |

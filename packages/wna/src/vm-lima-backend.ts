@@ -39,7 +39,7 @@ import { isAbsolute, win32 } from "node:path";
 
 export type LimaInstanceStatus = "Running" | "Stopped" | "Installing" | "Broken" | "Uninitialized";
 
-export const SUPPORTED_LIMA_STATUSES: ReadonlySet<string> = new Set<LimaInstanceStatus>([
+const SUPPORTED_LIMA_STATUSES: ReadonlySet<string> = new Set<LimaInstanceStatus>([
   "Running",
   "Stopped",
   "Installing",
@@ -517,13 +517,18 @@ export class LimaVmBackend {
         const rawStdout = Buffer.concat(stdoutChunks);
         const rawStderr = Buffer.concat(stderrChunks);
 
-        resolve({
-          exitCode: exitCode ?? (signalStr ? 128 : -1),
-          stdout: rawStdout.toString("utf8"),
-          stderr: rawStderr.toString("utf8"),
-          rawStdout,
-          rawStderr,
-        });
+        try {
+          const decoder = new TextDecoder("utf-8", { fatal: true });
+          resolve({
+            exitCode: exitCode ?? (signalStr ? 128 : -1),
+            stdout: decoder.decode(rawStdout),
+            stderr: decoder.decode(rawStderr),
+            rawStdout,
+            rawStderr,
+          });
+        } catch {
+          reject(new Error("ERR_VM_OUTPUT_INVALID: Lima CLI output is not valid UTF-8"));
+        }
       };
 
       const terminateChildAndSettleBounded = (reason: "timeout" | "abort" | "overflow") => {
@@ -588,12 +593,12 @@ export class LimaVmBackend {
         stderrChunks.push(chunk);
       });
 
-      child.on("error", (err) => {
+      child.on("error", () => {
         if (settled) return;
         settled = true;
         cleanupAllTimers();
         destroyStreams();
-        reject(new Error(`ERR_VM_COMMAND_SPAWN_FAILED: ${sanitizeErrorOutput(err.message)}`));
+        reject(new Error("ERR_VM_COMMAND_SPAWN_FAILED: Unable to launch configured Lima CLI"));
       });
 
       child.on("exit", (code, signalStr) => {
@@ -620,7 +625,7 @@ export class LimaVmBackend {
     const result = await this.runHostCli(["list", "--json"], signal);
     if (result.exitCode !== 0) {
       throw new Error(
-        `ERR_LIMA_PROBE_FAILED: limactl list exited with code ${result.exitCode}: ${sanitizeErrorOutput(result.stderr)}`
+        `ERR_LIMA_PROBE_FAILED: limactl list exited with code ${result.exitCode}`
       );
     }
 
@@ -665,7 +670,7 @@ export class LimaVmBackend {
     const result = await this.runHostCli(startArgs, signal);
     if (result.exitCode !== 0) {
       throw new Error(
-        `ERR_VM_START_FAILED: Failed to start instance "${this.config.instanceName}": ${sanitizeErrorOutput(result.stderr)}`
+        `ERR_VM_START_FAILED: Failed to start instance "${this.config.instanceName}"`
       );
     }
   }
@@ -696,7 +701,7 @@ export class LimaVmBackend {
     const result = await this.runHostCli(stopArgs, signal);
     if (result.exitCode !== 0) {
       throw new Error(
-        `ERR_VM_STOP_FAILED: Failed to stop instance "${this.config.instanceName}": ${sanitizeErrorOutput(result.stderr)}`
+        `ERR_VM_STOP_FAILED: Failed to stop instance "${this.config.instanceName}"`
       );
     }
   }

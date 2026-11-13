@@ -1837,3 +1837,12 @@ export {
   type VmProbeResult as Wsl2VmProbeResult,
   type VmCommandResult as Wsl2VmCommandResult,
 } from "./vm-wsl2-backend.ts";
+
+// Lima foundation; native start and diagnostic execution remain fail-closed.
+export {
+  LimaVmBackend,
+  type LimaVmBackendConfig,
+  type LimaInstanceStatus,
+  type VmProbeResult as LimaVmProbeResult,
+  type VmCommandResult as LimaVmCommandResult,
+} from "./vm-lima-backend.ts";

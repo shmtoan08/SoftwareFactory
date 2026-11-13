@@ -92,7 +92,9 @@ describe("M6C-3 Step 6 — Lima VM Backend Foundation (LimaVmBackend)", () => {
   describe("Group 1: Production Platform Guard & Configuration Validation", () => {
     it("production guard rejects non-darwin platforms when testOnlyEmulator is false", () => {
       if (process.platform === "darwin") {
-        return; // Skip on native Darwin host
+        const backend = new LimaVmBackend({ binaryPath: "/usr/local/bin/limactl", instanceName: "worker-vm" });
+        assert.equal(backend.config.testOnlyEmulator, false);
+        return; // Constructor only: no native CLI invocation.
       }
 
       assert.throws(
@@ -251,7 +253,8 @@ describe("M6C-3 Step 6 — Lima VM Backend Foundation (LimaVmBackend)", () => {
 
     it("native mode (testOnlyEmulator: false) fails closed on start() and execOperatorCommand() on darwin", async () => {
       if (process.platform !== "darwin") {
-        return;
+        assert.throws(() => new LimaVmBackend({ binaryPath: "/usr/local/bin/limactl", instanceName: "worker-vm" }), /ERR_LIMA_PLATFORM_UNSUPPORTED/);
+        return; // Native operations are unreachable on this platform.
       }
 
       const backend = new LimaVmBackend({
@@ -1405,7 +1408,7 @@ describe("M6C-3 Step 6 — Lima VM Backend Foundation (LimaVmBackend)", () => {
             const backend = new LimaVmBackend({
               binaryPath: fixturePath,
               instanceName: "worker-vm",
-              commandTimeoutMs: 300,
+              commandTimeoutMs: 800,
               testOnlyEmulator: true,
             });
 
@@ -1418,8 +1421,9 @@ describe("M6C-3 Step 6 — Lima VM Backend Foundation (LimaVmBackend)", () => {
                 return true;
               }
             );
+            assert.ok(existsSync(pidFile), "Guest fixture must have executed before timeout, not just its probe");
             const durationMs = Date.now() - startTime;
-            assert.ok(durationMs >= 250, `Expected timeout to remain armed >= 250ms, settled in ${durationMs}ms`);
+            assert.ok(durationMs >= 750, `Expected timeout to remain armed >= 750ms, settled in ${durationMs}ms`);
             assert.ok(durationMs < 2000, `Expected bounded settlement < 2000ms, took ${durationMs}ms`);
           } finally {
             try {
@@ -1454,6 +1458,30 @@ describe("M6C-3 Step 6 — Lima VM Backend Foundation (LimaVmBackend)", () => {
   // --------------------------------------------------------------------------
   // Group 8: Error Sanitization Helper
   // --------------------------------------------------------------------------
+  describe("Integration: CLI error boundary", () => {
+    it("does not reflect arbitrary CLI stderr into probe errors", async () => {
+      await withTempFixture(`#!/usr/bin/env node
+        process.stderr.write('PRIVATE_DEPLOYMENT_VALUE_without_known_token_prefix');
+        process.exitCode = 1;
+      `, async (binaryPath) => {
+        const backend = new LimaVmBackend({ binaryPath, instanceName: "worker-vm", testOnlyEmulator: true });
+        await assert.rejects(backend.probe(), (error: Error) => {
+          assert.match(error.message, /ERR_LIMA_PROBE_FAILED/);
+          assert.doesNotMatch(error.message, /PRIVATE_DEPLOYMENT_VALUE/);
+          return true;
+        });
+      });
+    });
+    it("rejects invalid UTF-8 bytes without throwing outside the operation promise", async () => {
+      await withTempFixture(`#!/usr/bin/env node
+        process.stdout.write(Buffer.from([0xff, 0xfe, 0xff]));
+      `, async (binaryPath) => {
+        const backend = new LimaVmBackend({ binaryPath, instanceName: "worker-vm", testOnlyEmulator: true });
+        await assert.rejects(backend.probe(), /ERR_VM_OUTPUT_INVALID/);
+      });
+    });
+  });
+
   describe("Group 8: Error Sanitization Helper", () => {
     it("sanitizeErrorOutput redacts token, api key, and canary substrings", () => {
       const input = "Error with sk-mock-api-key-sample-value-12345 and ghp_sample_token_mock_123 and canary-mock-credential-val";

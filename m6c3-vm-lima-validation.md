@@ -6,7 +6,7 @@
 **Initial Commit SHA**: `78a7f40a9563b4631e6431ec65ca02b9ec408124`  
 **Branch**: `m6c3/vm-lima-foundation-b`  
 **Date**: 2026-11-13  
-**Status**: Complete (Unit & CLI Process Contract Tests Passed; Native Lima Host Evidence PENDING & Native Runtime Fail-Closed)
+**Status**: CLI foundation implemented; integration validation below; native Lima acceptance PENDING (native start/diagnostic fail closed)
 
 ---
 
@@ -117,3 +117,19 @@ Passed: **51** | Failed: **0** | Skipped: **0** (`10110.52ms`)
 ## 4. Environment Limits & Pending Status
 - **Native Lima Evidence**: **PENDING**. Full end-to-end VM virtualization on macOS VZ/QEMU hypervisor requires verified safe login shell isolation and template creation defenses in future milestones.
 - **Fail-Closed Guarantees**: Any attempt to invoke `start()` or `execOperatorCommand()` without explicit `testOnlyEmulator: true` safely halts with `ERR_LIMA_NATIVE_BOUNDARY_UNSUPPORTED`.
+
+## 5. Agent A takeover and integration
+
+The owner transferred remaining Lima work to A after B exhausted its quota. A preserved B's original commits `78a7f40` and `e899ec4`, cherry-picked both into the integration branch, and independently verified the baseline **103/103** Lima+WSL2 tests.
+
+A strengthened the inherited-pipe regression: its deadline is now 800 ms (longer than the removed 300 ms false-success fallback), and it asserts that the guest fixture actually wrote its descendant PID. This prevents a slow metadata probe timeout from masquerading as proof of guest pipe handling. A also replaced empty platform-specific test returns with real constructor/platform assertions; Darwin-only native-operation guard assertions remain exercised on macOS.
+
+Lima operation errors no longer include arbitrary CLI stderr or spawn error messages. UTF-8 decoding is strict and catches malformed byte output inside the operation promise. Two child-process tests verify arbitrary-secret stderr suppression and malformed-byte rejection. The internal status allowlist is no longer exported as a mutable Set.
+
+Public WNA exports expose the Lima backend and aliased contract types, using `.ts` imports. The default npm test suite now includes Lima; Linux PG16/17 jobs execute it, and the macOS native-Codex job also executes the Lima CLI fixture suite to exercise Darwin guards. This adds no VM installation or startup and does not wire either backend into production dispatch.
+
+Official schema checked against [Lima v2.0.3 instance types](https://github.com/lima-vm/lima/blob/v2.0.3/pkg/limatype/lima_instance.go) and [list implementation](https://github.com/lima-vm/lima/blob/v2.0.3/cmd/limactl/list.go). JSONL is the upstream piped format; JSON arrays are an additional parser input accepted by this adapter, not a claim that upstream emits arrays by default. The reference version is documented, not a runtime binary-version attestation.
+
+Native VM start/diagnostic, actual SSH/login controls, Linux guest cleanup/isolation and full M6C/G7 acceptance remain pending. Safe native metadata probing and explicitly opted-in targeted stop are the only native operations offered by this foundation.
+
+Local integration results (Node24.16.0/macOS): Lima **53/53**, WSL2 **52/52**, combined **105 tests / 19 suites / 105 pass / 0 fail, cancelled, skipped or todo**. Typecheck PASS; lint171 source files PASS; secret scan170 files/0leaks PASS. Full Linux PG16/17 and macOS CI results are linked in issue #16 for the exact pushed commit.
