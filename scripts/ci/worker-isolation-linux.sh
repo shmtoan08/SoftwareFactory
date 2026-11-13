@@ -37,7 +37,6 @@ else
   exit "$sf_isolation_result"
 fi
 if [[ "$sf_isolation_strict" == 1 ]]; then
-  grep -Eq '^# tests [1-9][0-9]*$' "$sf_isolation_log" &&
-    grep -Eq '^# fail 0$' "$sf_isolation_log" &&
-    grep -Eq '^# skipped 0$' "$sf_isolation_log" || { echo 'Strict acceptance requires an executed TAP summary with zero failures/skips' >&2; exit 1; }
+  sf_isolation_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  bash "$sf_isolation_dir/worker-isolation-tap-summary.sh" "$sf_isolation_log"
 fi
