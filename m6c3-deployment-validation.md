@@ -1,6 +1,6 @@
 # M6C-3 — Signed Production Deployment Gate
 
-Baseline: `7edf453` on main. Its CI #43348718857 passed all four jobs. GitHub review retrieved for the preceding verifier commit `f963c6d` was ĐẠT; no newer review comment for `7edf453` was visible when work began. The owner explicitly authorized continuing development.
+Baseline: `7edf453` on main. Its CI #43348718857 passed all four jobs. [Team review of 7edf453](https://github.com/shmtoan08/SoftwareFactory/commit/7edf45398045bde80d065ead2fbeeb7e5b443efc#commitcomment-209696069) is **ĐẠT**, with no blocking issues. Its optional token-permission wording note is addressed in README and the verifier report.
 
 ## Implemented boundary
 
