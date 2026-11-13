@@ -2755,18 +2755,38 @@ jobs:
       - name: Verify independent worker adversarial and isolation acceptance without skips
         run: sudo env PATH="$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash scripts/ci/worker-isolation-linux.sh --strict-linux
 
-      - name: Prove strict acceptance rejects a TAP run containing skips
+      - name: Prove strict acceptance rejects incomplete or non-passing TAP runs
         run: |
-          SF_SKIP_PROBE_DIR="$(mktemp -d)"
-          trap 'rm -rf "$SF_SKIP_PROBE_DIR"' EXIT
-          cat > "$SF_SKIP_PROBE_DIR/node" <<'SH'
+          SF_TAP_PROBE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$SF_TAP_PROBE_DIR"' EXIT
+          cat > "$SF_TAP_PROBE_DIR/node" <<'SH'
           #!/bin/sh
-          printf '# tests 1\n# fail 0\n# skipped 1\n'
+          cat "$SF_TAP_PROBE_LOG"
           SH
-          chmod +x "$SF_SKIP_PROBE_DIR/node"
-          if sudo env PATH="$SF_SKIP_PROBE_DIR:$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash scripts/ci/worker-isolation-linux.sh --strict-linux > "$SF_SKIP_PROBE_DIR/output" 2>&1; then
-            cat "$SF_SKIP_PROBE_DIR/output"
-            exit 1
-          fi
-          cat "$SF_SKIP_PROBE_DIR/output"
-          grep -q 'Strict acceptance requires an executed TAP summary' "$SF_SKIP_PROBE_DIR/output"
+          chmod +x "$SF_TAP_PROBE_DIR/node"
+          for SF_TAP_CASE in skipped cancelled todo pass-mismatch missing-pass; do
+            SF_TAP_PASS=1
+            SF_TAP_SKIPPED=0
+            SF_TAP_CANCELLED=0
+            SF_TAP_TODO=0
+            case "$SF_TAP_CASE" in
+              skipped) SF_TAP_SKIPPED=1 ;;
+              cancelled) SF_TAP_CANCELLED=1 ;;
+              todo) SF_TAP_TODO=1 ;;
+              pass-mismatch) SF_TAP_PASS=0 ;;
+            esac
+            {
+              echo '# tests 1'
+              if [ "$SF_TAP_CASE" != missing-pass ]; then echo "# pass $SF_TAP_PASS"; fi
+              echo '# fail 0'
+              echo "# cancelled $SF_TAP_CANCELLED"
+              echo "# skipped $SF_TAP_SKIPPED"
+              echo "# todo $SF_TAP_TODO"
+            } > "$SF_TAP_PROBE_DIR/input"
+            if sudo env PATH="$SF_TAP_PROBE_DIR:$PATH" SF_TAP_PROBE_LOG="$SF_TAP_PROBE_DIR/input" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash scripts/ci/worker-isolation-linux.sh --strict-linux > "$SF_TAP_PROBE_DIR/output" 2>&1; then
+              cat "$SF_TAP_PROBE_DIR/output"
+              exit 1
+            fi
+            cat "$SF_TAP_PROBE_DIR/output"
+            grep -q 'Strict acceptance requires an executed TAP summary' "$SF_TAP_PROBE_DIR/output"
+          done

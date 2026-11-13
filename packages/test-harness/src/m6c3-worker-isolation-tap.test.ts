@@ -508,3 +508,22 @@ describe("M6C-3 Step 5 — Strict TAP Summary Validator (worker-isolation-tap-su
     });
   });
 });
+
+
+describe("TAP decimal counter precision", () => {
+  const summary = (tests: string, passed: string) => `# tests ${tests}\n# pass ${passed}\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n`;
+  it("rejects unequal decimal counts that round to the same awk floating-point number", () => {
+    withTempLog(summary("9007199254740992", "9007199254740993"), (path) => {
+      const result = runValidator([path]);
+      assert.equal(result.status, 1);
+      assert.ok(result.stderr.startsWith(REQUIRED_PREFIX));
+      assert.ok(result.stderr.includes("does not match"));
+    });
+  });
+  it("accepts exactly equal decimal counts beyond floating-point precision", () => {
+    withTempLog(summary("9007199254740993", "9007199254740993"), (path) => assert.equal(runValidator([path]).status, 0));
+  });
+  it("compares leading-zero decimal counters canonically", () => {
+    withTempLog(summary("0002", "2"), (path) => assert.equal(runValidator([path]).status, 0));
+  });
+});

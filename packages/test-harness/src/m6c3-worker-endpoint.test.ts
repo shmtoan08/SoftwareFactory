@@ -25,7 +25,7 @@ async function fixture(options: { config?: Partial<WorkerEndpointServerConfig>; 
 }
 async function post(endpoint: string, route: string, a: unknown, patch: Record<string, unknown> = {}, key?: string, badSignature = false) {
   const nonce = randomBytes(24).toString("hex"); const body = { schema_version: "sf-target-v1", nonce, action: a, ...patch };
-  return fetch(`${endpoint}/${route}`, { method: "POST", headers: { "content-type": "application/json", "x-sf-target-signature": badSignature ? "0".repeat(64) : signTargetProtocol(secret, "request", `/${route}`, nonce, body), ...(key ? { "idempotency-key": key } : {}) }, body: JSON.stringify(body) });
+  return fetch(`${endpoint}/${route}`, { method: "POST", signal: AbortSignal.timeout(5000), headers: { "content-type": "application/json", "x-sf-target-signature": badSignature ? "0".repeat(64) : signTargetProtocol(secret, "request", `/${route}`, nonce, body), ...(key ? { "idempotency-key": key } : {}) }, body: JSON.stringify(body) });
 }
 describe("M6C-3 worker endpoint and durable journal", () => {
   it("real HTTP protocol signs health and terminal replay with fresh nonce, without runner re-execution", async () => {
@@ -47,21 +47,37 @@ describe("M6C-3 worker endpoint and durable journal", () => {
       assert.equal((await post(fx.endpoint, "execute", a, { endpoint: "https://attacker.test" }, a.execution_id)).ok, false);
       assert.equal((await post(fx.endpoint, "execute", a)).ok, false);
       assert.equal((await post(fx.endpoint, "health", { injected: "command" })).ok, false);
-      try { const response = await post(fx.endpoint, "health", { padding: "x".repeat(20000) }); assert.equal(response.ok, false); } catch { /* bounded stream cancellation may close transport */ }
+      const oversized = await post(fx.endpoint, "health", { padding: "x".repeat(20000) });
+      assert.equal(oversized.status, 400); await oversized.text();
       assert.equal(fx.calls(), 0); assert.equal(new WorkerExecutionJournal(fx.stateDir, "tenant-a").read(a), null);
     } finally { await fx.close(); }
   });
-  it("two endpoint instances/process-safe journal claims cannot run one execution twice", async () => {
-    const first = await fixture(); let unblock!: () => void; const gate = new Promise<void>((resolve) => { unblock = resolve; }); let calls = 0;
-    const runner: WorkerEndpointRunner = { health: async () => {}, execute: async (a) => { calls++; await gate; return { submission, cleanupEvidence: evidence(a) }; } };
+  it("two endpoint instances/process-safe journal claims cannot run one execution twice", { timeout: 10000 }, async () => {
+    const first = await fixture();
+    let unblock!: () => void, markEntered!: () => void;
+    const gate = new Promise<void>((resolve) => { unblock = resolve; });
+    const entered = new Promise<void>((resolve) => { markEntered = resolve; }); let calls = 0;
+    const runner: WorkerEndpointRunner = { health: async () => {}, execute: async (a) => { calls++; markEntered(); await gate; return { submission, cleanupEvidence: evidence(a) }; } };
     const second = await fixture({ stateDir: first.stateDir, runner }); const third = await fixture({ stateDir: first.stateDir, runner }); const a = action();
+    const controller = new AbortController();
+    const observed = second.connector.execute(a, AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])).then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const one = second.connector.execute(a, AbortSignal.timeout(5000));
-      while (calls === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+      await Promise.race([
+        entered,
+        observed.then((result) => { throw new Error("First worker request settled before runner entry", { cause: result.ok ? undefined : result.error }); }),
+        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("First worker did not enter the runner within 2000ms")), 2000); }),
+      ]);
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined; }
       await assert.rejects(third.connector.execute(a, AbortSignal.timeout(2000))); assert.equal(calls, 1);
-      unblock(); await one;
+      unblock(); const result = await observed; if (!result.ok) throw result.error;
+      assert.deepEqual(result.value, submission);
       assert.deepEqual(await third.connector.execute(a, AbortSignal.timeout(3000)), submission); assert.equal(calls, 1);
-    } finally { unblock(); await third.close(); await second.close(); await first.close(); }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      controller.abort(); unblock(); await observed;
+      await third.close(); await second.close(); await first.close();
+    }
   });
   it("failed terminal persistence and aborted execution keep claims held across restart", async () => {
     const fx = await fixture({ config: { testOnlyHooks: { beforeTerminalPersist: () => { throw new Error("private-injected-error"); } } } }); const a = action();

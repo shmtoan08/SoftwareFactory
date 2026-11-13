@@ -65,7 +65,10 @@ BEGIN {
   }
 
   counter = $2;
-  val = $3 + 0;
+  # Compare canonical decimal strings, not awk doubles (which round above 2^53).
+  val = $3;
+  sub(/^0+/, "", val);
+  if (val == "") val = "0";
 
   if (counter == "tests") { tests_seen++; tests_val = val; }
   else if (counter == "pass") { pass_seen++; pass_val = val; }
@@ -98,12 +101,12 @@ END {
   if (todo_seen > 1) { printf "Strict acceptance requires an executed TAP summary: duplicate \"# todo\" counter (seen %d times)\n", todo_seen; exit 1; }
 
   # Check values
-  if (tests_val <= 0) { printf "Strict acceptance requires an executed TAP summary: tests count must be > 0 (got %d)\n", tests_val; exit 1; }
-  if (pass_val != tests_val) { printf "Strict acceptance requires an executed TAP summary: pass count (%d) does not match tests count (%d)\n", pass_val, tests_val; exit 1; }
-  if (fail_val != 0) { printf "Strict acceptance requires an executed TAP summary: fail count must be 0 (got %d)\n", fail_val; exit 1; }
-  if (cancelled_val != 0) { printf "Strict acceptance requires an executed TAP summary: cancelled count must be 0 (got %d)\n", cancelled_val; exit 1; }
-  if (skipped_val != 0) { printf "Strict acceptance requires an executed TAP summary: skipped count must be 0 (got %d)\n", skipped_val; exit 1; }
-  if (todo_val != 0) { printf "Strict acceptance requires an executed TAP summary: todo count must be 0 (got %d)\n", todo_val; exit 1; }
+  if (("n" tests_val) == "n0") { printf "Strict acceptance requires an executed TAP summary: tests count must be > 0 (got %s)\n", tests_val; exit 1; }
+  if (("n" pass_val) != ("n" tests_val)) { printf "Strict acceptance requires an executed TAP summary: pass count (%s) does not match tests count (%s)\n", pass_val, tests_val; exit 1; }
+  if (("n" fail_val) != "n0") { printf "Strict acceptance requires an executed TAP summary: fail count must be 0 (got %s)\n", fail_val; exit 1; }
+  if (("n" cancelled_val) != "n0") { printf "Strict acceptance requires an executed TAP summary: cancelled count must be 0 (got %s)\n", cancelled_val; exit 1; }
+  if (("n" skipped_val) != "n0") { printf "Strict acceptance requires an executed TAP summary: skipped count must be 0 (got %s)\n", skipped_val; exit 1; }
+  if (("n" todo_val) != "n0") { printf "Strict acceptance requires an executed TAP summary: todo count must be 0 (got %s)\n", todo_val; exit 1; }
 
   exit 0;
 }

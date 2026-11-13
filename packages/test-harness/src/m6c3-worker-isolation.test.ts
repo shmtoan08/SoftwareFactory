@@ -156,6 +156,7 @@ async function sendRawWorkerRequest(
   const body = { schema_version: "sf-target-v1", nonce, action: actionPayload, ...patch };
   return fetch(`${endpoint}/${route}`, {
     method: "POST",
+    signal: AbortSignal.timeout(5000),
     headers: {
       "content-type": "application/json",
       "x-sf-target-signature": badSignature

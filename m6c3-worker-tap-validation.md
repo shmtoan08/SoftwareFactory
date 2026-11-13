@@ -121,3 +121,10 @@ node --test packages/test-harness/src/m6c3-worker-isolation.test.ts
 - **Typecheck & Lint**: 163 files checked, 100% clean (0 error, 0 warning).
 - **Secret Scanner**: 162 files scanned, 0 leak phát hiện.
 - **Tài nguyên**: Không có daemon, service, database hay scope cgroup nào tồn lưu.
+
+
+## Integration follow-up
+
+A reproduced an awk numeric-rounding false acceptance for tests9007199254740992 versus pass9007199254740993. Counters are now compared as canonical decimal strings, preserving leading-zero handling without floating-point equality. Three additional cases verify unequal large integers, equal large integers and canonical leading-zero counts. The original B handoff has29 tests; integrated TAP suite has32 tests. These are parser fixtures, not evidence that billions of tests executed.
+
+The validator is added to the ordinary regression suite and Linux CI retains a full test-run integration probe with five invalid TAP fixtures: skipped, cancelled, todo, pass-mismatch and missing-pass. Each fixture must be rejected by the strict worker runner with the expected diagnostic. Exact final source/CI evidence is tracked in issue15 after merge main.

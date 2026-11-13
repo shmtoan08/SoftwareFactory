@@ -31,3 +31,10 @@ Chạy mutation checks một lần trên bản copy tạm của file test, sau m
 ## Phần Agent B
 
 TAP summary validator và regression tests riêng thực thi contract pass==tests, tests>0 và fail/cancelled/skipped/todo==0; thiếu/malformed/duplicate summary phải fail. A tích hợp commit READY và nối workflow/package scripts sau bàn giao. Kết quả của bản tích hợp xem issue15 và báo cáo TAP riêng, không suy diễn Linux PASS từ các skip Darwin.
+
+
+## Integrated TAP guard and companion suite
+
+B's handoff691709f is received as commit [bb26320](https://github.com/shmtoan08/SoftwareFactory/commit/bb2632009eacb92e099ce797f4ac8088c6f9ee1a), with29 standalone validator cases. Integration fixes awk precision loss by comparing canonical decimal strings; the integrated suite has32 cases. Ordinary PG regression now includes these32 parser cases alongside the prior145 tests. Strict Linux additionally exercises the existing worker3/3 and independent20-case suites; invalid skipped/cancelled/todo/pass-mismatch/missing-pass fixtures are negative probes, not skipped feature tests.
+
+The same empty-catch and unbounded-wait patterns were removed from A's companion worker-endpoint suite. Both HTTP test helpers now use a5-second request deadline. No production file or runtime policy was modified.
