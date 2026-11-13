@@ -680,6 +680,7 @@ export interface ControlPlaneStore {
     hermetic_network_disabled?: boolean;
     hardlink_cache_forbidden?: boolean;
     is_docker_isolated?: boolean;
+    isolation_runtime?: "runsc" | null;
     trusted_policy_sha256?: string | null;
     keep_verifying_on_infra_retry?: boolean;
     exit_code: number;

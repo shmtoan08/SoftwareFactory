@@ -1,3 +1,4 @@
+import { validateVerificationIsolation } from "./m6c3-validation.ts";
 import { validateCodeImportReceipt } from "./m6c-validation.ts";
 import { createHash, createHmac, pbkdf2Sync, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -1707,6 +1708,7 @@ function mapVerificationRunRow(row: Record<string, unknown>): VerificationRunRec
     hermetic_network_disabled: Boolean(row.hermetic_network_disabled ?? true),
     hardlink_cache_forbidden: Boolean(row.hardlink_cache_forbidden ?? true),
     is_docker_isolated: Boolean(row.is_docker_isolated ?? false),
+    isolation_runtime: row.isolation_runtime === "runsc" ? "runsc" : null,
     trusted_policy_sha256: row.trusted_policy_sha256 ? String(row.trusted_policy_sha256) : null,
     exit_code: Number(row.exit_code),
     duration_ms: Number(row.duration_ms),
@@ -4225,12 +4227,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     hermetic_network_disabled?: boolean;
     hardlink_cache_forbidden?: boolean;
     is_docker_isolated?: boolean;
+    isolation_runtime?: "runsc" | null;
     trusted_policy_sha256?: string | null;
     keep_verifying_on_infra_retry?: boolean;
     exit_code: number;
     duration_ms: number;
     report_sha256: string;
   }): Promise<VerificationRunRecord> {
+    validateVerificationIsolation(input);
     return this.withExistingOrRlsTransaction(
       { currentProjectId: input.project_id, currentRole: "core_api_service" },
       async () => {
@@ -4305,7 +4309,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
               tier3_agent_tests_passed, tier3_assertions_json,
               infra_retry_count, execution_backend, hermetic_network_disabled,
               hardlink_cache_forbidden, is_docker_isolated, trusted_policy_sha256,
-              exit_code, duration_ms, report_sha256
+              exit_code, duration_ms, report_sha256, isolation_runtime
             ) VALUES (
               $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text,
               $6::text, $7::text, $8::text,
@@ -4314,7 +4318,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
               $13::boolean, $14::jsonb,
               $15::integer, $16::text, $17::boolean,
               $18::boolean, $19::boolean, $20::text,
-              $21::integer, $22::integer, $23::text
+              $21::integer, $22::integer, $23::text, $24::text
             ) RETURNING *;`,
             [
               input.project_id,
@@ -4340,6 +4344,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
               input.exit_code,
               input.duration_ms,
               input.report_sha256,
+              input.isolation_runtime ?? null,
             ]
           );
           const record = mapVerificationRunRow(ins.rows[0]!);
@@ -4381,6 +4386,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
               infra_retry_count: record.infra_retry_count,
               execution_backend: record.execution_backend,
               is_docker_isolated: record.is_docker_isolated,
+              isolation_runtime: record.isolation_runtime,
               resulting_task_status: nextTaskStatus,
             }
           );

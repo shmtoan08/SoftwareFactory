@@ -1284,6 +1284,7 @@ export class CoreApiHttpServer {
           docker_image?: string;
           execution_mode?: "auto" | "docker" | "sandbox" | "subprocess";
           require_docker?: boolean;
+          require_kernel_isolation?: boolean;
           network_disabled?: boolean;
           step_timeout_ms?: number;
           max_infra_retries?: number;
@@ -1782,6 +1783,7 @@ export class HttpCoreApiClient {
       docker_image?: string;
       execution_mode?: "auto" | "docker" | "sandbox" | "subprocess";
       require_docker?: boolean;
+      require_kernel_isolation?: boolean;
       network_disabled?: boolean;
       step_timeout_ms?: number;
       max_infra_retries?: number;

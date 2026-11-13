@@ -1995,6 +1995,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_upgrade_test;"
@@ -2272,6 +2274,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6a_upgrade_test;"
@@ -2627,6 +2631,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6b_upgrade_test;"
@@ -2643,6 +2649,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
       - name: Prepare Optional Docker Verifier Base Image
@@ -2671,3 +2679,27 @@ jobs:
       - name: Verify real sandbox commit, common ref denial and worker cleanup
         run: |
           SF_TEST_CODEX_SANDBOX_BINARY="$(command -v codex)" node --test --test-name-pattern='Codex adapter contract|Codex runtime passes' packages/test-harness/src/m6c-import-adapters.test.ts
+
+  gvisor-verifier:
+    name: M6C-3 real gVisor verifier
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - name: Install pinned gVisor release and register Docker runtime
+        run: |
+          curl -fL --retry 3 -o /tmp/gvisor-x86_64.tar.bz2 https://github.com/google/gvisor/releases/download/release-20261109.0/gvisor-x86_64.tar.bz2
+          echo '0846228061b05eb936a96ed2ea205cbd8ddf6936c946f8a390b699cff3b5c138  /tmp/gvisor-x86_64.tar.bz2' | sha256sum -c -
+          sudo tar -xjf /tmp/gvisor-x86_64.tar.bz2 -C /usr/local/bin
+          sudo /usr/local/bin/runsc install
+          sudo systemctl restart docker
+          /usr/local/bin/runsc --version
+          docker info --format '{{json .Runtimes}}'
+          docker pull node:22-alpine
+      - name: Verify all tiers under real runsc with no fallback
+        run: npm run test:m6c3:gvisor

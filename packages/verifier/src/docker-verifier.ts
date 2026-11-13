@@ -38,6 +38,28 @@ export class DockerVerifierUnavailableError extends Error {
   }
 }
 
+export class KernelIsolationUnavailableError extends DockerVerifierUnavailableError {
+  constructor(message: string) { super(`ERR_KERNEL_ISOLATION_UNAVAILABLE: ${message}`); this.name = "KernelIsolationUnavailableError"; }
+}
+
+/** Server configuration only. Unknown values must never weaken isolation. */
+export function parseVerifierIsolationPolicy(value: string | undefined): "standard" | "gvisor" {
+  if (value === undefined || value === "standard") return "standard";
+  if (value === "gvisor") return "gvisor";
+  throw new KernelIsolationUnavailableError("SF_VERIFIER_ISOLATION must be standard or gvisor");
+}
+
+export function probeGvisorRuntime(): boolean {
+  const probe = spawnSync("docker", ["info", "--format", "{{json .Runtimes}}"], { encoding: "utf8", timeout: 5_000, maxBuffer: 65_536 });
+  if (probe.error || probe.status !== 0) return false;
+  try {
+    const runtimes: unknown = JSON.parse(probe.stdout);
+    return runtimes !== null && typeof runtimes === "object" && !Array.isArray(runtimes)
+      && Object.hasOwn(runtimes, "runsc") && typeof (runtimes as Record<string, unknown>).runsc === "object"
+      && (runtimes as Record<string, unknown>).runsc !== null;
+  } catch { return false; }
+}
+
 export class HardlinkCacheViolationError extends Error {
   public readonly code = "ERR_HARDLINK_CACHE_VIOLATION";
   constructor(message: string) {
@@ -84,6 +106,8 @@ export interface VerifierRunInput {
   readonly dockerImage?: string;
   readonly executionMode?: "auto" | "docker" | "sandbox" | "subprocess";
   readonly requireDocker?: boolean;
+  /** A caller can strengthen, never weaken, the verifier constructor policy. */
+  readonly requireKernelIsolation?: boolean;
   readonly networkDisabled?: boolean;
   readonly stepTimeoutMs?: number;
   readonly maxInfraRetries?: number;
@@ -115,6 +139,8 @@ export interface SingleVerificationAttemptResult {
   readonly verifierImageDigest: string;
   readonly executionBackend: VerificationExecutionBackend;
   readonly isDockerIsolated: boolean;
+  /** Selected runtime, not a claim that any test actually executed. See tierOutcomes. */
+  readonly isolationRuntime: "runsc" | null;
   readonly hermeticNetworkDisabled: boolean;
   readonly hardlinkCacheForbidden: boolean;
   readonly kernelSysctls: LinuxKernelHardlinkSymlinkSysctls;
@@ -287,6 +313,7 @@ export function probeDockerVerifierSupport(dockerImage = "node:22-alpine"): Dock
  */
 export function buildDockerRunSecurityArgs(options: {
   readonly containerName?: string;
+  readonly isolationRuntime?: "runsc";
   readonly dockerImage: string;
   readonly baselineDir: string;
   readonly trustedAcceptanceDir: string;
@@ -295,8 +322,15 @@ export function buildDockerRunSecurityArgs(options: {
   readonly env?: Readonly<Record<string, string>>;
   readonly command: readonly string[];
 }): string[] {
+  if (options.isolationRuntime !== undefined && options.isolationRuntime !== "runsc") {
+    throw new KernelIsolationUnavailableError("Only the runsc runtime is supported");
+  }
+  if (options.isolationRuntime && options.networkDisabled === false) {
+    throw new KernelIsolationUnavailableError("gVisor verification requires network=none");
+  }
   const args: string[] = [
     "run",
+    ...(options.isolationRuntime ? ["--runtime=runsc"] : []),
     "--rm",
     ...(options.containerName ? ["--name", options.containerName] : []),
     "--read-only",
@@ -889,8 +923,10 @@ function restoreDirectoryWritableRecursive(dirPath: string): void {
 export class Docker3TierVerifier {
   public readonly snapshotStore: ImmutableSourceSnapshotStore;
 
-  constructor(options: { snapshotStore: ImmutableSourceSnapshotStore }) {
+  private readonly isolationPolicy: "standard" | "gvisor";
+  constructor(options: { snapshotStore: ImmutableSourceSnapshotStore; isolationPolicy?: "standard" | "gvisor" }) {
     this.snapshotStore = options.snapshotStore;
+    this.isolationPolicy = parseVerifierIsolationPolicy(options.isolationPolicy);
   }
 
   public async runSingleAttempt(
@@ -900,6 +936,10 @@ export class Docker3TierVerifier {
     const startedMs = Date.now();
     const dockerImage = input.dockerImage ?? "node:22-alpine";
     const mode = input.executionMode ?? "auto";
+    const kernelIsolationRequired = this.isolationPolicy === "gvisor" || input.requireKernelIsolation === true;
+    if (kernelIsolationRequired && (mode === "subprocess" || mode === "sandbox" || input.networkDisabled === false)) {
+      throw new KernelIsolationUnavailableError("gVisor policy forbids host fallback and network access");
+    }
     const kernelSysctls = probeLinuxHardlinkSymlinkSysctls();
     const dockerProbe =
       mode === "subprocess" || mode === "sandbox"
@@ -920,6 +960,11 @@ export class Docker3TierVerifier {
       );
     }
 
+    if (kernelIsolationRequired && (!dockerProbe.daemonAvailable || !dockerProbe.imageAvailable
+      || !/^sha256:[a-f0-9]{64}$/.test(dockerProbe.imageDigest ?? "") || !probeGvisorRuntime())) {
+      throw new KernelIsolationUnavailableError("Docker, a local image digest and registered runsc are required; no fallback is allowed");
+    }
+    const isolationRuntime = kernelIsolationRequired ? "runsc" as const : null;
     const useDocker = dockerProbe.daemonAvailable && dockerProbe.imageAvailable;
     const useLinuxSupervisor = !useDocker && mode === "sandbox" && process.platform === "linux";
     const executionBackend: VerificationExecutionBackend = useDocker
@@ -939,7 +984,7 @@ export class Docker3TierVerifier {
     const finalizeReport = (
       partial: Omit<
         SingleVerificationAttemptResult,
-        "reportSha256" | "durationMs"
+        "reportSha256" | "durationMs" | "isolationRuntime"
       > & { durationMs?: number }
     ): SingleVerificationAttemptResult => {
       const durationMs = partial.durationMs ?? Date.now() - startedMs;
@@ -953,6 +998,7 @@ export class Docker3TierVerifier {
           verifierImageDigest: partial.verifierImageDigest,
           executionBackend: partial.executionBackend,
           isDockerIsolated: partial.isDockerIsolated,
+          isolationRuntime,
           tier1TrustedAcceptancePassed: partial.tier1TrustedAcceptancePassed,
           tier2ProtectedBaselinePassed: partial.tier2ProtectedBaselinePassed,
           tier2BaselineTamperDetected: partial.tier2BaselineTamperDetected,
@@ -966,6 +1012,7 @@ export class Docker3TierVerifier {
       );
       return {
         ...partial,
+        isolationRuntime,
         durationMs,
         reportSha256,
       };
@@ -1296,7 +1343,8 @@ export class Docker3TierVerifier {
             .join(" ");
           const dockerArgs = buildDockerRunSecurityArgs({
             containerName,
-            dockerImage,
+            isolationRuntime: isolationRuntime ?? undefined,
+            dockerImage: isolationRuntime ? dockerProbe.imageDigest! : dockerImage,
             baselineDir,
             trustedAcceptanceDir: roAcceptanceDir,
             depsCacheDir: roDepsDir,

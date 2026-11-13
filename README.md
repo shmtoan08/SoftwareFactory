@@ -59,6 +59,7 @@ psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0009_m6c_parallel_schedu
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0010_m6c_extended_code_import_submissions.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_hardening.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 ```
 
@@ -164,7 +165,7 @@ Both `/scheduler/dispatch` and `/tasks/:taskId/dispatch` enforce project capacit
 
 ## M6C-2 Runtime & Import API
 
-Apply migrations through `0012` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
+Apply migrations through `0013` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
 
 Production `SF_AGENT_RUNTIME=codex-cli` is disabled with `ERR_UNMETERED_CODEX_DISABLED` until trusted Cost Guard metering is integrated (explicit project-owner decision for issue #8 note 9). There is no environment flag to enable unmetered production calls. Provider-free fixtures explicitly pass `testOnlyEmulator: true`, an emulator binary and the fixed `CODEX_EMULATOR_CREDENTIAL`; live credentials and resolver callbacks are rejected in that mode. The detached-worktree permission profile and controlled push remain tested by a mandatory native Codex sandbox CI job. Runtime timeout belongs to WNA, which enforces the adapter's `timeoutMs` and reaps/cleans the invocation. See [remaining-note validation](./m6c-review-notes-validation.md).
 
@@ -194,3 +195,13 @@ For a provider-free native sandbox smoke, set `SF_TEST_CODEX_SANDBOX_BINARY` to 
 See [the remaining-note report](./m6c-review-notes-validation.md) for all 14 follow-ups. The legacy CAS API now uses the FIFO queue and project lock; a request behind older entries must drain the queue first. Budget denials use a durable PostgreSQL intent journal before transaction-end retry; snapshot/dispatch/preflight replay completed-owner intents after a crash. Pending intents block new execution until replay succeeds. Journal payloads contain hashes/usage/request identity, never provider credentials or prompts.
 
 Bootstrap coordination uses a native POSIX `flock` helper (a C compiler is required on the coordinator host). Kernel locks release on helper exit or coordinator EOF. Lock sidecar inodes remain in place intentionally; do not unlink them while a bootstrap is active. Stop pre-upgrade coordinators before switching from the old existence-only lock. Pending-ref cleanup runs during bootstrap and respects live same-host owners and ref creation timestamps. Custom acceptance assertions are parsed/allowlisted/reprinted from AST; executing candidate exports still belongs inside the verifier sandbox.
+
+### M6C-3 in progress: gVisor verifier foundation
+
+Set `SF_VERIFIER_ISOLATION=gvisor` on the Core API to require registered Docker `runsc` for every tier. Unset or `standard` retains the existing Tier 1/2 verification policy; other values fail startup. A request can strengthen this with `require_kernel_isolation: true`, but `false`, admin overrides and host execution modes cannot weaken the constructor policy. No host/runc fallback or network-enabled run is permitted under gVisor policy. The selected local image is pinned by SHA-256 across tiers.
+
+Migration `0013` stores nullable `verification_runs.isolation_runtime`; it remains NULL for historical/standard runs. `runsc` evidence must bind to network-disabled Docker, `is_docker_isolated=true`, and an immutable image digest in both stores and in SQL. It is included in the report hash and completion event. Runtime selection alone does not prove a tier executed: inspect verdict/status and tier outcomes as well. Trust the operator-managed Docker daemon and runtime installation, not assertions from candidate code.
+
+Run `npm run test:m6c3` for policy, failure, persistence and RLS checks. `npm run test:m6c3:gvisor` requires a real Linux Docker daemon with gVisor and a local `node:22-alpine` image; it fails rather than skips when unavailable. A dedicated required-in-workflow Linux CI job installs checksummed gVisor `release-20261109.0` and runs all three tiers, protected-mount/credential/network probes and container cleanup checks. [Official installation](https://gvisor.dev/docs/user_guide/install/) and [Docker runtime configuration](https://gvisor.dev/docs/user_guide/quick_start/docker/) are the operator references.
+
+This is the first M6C-3 implementation slice. External target connectors, automatic trust-tier routing, Firecracker, Lima/WSL2 and the signed production deployment gate remain pending; M6C/G7 is not accepted. See [the M6C-3 report](./m6c3-validation-report.md).

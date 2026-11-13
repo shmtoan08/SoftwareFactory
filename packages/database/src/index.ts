@@ -1,3 +1,4 @@
+import { validateVerificationIsolation } from "./m6c3-validation.ts";
 import { validateCodeImportReceipt } from "./m6c-validation.ts";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -2072,6 +2073,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     hermetic_network_disabled?: boolean;
     hardlink_cache_forbidden?: boolean;
     is_docker_isolated?: boolean;
+    isolation_runtime?: "runsc" | null;
     trusted_policy_sha256?: string | null;
     keep_verifying_on_infra_retry?: boolean;
     exit_code: number;
@@ -2079,6 +2081,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     report_sha256: string;
   }): VerificationRunRecord {
     this.assertWritePermissionForProject(input.project_id);
+    validateVerificationIsolation(input);
     const mc = this.mergeCandidates.get(input.merge_candidate_id);
     const task = this.tasks.get(input.task_id);
     if (
@@ -2178,6 +2181,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       hermetic_network_disabled: input.hermetic_network_disabled ?? true,
       hardlink_cache_forbidden: input.hardlink_cache_forbidden ?? true,
       is_docker_isolated: input.is_docker_isolated ?? false,
+      isolation_runtime: input.isolation_runtime ?? null,
       trusted_policy_sha256: input.trusted_policy_sha256 ?? null,
       exit_code: input.exit_code,
       duration_ms: input.duration_ms,
@@ -2217,6 +2221,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         infra_retry_count: record.infra_retry_count,
         execution_backend: record.execution_backend,
         is_docker_isolated: record.is_docker_isolated,
+        isolation_runtime: record.isolation_runtime,
         resulting_task_status: task.status,
       }
     );

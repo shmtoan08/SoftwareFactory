@@ -1291,6 +1291,7 @@ export class CoreApiService {
       docker_image?: string;
       execution_mode?: "auto" | "docker" | "sandbox" | "subprocess";
       require_docker?: boolean;
+      require_kernel_isolation?: boolean;
       network_disabled?: boolean;
       step_timeout_ms?: number;
       max_infra_retries?: number;
@@ -1359,6 +1360,7 @@ export class CoreApiService {
       dockerImage: input.docker_image,
       executionMode: input.execution_mode,
       requireDocker: input.require_docker,
+      requireKernelIsolation: input.require_kernel_isolation,
       networkDisabled: input.network_disabled,
       stepTimeoutMs: input.step_timeout_ms,
       maxInfraRetries: input.max_infra_retries,
@@ -1396,6 +1398,7 @@ export class CoreApiService {
               hermetic_network_disabled: attempt.hermeticNetworkDisabled,
               hardlink_cache_forbidden: attempt.hardlinkCacheForbidden,
               is_docker_isolated: attempt.isDockerIsolated,
+              isolation_runtime: attempt.isolationRuntime,
               trusted_policy_sha256: attempt.trustedPolicySha256,
               keep_verifying_on_infra_retry:
                 attempt.overallStatus === "INFRA_ERROR" && !isFinal,
@@ -1474,6 +1477,7 @@ export class CoreApiService {
       docker_image?: string;
       execution_mode?: "auto" | "docker" | "sandbox" | "subprocess";
       require_docker?: boolean;
+      require_kernel_isolation?: boolean;
       network_disabled?: boolean;
       step_timeout_ms?: number;
       max_infra_retries?: number;
@@ -1531,6 +1535,7 @@ export class CoreApiService {
       docker_image: input.docker_image,
       execution_mode: input.execution_mode,
       require_docker: input.require_docker,
+      require_kernel_isolation: input.require_kernel_isolation,
       network_disabled: input.network_disabled,
       step_timeout_ms: input.step_timeout_ms,
       max_infra_retries: input.max_infra_retries,

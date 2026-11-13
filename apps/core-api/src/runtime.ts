@@ -23,6 +23,7 @@ import {
 import type { ModelPricingRate } from "@software-factory/shared-types";
 import {
   Docker3TierVerifier,
+  parseVerifierIsolationPolicy,
   ImmutableSourceSnapshotStore,
 } from "@software-factory/verifier";
 import { CoreApiHttpServer, type CoreApiVerifyHttpPolicy } from "./http-server.ts";
@@ -112,6 +113,7 @@ export async function createCoreApiRuntime(
   options?: CreateCoreApiRuntimeOptions
 ): Promise<CoreApiRuntime> {
   const env = options?.env ?? process.env;
+  const isolationPolicy = parseVerifierIsolationPolicy(env.SF_VERIFIER_ISOLATION);
   const requirePostgres = options?.requirePostgres ?? env.SF_REQUIRE_POSTGRES === "1";
 
   const ownedHandle = options?.store
@@ -137,7 +139,7 @@ export async function createCoreApiRuntime(
     : (ephemeralSnapshotDir = mkdtempSync(join(tmpdir(), "sf-core-api-snapshots-")));
 
   const snapshotStore = new ImmutableSourceSnapshotStore({ storageDir: snapshotRootDir });
-  const verifier = new Docker3TierVerifier({ snapshotStore });
+  const verifier = new Docker3TierVerifier({ snapshotStore, isolationPolicy });
   const authenticator = new CoreApiTokenAuthenticator({
     signingSecret: options?.authSecret ?? env.SF_CORE_API_AUTH_SECRET,
     clockFn: options?.clockFn,
