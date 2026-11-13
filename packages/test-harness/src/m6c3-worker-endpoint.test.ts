@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createWorkerEndpointServer, LinuxWorkerEndpointRunner, WorkerExecutionJournal, type WorkerEndpointRunner, type WorkerEndpointServerConfig, type SandboxCleanupEvidence } from "@software-factory/wna";
+import { createWorkerEndpointServer, LinuxWorkerEndpointRunner, WorkerExecutionJournal, assertWorkerCleanup, type WorkerEndpointRunner, type WorkerEndpointServerConfig, type SandboxCleanupEvidence } from "@software-factory/wna";
 import { UserManagedWorkerHttpConnector, signTargetProtocol, type ExternalTargetAction } from "@software-factory/adapter-sdk";
 import { CoreApiService } from "@software-factory/core-api";
 import { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
@@ -87,11 +87,10 @@ describe("M6C-3 worker endpoint and durable journal", () => {
     } finally { if (child.exitCode === null) child.kill("SIGKILL"); rmSync(stateDir, { recursive: true, force: true }); }
   });
   it("production endpoint refuses simulated cleanup; strict Linux runner fails closed on unsupported host", async () => {
-    const fx = await fixture({ config: { testOnlyEmulator: false } }); const a = action();
-    try { await assert.rejects(fx.connector.execute(a, AbortSignal.timeout(3000))); assert.equal(new WorkerExecutionJournal(fx.stateDir, "tenant-a").read(a)?.status, "CLAIMED"); }
-    finally { await fx.close(); }
+    const a = action(); assert.throws(() => assertWorkerCleanup(evidence(a), a), /kernel cleanup/);
     const stateDir = mkdtempSync(join(tmpdir(), "sf-m6c3-a-kernel-")); chmodSync(stateDir, 0o700);
     try {
+      assert.throws(() => createWorkerEndpointServer({ tenantNamespace: "tenant-a", principalId: "p", workerId: "w", provider: "emulator", model: "provider-free", signingSecret: secret, stateDir, runner: { health: async () => {}, execute: async () => { throw new Error(); } } }), /strict Linux runner/);
       assert.throws(() => createWorkerEndpointServer({ tenantNamespace: "tenant-a", principalId: "p", workerId: "w", provider: "codex", model: "codex", signingSecret: secret, stateDir, runner: { health: async () => {}, execute: async () => { throw new Error(); } } }), /UNMETERED/);
       if (process.platform !== "linux") {
         const runner = new LinuxWorkerEndpointRunner({ tenantNamespace: "tenant-a", stateDir, worktreeBaseDir: join(stateDir, "workspaces"), baselineCommitRegistry: {}, adapter: { runtimeId: "fake-agent-harness", writerProvider: "emulator", writerModel: "provider-free", prepareInvocation: async () => { throw new Error("must not prepare"); }, parseExecutionResult: async () => { throw new Error(); } } });

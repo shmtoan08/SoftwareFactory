@@ -1,6 +1,6 @@
 # M6C-3 bước 5 — Kế hoạch worker endpoint và Linux supervisor
 
-Trạng thái: **chuẩn bị triển khai**, chưa có endpoint/supervisor mới trong source.
+Trạng thái: **đang triển khai trên branch Agent A**; endpoint/journal/runner ban đầu đã có, xem [báo cáo implementation](./m6c3-worker-endpoint-validation.md). Independent acceptance và Linux kernel CI còn cần kiểm chứng; chưa nghiệm thu bước 5.
 
 ## Baseline và đối ứng review
 

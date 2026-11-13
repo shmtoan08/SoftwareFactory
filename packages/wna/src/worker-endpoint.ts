@@ -5,6 +5,7 @@ import { canonicalizeJson } from "@software-factory/shared-types";
 import { isSafeRelativePosixPath, validateCodeImportSubmission, type CodeImportSubmission } from "@software-factory/task-contract";
 import { WorkerExecutionJournal, WorkerJournalConflict } from "./worker-execution-journal.ts";
 import type { SandboxCleanupEvidence } from "./index.ts";
+import { LinuxWorkerEndpointRunner } from "./worker-endpoint-runner.ts";
 
 export interface WorkerEndpointRunner {
   health(signal: AbortSignal): Promise<void>;
@@ -55,8 +56,10 @@ export class WorkerEndpointServer {
     if (/codex/i.test(`${config.provider} ${config.model}`)) throw new Error("ERR_UNMETERED_CODEX_DISABLED");
     if (config.host !== undefined && !["127.0.0.1", "::1"].includes(config.host) || config.port !== undefined && (!Number.isSafeInteger(config.port) || config.port < 0 || config.port > 65535)) throw new Error("Worker endpoint requires loopback binding");
     if (config.testOnlyHooks && config.testOnlyEmulator !== true) throw new Error("Fault injection requires explicit test-only configuration");
+    if (!config.testOnlyEmulator && !(config.runner instanceof LinuxWorkerEndpointRunner)) throw new Error("Production worker endpoint requires the strict Linux runner");
     this.config = { ...config }; this.journal = new WorkerExecutionJournal(config.stateDir, config.tenantNamespace);
     this.server = createServer((req, res) => {
+      res.on("error", () => {});
       const work = this.handle(req, res).catch(() => { if (!res.headersSent) res.writeHead(400, { "content-type": "application/json" }); if (!res.writableEnded) res.end('{"error":"ERR_WORKER_REQUEST"}'); });
       this.pending.add(work); void work.finally(() => this.pending.delete(work));
     });
@@ -83,6 +86,7 @@ export class WorkerEndpointServer {
     if (typeof signature !== "string" || !/^[a-f0-9]{64}$/.test(signature) || !timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(signTargetProtocol(this.config.signingSecret, "request", req.url!, body.nonce, body), "hex"))) { res.writeHead(401); res.end(); return; }
     const identity = { schema_version: "sf-target-v1", nonce: body.nonce, target_type: "user_managed_worker", principal_id: this.config.principalId, worker_id: this.config.workerId, provider: this.config.provider, model: this.config.model };
     const send = (payload: unknown) => { const data = canonicalizeJson(payload); if (Buffer.byteLength(data) > 3 * 1024 * 1024) throw new Error("Worker response too large"); res.writeHead(200, { "content-type": "application/json", "x-sf-target-signature": signTargetProtocol(this.config.signingSecret, "response", req.url!, body.nonce as string, payload) }); res.end(data); };
+    if (this.active.size >= 8) { res.writeHead(503); res.end(); return; }
     const controller = new AbortController(); this.active.add(controller);
     const disconnected = () => { if (!res.writableEnded) controller.abort(); }; res.once("close", disconnected);
     try {

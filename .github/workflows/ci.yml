@@ -2727,3 +2727,27 @@ jobs:
           docker pull node:22-alpine
       - name: Verify all tiers under real runsc with no fallback
         run: npm run test:m6c3:gvisor
+
+
+  external-worker-linux:
+    name: M6C-3 strict Linux external worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - name: Prepare dedicated cgroups v2 delegation
+        run: |
+          sudo env SF_WORKER_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash -eu -c '
+            test -f /sys/fs/cgroup/cgroup.controllers
+            echo "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control
+            mkdir "$SF_WORKER_CGROUP_ROOT"
+            echo "+cpu +memory +pids" > "$SF_WORKER_CGROUP_ROOT/cgroup.subtree_control"
+            mkdir "$SF_WORKER_CGROUP_ROOT/software-factory.slice"
+            echo "+cpu +memory +pids" > "$SF_WORKER_CGROUP_ROOT/software-factory.slice/cgroup.subtree_control"
+          '
+      - name: Verify real worker filesystem, parent-death, deadline and cleanup
+        run: sudo env PATH="$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" npm run test:m6c3:worker-linux
