@@ -3,22 +3,27 @@
  * @description Unit and contract test suite for Wsl2VmBackend (Issue #16 / M6C-3 VM Foundation).
  *
  * Verifies:
- * - Production platform guard: requires win32 host platform; emulator mode requires explicit testOnlyEmulator: true.
- * - Configuration validation: absolute binaryPath, distributionName, guestUser, bounded timeouts/output caps.
+ * - Production platform guard: requires win32 host platform; emulator mode requires explicit boolean testOnlyEmulator: true.
+ * - Configuration validation: absolute binaryPath, distributionName, guestUser, strict boolean options,
+ *   strictly bounded finite integer commandTimeoutMs (<= 120000) and maxOutputBytes (<= 1048576).
  * - Real WSL CLI output decoding: UTF-16LE with BOM (\uFEFF), UTF-16LE without BOM, UTF-8 with BOM, standard UTF-8.
- * - Distribution probing: validates exact distribution identity, strictly requires WSL version 2,
- *   rejects version 1, missing distros, ambiguous duplicates, and corrupt/unparseable output without default fallback.
+ * - Strict distribution probing: validates exact distribution identity, strictly requires WSL version 2
+ *   (rejecting "2junk", "2.5", "02", "v2", "1"), missing distros, ambiguous duplicates, and corrupt output without default fallback.
  * - Lifecycle operations: start/stop require both allowLifecycle=true and dedicatedInstance=true.
  *   Stop invokes targeted --terminate <Distro>; strictly forbids --shutdown (which terminates all distros globally).
+ * - Diagnostic execution pre-probe: execOperatorCommand validates arguments, probes pinned distro/version 2
+ *   before guest invocation, and halts without secondary execution if probe fails.
  * - Operator command execution: direct argv array execution, shell: false, clean guest env-i, host env minimal,
  *   excludes canary credentials, and clears WSLENV ("").
- * - Bounded timeouts, abort signals, and output overflow: reports uncertain outcome on transport kill,
+ * - Bounded settlement & inherited pipe hang defense: single-pass cleanup, stream destruction, and bounded
+ *   settlement preventing hangs when descendants outlive parent.
+ * - Uncertain outcome reporting: abort, timeout, or guest output overflow reports uncertain guest state,
  *   never retrying automatically or faking guest cleanup.
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -104,6 +109,44 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
           assert.match(err.message, /testOnlyEmulator: true/);
           return true;
         }
+      );
+    });
+
+    it("constructor rejects non-boolean testOnlyEmulator via cast ('false', 'true', 1, 0, {})", () => {
+      for (const invalid of ["false", "true", 1, 0, {}, []] as const) {
+        assert.throws(
+          () =>
+            new Wsl2VmBackend({
+              binaryPath: "/bin/wsl",
+              distributionName: "Ubuntu-22.04",
+              testOnlyEmulator: invalid as unknown as boolean,
+            }),
+          /ERR_WSL_CONFIG_INVALID.*testOnlyEmulator must be a boolean/
+        );
+      }
+    });
+
+    it("constructor rejects non-boolean allowLifecycle and dedicatedInstance via cast", () => {
+      assert.throws(
+        () =>
+          new Wsl2VmBackend({
+            binaryPath: "/bin/wsl",
+            distributionName: "Ubuntu-22.04",
+            allowLifecycle: "true" as unknown as boolean,
+            testOnlyEmulator: true,
+          }),
+        /ERR_WSL_CONFIG_INVALID.*allowLifecycle must be a boolean/
+      );
+
+      assert.throws(
+        () =>
+          new Wsl2VmBackend({
+            binaryPath: "/bin/wsl",
+            distributionName: "Ubuntu-22.04",
+            dedicatedInstance: 1 as unknown as boolean,
+            testOnlyEmulator: true,
+          }),
+        /ERR_WSL_CONFIG_INVALID.*dedicatedInstance must be a boolean/
       );
     });
 
@@ -216,7 +259,7 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
       );
     });
 
-    it("constructor validates commandTimeoutMs bounds", () => {
+    it("constructor validates commandTimeoutMs bounds and integer type", () => {
       assert.throws(
         () =>
           new Wsl2VmBackend({
@@ -225,7 +268,29 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
             commandTimeoutMs: -100,
             testOnlyEmulator: true,
           }),
-        /ERR_WSL_CONFIG_INVALID.*commandTimeoutMs must be a positive number/
+        /ERR_WSL_CONFIG_INVALID.*commandTimeoutMs must be an integer > 0/
+      );
+
+      assert.throws(
+        () =>
+          new Wsl2VmBackend({
+            binaryPath: "/bin/wsl",
+            distributionName: "Ubuntu-22.04",
+            commandTimeoutMs: 100.5,
+            testOnlyEmulator: true,
+          }),
+        /ERR_WSL_CONFIG_INVALID.*commandTimeoutMs must be an integer > 0/
+      );
+
+      assert.throws(
+        () =>
+          new Wsl2VmBackend({
+            binaryPath: "/bin/wsl",
+            distributionName: "Ubuntu-22.04",
+            commandTimeoutMs: Number.NaN,
+            testOnlyEmulator: true,
+          }),
+        /ERR_WSL_CONFIG_INVALID.*commandTimeoutMs must be an integer > 0/
       );
 
       assert.throws(
@@ -236,11 +301,11 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
             commandTimeoutMs: 200_000, // > 120_000 max
             testOnlyEmulator: true,
           }),
-        /ERR_WSL_CONFIG_INVALID.*commandTimeoutMs must be a positive number <= 120000/
+        /ERR_WSL_CONFIG_INVALID.*commandTimeoutMs must be an integer > 0 and <= 120000/
       );
     });
 
-    it("constructor validates maxOutputBytes bounds", () => {
+    it("constructor validates maxOutputBytes bounds and integer type", () => {
       assert.throws(
         () =>
           new Wsl2VmBackend({
@@ -249,7 +314,29 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
             maxOutputBytes: 0,
             testOnlyEmulator: true,
           }),
-        /ERR_WSL_CONFIG_INVALID.*maxOutputBytes must be a positive number/
+        /ERR_WSL_CONFIG_INVALID.*maxOutputBytes must be an integer > 0/
+      );
+
+      assert.throws(
+        () =>
+          new Wsl2VmBackend({
+            binaryPath: "/bin/wsl",
+            distributionName: "Ubuntu-22.04",
+            maxOutputBytes: 1024.5,
+            testOnlyEmulator: true,
+          }),
+        /ERR_WSL_CONFIG_INVALID.*maxOutputBytes must be an integer > 0/
+      );
+
+      assert.throws(
+        () =>
+          new Wsl2VmBackend({
+            binaryPath: "/bin/wsl",
+            distributionName: "Ubuntu-22.04",
+            maxOutputBytes: Number.NaN,
+            testOnlyEmulator: true,
+          }),
+        /ERR_WSL_CONFIG_INVALID.*maxOutputBytes must be an integer > 0/
       );
 
       assert.throws(
@@ -260,7 +347,7 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
             maxOutputBytes: 2 * 1024 * 1024, // > 1 MiB max
             testOnlyEmulator: true,
           }),
-        /ERR_WSL_CONFIG_INVALID.*maxOutputBytes must be a positive number <= 1048576/
+        /ERR_WSL_CONFIG_INVALID.*maxOutputBytes must be an integer > 0 and <= 1048576/
       );
     });
 
@@ -285,7 +372,6 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
   describe("Group 2: Output Decoding (UTF-16LE, BOM, UTF-8)", () => {
     it("decodeWslOutput decodes UTF-16LE with BOM (\\uFEFF)", () => {
       const text = "  NAME    STATE    VERSION\n* Ubuntu  Running  2\n";
-      // Construct UTF-16LE with BOM: 0xFF, 0xFE followed by utf16le bytes
       const bom = Buffer.from([0xff, 0xfe]);
       const body = Buffer.from(text, "utf16le");
       const raw = Buffer.concat([bom, body]);
@@ -429,6 +515,46 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
       });
     });
 
+    it("parseWslListVerboseOutput rejects '2junk' as malformed version", () => {
+      const table =
+        "  NAME            STATE           VERSION\n" +
+        "* Ubuntu-22.04    Running         2junk\n";
+      assert.throws(
+        () => parseWslListVerboseOutput(table, "Ubuntu-22.04"),
+        /ERR_WSL_VERSION_UNSUPPORTED.*unsupported or malformed WSL version "2junk"/
+      );
+    });
+
+    it("parseWslListVerboseOutput rejects '2.5' as malformed version", () => {
+      const table =
+        "  NAME            STATE           VERSION\n" +
+        "* Ubuntu-22.04    Running         2.5\n";
+      assert.throws(
+        () => parseWslListVerboseOutput(table, "Ubuntu-22.04"),
+        /ERR_WSL_VERSION_UNSUPPORTED.*unsupported or malformed WSL version "2.5"/
+      );
+    });
+
+    it("parseWslListVerboseOutput rejects '02' as malformed version", () => {
+      const table =
+        "  NAME            STATE           VERSION\n" +
+        "* Ubuntu-22.04    Running         02\n";
+      assert.throws(
+        () => parseWslListVerboseOutput(table, "Ubuntu-22.04"),
+        /ERR_WSL_VERSION_UNSUPPORTED.*unsupported or malformed WSL version "02"/
+      );
+    });
+
+    it("parseWslListVerboseOutput rejects 'v2' as malformed version", () => {
+      const table =
+        "  NAME            STATE           VERSION\n" +
+        "* Ubuntu-22.04    Running         v2\n";
+      assert.throws(
+        () => parseWslListVerboseOutput(table, "Ubuntu-22.04"),
+        /ERR_WSL_VERSION_UNSUPPORTED.*unsupported or malformed WSL version "v2"/
+      );
+    });
+
     it("probe rejects missing distribution without falling back to default distro", async () => {
       const table =
         "  NAME            STATE           VERSION\n" +
@@ -541,7 +667,6 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
     });
 
     it("probe handles localized headers and state descriptions", () => {
-      // French localized output
       const french =
         "  NOM             ÉTAT                    VERSION\n" +
         "* Ubuntu-22.04    En cours d'exécution   2\n";
@@ -707,12 +832,17 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
   // Group 5: Operator Diagnostic Execution (execOperatorCommand())
   // --------------------------------------------------------------------------
   describe("Group 5: Operator Diagnostic Execution (execOperatorCommand())", () => {
-    it("execOperatorCommand executes command via direct argv array under clean guest env-i", async () => {
+    it("execOperatorCommand executes command via direct argv array under clean guest env-i after probe", async () => {
       await withTempFixture(
         (testDir) => `#!/usr/bin/env node
-          import { writeFileSync } from 'node:fs';
+          import { writeFileSync, appendFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+            process.exit(0);
+          }
           const record = {
-            argv: process.argv.slice(2),
+            argv: args,
             env: process.env,
           };
           writeFileSync(${JSON.stringify(join(testDir, "exec-record.json"))}, JSON.stringify(record));
@@ -732,7 +862,6 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
           assert.strictEqual(result.stderr, "");
 
           const record = readRecordedInvocation(recordFile);
-          // Check argv structure: pinned distro, --exec /usr/bin/env -i <command>
           assert.deepStrictEqual(record.argv, [
             "--distribution",
             "Ubuntu-22.04",
@@ -749,7 +878,12 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
       await withTempFixture(
         (testDir) => `#!/usr/bin/env node
           import { writeFileSync } from 'node:fs';
-          writeFileSync(${JSON.stringify(join(testDir, "user-record.json"))}, JSON.stringify(process.argv.slice(2)));
+          const args = process.argv.slice(2);
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+            process.exit(0);
+          }
+          writeFileSync(${JSON.stringify(join(testDir, "user-record.json"))}, JSON.stringify(args));
           process.stdout.write("1001\\n");
         `,
         async (fixturePath, testDir) => {
@@ -784,7 +918,12 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
       await withTempFixture(
         (testDir) => `#!/usr/bin/env node
           import { writeFileSync } from 'node:fs';
-          writeFileSync(${JSON.stringify(join(testDir, "env-record.json"))}, JSON.stringify(process.argv.slice(2)));
+          const args = process.argv.slice(2);
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+            process.exit(0);
+          }
+          writeFileSync(${JSON.stringify(join(testDir, "env-record.json"))}, JSON.stringify(args));
         `,
         async (fixturePath, testDir) => {
           const recordFile = join(testDir, "env-record.json");
@@ -806,6 +945,103 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
             "FOO=BAR",
             "/bin/sh",
           ]);
+        }
+      );
+    });
+
+    it("execOperatorCommand validates probe and rejects missing distro without invoking secondary exec command", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { appendFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          appendFileSync(${JSON.stringify(join(testDir, "invocations.log"))}, JSON.stringify(args) + '\\n');
+          if (args.includes('--list')) {
+            // Missing Ubuntu-22.04
+            process.stdout.write("  NAME            STATE           VERSION\\n* Debian          Running         2\\n");
+          } else {
+            process.stdout.write("secondary-command-ran\\n");
+          }
+        `,
+        async (fixturePath, testDir) => {
+          const logFile = join(testDir, "invocations.log");
+          const backend = new Wsl2VmBackend({
+            binaryPath: fixturePath,
+            distributionName: "Ubuntu-22.04",
+            testOnlyEmulator: true,
+          });
+
+          await assert.rejects(
+            async () => backend.execOperatorCommand("/usr/bin/uptime", []),
+            /ERR_WSL_DISTRO_NOT_FOUND/
+          );
+
+          const lines = readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+          assert.strictEqual(lines.length, 1);
+          assert.deepStrictEqual(lines[0], ["--list", "--verbose"]);
+        }
+      );
+    });
+
+    it("execOperatorCommand validates probe and rejects WSL1 distro without invoking secondary exec command", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { appendFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          appendFileSync(${JSON.stringify(join(testDir, "invocations.log"))}, JSON.stringify(args) + '\\n');
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         1\\n");
+          } else {
+            process.stdout.write("secondary-command-ran\\n");
+          }
+        `,
+        async (fixturePath, testDir) => {
+          const logFile = join(testDir, "invocations.log");
+          const backend = new Wsl2VmBackend({
+            binaryPath: fixturePath,
+            distributionName: "Ubuntu-22.04",
+            testOnlyEmulator: true,
+          });
+
+          await assert.rejects(
+            async () => backend.execOperatorCommand("/usr/bin/uptime", []),
+            /ERR_WSL_VERSION_UNSUPPORTED/
+          );
+
+          const lines = readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+          assert.strictEqual(lines.length, 1);
+          assert.deepStrictEqual(lines[0], ["--list", "--verbose"]);
+        }
+      );
+    });
+
+    it("execOperatorCommand validates probe and rejects malformed output without invoking secondary exec command", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { appendFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          appendFileSync(${JSON.stringify(join(testDir, "invocations.log"))}, JSON.stringify(args) + '\\n');
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n  corrupt data row\\n");
+          } else {
+            process.stdout.write("secondary-command-ran\\n");
+          }
+        `,
+        async (fixturePath, testDir) => {
+          const logFile = join(testDir, "invocations.log");
+          const backend = new Wsl2VmBackend({
+            binaryPath: fixturePath,
+            distributionName: "Ubuntu-22.04",
+            testOnlyEmulator: true,
+          });
+
+          await assert.rejects(
+            async () => backend.execOperatorCommand("/usr/bin/uptime", []),
+            /ERR_WSL_OUTPUT_UNRECOGNIZED/
+          );
+
+          const lines = readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+          assert.strictEqual(lines.length, 1);
+          assert.deepStrictEqual(lines[0], ["--list", "--verbose"]);
         }
       );
     });
@@ -856,6 +1092,11 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
 
     it("execOperatorCommand returns non-zero exit codes cleanly in VmCommandResult", async () => {
       const script = `#!/usr/bin/env node
+        const args = process.argv.slice(2);
+        if (args.includes('--list')) {
+          process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+          process.exit(0);
+        }
         process.stderr.write("failed-diagnostic\\n");
         process.exit(42);
       `;
@@ -882,6 +1123,11 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
       await withTempFixture(
         (testDir) => `#!/usr/bin/env node
           import { writeFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+            process.exit(0);
+          }
           writeFileSync(${JSON.stringify(join(testDir, "env-secrets-record.json"))}, JSON.stringify(process.env));
         `,
         async (fixturePath, testDir) => {
@@ -938,6 +1184,11 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
     it("command timeout terminates host transport and throws ERR_VM_COMMAND_TIMEOUT with uncertain outcome diagnostic", async () => {
       // Child script that hangs until killed
       const script = `#!/usr/bin/env node
+        const args = process.argv.slice(2);
+        if (args.includes('--list')) {
+          process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+          process.exit(0);
+        }
         setInterval(() => {}, 1000);
       `;
 
@@ -963,6 +1214,11 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
 
     it("abort signal terminates host transport and throws ERR_VM_COMMAND_UNCERTAIN", async () => {
       const script = `#!/usr/bin/env node
+        const args = process.argv.slice(2);
+        if (args.includes('--list')) {
+          process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+          process.exit(0);
+        }
         setInterval(() => {}, 1000);
       `;
 
@@ -1004,8 +1260,13 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
       );
     });
 
-    it("output exceeding maxOutputBytes is capped and throws ERR_VM_OUTPUT_OVERFLOW", async () => {
+    it("output exceeding maxOutputBytes during guest invocation reports ERR_VM_COMMAND_UNCERTAIN", async () => {
       const script = `#!/usr/bin/env node
+        const args = process.argv.slice(2);
+        if (args.includes('--list')) {
+          process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+          process.exit(0);
+        }
         // Generate a large payload exceeding maxOutputBytes
         const big = "X".repeat(2048);
         for (let i = 0; i < 100; i++) {
@@ -1023,9 +1284,67 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
 
         await assert.rejects(
           async () => backend.execOperatorCommand("/usr/bin/dump", []),
-          /ERR_VM_OUTPUT_OVERFLOW.*Output exceeded maximum bounded limit of 1024 bytes/
+          /ERR_VM_COMMAND_UNCERTAIN.*Output exceeded maximum bounded limit of 1024 bytes.*guest process state is uncertain/
         );
       });
+    });
+
+    it("execOperatorCommand settles within bounded time when background descendant inherits and keeps pipe open", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { spawn } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+            process.exit(0);
+          }
+          // In exec: spawn a background descendant that inherits stdout/stderr
+          const bg = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            stdio: ['ignore', 'inherit', 'inherit'],
+          });
+          writeFileSync(${JSON.stringify(join(testDir, "bg.pid"))}, String(bg.pid));
+          // Direct child sleeps indefinitely
+          setTimeout(() => {}, 60000);
+        `,
+        async (fixturePath, testDir) => {
+          const pidFile = join(testDir, "bg.pid");
+          let bgPid: number | null = null;
+          try {
+            const backend = new Wsl2VmBackend({
+              binaryPath: fixturePath,
+              distributionName: "Ubuntu-22.04",
+              commandTimeoutMs: 200,
+              testOnlyEmulator: true,
+            });
+
+            const startTime = Date.now();
+            await assert.rejects(
+              async () => backend.execOperatorCommand("/usr/bin/sleep", ["60"]),
+              (err: Error) => {
+                assert.match(err.message, /^ERR_VM_COMMAND_TIMEOUT/);
+                assert.match(err.message, /guest process state is uncertain/);
+                return true;
+              }
+            );
+            const durationMs = Date.now() - startTime;
+            // Must settle bounded (< 2000ms), proving it did NOT hang waiting for descendant pipe close
+            assert.ok(durationMs < 2000, `Expected bounded settlement < 2000ms, took ${durationMs}ms`);
+          } finally {
+            // Watchdog & cleanup: kill background descendant process if created
+            try {
+              if (existsSync(pidFile)) {
+                bgPid = Number(readFileSync(pidFile, "utf8").trim());
+                if (bgPid && !Number.isNaN(bgPid)) {
+                  process.kill(bgPid, "SIGKILL");
+                }
+              }
+            } catch {
+              // ignore process kill error if already exited
+            }
+          }
+        }
+      );
     });
 
     it("spawn error throws ERR_VM_COMMAND_SPAWN_FAILED without leaking sensitive paths", async () => {

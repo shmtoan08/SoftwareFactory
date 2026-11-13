@@ -7,18 +7,22 @@
  *
  * Features & Invariants:
  * - Operator configuration pinning: absolute binary path, distribution identity, guest user.
+ * - Strict boolean type validation: testOnlyEmulator, allowLifecycle, dedicatedInstance must be booleans.
  * - Strict WSL2 validation: Probe validates distribution existence and strictly requires WSL version 2.
+ *   Version tokens must strictly equal "2" (rejecting "2junk", "2.5", "02", etc.).
  * - No default fallback: Never falls back to the default distribution marked with asterisk (*).
  * - Real WSL CLI output decoding: Decodes UTF-16LE with BOM (\uFEFF), UTF-16LE without BOM, and UTF-8.
  * - Targeted lifecycle operations: 'start' boots registered distro, 'stop' invokes --terminate <Distro>.
  *   Strictly forbids --shutdown (which terminates all distros globally), install, import, or config mutation.
+ * - Diagnostic execution pre-probe: Probes distribution identity and version 2 before guest execution.
  * - Bounded operator execution: Direct argv array spawn with shell: false, guest env -i isolation,
  *   minimal host environment without credential forwarding, and WSLENV explicitly cleared ("").
- * - Bounded timeouts & output caps: Enforces execution timeout and output buffer byte limits.
- * - Uncertain outcome reporting: Abort or timeout terminates host transport (wsl.exe) but reports
- *   uncertain guest state, never faking process cleanup or auto-terminating the entire distro.
+ * - Bounded timeouts, output caps & inherited pipe hang defense: Single-pass cleanup, stream destruction,
+ *   and bounded settlement preventing inherited pipe hangs when descendants outlive parent.
+ * - Uncertain outcome reporting: Abort, timeout, or guest output overflow terminates host transport (wsl.exe)
+ *   and reports uncertain guest state, never faking process cleanup or auto-terminating the entire distro.
  * - Strict platform gating: Production requires win32 host platform; emulator mode requires explicit
- *   constructor flag testOnlyEmulator: true (never switched via env vars or HTTP headers).
+ *   constructor flag testOnlyEmulator: true (strictly validated as boolean true).
  */
 
 import { spawn } from "node:child_process";
@@ -158,6 +162,10 @@ export function buildMinimalHostEnv(): NodeJS.ProcessEnv {
  * Expected column format:
  *   [NAME] [STATE] [VERSION]
  * with optional leading asterisk (*) marking the default distro.
+ *
+ * Strict Version Parsing Contract:
+ * - Version token must strictly match "1" or "2".
+ * - Malformed tokens like "2junk", "2.5", "02", "v2" are NOT accepted as valid versions.
  */
 export function parseWslListVerboseOutput(decoded: string, targetDistro: string): VmProbeResult {
   const lines = decoded
@@ -198,8 +206,14 @@ export function parseWslListVerboseOutput(decoded: string, targetDistro: string)
     const name = match[2].trim();
     const state = match[3].trim();
     const rawVersion = match[4].trim();
-    const parsedVer = Number.parseInt(rawVersion, 10);
-    const version = Number.isInteger(parsedVer) ? parsedVer : null;
+
+    // Strict version validation: ONLY "1" or "2" are valid version integers
+    let version: number | null = null;
+    if (rawVersion === "1") {
+      version = 1;
+    } else if (rawVersion === "2") {
+      version = 2;
+    }
 
     entries.push({
       name,
@@ -230,10 +244,10 @@ export function parseWslListVerboseOutput(decoded: string, targetDistro: string)
     );
   }
 
-  // Strictly enforce WSL Version 2
-  if (entry.version !== 2) {
+  // Strictly enforce WSL Version 2 (token must be strictly "2")
+  if (entry.rawVersion !== "2" || entry.version !== 2) {
     throw new Error(
-      `ERR_WSL_VERSION_UNSUPPORTED: Distribution "${targetDistro}" is using WSL version ${entry.rawVersion}, strictly require version 2`
+      `ERR_WSL_VERSION_UNSUPPORTED: Distribution "${targetDistro}" has unsupported or malformed WSL version "${entry.rawVersion}", strictly require version 2`
     );
   }
 
@@ -302,25 +316,55 @@ export class Wsl2VmBackend {
       }
     }
 
-    // 4. Validate timeouts and bounded limits
-    const timeout = config.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
-    if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0 || timeout > MAX_ALLOWED_TIMEOUT_MS) {
+    // 4. Validate strict boolean options
+    if (config.testOnlyEmulator !== undefined && typeof config.testOnlyEmulator !== "boolean") {
       throw new Error(
-        `ERR_WSL_CONFIG_INVALID: commandTimeoutMs must be a positive number <= ${MAX_ALLOWED_TIMEOUT_MS} (received ${timeout})`
+        `ERR_WSL_CONFIG_INVALID: testOnlyEmulator must be a boolean (received ${typeof config.testOnlyEmulator})`
+      );
+    }
+    if (config.allowLifecycle !== undefined && typeof config.allowLifecycle !== "boolean") {
+      throw new Error(
+        `ERR_WSL_CONFIG_INVALID: allowLifecycle must be a boolean (received ${typeof config.allowLifecycle})`
+      );
+    }
+    if (config.dedicatedInstance !== undefined && typeof config.dedicatedInstance !== "boolean") {
+      throw new Error(
+        `ERR_WSL_CONFIG_INVALID: dedicatedInstance must be a boolean (received ${typeof config.dedicatedInstance})`
+      );
+    }
+
+    // 5. Validate timeouts and bounded limits (strictly finite positive integers)
+    const timeout = config.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+    if (
+      typeof timeout !== "number" ||
+      !Number.isFinite(timeout) ||
+      !Number.isInteger(timeout) ||
+      timeout <= 0 ||
+      timeout > MAX_ALLOWED_TIMEOUT_MS
+    ) {
+      throw new Error(
+        `ERR_WSL_CONFIG_INVALID: commandTimeoutMs must be an integer > 0 and <= ${MAX_ALLOWED_TIMEOUT_MS} (received ${timeout})`
       );
     }
     this.commandTimeoutMs = timeout;
 
     const maxBytes = config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-    if (typeof maxBytes !== "number" || !Number.isFinite(maxBytes) || maxBytes <= 0 || maxBytes > MAX_ALLOWED_OUTPUT_BYTES) {
+    if (
+      typeof maxBytes !== "number" ||
+      !Number.isFinite(maxBytes) ||
+      !Number.isInteger(maxBytes) ||
+      maxBytes <= 0 ||
+      maxBytes > MAX_ALLOWED_OUTPUT_BYTES
+    ) {
       throw new Error(
-        `ERR_WSL_CONFIG_INVALID: maxOutputBytes must be a positive number <= ${MAX_ALLOWED_OUTPUT_BYTES} (received ${maxBytes})`
+        `ERR_WSL_CONFIG_INVALID: maxOutputBytes must be an integer > 0 and <= ${MAX_ALLOWED_OUTPUT_BYTES} (received ${maxBytes})`
       );
     }
     this.maxOutputBytes = maxBytes;
 
-    // 5. Native platform check vs explicit emulator mode
-    if (!config.testOnlyEmulator) {
+    // 6. Strict platform check vs normalized boolean emulator mode
+    const isEmulator = config.testOnlyEmulator === true;
+    if (!isEmulator) {
       if (process.platform !== "win32") {
         throw new Error(
           `ERR_WSL_PLATFORM_UNSUPPORTED: WSL2 backend requires win32 host platform (current platform is "${process.platform}"). Use testOnlyEmulator: true for testing.`
@@ -334,22 +378,30 @@ export class Wsl2VmBackend {
       dedicatedInstance: config.dedicatedInstance === true,
       commandTimeoutMs: this.commandTimeoutMs,
       maxOutputBytes: this.maxOutputBytes,
-      testOnlyEmulator: config.testOnlyEmulator === true,
+      testOnlyEmulator: isEmulator,
     });
   }
 
   /**
    * Internal runner for host CLI invocations (wsl.exe).
+   * Features:
+   * - Single-pass cleanup of timers and event listeners.
+   * - Bounded settlement: destroys parent stream handles on timeout/abort/overflow so descendant
+   *   processes retaining stdout/stderr file descriptors cannot hang the promise indefinitely.
+   * - Differentiates guest invocations to preserve uncertain outcome diagnostics on overflow.
    */
   private runHostCli(
     args: readonly string[],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    options?: { isGuestInvocation?: boolean }
   ): Promise<{ exitCode: number; stdout: string; stderr: string; rawStdout: Buffer; rawStderr: Buffer }> {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
         return reject(new Error("ERR_VM_COMMAND_ABORTED: Command aborted before execution"));
       }
 
+      let settled = false;
+      let terminating = false;
       let timedOut = false;
       let aborted = false;
       let overflowed = false;
@@ -357,7 +409,9 @@ export class Wsl2VmBackend {
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
 
-      let timer: NodeJS.Timeout | null = null;
+      let executionTimer: NodeJS.Timeout | null = null;
+      let killEscalationTimer: NodeJS.Timeout | null = null;
+      let forceSettlementTimer: NodeJS.Timeout | null = null;
       let abortListener: (() => void) | null = null;
 
       const child = spawn(this.config.binaryPath, args, {
@@ -366,61 +420,43 @@ export class Wsl2VmBackend {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
-      const cleanupProcess = (sig: NodeJS.Signals) => {
+      const destroyStreams = () => {
         try {
-          child.kill(sig);
+          if (!child.stdout.destroyed) child.stdout.destroy();
         } catch {
-          // ignore error
+          // ignore stream destruction errors
         }
-        setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // ignore error
-          }
-        }, 500).unref();
+        try {
+          if (!child.stderr.destroyed) child.stderr.destroy();
+        } catch {
+          // ignore stream destruction errors
+        }
       };
 
-      if (signal) {
-        abortListener = () => {
-          aborted = true;
-          cleanupProcess("SIGTERM");
-        };
-        signal.addEventListener("abort", abortListener, { once: true });
-      }
-
-      timer = setTimeout(() => {
-        timedOut = true;
-        cleanupProcess("SIGTERM");
-      }, this.commandTimeoutMs);
-
-      child.stdout.on("data", (chunk: Buffer) => {
-        totalBytes += chunk.length;
-        if (totalBytes > this.maxOutputBytes) {
-          overflowed = true;
-          cleanupProcess("SIGKILL");
-          return;
+      const cleanupAllTimers = () => {
+        if (executionTimer) {
+          clearTimeout(executionTimer);
+          executionTimer = null;
         }
-        stdoutChunks.push(chunk);
-      });
-
-      child.stderr.on("data", (chunk: Buffer) => {
-        totalBytes += chunk.length;
-        if (totalBytes > this.maxOutputBytes) {
-          overflowed = true;
-          cleanupProcess("SIGKILL");
-          return;
+        if (killEscalationTimer) {
+          clearTimeout(killEscalationTimer);
+          killEscalationTimer = null;
         }
-        stderrChunks.push(chunk);
-      });
+        if (forceSettlementTimer) {
+          clearTimeout(forceSettlementTimer);
+          forceSettlementTimer = null;
+        }
+        if (signal && abortListener) {
+          signal.removeEventListener("abort", abortListener);
+          abortListener = null;
+        }
+      };
 
-      child.on("error", (err) => {
-        teardown();
-        reject(new Error(`ERR_VM_COMMAND_SPAWN_FAILED: ${sanitizeErrorOutput(err.message)}`));
-      });
-
-      child.on("close", (code, signalStr) => {
-        teardown();
+      const finalizeSettlement = (exitCode: number | null, signalStr: string | null) => {
+        if (settled) return;
+        settled = true;
+        cleanupAllTimers();
+        destroyStreams();
 
         if (aborted) {
           return reject(
@@ -439,6 +475,14 @@ export class Wsl2VmBackend {
         }
 
         if (overflowed) {
+          const isGuest = options?.isGuestInvocation === true;
+          if (isGuest) {
+            return reject(
+              new Error(
+                `ERR_VM_COMMAND_UNCERTAIN: Output exceeded maximum bounded limit of ${this.maxOutputBytes} bytes; host transport terminated but guest process state is uncertain`
+              )
+            );
+          }
           return reject(
             new Error(
               `ERR_VM_OUTPUT_OVERFLOW: Output exceeded maximum bounded limit of ${this.maxOutputBytes} bytes`
@@ -450,20 +494,106 @@ export class Wsl2VmBackend {
         const rawStderr = Buffer.concat(stderrChunks);
 
         resolve({
-          exitCode: code ?? (signalStr ? 128 : -1),
+          exitCode: exitCode ?? (signalStr ? 128 : -1),
           stdout: decodeWslOutput(rawStdout),
           stderr: decodeWslOutput(rawStderr),
           rawStdout,
           rawStderr,
         });
+      };
+
+      const terminateChildAndSettleBounded = (reason: "timeout" | "abort" | "overflow") => {
+        if (terminating || settled) return;
+        terminating = true;
+
+        if (reason === "timeout") timedOut = true;
+        if (reason === "abort") aborted = true;
+        if (reason === "overflow") overflowed = true;
+
+        // Destroy parent read-end streams immediately so descendant pipe retention cannot hold parent pipe
+        destroyStreams();
+
+        // Send SIGTERM to direct child
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // ignore kill errors
+        }
+
+        // Single escalation timer: escalate to SIGKILL after 250ms
+        killEscalationTimer = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // ignore kill errors
+          }
+        }, 250);
+        killEscalationTimer.unref();
+
+        // Bounded settlement watchdog: ensure runner settles within 500ms even if pipes or exit events hang
+        forceSettlementTimer = setTimeout(() => {
+          finalizeSettlement(null, "SIGKILL");
+        }, 500);
+        forceSettlementTimer.unref();
+      };
+
+      if (signal) {
+        abortListener = () => {
+          terminateChildAndSettleBounded("abort");
+        };
+        signal.addEventListener("abort", abortListener, { once: true });
+      }
+
+      executionTimer = setTimeout(() => {
+        terminateChildAndSettleBounded("timeout");
+      }, this.commandTimeoutMs);
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (terminating || settled) return;
+        totalBytes += chunk.length;
+        if (totalBytes > this.maxOutputBytes) {
+          terminateChildAndSettleBounded("overflow");
+          return;
+        }
+        stdoutChunks.push(chunk);
       });
 
-      function teardown() {
-        if (timer) clearTimeout(timer);
-        if (signal && abortListener) {
-          signal.removeEventListener("abort", abortListener);
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (terminating || settled) return;
+        totalBytes += chunk.length;
+        if (totalBytes > this.maxOutputBytes) {
+          terminateChildAndSettleBounded("overflow");
+          return;
         }
-      }
+        stderrChunks.push(chunk);
+      });
+
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        cleanupAllTimers();
+        destroyStreams();
+        reject(new Error(`ERR_VM_COMMAND_SPAWN_FAILED: ${sanitizeErrorOutput(err.message)}`));
+      });
+
+      child.on("exit", (code, signalStr) => {
+        // When direct child exits, if close doesn't follow shortly (e.g. inherited pipe held by descendant),
+        // bounded force settlement will ensure we do not hang!
+        if (terminating) {
+          finalizeSettlement(code, signalStr);
+        } else {
+          if (!forceSettlementTimer) {
+            forceSettlementTimer = setTimeout(() => {
+              finalizeSettlement(code, signalStr);
+            }, 300);
+            forceSettlementTimer.unref();
+          }
+        }
+      });
+
+      child.on("close", (code, signalStr) => {
+        finalizeSettlement(code, signalStr);
+      });
     });
   }
 
@@ -540,6 +670,7 @@ export class Wsl2VmBackend {
   /**
    * Executes internal operator diagnostic command in the guest.
    * - `command` must be an absolute path inside guest (e.g. /usr/bin/uptime).
+   * - Probes distribution existence and WSL version 2 using the same AbortSignal before execution.
    * - Direct argv array execution with shell: false.
    * - Executes under guest `env -i` clean environment.
    * - Host environment is sanitized and WSLENV is set to empty string.
@@ -572,6 +703,9 @@ export class Wsl2VmBackend {
       }
     }
 
+    // Diagnostic must verify target distribution existence and version 2 before execution
+    await this.probe(signal);
+
     // Construct argv for wsl.exe
     const spawnArgs: string[] = [
       "--distribution",
@@ -589,7 +723,7 @@ export class Wsl2VmBackend {
       spawnArgs.push("--exec", "/usr/bin/env", "-i", command, ...args);
     }
 
-    const result = await this.runHostCli(spawnArgs, signal);
+    const result = await this.runHostCli(spawnArgs, signal, { isGuestInvocation: true });
 
     return {
       exitCode: result.exitCode,
