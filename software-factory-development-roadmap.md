@@ -263,6 +263,8 @@ Tiến độ ngày **2026-11-13**, theo [M6C-SPEC-01](./m6c_parallel_execution_a
 
 Vòng sửa issue #8 đã merge `main`, được team review **ĐẠT** và issue đã đóng. Commit `b79df9b` xử lý đủ 14 ghi chú tiếp theo, review **ĐẠT**; [CI #43228644198](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43228644198) đạt **120/120** trên cả PG16/17, native Codex sandbox **2/2**, không skip. Xem [báo cáo ghi chú](./m6c-review-notes-validation.md). Codex production bị chặn theo quyết định của owner cho đến khi có Cost Guard đáng tin cậy; emulator không chứng minh production metering. Review mới có bốn ghi chú nhỏ: vòng đánh giá budget và spawn-error cleanup được chỉnh rõ hơn, assertion journal được bổ sung; giới hạn GC cross-host/PID reuse giữ nguyên có chủ đích. Vòng hardening đã được review **ĐẠT** tại `eaec0cb`, [CI #43328427725](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43328427725) xanh cả ba job. M6C-3 đã bắt đầu ở phần verifier gVisor; chưa nghiệm thu G7.
 
+Issue #12 đã được team review **ĐẠT**, tick 5/5 và đóng cho baseline `923bfc2c`; CI exact commit đạt PG16/17 **137/137** mỗi job và hai runtime jobs **2/2**. Bước kế tiếp được chuẩn bị tại [kế hoạch worker endpoint / Linux supervisor](./m6c3-worker-endpoint-implementation-plan.md): hoàn thiện server-side execution và cleanup trước khi đưa cùng runner vào Lima/WSL2. Kế hoạch chưa phải phần đã triển khai; M6C/G7 vẫn mở.
+
 Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
 
 - **Triển khai:**

@@ -1392,7 +1392,17 @@ export class CoreApiService {
         const assignment=await this.store.getTaskExecutionAssignment(t.task_id);
         const plan=(await this.store.listProjectTaskPlanLinks()).find((link)=>link.task_id===t.task_id);
         const planned=plan?.assigned_profile_id?await this.store.getAgentOrganizationProfileById(plan.assigned_profile_id):null;
-        if(assignment&&lease?.execution_target_assignment_id!==assignment.assignment_id||!lease?.execution_target_assignment_id&&planned&&planned.execution_target_type!=="factory_managed_worker")throw new PostgresRlsError("23514","External candidate is missing approved lease provenance");
+        const assignmentMismatch = Boolean(
+          assignment && lease?.execution_target_assignment_id !== assignment.assignment_id
+        );
+        const externalPlanWithoutProvenance = Boolean(
+          !lease?.execution_target_assignment_id &&
+          planned &&
+          planned.execution_target_type !== "factory_managed_worker"
+        );
+        if (assignmentMismatch || externalPlanWithoutProvenance) {
+          throw new PostgresRlsError("23514", "External candidate is missing approved lease provenance");
+        }
         return { task: t, candidate: mc, resolvedRepoPath, requiresTargetIsolation:Boolean(lease?.execution_target_assignment_id) };
       }
     );
