@@ -12,7 +12,7 @@ The execution API accepts only approval ID/token. Core API rechecks project auth
 
 The backend receives a frozen action (deployment UUID, project, release/package/commit/artifact/target) plus AbortSignal. Provider configuration/credentials belong to the operator backend, not request bodies or task context. The backend must verify artifact bytes and provenance, use the deployment UUID as its provider idempotency key and return a SHA-256 receipt. Real artifact-building/provenance and cloud execution are not established by the test executor.
 
-Timeout/error/invalid receipt becomes UNKNOWN without exposing provider error text. A crash before terminal recording leaves RUNNING. No automatic redispatch, unlock, compensation, or exactly-once physical side-effect guarantee is claimed. There is deliberately no force-unlock HTTP route in this slice: unresolved targets hold until a separately implemented, evidence-bound operator reconciliation workflow is available. Concrete cloud executors and that recovery workflow are still needed before production rollout.
+Timeout/error/invalid receipt becomes UNKNOWN without exposing provider error text. A crash before terminal recording leaves RUNNING. No automatic redispatch, unlock, compensation, or exactly-once physical side-effect guarantee is claimed. There is deliberately no force-unlock HTTP route. The subsequent [evidence-bound reconciliation workflow](./m6c3-reconciliation-validation.md) can release a hold only with configured provider-fence verification and fresh approver consent. Concrete cloud executors and real provider fencing/verifier adapters are still needed before production rollout.
 
 ## Database and audit
 

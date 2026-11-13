@@ -1,3 +1,5 @@
+import { validateReconciliationApproval } from "./reconciliation-validation.ts";
+export { deploymentBindingSha256, validateResolutionEvidence } from "./reconciliation-validation.ts";
 import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
 import { validateVerificationIsolation } from "./m6c3-validation.ts";
 import { validateCodeImportReceipt } from "./m6c-validation.ts";
@@ -34,6 +36,8 @@ import {
   type ModelCallStatus,
   type OutboxEventRecord,
   type ProcessedWorkerEventRecord,
+  type ProductionReconciliationApprovalRecord,
+  type ProductionReconciliationRecord,
   type ProductionDeploymentApprovalRecord,
   type ProductionDeploymentRecord,
   type ProductPipelineBundle,
@@ -211,6 +215,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   private devUserStories: Map<string, DevUserStoryRecord> = new Map();
   private taskPlanLinks: Map<string, TaskPlanLinkRecord> = new Map();
   private changeRequests: Map<string, ChangeRequestRecord> = new Map();
+  private reconciliationApprovals = new Map<string, ProductionReconciliationApprovalRecord>();
+  private reconciliations = new Map<string, ProductionReconciliationRecord>();
   private productionApprovals = new Map<string, ProductionDeploymentApprovalRecord>();
   private productionDeployments = new Map<string, ProductionDeploymentRecord>();
   private releaseAcceptancePackages: Map<string, ReleaseAcceptancePackageRecord> = new Map();
@@ -5616,6 +5622,49 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     );
   }
 
+  public createProductionReconciliationApproval(input: ProductionReconciliationApprovalRecord): ProductionReconciliationApprovalRecord {
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    const member = this.getProjectMembership(input.project_id,input.approver_principal_id);
+    if (input.approver_principal_id !== this.getCurrentRlsSession().currentPrincipalId || !member || !["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role)) throw new PostgresRlsError("42501", "Reconciliation requires the authenticated approver");
+    validateReconciliationApproval(input,this.getProductionDeploymentApproval(input.original_approval_id),this.getProductionDeploymentByApproval(input.original_approval_id),this.clockTimestampIso());
+    if (this.reconciliationApprovals.has(input.reconciliation_approval_id)) throw new PostgresRlsError("23505","Reconciliation approval already exists");
+    this.setInMap(this.reconciliationApprovals,input.reconciliation_approval_id,structuredClone(input));
+    this.insertOutboxEventInternal(input.project_id,"production_reconciliation",input.reconciliation_approval_id,"deployment.reconciliation_approved",{deployment_id:input.deployment_id,evidence_sha256:input.evidence.evidence_sha256});
+    return structuredClone(input);
+  }
+  public revokeProductionReconciliationApproval(projectId:string,id:string):void{
+    this.assertCoreApiWritePermissionForProject(projectId);const approval=this.getProductionReconciliationApproval(id);
+    if(!approval||approval.status!=="ACTIVE"||approval.approver_principal_id!==this.getCurrentRlsSession().currentPrincipalId)throw new PostgresRlsError("42501","Only the original approver may revoke active reconciliation approval");
+    this.setInMap(this.reconciliationApprovals,id,{...approval,status:"REVOKED"});
+    this.insertOutboxEventInternal(projectId,"production_reconciliation",id,"deployment.reconciliation_revoked",{reconciliation_approval_id:id});
+  }
+  public getProductionReconciliationApproval(id: string): ProductionReconciliationApprovalRecord | null {
+    const record=this.reconciliationApprovals.get(id); return record?.project_id===this.requireCurrentProjectId() ? structuredClone(record) : null;
+  }
+  public getProductionReconciliation(originalApprovalId: string): ProductionReconciliationRecord | null {
+    const record=[...this.reconciliations.values()].find((r)=>r.original_approval_id===originalApprovalId && r.project_id===this.requireCurrentProjectId());
+    return record ? structuredClone(record) : null;
+  }
+  public async commitProductionReconciliation(input:{project_id:string;reconciliation_approval_id:string;token_sha256:string}):Promise<ProductionReconciliationRecord>{
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    return this.withSerializedLock(`production:${input.project_id}`,()=>this.withRollbackBoundarySync(()=>{
+      const approval=this.getProductionReconciliationApproval(input.reconciliation_approval_id);
+      const member=approval ? this.getProjectMembership(input.project_id,approval.approver_principal_id) : null;
+      if (!approval || approval.token_sha256!==input.token_sha256 || approval.approver_principal_id!==this.getCurrentRlsSession().currentPrincipalId || !member || !["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role)) throw new PostgresRlsError("42501","Invalid reconciliation authorization");
+      const existing=this.getProductionReconciliation(approval.original_approval_id);
+      if(existing){if(existing.reconciliation_id!==approval.reconciliation_approval_id)throw new PostgresRlsError("23505","Deployment already reconciled differently");return existing;}
+      validateReconciliationApproval(approval,this.getProductionDeploymentApproval(approval.original_approval_id),this.getProductionDeploymentByApproval(approval.original_approval_id),this.clockTimestampIso());
+      const deployment=this.productionDeployments.get(approval.deployment_id)!;
+      const record:ProductionReconciliationRecord={reconciliation_id:approval.reconciliation_approval_id,project_id:input.project_id,deployment_id:deployment.deployment_id,
+        original_approval_id:approval.original_approval_id,outcome:approval.evidence.outcome,evidence_sha256:approval.evidence.evidence_sha256,approver_principal_id:approval.approver_principal_id,reconciled_at:this.clockTimestampIso()};
+      this.setInMap(this.reconciliationApprovals,approval.reconciliation_approval_id,{...approval,status:"CONSUMED"});
+      this.setInMap(this.reconciliations,record.reconciliation_id,record);
+      this.setInMap(this.productionDeployments,deployment.deployment_id,{...deployment,reconciled_at:record.reconciled_at});
+      this.insertOutboxEventInternal(input.project_id,"production_reconciliation",record.reconciliation_id,"deployment.reconciled",{deployment_id:record.deployment_id,outcome:record.outcome,evidence_sha256:record.evidence_sha256});
+      return structuredClone(record);
+    }));
+  }
+
   public createProductionDeploymentApproval(input: ProductionDeploymentApprovalRecord): ProductionDeploymentApprovalRecord {
     this.assertCoreApiWritePermissionForProject(input.project_id);
     const member = this.getProjectMembership(input.project_id,input.approver_principal_id);
@@ -5652,9 +5701,9 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       const existing = [...this.productionDeployments.values()].find((d) => d.approval_id === approval.approval_id);
       if (existing) return { record: structuredClone(existing), created: false };
       if (approval.status !== "ACTIVE" || Date.parse(approval.expires_at) <= Date.parse(this.clockTimestampIso())) throw new PostgresRlsError("42501", "Deployment approval expired, revoked or consumed");
-      if ([...this.productionDeployments.values()].some((d) => d.project_id === input.project_id && d.target_key === approval.target_key && ["RUNNING","UNKNOWN"].includes(d.status))) throw new PostgresRlsError("23505", "Production target already has an unresolved deployment");
+      if ([...this.productionDeployments.values()].some((d) => d.project_id === input.project_id && d.target_key === approval.target_key && !d.reconciled_at && ["RUNNING","UNKNOWN"].includes(d.status))) throw new PostgresRlsError("23505", "Production target already has an unresolved deployment");
       const record: ProductionDeploymentRecord = { deployment_id: randomUUID(), project_id: input.project_id, approval_id: approval.approval_id, target_key: approval.target_key,
-        requested_by_principal_id: input.requested_by_principal_id, status: "RUNNING", started_at: this.clockTimestampIso(), completed_at: null, receipt_sha256: null };
+        requested_by_principal_id: input.requested_by_principal_id, status: "RUNNING", started_at: this.clockTimestampIso(), completed_at: null, receipt_sha256: null, reconciled_at: null };
       this.setInMap(this.productionApprovals, approval.approval_id, { ...approval, status: "CONSUMED" });
       this.setInMap(this.productionDeployments, record.deployment_id, record);
       this.insertOutboxEventInternal(input.project_id, "production_deployment", record.deployment_id, "deployment.started", { deployment_id: record.deployment_id, approval_id: approval.approval_id, target_key: approval.target_key });
@@ -5665,7 +5714,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   public completeProductionDeployment(input: {project_id: string; deployment_id: string; status: "SUCCEEDED" | "UNKNOWN"; receipt_sha256: string | null}): ProductionDeploymentRecord {
     this.assertCoreApiWritePermissionForProject(input.project_id); validateDeploymentCompletion(input.status,input.receipt_sha256);
     const record = this.productionDeployments.get(input.deployment_id);
-    if (!record || record.project_id !== input.project_id || record.status !== "RUNNING") throw new PostgresRlsError("23514", "Only running deployment can complete");
+    if (!record || record.project_id !== input.project_id || record.status !== "RUNNING" || record.reconciled_at) throw new PostgresRlsError("23514", "Only running deployment can complete");
     const completed: ProductionDeploymentRecord = { ...record, status: input.status, receipt_sha256: input.receipt_sha256, completed_at: this.clockTimestampIso() };
     this.setInMap(this.productionDeployments, record.deployment_id, completed);
     this.insertOutboxEventInternal(input.project_id, "production_deployment", record.deployment_id, "deployment.completed", { deployment_id: record.deployment_id, status: input.status, receipt_sha256: input.receipt_sha256 });

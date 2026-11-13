@@ -1771,4 +1771,38 @@ export interface ProductionDeploymentRecord {
   readonly started_at: string;
   readonly completed_at: string | null;
   readonly receipt_sha256: string | null;
+  readonly reconciled_at?: string | null;
+}
+
+/** Provider verifier attests an existing durable fence; mere NOT_FOUND is insufficient. */
+export interface ProductionResolutionEvidence {
+  readonly outcome: "SUCCEEDED" | "NOT_DEPLOYED";
+  readonly terminal_fence: true;
+  readonly provider_operation_id: string;
+  readonly artifact_sha256: string | null;
+  readonly evidence_sha256: string;
+}
+export interface ProductionReconciliationApprovalRecord {
+  readonly reconciliation_approval_id: string;
+  readonly project_id: string;
+  readonly deployment_id: string;
+  readonly original_approval_id: string;
+  readonly deployment_binding_sha256: string;
+  readonly expected_status: "RUNNING" | "UNKNOWN";
+  readonly evidence: ProductionResolutionEvidence;
+  readonly approver_principal_id: string;
+  readonly issued_at: string;
+  readonly expires_at: string;
+  readonly token_sha256: string;
+  readonly status: "ACTIVE" | "CONSUMED" | "REVOKED";
+}
+export interface ProductionReconciliationRecord {
+  readonly reconciliation_id: string;
+  readonly project_id: string;
+  readonly deployment_id: string;
+  readonly original_approval_id: string;
+  readonly outcome: "SUCCEEDED" | "NOT_DEPLOYED";
+  readonly evidence_sha256: string;
+  readonly approver_principal_id: string;
+  readonly reconciled_at: string;
 }

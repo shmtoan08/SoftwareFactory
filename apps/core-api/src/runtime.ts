@@ -119,7 +119,7 @@ export async function createCoreApiRuntime(
   const productionDeployment = { ...options?.productionDeployment, signingSecret: options?.productionDeployment?.signingSecret ?? env.SF_DEPLOYMENT_APPROVAL_SECRET };
   validateDeploymentConfiguration(productionDeployment);
   if (options?.store) validateDeploymentStore(options.store,productionDeployment);
-  const productionRequiresPostgres = Object.keys(productionDeployment.executors ?? {}).length > 0 && productionDeployment.testOnlyEmulator !== true;
+  const productionRequiresPostgres = (Object.keys(productionDeployment.executors ?? {}).length > 0 || Object.keys(productionDeployment.resolutionVerifiers ?? {}).length > 0) && productionDeployment.testOnlyEmulator !== true;
   const requirePostgres = productionRequiresPostgres || (options?.requirePostgres ?? env.SF_REQUIRE_POSTGRES === "1");
 
   const ownedHandle = options?.store

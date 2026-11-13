@@ -1,3 +1,4 @@
+import type { ApproveReconciliationInput, ExecuteReconciliationInput } from "./deployment-reconciliation.ts";
 import type { ApproveProductionDeploymentInput, ExecuteProductionDeploymentInput } from "./production-deployment.ts";
 import { FactoryTelemetry, extractHttpTraceContext, formatTraceparent } from "@software-factory/observability";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -1146,6 +1147,18 @@ export class CoreApiHttpServer {
         this.sendJson(res, 200, matrix);
         return;
       }
+
+      const reconcileMatch=pathname.match(/^\/api\/v1\/projects\/([^/]+)\/production-deployments\/([^/]+)\/(reconciliation-evidence|reconciliation-approvals|reconciliation)$/);
+      if(reconcileMatch?.[1]&&reconcileMatch[2]){
+        const projectId=decodeURIComponent(reconcileMatch[1]);const originalApprovalId=decodeURIComponent(reconcileMatch[2]);const action=reconcileMatch[3];
+        if(method==="GET"&&action==="reconciliation-evidence"){this.sendJson(res,200,await this.coreApi.previewProductionReconciliation(projectId,auth,originalApprovalId));return;}
+        if(method==="POST"&&action==="reconciliation-approvals"){const body=await this.readJsonBody<ApproveReconciliationInput>(req);this.sendJson(res,201,await this.coreApi.approveProductionReconciliation(projectId,auth,originalApprovalId,body));return;}
+        if(method==="GET"&&action==="reconciliation"){const record=await this.coreApi.getProductionReconciliation(projectId,auth,originalApprovalId);this.sendJson(res,record?200:404,record??{error_code:"ERR_NOT_FOUND"});return;}
+      }
+      const revokeReconcileMatch=pathname.match(/^\/api\/v1\/projects\/([^/]+)\/deployment-reconciliations\/([^/]+)\/revoke$/);
+      if(method==="POST"&&revokeReconcileMatch?.[1]&&revokeReconcileMatch[2]){await this.coreApi.revokeProductionReconciliationApproval(decodeURIComponent(revokeReconcileMatch[1]),auth,decodeURIComponent(revokeReconcileMatch[2]));this.sendJson(res,200,{revoked:true});return;}
+      const executeReconcileMatch=pathname.match(/^\/api\/v1\/projects\/([^/]+)\/deployment-reconciliations$/);
+      if(method==="POST"&&executeReconcileMatch?.[1]){const body=await this.readJsonBody<ExecuteReconciliationInput>(req);this.sendJson(res,200,await this.coreApi.executeProductionReconciliation(decodeURIComponent(executeReconcileMatch[1]),auth,body));return;}
 
       const deploymentMatch = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/(deployment-approvals|production-deployments)(?:\/([^/]+)(?:\/(revoke))?)?$/);
       if (deploymentMatch?.[1]) {

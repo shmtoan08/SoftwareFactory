@@ -1,3 +1,4 @@
+import { validateReconciliationApproval } from "./reconciliation-validation.ts";
 import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
 import { validateVerificationIsolation } from "./m6c3-validation.ts";
 import { validateCodeImportReceipt } from "./m6c-validation.ts";
@@ -42,6 +43,8 @@ import {
   type PipelineSessionStatus,
   type PipelineStageName,
   type ProcessedWorkerEventRecord,
+  type ProductionReconciliationApprovalRecord,
+  type ProductionReconciliationRecord,
   type ProductionDeploymentApprovalRecord,
   type ProductionDeploymentRecord,
   type ProductPipelineBundle,
@@ -2227,6 +2230,15 @@ function mapChangeRequestRow(row: Record<string, unknown>): ChangeRequestRecord 
   return record;
 }
 
+function mapReconciliationApproval(row:Record<string,unknown>):ProductionReconciliationApprovalRecord{
+  return {reconciliation_approval_id:String(row.reconciliation_approval_id),project_id:String(row.project_id),deployment_id:String(row.deployment_id),original_approval_id:String(row.original_approval_id),
+    deployment_binding_sha256:String(row.deployment_binding_sha256),expected_status:row.expected_status as ProductionReconciliationApprovalRecord["expected_status"],evidence:row.evidence as ProductionReconciliationApprovalRecord["evidence"],
+    approver_principal_id:String(row.approver_principal_id),issued_at:new Date(String(row.issued_at)).toISOString(),expires_at:new Date(String(row.expires_at)).toISOString(),token_sha256:String(row.token_sha256),status:row.status as ProductionReconciliationApprovalRecord["status"]};
+}
+function mapReconciliation(row:Record<string,unknown>):ProductionReconciliationRecord{
+  return {reconciliation_id:String(row.reconciliation_id),project_id:String(row.project_id),deployment_id:String(row.deployment_id),original_approval_id:String(row.original_approval_id),
+    outcome:row.outcome as ProductionReconciliationRecord["outcome"],evidence_sha256:String(row.evidence_sha256),approver_principal_id:String(row.approver_principal_id),reconciled_at:new Date(String(row.reconciled_at)).toISOString()};
+}
 function mapProductionApproval(row: Record<string, unknown>): ProductionDeploymentApprovalRecord {
   return { approval_id: String(row.approval_id), project_id: String(row.project_id), pipeline_session_id: String(row.pipeline_session_id),
     release_id: String(row.release_id), release_package_sha256: String(row.release_package_sha256), commit_hash: String(row.commit_hash), artifact_sha256: String(row.artifact_sha256),
@@ -2236,7 +2248,7 @@ function mapProductionApproval(row: Record<string, unknown>): ProductionDeployme
 function mapProductionDeployment(row: Record<string, unknown>): ProductionDeploymentRecord {
   return { deployment_id: String(row.deployment_id), project_id: String(row.project_id), approval_id: String(row.approval_id), target_key: String(row.target_key),
     requested_by_principal_id: String(row.requested_by_principal_id), status: row.status as ProductionDeploymentRecord["status"], started_at: new Date(String(row.started_at)).toISOString(),
-    completed_at: row.completed_at ? new Date(String(row.completed_at)).toISOString() : null, receipt_sha256: row.receipt_sha256 ? String(row.receipt_sha256) : null };
+    completed_at: row.completed_at ? new Date(String(row.completed_at)).toISOString() : null, receipt_sha256: row.receipt_sha256 ? String(row.receipt_sha256) : null, reconciled_at: row.reconciled_at ? new Date(String(row.reconciled_at)).toISOString() : null };
 }
 
 function mapReleaseAcceptancePackageRow(
@@ -7476,6 +7488,40 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     if (this.pool.getActiveTxSession()) throw new PostgresRlsError("23514", "Production execution requires its own committed transaction");
   }
 
+  public async createProductionReconciliationApproval(input:ProductionReconciliationApprovalRecord):Promise<ProductionReconciliationApprovalRecord>{
+    const member=await this.getProjectMembership(input.project_id,input.approver_principal_id);
+    if(input.approver_principal_id!==this.pool.getActiveTxSession()?.currentPrincipalId || !member || !["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role))throw new PostgresRlsError("42501","Reconciliation requires the authenticated approver");
+    validateReconciliationApproval(input,await this.getProductionDeploymentApproval(input.original_approval_id),await this.getProductionDeploymentByApproval(input.original_approval_id),await this.clockTimestampIso());
+    const columns=["reconciliation_approval_id","project_id","deployment_id","original_approval_id","deployment_binding_sha256","expected_status","evidence","approver_principal_id","issued_at","expires_at","token_sha256","status"] as const;
+    const result=await this.pool.queryInActiveTx(`INSERT INTO production_reconciliation_approvals(${columns.join(",")}) VALUES(${columns.map((_,i)=>`$${i+1}`).join(",")}) RETURNING *;`,columns.map((c)=>input[c]));
+    await this.insertOutboxEventSql(input.project_id,"production_reconciliation",input.reconciliation_approval_id,"deployment.reconciliation_approved",{deployment_id:input.deployment_id,evidence_sha256:input.evidence.evidence_sha256});
+    return mapReconciliationApproval(result.rows[0]!);
+  }
+  public async revokeProductionReconciliationApproval(projectId:string,id:string):Promise<void>{
+    const result=await this.pool.queryInActiveTx("UPDATE production_reconciliation_approvals SET status='REVOKED' WHERE reconciliation_approval_id=$1::uuid AND project_id=$2::uuid AND status='ACTIVE' AND approver_principal_id=$3 RETURNING reconciliation_approval_id;",[id,projectId,this.pool.getActiveTxSession()?.currentPrincipalId]);
+    if(!result.rowCount)throw new PostgresRlsError("42501","Only the original approver may revoke active reconciliation approval");
+    await this.insertOutboxEventSql(projectId,"production_reconciliation",id,"deployment.reconciliation_revoked",{reconciliation_approval_id:id});
+  }
+  public async getProductionReconciliationApproval(id:string):Promise<ProductionReconciliationApprovalRecord|null>{
+    const result=await this.pool.queryInActiveTx("SELECT * FROM production_reconciliation_approvals WHERE reconciliation_approval_id=$1::uuid;",[id]);return result.rows[0]?mapReconciliationApproval(result.rows[0]):null;
+  }
+  public async getProductionReconciliation(originalApprovalId:string):Promise<ProductionReconciliationRecord|null>{
+    const result=await this.pool.queryInActiveTx("SELECT * FROM production_deployment_reconciliations WHERE original_approval_id=$1::uuid;",[originalApprovalId]);return result.rows[0]?mapReconciliation(result.rows[0]):null;
+  }
+  public async commitProductionReconciliation(input:{project_id:string;reconciliation_approval_id:string;token_sha256:string}):Promise<ProductionReconciliationRecord>{
+    const row=(await this.pool.queryInActiveTx("SELECT * FROM production_reconciliation_approvals WHERE reconciliation_approval_id=$1::uuid AND project_id=$2::uuid FOR UPDATE;",[input.reconciliation_approval_id,input.project_id])).rows[0];
+    if(!row)throw new PostgresRlsError("42501","Invalid reconciliation authorization");
+    const approval=mapReconciliationApproval(row);const member=await this.getProjectMembership(input.project_id,approval.approver_principal_id);
+    if(approval.token_sha256!==input.token_sha256 || approval.approver_principal_id!==this.pool.getActiveTxSession()?.currentPrincipalId || !member || !["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role))throw new PostgresRlsError("42501","Invalid reconciliation authorization");
+    const existing=await this.getProductionReconciliation(approval.original_approval_id);
+    if(existing){if(existing.reconciliation_id!==approval.reconciliation_approval_id)throw new PostgresRlsError("23505","Deployment already reconciled differently");return existing;}
+    const deployment=(await this.pool.queryInActiveTx("SELECT * FROM production_deployments WHERE deployment_id=$1::uuid AND project_id=$2::uuid FOR UPDATE;",[approval.deployment_id,input.project_id])).rows[0];
+    validateReconciliationApproval(approval,await this.getProductionDeploymentApproval(approval.original_approval_id),deployment?mapProductionDeployment(deployment):null,await this.clockTimestampIso());
+    const result=await this.pool.queryInActiveTx("INSERT INTO production_deployment_reconciliations(reconciliation_id,project_id,deployment_id,original_approval_id,outcome,evidence_sha256,approver_principal_id) VALUES($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5,$6,$7) RETURNING *;",[approval.reconciliation_approval_id,input.project_id,approval.deployment_id,approval.original_approval_id,approval.evidence.outcome,approval.evidence.evidence_sha256,approval.approver_principal_id]);
+    await this.insertOutboxEventSql(input.project_id,"production_reconciliation",approval.reconciliation_approval_id,"deployment.reconciled",{deployment_id:approval.deployment_id,outcome:approval.evidence.outcome,evidence_sha256:approval.evidence.evidence_sha256});
+    return mapReconciliation(result.rows[0]!);
+  }
+
   public async createProductionDeploymentApproval(input: ProductionDeploymentApprovalRecord): Promise<ProductionDeploymentApprovalRecord> {
     const member = await this.getProjectMembership(input.project_id,input.approver_principal_id);
     if (input.approver_principal_id !== this.pool.getActiveTxSession()?.currentPrincipalId || !member || !["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role)) throw new PostgresRlsError("42501", "Production approval requires the authenticated project approver");
@@ -7514,7 +7560,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   }
   public async completeProductionDeployment(input: {project_id:string;deployment_id:string;status:"SUCCEEDED"|"UNKNOWN";receipt_sha256:string|null}):Promise<ProductionDeploymentRecord>{
     validateDeploymentCompletion(input.status,input.receipt_sha256);
-    const result=await this.pool.queryInActiveTx("UPDATE production_deployments SET status=$3,receipt_sha256=$4,completed_at=clock_timestamp() WHERE project_id=$1::uuid AND deployment_id=$2::uuid AND status='RUNNING' RETURNING *;",[input.project_id,input.deployment_id,input.status,input.receipt_sha256]);
+    const result=await this.pool.queryInActiveTx("UPDATE production_deployments SET status=$3,receipt_sha256=$4,completed_at=clock_timestamp() WHERE project_id=$1::uuid AND deployment_id=$2::uuid AND status='RUNNING' AND reconciled_at IS NULL RETURNING *;",[input.project_id,input.deployment_id,input.status,input.receipt_sha256]);
     if(!result.rows[0])throw new PostgresRlsError("23514","Only running deployment can complete");
     await this.insertOutboxEventSql(input.project_id,"production_deployment",input.deployment_id,"deployment.completed",{deployment_id:input.deployment_id,status:input.status,receipt_sha256:input.receipt_sha256});
     return mapProductionDeployment(result.rows[0]);

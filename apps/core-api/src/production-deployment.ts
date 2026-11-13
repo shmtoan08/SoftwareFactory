@@ -1,6 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { canonicalizeJson, sha256Hex, type ProductionDeploymentApprovalRecord, type ProductionDeploymentRecord } from "@software-factory/shared-types";
+import { canonicalizeJson, sha256Hex, type ProductionDeploymentApprovalRecord, type ProductionDeploymentRecord, type ProductionResolutionEvidence } from "@software-factory/shared-types";
 import { PostgresControlPlaneRepository, PostgresRlsError, type ControlPlaneStore } from "@software-factory/database";
 
 export interface ProductionDeploymentAction {
@@ -14,9 +14,13 @@ export interface ProductionDeploymentAction {
 }
 /** Operator-injected executor must deploy the exact digest and use deployment_id as its idempotency key. */
 export type ProductionDeploymentExecutor = (action: Readonly<ProductionDeploymentAction>, signal: AbortSignal) => Promise<{ readonly receipt_sha256: string }>;
+/** Read-only provider lookup. It must attest a durable terminal fence blocking ALL late submissions of deployment_id.
+ * No "not found" inference, cancellation side effect, deploy, or retry is permitted here. */
+export type ProductionResolutionVerifier = (action: Readonly<ProductionDeploymentAction>, signal: AbortSignal) => Promise<ProductionResolutionEvidence>;
 export interface ProductionDeploymentConfiguration {
   readonly signingSecret?: string;
   readonly executors?: Readonly<Record<string, ProductionDeploymentExecutor>>;
+  readonly resolutionVerifiers?: Readonly<Record<string, ProductionResolutionVerifier>>;
   readonly timeoutMs?: number;
   /** Explicit provider-free unit-test mode; never enabled through environment variables. */
   readonly testOnlyEmulator?: boolean;
@@ -35,7 +39,7 @@ export interface ExecuteProductionDeploymentInput {
 
 export function validateDeploymentConfiguration(config: ProductionDeploymentConfiguration): void {
   if (config.signingSecret !== undefined && Buffer.byteLength(config.signingSecret) < 32) throw new Error("Production approval signing secret must contain at least 32 bytes");
-  const entries = Object.entries(config.executors ?? {});
+  const entries = [...Object.entries(config.executors ?? {}),...Object.entries(config.resolutionVerifiers ?? {})];
   if (entries.length && !config.signingSecret) throw new Error("Production executors require an explicit approval signing secret");
   if (entries.some(([key, executor]) => !/^[a-z][a-z0-9-]{0,63}$/.test(key) || typeof executor !== "function")) throw new Error("Invalid production executor registry");
   if (config.timeoutMs !== undefined && (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs < 1 || config.timeoutMs > 120_000)) throw new Error("Production executor timeout must be 1..120000 ms");
@@ -44,7 +48,7 @@ export function validateProductionId(value: string): void {
   if (typeof value !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value)) throw new PostgresRlsError("23514", "Production identifiers must be canonical UUIDs");
 }
 export function validateDeploymentStore(store: ControlPlaneStore, config: ProductionDeploymentConfiguration): void {
-  if (Object.keys(config.executors ?? {}).length && config.testOnlyEmulator !== true && !(store instanceof PostgresControlPlaneRepository)) {
+  if ((Object.keys(config.executors ?? {}).length || Object.keys(config.resolutionVerifiers ?? {}).length) && config.testOnlyEmulator !== true && !(store instanceof PostgresControlPlaneRepository)) {
     throw new Error("Production deployment requires PostgreSQL; in-memory execution is test-only");
   }
 }

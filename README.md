@@ -61,6 +61,7 @@ psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0011_m6c_review_notes_ha
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_denial_journal.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0014_m6c3_production_deployment_gate.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 ```
 
@@ -166,7 +167,7 @@ Both `/scheduler/dispatch` and `/tasks/:taskId/dispatch` enforce project capacit
 
 ## M6C-2 Runtime & Import API
 
-Apply migrations through `0014` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
+Apply migrations through `0015` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
 
 Production `SF_AGENT_RUNTIME=codex-cli` is disabled with `ERR_UNMETERED_CODEX_DISABLED` until trusted Cost Guard metering is integrated (explicit project-owner decision for issue #8 note 9). There is no environment flag to enable unmetered production calls. Provider-free fixtures explicitly pass `testOnlyEmulator: true`, an emulator binary and the fixed `CODEX_EMULATOR_CREDENTIAL`; live credentials and resolver callbacks are rejected in that mode. The detached-worktree permission profile and controlled push remain tested by a mandatory native Codex sandbox CI job. Runtime timeout belongs to WNA, which enforces the adapter's `timeoutMs` and reaps/cleans the invocation. See [remaining-note validation](./m6c-review-notes-validation.md).
 
@@ -217,6 +218,22 @@ Migration `0014` adds FORCE-RLS approval/deployment journals. `POST /api/v1/proj
 
 Production execution is disabled by default and requires PostgreSQL; configured production executors cannot silently run on the memory store. The in-process `testOnlyEmulator: true` flag permits provider-free unit tests only and has no environment-variable switch. Operators must explicitly inject a `productionDeployment.executors` registry into `createCoreApiRuntime` and configure a stable, random signing secret of at least 32 bytes (`productionDeployment.signingSecret` or `SF_DEPLOYMENT_APPROVAL_SECRET`). HTTP requests cannot select commands, URLs, credentials or backends. Registered executors receive only the immutable approved action and an AbortSignal; they must verify artifact bytes/provenance, deploy the exact digest and honor `deployment_id` as the provider idempotency key. The Factory signature attests an authenticated approver action; it is not a user-held asymmetric signature or a WebAuthn presence check.
 
-A successful executor returns a SHA-256 receipt. Timeout, exception or malformed receipt produces UNKNOWN; raw provider errors are not exposed. RUNNING and UNKNOWN both hold the `(project, target_key)` exclusion lock, so a fresh approval cannot bypass unresolved work. If the process dies or terminal persistence fails, RUNNING survives; there is no automatic retry, unlock or claim of exactly-once external effect. Outcomes require operator investigation. An authenticated reconciliation/unlock workflow and concrete cloud deployment executors remain future work; the gate deliberately stays closed in those recovery cases. Removing/relabeling a target is not a supported recovery mechanism.
+A successful executor returns a SHA-256 receipt. Timeout, exception or malformed receipt produces UNKNOWN; raw provider errors are not exposed. RUNNING and UNKNOWN both hold the `(project, target_key)` exclusion lock, so a fresh approval cannot bypass unresolved work. If the process dies or terminal persistence fails, RUNNING survives; there is no automatic retry, unlock or claim of exactly-once external effect. Outcomes require operator investigation. Recovery now requires the separately approved, provider-evidence-bound reconciliation workflow below; without its configured verifier and approval the target stays closed. Concrete cloud deployment executors remain future work. Removing/relabeling a target is not a supported recovery mechanism.
 
 `npm run test:m6c3:deployment` covers memory/HTTP/PostgreSQL, signatures/RBAC, exact binding, concurrency, timeout/revoke/expiry, unresolved target holds, commit-before-effect, process death and restart. It uses local test executors only, not production infrastructure. See [deployment validation](./m6c3-deployment-validation.md). External execution connectors, VM backends and M6C/G7 acceptance remain pending.
+
+### M6C-3 in progress: approved deployment reconciliation
+
+Apply migration `0015`. Configure `productionDeployment.resolutionVerifiers[target_key]` alongside the stable approval signing key. PostgreSQL is mandatory except for explicit in-process emulator tests. Resolution verifiers are trusted, read-only provider adapters; they must attest an **existing durable terminal fence** for the original `deployment_id`, preventing every late submission/retry of that ID from creating an effect. A missing operation, an elapsed timeout or a cancellation request alone is insufficient. This workflow does not create that provider fence or call deployment/cancellation APIs. A provider without durable fencing support must remain HOLD.
+
+For an unresolved deployment, use these project-scoped routes (the path ID is the original deployment approval ID):
+
+1. `GET /production-deployments/:approvalId/reconciliation-evidence` — approver/admin previews configured provider evidence.
+2. `POST /production-deployments/:approvalId/reconciliation-approvals` — the same human reviews and approves `expected_outcome` (`SUCCEEDED` or `NOT_DEPLOYED`), `expected_evidence_sha256`, and optional `ttl_ms` (default 5 minutes, max 15). The server rechecks evidence and returns a purpose-separated signed token bound to the immutable deployment snapshot.
+3. `POST /deployment-reconciliations` with only `reconciliation_approval_id` and `approval_token` — requires the original approver, rechecks live provider evidence, atomically consumes approval, appends reconciliation audit and releases only that deployment's HOLD. Replay is idempotent. The original status/receipt and consumed deployment approval remain unchanged.
+
+All paths above are relative to `/api/v1/projects/:projectId`. Developers/auditors cannot approve or execute recovery. `POST /deployment-reconciliations/:id/revoke` revokes an unused recovery approval; `GET /production-deployments/:approvalId/reconciliation` exposes project-scoped history to read roles. Current main may advance during recovery: the recovery decision binds the immutable old deployment, not a fresh deploy request. A new deployment still requires its own valid approval against live main.
+
+There is no force-unlock or automatic redispatch. `SUCCEEDED` evidence must identify the exact approved artifact; `NOT_DEPLOYED` requires a terminal provider fence/tombstone, not NOT_FOUND. Changed evidence/status, failed lookup, timeout, expired/revoked approval or transaction failure retains HOLD. A late completion from the old executor cannot overwrite reconciliation. The new `reconciled_at` marks closure while original RUNNING/UNKNOWN execution status is retained as history.
+
+`npm run test:m6c3:reconciliation` covers the workflow on memory, HTTP and PostgreSQL; [recovery validation and trust boundaries](./m6c3-reconciliation-validation.md) distinguish test fence evidence from a real cloud adapter. Concrete provider fencing/verifier adapters, external targets, VM backends and M6C/G7 acceptance remain pending.

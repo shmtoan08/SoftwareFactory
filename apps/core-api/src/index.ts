@@ -1,3 +1,5 @@
+import { ProductionDeploymentReconciler, type ApproveReconciliationInput, type ExecuteReconciliationInput } from "./deployment-reconciliation.ts";
+export * from "./deployment-reconciliation.ts";
 import { ProductionDeploymentGate, validateProductionId, type ProductionDeploymentConfiguration, type ApproveProductionDeploymentInput, type ExecuteProductionDeploymentInput } from "./production-deployment.ts";
 export * from "./production-deployment.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -373,6 +375,7 @@ export class CoreApiService {
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
   public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
+  private readonly productionDeploymentReconciler: ProductionDeploymentReconciler;
   private readonly productionDeploymentGate: ProductionDeploymentGate;
   private readonly onWarning?: (warning: CoreApiWarning) => void;
 
@@ -396,6 +399,7 @@ export class CoreApiService {
   ) {
     this.store = store;
     this.productionDeploymentGate = new ProductionDeploymentGate(store, options?.productionDeployment);
+    this.productionDeploymentReconciler = new ProductionDeploymentReconciler(store, options?.productionDeployment);
     this.telemetry = options?.telemetry ?? createFactoryTelemetryFromEnv(options?.env ?? process.env);
     this.snapshotStore = options?.snapshotStore ?? null;
     this.onWarning = options?.onWarning;
@@ -760,6 +764,22 @@ export class CoreApiService {
     return this.withAuthorizedRlsTransaction(auth, projectId, READ_ROLES, () =>
       this.store.selectVisibleTasks()
     );
+  }
+
+  public async previewProductionReconciliation(projectId:string,auth:CoreApiAuthContext,originalApprovalId:string){
+    const actor=await this.authorize(auth,projectId,APPROVAL_ROLES);return this.productionDeploymentReconciler.preview(projectId,actor.principalId,originalApprovalId);
+  }
+  public async approveProductionReconciliation(projectId:string,auth:CoreApiAuthContext,originalApprovalId:string,input:ApproveReconciliationInput){
+    const actor=await this.authorize(auth,projectId,APPROVAL_ROLES);return this.productionDeploymentReconciler.approve(projectId,actor.principalId,originalApprovalId,input);
+  }
+  public async executeProductionReconciliation(projectId:string,auth:CoreApiAuthContext,input:ExecuteReconciliationInput){
+    const actor=await this.authorize(auth,projectId,APPROVAL_ROLES);return this.productionDeploymentReconciler.execute(projectId,actor.principalId,input);
+  }
+  public revokeProductionReconciliationApproval(projectId:string,auth:CoreApiAuthContext,id:string){
+    return this.withAuthorizedRlsTransaction(auth,projectId,APPROVAL_ROLES,()=>{validateProductionId(id);return this.store.revokeProductionReconciliationApproval(projectId,id);});
+  }
+  public getProductionReconciliation(projectId:string,auth:CoreApiAuthContext,originalApprovalId:string){
+    return this.withAuthorizedRlsTransaction(auth,projectId,READ_ROLES,()=>{validateProductionId(originalApprovalId);return this.store.getProductionReconciliation(originalApprovalId);});
   }
 
   public async approveProductionDeployment(projectId: string, auth: CoreApiAuthContext, input: ApproveProductionDeploymentInput) {

@@ -29,6 +29,8 @@ import type {
   OutboxEventRecord,
   PipelineStageName,
   ProcessedWorkerEventRecord,
+  ProductionReconciliationApprovalRecord,
+  ProductionReconciliationRecord,
   ProductionDeploymentApprovalRecord,
   ProductionDeploymentRecord,
   ProductPipelineBundle,
@@ -884,6 +886,11 @@ export interface ControlPlaneStore {
     pipelineSessionId: string
   ): ProductPipelineBundle | null | Promise<ProductPipelineBundle | null>;
 
+  createProductionReconciliationApproval(input: ProductionReconciliationApprovalRecord): ProductionReconciliationApprovalRecord | Promise<ProductionReconciliationApprovalRecord>;
+  revokeProductionReconciliationApproval(projectId: string, id: string): void | Promise<void>;
+  getProductionReconciliationApproval(id: string): ProductionReconciliationApprovalRecord | null | Promise<ProductionReconciliationApprovalRecord | null>;
+  getProductionReconciliation(originalApprovalId: string): ProductionReconciliationRecord | null | Promise<ProductionReconciliationRecord | null>;
+  commitProductionReconciliation(input: {project_id: string; reconciliation_approval_id: string; token_sha256: string}): ProductionReconciliationRecord | Promise<ProductionReconciliationRecord>;
   createProductionDeploymentApproval(input: ProductionDeploymentApprovalRecord): ProductionDeploymentApprovalRecord | Promise<ProductionDeploymentApprovalRecord>;
   getProductionDeploymentApproval(approvalId: string): ProductionDeploymentApprovalRecord | null | Promise<ProductionDeploymentApprovalRecord | null>;
   getProductionDeploymentByApproval(approvalId: string): ProductionDeploymentRecord | null | Promise<ProductionDeploymentRecord | null>;
