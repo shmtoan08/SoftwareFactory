@@ -630,7 +630,12 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     maskedPaths?: readonly string[];
     readOnlyPaths?: readonly string[];
     dropPrivileges?: boolean;
+    /** Strict external worker mode: native parent-death, deadline and read-only host mounts. */
+    externalWorkerGuard?: { readonly maxRuntimeMs: number };
   }): RealProcessSpawnResult {
+    if (input.externalWorkerGuard && (process.platform !== "linux" || !Number.isSafeInteger(input.externalWorkerGuard.maxRuntimeMs) || input.externalWorkerGuard.maxRuntimeMs < 1 || input.externalWorkerGuard.maxRuntimeMs > 125000 || !input.requireKernelCgroup || !input.requireSubreaper || !input.requireNamespaceIsolation || !input.dropPrivileges)) {
+      throw new Error("ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED");
+    }
     const k = this.key(input.taskId, input.leaseEpoch);
     const cgroupPath = this.getCgroupPath(input.taskId, input.leaseEpoch);
     const taskUid = deriveTaskRunnerUid(input.taskId);
@@ -648,6 +653,16 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
       }
       mkdirSync(cgroupPath, { recursive: true });
       cgroupCreated = true;
+      if (input.externalWorkerGuard) {
+        try {
+          writeFileSync(join(cgroupPath, "pids.max"), "64");
+          writeFileSync(join(cgroupPath, "memory.max"), String(512 * 1024 * 1024));
+          writeFileSync(join(cgroupPath, "cpu.max"), "50000 100000");
+        } catch (error) {
+          try { rmdirSync(cgroupPath); } catch { /* leave failed scope for inspection */ }
+          throw error;
+        }
+      }
       executionMode = "real-cgroup-v2";
     }
 
@@ -804,6 +819,9 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         ["reap_file", reapPath],
         ["cmd", input.command],
       ];
+      if (input.externalWorkerGuard) {
+        configPairs.push(["parent_pid", String(process.pid)], ["max_runtime_ms", String(input.externalWorkerGuard.maxRuntimeMs)], ["workspace_only", "1"]);
+      }
       for (const a of input.args) {
         configPairs.push(["arg", a]);
       }
@@ -1807,3 +1825,7 @@ export class LocalOutboxBuffer {
 
 export * from "./daemon.ts";
 
+
+export * from "./worker-endpoint.ts";
+export * from "./worker-execution-journal.ts";
+export * from "./worker-endpoint-runner.ts";

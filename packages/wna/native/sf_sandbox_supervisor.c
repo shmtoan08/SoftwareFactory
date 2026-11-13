@@ -6,6 +6,7 @@
 #include <grp.h>
 #include <limits.h>
 #include <linux/capability.h>
+#include <linux/mount.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
@@ -435,6 +436,9 @@ typedef struct {
   bool require_ns;
   bool enable_subreaper;
   bool require_subreaper;
+  pid_t parent_pid;
+  unsigned int max_runtime_ms;
+  bool workspace_only;
   int drop_privs_mode; /* 0 = never, 1 = auto, 2 = force */
   uid_t target_uid;
   gid_t target_gid;
@@ -484,6 +488,12 @@ static int parse_nul_config(const char *buf, size_t len, SupervisorConfig *cfg) 
       cfg->enable_subreaper = strcmp(val, "1") == 0;
     } else if (strcmp(key, "require_subreaper") == 0) {
       cfg->require_subreaper = strcmp(val, "1") == 0;
+    } else if (strcmp(key, "parent_pid") == 0) {
+      cfg->parent_pid = (pid_t)strtol(val, NULL, 10);
+    } else if (strcmp(key, "max_runtime_ms") == 0) {
+      cfg->max_runtime_ms = (unsigned int)strtoul(val, NULL, 10);
+    } else if (strcmp(key, "workspace_only") == 0) {
+      cfg->workspace_only = strcmp(val, "1") == 0;
     } else if (strcmp(key, "drop_privs") == 0) {
       cfg->drop_privs_mode = atoi(val);
     } else if (strcmp(key, "uid") == 0) {
@@ -845,6 +855,12 @@ int main(int argc, char **argv) {
     return 2;
   }
 
+  struct timespec watchdog_started;
+  (void)clock_gettime(CLOCK_MONOTONIC, &watchdog_started);
+  if (cfg.parent_pid > 0 && (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) != 0 || getppid() != cfg.parent_pid || g_terminate_requested)) {
+    write_ready_failure(cfg.ready_file, "ERR_WORKER_PARENT_LOST", "Coordinator ownership lost before spawn");
+    return 1;
+  }
   bool subreaper_enabled = false;
   if (cfg.enable_subreaper) {
     if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0) {
@@ -1004,6 +1020,30 @@ int main(int argc, char **argv) {
             _exit(1);
           }
         }
+      }
+    }
+
+    if (cfg.workspace_only) {
+      bool boundary_ok = ns_applied;
+#ifdef SYS_mount_setattr
+      struct mount_attr ro_attr;
+      memset(&ro_attr, 0, sizeof(ro_attr));
+      ro_attr.attr_set = MOUNT_ATTR_RDONLY;
+      if (boundary_ok && mount("/", "/", NULL, MS_BIND | MS_REC, NULL) != 0) boundary_ok = false;
+      if (boundary_ok && syscall(SYS_mount_setattr, AT_FDCWD, "/", AT_RECURSIVE, &ro_attr, sizeof(ro_attr)) != 0) boundary_ok = false;
+      if (boundary_ok && mount(cfg.cwd, cfg.cwd, NULL, MS_BIND | MS_REC, NULL) != 0) boundary_ok = false;
+      struct mount_attr rw_attr;
+      memset(&rw_attr, 0, sizeof(rw_attr));
+      rw_attr.attr_clr = MOUNT_ATTR_RDONLY;
+      rw_attr.attr_set = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV;
+      if (boundary_ok && syscall(SYS_mount_setattr, AT_FDCWD, cfg.cwd, AT_RECURSIVE, &rw_attr, sizeof(rw_attr)) != 0) boundary_ok = false;
+#else
+      boundary_ok = false;
+#endif
+      if (!boundary_ok) {
+        send_pipe_error(meta_pipe[1], "ERR_WORKER_FILESYSTEM_BOUNDARY", "Read-only host and writable task mount required");
+        close(meta_pipe[1]);
+        _exit(1);
       }
     }
 
@@ -1209,6 +1249,16 @@ int main(int argc, char **argv) {
   char *mbuf = (char *)malloc(mcap);
   if (mbuf) {
     for (;;) {
+      if (cfg.parent_pid > 0) {
+        if (g_terminate_requested) break;
+        struct timespec setup_now;
+        (void)clock_gettime(CLOCK_MONOTONIC, &setup_now);
+        long long setup_ms = (setup_now.tv_sec - watchdog_started.tv_sec) * 1000LL + (setup_now.tv_nsec - watchdog_started.tv_nsec) / 1000000LL;
+        if (cfg.max_runtime_ms > 0 && setup_ms >= cfg.max_runtime_ms) { g_terminate_requested = 1; break; }
+        struct pollfd setup_fd = { meta_pipe[0], POLLIN | POLLHUP, 0 };
+        int ready = poll(&setup_fd, 1, 100);
+        if (ready <= 0) continue;
+      }
       if (mlen + 1024 > mcap) {
         mcap *= 2;
         char *next = (char *)realloc(mbuf, mcap);
@@ -1262,6 +1312,11 @@ int main(int argc, char **argv) {
         snprintf(err_msg, sizeof(err_msg), "%.500s", tab + 1);
       }
     }
+    if (cfg.parent_pid > 0 && cfg.cgroup_path) {
+      char failed_scope_kill[PATH_MAX];
+      snprintf(failed_scope_kill, sizeof(failed_scope_kill), "%s/cgroup.kill", cfg.cgroup_path);
+      (void)write_str_file(failed_scope_kill, "1");
+    }
     kill(-c1_pid, SIGKILL);
     kill(c1_pid, SIGKILL);
     for (;;) {
@@ -1301,6 +1356,12 @@ int main(int argc, char **argv) {
   bool main_exited = false;
 
   for (;;) {
+    if (cfg.max_runtime_ms > 0) {
+      struct timespec now;
+      (void)clock_gettime(CLOCK_MONOTONIC, &now);
+      long long elapsed_ms = (now.tv_sec - watchdog_started.tv_sec) * 1000LL + (now.tv_nsec - watchdog_started.tv_nsec) / 1000000LL;
+      if (elapsed_ms >= cfg.max_runtime_ms) g_terminate_requested = 1;
+    }
     if (g_terminate_requested) {
       break;
     }
@@ -1345,6 +1406,11 @@ int main(int argc, char **argv) {
   }
 
   if (g_terminate_requested) {
+    if (cfg.cgroup_path && cfg.cgroup_path[0]) {
+      char kill_path[PATH_MAX];
+      snprintf(kill_path, sizeof(kill_path), "%s/cgroup.kill", cfg.cgroup_path);
+      (void)write_str_file(kill_path, "1");
+    }
     pid_t my_pid = getpid();
     for (int round = 0; round < 100; round++) {
       if (!main_exited) {
@@ -1385,6 +1451,22 @@ int main(int argc, char **argv) {
       }
       struct timespec ts = {0, 15 * 1000 * 1000};
       nanosleep(&ts, NULL);
+    }
+  }
+
+  if (cfg.max_runtime_ms > 0 && g_terminate_requested) main_exit_code = 124;
+  // The live coordinator owns normal cleanup. After its death this native
+  // supervisor alone drains/removes its exact scope; no PID-based ownership recovery.
+  if (cfg.parent_pid > 0 && getppid() != cfg.parent_pid && cfg.cgroup_path) {
+    char events_path[PATH_MAX];
+    snprintf(events_path, sizeof(events_path), "%s/cgroup.events", cfg.cgroup_path);
+    for (int attempt = 0; attempt < 200; attempt++) {
+      char *events = read_entire_file(events_path, NULL);
+      bool empty = events && strstr(events, "populated 0") != NULL;
+      free(events);
+      if (empty) { (void)rmdir(cfg.cgroup_path); break; }
+      struct timespec pause_time = {0, 25 * 1000 * 1000};
+      nanosleep(&pause_time, NULL);
     }
   }
 
