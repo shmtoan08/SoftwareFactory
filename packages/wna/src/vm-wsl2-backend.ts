@@ -108,10 +108,24 @@ export function decodeWslOutput(raw: Buffer): string {
     return raw.toString("utf8").replace(/^\uFEFF/, "");
   }
 
-  // UTF-16LE without BOM (Windows console pipe default)
-  // When ASCII text is rendered in UTF-16LE, even indices hold ASCII values and odd indices are 0x00.
-  if (raw.length >= 4 && raw.length % 2 === 0 && raw[1] === 0x00 && raw[3] === 0x00) {
-    return raw.toString("utf16le").replace(/^\uFEFF/, "");
+  // BOM-less encoding is inherently ambiguous. Require an ASCII-dominated
+  // sample across multiple code units, not just two early NUL bytes in UTF-8.
+  // WSL listing headers/column spacing normally provide this evidence.
+  if (raw.length >= 16 && raw.length % 2 === 0) {
+    const sampleUnits = Math.min(raw.length / 2, 64);
+    let asciiUnits = 0;
+    for (let i = 0; i < sampleUnits; i++) {
+      const low = raw[i * 2]!;
+      if (raw[i * 2 + 1] === 0 && (low === 9 || low === 10 || low === 13 || (low >= 32 && low <= 126))) asciiUnits++;
+    }
+    if (asciiUnits >= 8 && asciiUnits / sampleUnits >= 0.7) {
+      try {
+        const decoded = new TextDecoder("utf-16le", { fatal: true }).decode(raw);
+        if (!decoded.includes("\0")) return decoded;
+      } catch {
+        // Insufficient evidence for UTF-16LE: retain the UTF-8 fallback below.
+      }
+    }
   }
 
   // Default fallback: UTF-8

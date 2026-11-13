@@ -406,6 +406,22 @@ describe("M6C-3 Step 6 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
       assert.strictEqual(decoded, text);
     });
 
+    it("decodeWslOutput preserves UTF-8 with early NUL bytes across a longer sample", () => {
+      for (const text of ["A\0B\0 plain UTF8 text", "A\0B\0 café UTF8 data", "A\0B\0x"]) {
+        assert.equal(decodeWslOutput(Buffer.from(text, "utf8")), text);
+      }
+    });
+
+    it("decodeWslOutput decodes BOM-less UTF-16LE listing with localized text", () => {
+      const text = "  NOM                  ETAT                       VERSION\r\n* Ubuntu               En cours d'exécution       2\r\n";
+      assert.equal(decodeWslOutput(Buffer.from(text, "utf16le")), text);
+    });
+
+    it("decodeWslOutput leaves short ambiguous BOM-less bytes on UTF-8 fallback", () => {
+      const raw = Buffer.from("AB", "utf16le");
+      assert.equal(decodeWslOutput(raw), raw.toString("utf8"));
+    });
+
     it("decodeWslOutput returns empty string for empty buffer", () => {
       assert.strictEqual(decodeWslOutput(Buffer.alloc(0)), "");
     });
@@ -719,6 +735,22 @@ describe("M6C-3 Step 6 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
         async () => backend.stop(),
         /ERR_VM_LIFECYCLE_DISABLED.*require both allowLifecycle=true and dedicatedInstance=true/
       );
+    });
+
+    it("start() retains targeted idempotent boot for localized running state", async () => {
+      await withTempFixture((testDir) => `#!/usr/bin/env node
+        import { appendFileSync } from 'node:fs';
+        const args = process.argv.slice(2);
+        appendFileSync(${JSON.stringify(join(testDir, "localized.log"))}, JSON.stringify(args) + String.fromCharCode(10));
+        if (args.includes('--list')) {
+          console.log(${JSON.stringify("  NOM             ETAT                       VERSION\n  Ubuntu-22.04    En cours d'exécution       2\n")});
+        }
+      `, async (binaryPath, testDir) => {
+        const backend = new Wsl2VmBackend({binaryPath, distributionName: "Ubuntu-22.04", allowLifecycle: true, dedicatedInstance: true, testOnlyEmulator: true});
+        await backend.start();
+        const calls = readFileSync(join(testDir, "localized.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        assert.deepEqual(calls, [["--list", "--verbose"], ["--distribution", "Ubuntu-22.04", "--exec", "/bin/true"]]);
+      });
     });
 
     it("start() probes and invokes targeted boot command for stopped distro", async () => {

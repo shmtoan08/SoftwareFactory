@@ -1,11 +1,11 @@
 # M6C-3 Step 6 — WSL2 VM Backend Foundation Technical Validation Report
 
-**Author**: Agent B  
-**Tracker**: [Issue #16 — VM Backend Foundation](https://github.com/shmtoan08/SoftwareFactory/issues/16)  
-**Baseline SHA**: `6d1d846dae387f78e5eb93cfa000394e2556f0a0`  
-**Follow-up Base SHA**: `82a09aa1775c0fe522c31f65ee7945bf37c75183`  
-**Branch**: `m6c3/vm-wsl2-foundation`  
-**Date**: 2026-11-13  
+**Author**: Agent B\
+**Tracker**: [Issue #16 — VM Backend Foundation](https://github.com/shmtoan08/SoftwareFactory/issues/16)\
+**Baseline SHA**: `6d1d846dae387f78e5eb93cfa000394e2556f0a0`\
+**Follow-up Base SHA**: `82a09aa1775c0fe522c31f65ee7945bf37c75183`\
+**Branch**: `m6c3/vm-wsl2-foundation`\
+**Date**: 2026-11-13\
 **Status**: Complete (Unit & CLI Process Contract Tests Passed; Native Windows Evidence PENDING)
 
 ---
@@ -97,21 +97,21 @@ When `commandTimeoutMs` expires, an `AbortSignal` fires, or output exceeds `maxO
 
 ## 3. Test Matrix & Results
 
-Suite: `packages/test-harness/src/m6c3-vm-wsl2.test.ts`  
-Runner: `node --test`  
-Total Test Cases: **51**  
-Total Test Suites: **9**  
-Passed: **51** | Failed: **0** | Skipped: **0**
+Suite: `packages/test-harness/src/m6c3-vm-wsl2.test.ts`\
+Runner: `node --test`\
+Total Test Cases: **56**\
+Total Test Suites: **9**\
+Passed: **56** | Failed: **0** | Cancelled: **0** | Skipped: **0** | Todo: **0**
 
 | Group | Description | Cases | Outcome |
 |---|---|---|---|
 | Group 1 | Production Platform Guard & Configuration Validation | 9 | 9 PASS |
-| Group 2 | Output Decoding (UTF-16LE with BOM, UTF-16LE without BOM, UTF-8 BOM, UTF-8) | 5 | 5 PASS |
+| Group 2 | Output Decoding (BOM, BOM-less UTF-16LE, early UTF-8 NUL and short ambiguous input) | 8 | 8 PASS |
 | Group 3 | Distribution Probing & Version 2 Contract (`probe()`) | 14 | 14 PASS |
-| Group 4 | Lifecycle Operations (`start()`, `stop()`) | 5 | 5 PASS |
+| Group 4 | Lifecycle Operations (`start()`, `stop()`, localized-state limitation) | 6 | 6 PASS |
 | Group 5 | Operator Diagnostic Execution (`execOperatorCommand()`) | 10 | 10 PASS |
 | Group 6 | Host & Guest Environment Boundary (Secrets & WSLENV) | 1 | 1 PASS |
-| Group 7 | Timeout, Abort, Output Caps & Uncertain Outcome Semantics | 6 | 6 PASS |
+| Group 7 | Timeout, Abort, Output Caps & Uncertain Outcome Semantics | 7 | 7 PASS |
 | Group 8 | Error Sanitization Helper | 1 | 1 PASS |
 
 ### Specific Regression Coverage for Follow-Up Items
@@ -159,4 +159,14 @@ B delivered commits `82a09aa` and `eb97c36` with 51 passing tests. A cherry-pick
 
 A removed the 300 ms successful settlement fallback after host CLI exit: if a descendant retains output pipes, an incomplete stream must not be reported as success. The existing execution deadline now remains in force until pipe closure; timeout reports uncertain outcome. A second process fixture exits the direct CLI with code zero while a descendant retains pipes, asserts timeout rejection, and kills its recorded descendant in cleanup.
 
-Local integration validation on macOS with Node 24.16.0: **52 tests, 9 suites, 52 pass, 0 fail/cancelled/skipped/todo**. Typecheck, lint and secret scan are recorded separately in the integration handoff. Native Windows/WSL2, guest cleanup and kernel isolation remain **PENDING**. Lima is not implemented in this integration; issue #16 and M6C/G7 remain open.
+Historical integration validation at main `9d2aea6` on macOS with Node 24.16.0: **52 tests, 9 suites, 52 pass, 0 fail/cancelled/skipped/todo**. Typecheck, lint and secret scan are recorded separately in the integration handoff. Native Windows/WSL2, guest cleanup and kernel isolation remain **PENDING**. Lima is not implemented in this integration; issue #16 and M6C/G7 remain open.
+
+## 6. Issue #17 review follow-up (2026-11-14)
+
+**S6-NOTE-01 — localized running state:** the no-op optimization in `start()` recognizes the English `Running` token only (case-insensitive). Other state text, including French `En cours d'exécution`, still passes through exact identity/version checks and, with both lifecycle opt-ins enabled, invokes the same targeted `/bin/true` boot command. It may perform a redundant idempotent invocation; it does not select the default distro, retry, terminate or globally shut down WSL. A process fixture records both calls and locks this behavior. No translation dictionary or unsupported language-independent state claim is introduced.
+
+**S6-NOTE-02 — BOM-less encoding:** detection now samples up to 64 UTF-16 code units, requires at least eight printable ASCII/control-whitespace units and at least 70% matching zero-high-byte evidence, then validates UTF-16 decoding and rejects candidates containing decoded NUL. Two early NUL bytes alone no longer trigger UTF-16LE. Tests cover genuine BOM-less listing output with localized text, UTF-8 with early NUL (including non-ASCII and odd-length buffers), and short ambiguous input.
+
+BOM-less detection remains a heuristic: short or non-ASCII-dominated input falls back to UTF-8, and deliberately ambiguous byte sequences cannot be classified perfectly without an encoding signal. Use a BOM for deterministic UTF-16 decoding. The change does not establish native Windows/WSL2 acceptance.
+
+Current suite: **56 tests / 9 suites**. The older 51- and 52-test results above are historical handoff/integration evidence; the current matrix in section 3 supersedes those snapshots.

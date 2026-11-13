@@ -1441,6 +1441,59 @@ describe("M6C-3 Step 6 — Lima VM Backend Foundation (LimaVmBackend)", () => {
       );
     });
 
+    it("probe rejects with ERR_VM_COMMAND_TIMEOUT when metadata CLI exits 0 while descendant holds pipe open", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { spawn } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          process.stdout.write(JSON.stringify({ name: "worker-vm", status: "Running" }) + '\\n');
+          // Spawn detached-free descendant holding inherited stdout/stderr pipes open, then exit 0 immediately!
+          const bg = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            stdio: ['ignore', 'inherit', 'inherit'],
+          });
+          writeFileSync(${JSON.stringify(join(testDir, "bg-exit0.pid"))}, String(bg.pid));
+          process.exit(0);
+        `,
+        async (fixturePath, testDir) => {
+          const pidFile = join(testDir, "bg-exit0.pid");
+          let bgPid: number | null = null;
+          try {
+            const backend = new LimaVmBackend({
+              binaryPath: fixturePath,
+              instanceName: "worker-vm",
+              commandTimeoutMs: 800,
+              testOnlyEmulator: true,
+            });
+
+            const startTime = Date.now();
+            await assert.rejects(
+              async () => backend.probe(),
+              (err: Error) => {
+                assert.match(err.message, /^ERR_VM_COMMAND_TIMEOUT/);
+                assert.match(err.message, /guest process state is uncertain/);
+                return true;
+              }
+            );
+            assert.ok(existsSync(pidFile), "Metadata fixture must spawn its descendant before timeout");
+            const durationMs = Date.now() - startTime;
+            assert.ok(durationMs >= 750, `Expected timeout to remain armed >= 750ms, settled in ${durationMs}ms`);
+            assert.ok(durationMs < 2000, `Expected bounded settlement < 2000ms, took ${durationMs}ms`);
+          } finally {
+            try {
+              if (existsSync(pidFile)) {
+                bgPid = Number(readFileSync(pidFile, "utf8").trim());
+                if (bgPid && !Number.isNaN(bgPid)) {
+                  process.kill(bgPid, "SIGKILL");
+                }
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+      );
+    });
+
     it("spawn error throws ERR_VM_COMMAND_SPAWN_FAILED without leaking sensitive paths", async () => {
       const backend = new LimaVmBackend({
         binaryPath: "/nonexistent/path/to/limactl",

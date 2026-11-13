@@ -1,11 +1,12 @@
 # M6C-3 Step 6 — Lima VM Backend Foundation Technical Validation Report
 
-**Author**: Agent B  
-**Tracker**: [Issue #16 — VM Backend Foundation](https://github.com/shmtoan08/SoftwareFactory/issues/16)  
-**Baseline SHA**: `9d2aea69c636bc500f92ff7a7489f4d0b8834894`  
-**Initial Commit SHA**: `78a7f40a9563b4631e6431ec65ca02b9ec408124`  
-**Branch**: `m6c3/vm-lima-foundation-b`  
-**Date**: 2026-11-13  
+**Authors**: Agent B (initial implementation), Agent A (integration and review follow-up)\
+**Tracker**: [Issue #16 — VM Backend Foundation](https://github.com/shmtoan08/SoftwareFactory/issues/16)\
+**Baseline SHA**: `9d2aea69c636bc500f92ff7a7489f4d0b8834894`\
+**Initial main commit**: `b6e08b5ccb91c22a95f1f9b16b5d4740f64db306`\
+**Hardening main commit**: `1cbf54a`\
+**Published branch**: `main`\
+**Updated**: 2026-11-14\
 **Status**: CLI foundation implemented; integration validation below; native Lima acceptance PENDING (native start/diagnostic fail closed)
 
 ---
@@ -89,11 +90,11 @@ export interface LimaVmBackendConfig {
 
 ## 3. Test Matrix & Results
 
-Suite: `packages/test-harness/src/m6c3-vm-lima.test.ts`  
-Runner: Node.js v24 (`node --test`)  
-Total Test Cases: **51**  
-Total Test Suites: **9**  
-Passed: **51** | Failed: **0** | Skipped: **0** (`10110.52ms`)
+Suite: `packages/test-harness/src/m6c3-vm-lima.test.ts`\
+Runner: Node.js v24 (`node --test`)\
+Total Test Cases: **54**\
+Total Test Suites: **10**\
+Passed: **54** | Failed: **0** | Cancelled: **0** | Skipped: **0** | Todo: **0**
 
 | Group | Description | Cases | Outcome |
 |---|---|---|---|
@@ -103,11 +104,12 @@ Passed: **51** | Failed: **0** | Skipped: **0** (`10110.52ms`)
 | Group 4 | Lifecycle Operations (`start()`, `stop()`) | 7 | 7 PASS |
 | Group 5 | Operator Diagnostic Execution (`execOperatorCommand()`) | 9 | 9 PASS |
 | Group 6 | Host & Guest Environment Boundary (Secrets & `SSH_AUTH_SOCK`) | 3 | 3 PASS |
-| Group 7 | Timeout, Abort, Output Caps & Uncertain Outcome Semantics | 7 | 7 PASS |
+| Group 7 | Timeout, Abort, Output Caps & Uncertain Outcome Semantics (including probe inherited-pipe regression) | 8 | 8 PASS |
 | Group 8 | Error Sanitization Helper | 1 | 1 PASS |
+| Integration | CLI error boundary (stderr suppression and invalid UTF-8) | 2 | 2 PASS |
 
 ### Regression Suites & Quality Gates
-- **WSL2 VM Foundation Regression**: `packages/test-harness/src/m6c3-vm-wsl2.test.ts`: **52 passed, 0 failed, 0 skipped** (9 suites, `10398.10ms`).
+- **WSL2 VM Foundation Regression**: `packages/test-harness/src/m6c3-vm-wsl2.test.ts`: **56 passed, 0 failed, 0 skipped** (9 suites).
 - **Typecheck**: `npm run typecheck` (`tsc -p tsconfig.json --noEmit`): **PASS** (0 errors).
 - **Linter**: `npm run lint` (`node scripts/ci/lint.mjs`): **PASS** (171 source files checked).
 - **Secret Scan**: `npm run scan:secrets` (`node scripts/ci/secret-scan.mjs`): **PASS** (170 source files scanned, 0 leaks).
@@ -120,7 +122,7 @@ Passed: **51** | Failed: **0** | Skipped: **0** (`10110.52ms`)
 
 ## 5. Agent A takeover and integration
 
-The owner transferred remaining Lima work to A after B exhausted its quota. A preserved B's original commits `78a7f40` and `e899ec4`, cherry-picked both into the integration branch, and independently verified the baseline **103/103** Lima+WSL2 tests.
+The owner transferred remaining Lima work to A after B exhausted its quota. A integrated B's work as main commits [`b6e08b5`](https://github.com/shmtoan08/SoftwareFactory/commit/b6e08b5ccb91c22a95f1f9b16b5d4740f64db306) and [`1cbf54a`](https://github.com/shmtoan08/SoftwareFactory/commit/1cbf54a), then independently verified that historical pre-integration baseline of **103/103** Lima+WSL2 tests.
 
 A strengthened the inherited-pipe regression: its deadline is now 800 ms (longer than the removed 300 ms false-success fallback), and it asserts that the guest fixture actually wrote its descendant PID. This prevents a slow metadata probe timeout from masquerading as proof of guest pipe handling. A also replaced empty platform-specific test returns with real constructor/platform assertions; Darwin-only native-operation guard assertions remain exercised on macOS.
 
@@ -132,4 +134,14 @@ Official schema checked against [Lima v2.0.3 instance types](https://github.com/
 
 Native VM start/diagnostic, actual SSH/login controls, Linux guest cleanup/isolation and full M6C/G7 acceptance remain pending. Safe native metadata probing and explicitly opted-in targeted stop are the only native operations offered by this foundation.
 
-Local integration results (Node24.16.0/macOS): Lima **53/53**, WSL2 **52/52**, combined **105 tests / 19 suites / 105 pass / 0 fail, cancelled, skipped or todo**. Typecheck PASS; lint171 source files PASS; secret scan170 files/0leaks PASS. Full Linux PG16/17 and macOS CI results are linked in issue #16 for the exact pushed commit.
+Historical integration results at main `0a6bc9d` (Node24.16.0/macOS): Lima **53/53**, WSL2 **52/52**, combined **105 tests / 19 suites / 105 pass / 0 fail, cancelled, skipped or todo**. Typecheck PASS; lint171 source files PASS; secret scan170 files/0leaks PASS. Full Linux PG16/17 and macOS CI results are linked in issue #16 for the exact pushed commit.
+
+## 6. Issue #17 review follow-up (2026-11-14)
+
+S6-NOTE-03 adds a metadata-only `probe()` fixture that emits valid listing JSON, spawns a descendant inheriting stdout/stderr, and exits zero. With an 800 ms deadline it must reject `ERR_VM_COMMAND_TIMEOUT`, never return parsed metadata early. The test verifies descendant creation, bounds settlement time and kills only its recorded fixture descendant in cleanup. It does not invoke a guest or VM.
+
+S6-NOTE-04 synchronizes section 3 with the current **54 tests / 10 suites**: the reviewed HEAD had 53 tests (51 original + 2 CLI error-boundary integration tests), and this follow-up adds the probe regression. Historical results in section 5 are explicitly labeled historical. S6-NOTE-05 replaces branch-only SHA references with main commits and main links.
+
+Native Lima acceptance remains PENDING. Native `stop()` remains the documented, deliberately supported exception: it requires explicit lifecycle and dedicated-instance opt-in, reprobes exact identity/state and targets only the configured instance. Native start/diagnostic remain blocked; no new native operations are enabled by this follow-up.
+
+Local issue #17 validation (Node24.16.0/macOS): Lima **54/54**, WSL2 **56/56**, combined **110 tests / 19 suites / 110 pass / 0 fail, cancelled, skipped or todo**. Exact-main CI results are tracked on issue #17.
