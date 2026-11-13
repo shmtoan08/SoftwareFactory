@@ -71,6 +71,23 @@ describe("M6C-3 worker endpoint and durable journal", () => {
       try { await assert.rejects(restarted.connector.execute(a, AbortSignal.timeout(3000))); assert.equal(restarted.calls(), 0); } finally { await restarted.close(); }
     } finally { await fx.close(); }
   });
+  it("shutdown stops accepting requests, signals cancellation and waits for cleanup before returning", async () => {
+    let entered!: () => void, finishCleanup!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const cleanupGate = new Promise<void>((resolve) => { finishCleanup = resolve; }); let cancelled = false;
+    const fx = await fixture({ runner: { health: async () => {}, execute: async (a, signal) => {
+      entered(); await new Promise<void>((resolve) => { const abort = () => { cancelled = true; resolve(); }; if (signal.aborted) abort(); else signal.addEventListener("abort", abort, { once: true }); });
+      await cleanupGate; return { submission, cleanupEvidence: evidence(a) };
+    } } }); const a = action();
+    try {
+      const execution = fx.connector.execute(a, AbortSignal.timeout(5000)).catch(() => null); await started;
+      let closed = false; const shutdown = fx.server.close().then(() => { closed = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20)); assert.equal(cancelled, true); assert.equal(closed, false);
+      await assert.rejects(fx.connector.health(AbortSignal.timeout(1000)));
+      finishCleanup(); await shutdown; await execution;
+      assert.equal(new WorkerExecutionJournal(fx.stateDir, "tenant-a").read(a)?.status, "CLAIMED");
+    } finally { finishCleanup(); await fx.close(); }
+  });
   it("process death after durable claim and before runner leaves HOLD after actual restart", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "sf-m6c3-a-death-")); const marker = join(stateDir, "spawned");
     const source = `import {createWorkerEndpointServer} from '@software-factory/wna'; import {writeFileSync} from 'node:fs';

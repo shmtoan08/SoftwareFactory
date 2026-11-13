@@ -34,8 +34,12 @@ Health runs an actual short strict sandbox probe, including filesystem setup and
 
 ## Validation and remaining work
 
-Agent A focused suite: **7/7 passed** on Node24.16 / Darwin, no skips. It exercises the real HTTP server/HMAC client and filesystem journal with an explicitly injected provider-free runner emulator: fresh-nonce replay, cross-instance claim contention, authentication/schema/deadline limits, lost terminal persistence, actual child-process death before runner and Core broker/controlled artifact import preserving main. Production runner injection/cleanup guards and unsupported-host fail-closed are checked separately. These tests do not prove Linux isolation.
+Agent A focused suite: **8/8 passed** on Node24.16 / Darwin, no skips. It exercises the real HTTP server/HMAC client and filesystem journal with an explicitly injected provider-free runner emulator: fresh-nonce replay, cross-instance claim contention, authentication/schema/deadline limits, shutdown waiting for cleanup, lost terminal persistence, actual child-process death before runner and Core broker/controlled artifact import preserving main. Production runner injection/cleanup guards and unsupported-host fail-closed are checked separately. These tests do not prove Linux isolation.
+
+Full local PostgreSQL17 regression: **145/145 passed, 19 suites, 0 failures/skips** (~301 seconds); lint/strict TypeScript and secret scan passed.
 
 A dedicated strict Linux CI suite has three no-skip cases: concrete runner filesystem/secret/artifact cleanup, native coordinator death with detached descendants, and native monotonic timeout. It requires root, a dedicated delegated cgroups v2 root and actual namespaces/mount_setattr. Missing prerequisites fail rather than skip. Source commits, full PG16/17 regression counts, completed Linux evidence and independent Agent B review are tracked in issue #13 and the local handoff; no result is assumed before those runs finish.
 
 The endpoint does not provision VMs, install a TLS proxy, deploy a cloud service, provide private repository access, implement vendor cancellation/fencing or enable Lima/WSL2/Firecracker. Tier 3/4 concrete supervisors and final M6C/G7 acceptance remain separate work.
+
+The initial `b51cf44` Linux CI job completed successfully in [run 43384128007](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43384128007), exercising all three strict cases on a real Linux host. Exact final source validation and independent-review status are recorded in issue #13 / PR #14; those records distinguish the subsequent shutdown refinement from this initial kernel evidence. Main remains the reviewed baseline until integration is accepted.

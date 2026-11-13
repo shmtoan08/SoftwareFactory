@@ -11,7 +11,7 @@ export interface WorkerEndpointRunner {
   health(signal: AbortSignal): Promise<void>;
   execute(action: Readonly<ExternalTargetAction>, signal: AbortSignal): Promise<{ submission: CodeImportSubmission; cleanupEvidence: SandboxCleanupEvidence }>;
 }
-export type WorkerEndpointHook = "beforeJournalClaim" | "afterJournalClaim" | "beforeRunnerSpawn" | "afterRunnerSpawn" | "beforeTerminalPersist" | "afterTerminalPersist";
+export type WorkerEndpointHook = "beforeJournalClaim" | "afterJournalClaim" | "beforeRunnerSpawn" | "afterRunnerCompletion" | "beforeTerminalPersist" | "afterTerminalPersist";
 export interface WorkerEndpointServerConfig {
   readonly tenantNamespace: string;
   readonly principalId: string;
@@ -71,10 +71,12 @@ export class WorkerEndpointServer {
     return { port: address.port, endpoint: `http://${address.family === "IPv6" ? "[::1]" : "127.0.0.1"}:${address.port}` };
   }
   public async close(): Promise<void> {
+    // Stop accepting connections before awaiting cleanup, including during concurrent shutdown calls.
+    const closed = this.server.listening ? new Promise<void>((resolve, reject) => this.server.close((err) => err ? reject(err) : resolve())) : Promise.resolve();
     for (const controller of this.active) controller.abort();
     this.server.closeAllConnections();
     await Promise.allSettled([...this.pending]);
-    if (this.server.listening) await new Promise<void>((resolve, reject) => this.server.close((err) => err ? reject(err) : resolve()));
+    await closed;
   }
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method !== "POST" || !["/health", "/execute"].includes(req.url ?? "") || !/^application\/json(?:;|$)/i.test(String(req.headers["content-type"] ?? ""))) { res.writeHead(404); res.end(); return; }
@@ -109,7 +111,7 @@ export class WorkerEndpointServer {
       await this.config.testOnlyHooks?.beforeRunnerSpawn?.(action);
       signal.throwIfAborted();
       const result = await this.config.runner.execute(action, signal);
-      await this.config.testOnlyHooks?.afterRunnerSpawn?.(action);
+      await this.config.testOnlyHooks?.afterRunnerCompletion?.(action);
       signal.throwIfAborted(); assertWorkerCleanup(result.cleanupEvidence, action, this.config.testOnlyEmulator);
       const submission = validateCodeImportSubmission(result.submission);
       await this.config.testOnlyHooks?.beforeTerminalPersist?.(action);
