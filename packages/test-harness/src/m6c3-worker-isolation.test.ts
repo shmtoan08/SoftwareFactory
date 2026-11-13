@@ -150,9 +150,9 @@ async function sendRawWorkerRequest(
   patch: Record<string, unknown> = {},
   key?: string,
   badSignature = false,
-  secret = TEST_SECRET
+  secret = TEST_SECRET,
+  nonce = randomBytes(24).toString("hex")
 ): Promise<Response> {
-  const nonce = randomBytes(24).toString("hex");
   const body = { schema_version: "sf-target-v1", nonce, action: actionPayload, ...patch };
   return fetch(`${endpoint}/${route}`, {
     method: "POST",
@@ -165,6 +165,26 @@ async function sendRawWorkerRequest(
     },
     body: JSON.stringify(body),
   });
+}
+
+type ObservedExecution<T> = { ok: true; value: T } | { ok: false; error: unknown };
+function observeExecution<T>(execution: Promise<T>): Promise<ObservedExecution<T>> {
+  // Attach both handlers immediately, even when the runner never enters execution.
+  return execution.then((value) => ({ ok: true as const, value }), (error: unknown) => ({ ok: false as const, error }));
+}
+async function waitForRunnerEntry<T>(entered: Promise<void>, observed: Promise<ObservedExecution<T>>, timeoutMs: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      entered,
+      observed.then((result) => {
+        throw new Error("Instance A request settled before entering the runner", { cause: result.ok ? undefined : result.error });
+      }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Instance A did not enter the runner within ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally { if (timer !== undefined) clearTimeout(timer); }
 }
 
 describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contract Suite", () => {
@@ -795,11 +815,11 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
           {},
           a.execution_id
         );
-        assert.equal(resInjectedAction.ok, false);
+        assert.equal(resInjectedAction.status, 400);
 
         // Injected field in health action
         const resInjectedHealth = await sendRawWorkerRequest(fx.endpoint, "health", { injected_cmd: "whoami" });
-        assert.equal(resInjectedHealth.ok, false);
+        assert.equal(resInjectedHealth.status, 400);
 
         assert.equal(fx.getCalls(), 0);
       } finally {
@@ -814,29 +834,17 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
       const fx = await createEndpointFixture();
       const a = createSampleAction();
       try {
-        // Oversized health request (> 16KB)
-        try {
-          const resHealthOversized = await sendRawWorkerRequest(fx.endpoint, "health", {
-            padding: "x".repeat(20000),
-          });
-          assert.equal(resHealthOversized.ok, false);
-        } catch {
-          // Bounded stream cancellation may close transport cleanly
-        }
-
-        // Oversized execute request (> 192KB)
-        try {
-          const resExecuteOversized = await sendRawWorkerRequest(
-            fx.endpoint,
-            "execute",
-            { ...a, public_context: "x".repeat(200 * 1024) },
-            {},
-            a.execution_id
-          );
-          assert.equal(resExecuteOversized.ok, false);
-        } catch {
-          // Bounded stream cancellation
-        }
+        // A reset/down endpoint is a transport failure, not proof of HTTP rejection.
+        const resHealthOversized = await sendRawWorkerRequest(fx.endpoint, "health", {
+          padding: "x".repeat(20000),
+        });
+        assert.equal(resHealthOversized.status, 400, "Oversized health must receive an explicit HTTP rejection");
+        await resHealthOversized.text();
+        const resExecuteOversized = await sendRawWorkerRequest(
+          fx.endpoint, "execute", { ...a, public_context: "x".repeat(200 * 1024) }, {}, a.execution_id
+        );
+        assert.equal(resExecuteOversized.status, 400, "Oversized execute must receive an explicit HTTP rejection");
+        await resExecuteOversized.text();
 
         assert.equal(fx.getCalls(), 0);
       } finally {
@@ -855,14 +863,14 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
           deadline: new Date(Date.now() - 5000).toISOString(),
         });
         const resPast = await sendRawWorkerRequest(fx.endpoint, "execute", pastAction, {}, pastAction.execution_id);
-        assert.equal(resPast.ok, false);
+        assert.equal(resPast.status, 400);
 
         // Deadline too far in future (> 125s)
         const farAction = createSampleAction({
           deadline: new Date(Date.now() + 180000).toISOString(),
         });
         const resFar = await sendRawWorkerRequest(fx.endpoint, "execute", farAction, {}, farAction.execution_id);
-        assert.equal(resFar.ok, false);
+        assert.equal(resFar.status, 400);
 
         assert.equal(fx.getCalls(), 0);
       } finally {
@@ -877,16 +885,24 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
       const fx = await createEndpointFixture();
       const a = createSampleAction();
       try {
-        // First execution call
-        const firstResult = await fx.connector.execute(a, AbortSignal.timeout(5000));
-        assert.deepEqual(firstResult, TEST_SUBMISSION);
-        assert.equal(fx.getCalls(), 1);
-
-        // Second execution call with same action payload
-        const replayResult = await fx.connector.execute(a, AbortSignal.timeout(5000));
-        assert.deepEqual(replayResult, TEST_SUBMISSION);
-        // Runner called exactly once; second call was satisfied idempotently from journal!
-        assert.equal(fx.getCalls(), 1);
+        const firstNonce = randomBytes(24).toString("hex");
+        const replayNonce = randomBytes(24).toString("hex");
+        assert.notEqual(firstNonce, replayNonce, "Retry must use a fresh request nonce");
+        const execute = async (nonce: string) => {
+          const response = await sendRawWorkerRequest(fx.endpoint, "execute", a, {}, a.execution_id, false, fx.secret, nonce);
+          assert.equal(response.status, 200);
+          const body = await response.json() as Record<string, unknown>;
+          const mac = response.headers.get("x-sf-target-signature");
+          assert.equal(body.nonce, nonce, "Response must echo this request's nonce, not a cached nonce");
+          assert.equal(mac, signTargetProtocol(fx.secret, "response", "/execute", nonce, body));
+          assert.deepEqual(body.submission, TEST_SUBMISSION);
+          return { body, mac };
+        };
+        const first = await execute(firstNonce);
+        const replay = await execute(replayNonce);
+        assert.notEqual(first.body.nonce, replay.body.nonce);
+        assert.notEqual(first.mac, replay.mac, "Replay must re-sign the persisted result for the new nonce");
+        assert.equal(fx.getCalls(), 1, "Replay must not execute the runner again");
 
         const journalRecord = new WorkerExecutionJournal(fx.stateDir, "tenant-iso").read(a);
         assert.equal(journalRecord?.status, "COMPLETED");
@@ -922,60 +938,42 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
       }
     });
 
-    it("TC08: Atomic Journal Concurrency & Single Spawn Lock", async () => {
+    it("TC08: Atomic Journal Concurrency & Single Spawn Lock", { timeout: 10000 }, async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC08_CONCURRENT_EXECUTION_LOCK");
       assert.ok(scenario);
-
-      let unblockGate!: () => void;
-      const executionGate = new Promise<void>((resolve) => {
-        unblockGate = resolve;
-      });
-
+      let unblockGate!: () => void, markEntered!: () => void;
+      const executionGate = new Promise<void>((resolve) => { unblockGate = resolve; });
+      const entered = new Promise<void>((resolve) => { markEntered = resolve; });
       let calls = 0;
       const delayedRunner: WorkerEndpointRunner = {
         health: async () => {},
         execute: async (a: ExternalTargetAction) => {
-          calls++;
+          calls++; markEntered();
           await executionGate;
           return { submission: TEST_SUBMISSION, cleanupEvidence: createMockCleanupEvidence(a) };
         },
       };
-
       const baseFx = await createEndpointFixture();
       const instanceA = await createEndpointFixture({ stateDir: baseFx.stateDir, runner: delayedRunner });
       const instanceB = await createEndpointFixture({ stateDir: baseFx.stateDir, runner: delayedRunner });
       const a = createSampleAction();
-
+      const controller = new AbortController();
+      const observed = observeExecution(instanceA.connector.execute(a, AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])));
       try {
-        // Start call on instance A
-        const callA = instanceA.connector.execute(a, AbortSignal.timeout(5000));
-
-        // Wait until instance A has entered execution
-        while (calls === 0) {
-          await new Promise((r) => setTimeout(r, 10));
-        }
-
-        // Concurrent call on instance B for same execution_id
-        await assert.rejects(
-          instanceB.connector.execute(a, AbortSignal.timeout(2000)),
-          /ERR_TARGET_PROTOCOL/
-        );
+        await waitForRunnerEntry(entered, observed, 2000);
+        await assert.rejects(instanceB.connector.execute(a, AbortSignal.timeout(2000)), /ERR_TARGET_PROTOCOL/);
         assert.equal(calls, 1, "Exactly one runner execution should occur");
-
-        // Release gate and verify instance A completes
         unblockGate();
-        const resA = await callA;
-        assert.deepEqual(resA, TEST_SUBMISSION);
-
-        // Subsequent call on instance B retrieves completed result from journal without extra runner call
+        const result = await observed;
+        if (!result.ok) throw result.error;
+        assert.deepEqual(result.value, TEST_SUBMISSION);
         const resB = await instanceB.connector.execute(a, AbortSignal.timeout(3000));
         assert.deepEqual(resB, TEST_SUBMISSION);
         assert.equal(calls, 1);
       } finally {
-        unblockGate();
-        await instanceB.close();
-        await instanceA.close();
-        await baseFx.close();
+        controller.abort(); unblockGate();
+        await observed;
+        await instanceB.close(); await instanceA.close(); await baseFx.close();
       }
     });
 
