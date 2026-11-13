@@ -209,6 +209,8 @@ export interface TaskRecord {
 }
 
 export interface TaskLeaseRecord {
+  readonly execution_target_assignment_id?: string | null;
+  readonly execution_target_request_id?: string | null;
   lease_id: string;
   project_id: string;
   task_id: string;
@@ -1805,4 +1807,33 @@ export interface ProductionReconciliationRecord {
   readonly evidence_sha256: string;
   readonly approver_principal_id: string;
   readonly reconciled_at: string;
+}
+
+export interface TaskExecutionAssignmentRecord {
+  readonly assignment_id: string;
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly profile_id: string;
+  readonly profile_snapshot: Readonly<Record<string, unknown>>;
+  readonly profile_sha256: string;
+  readonly task_contract_sha256: string;
+  readonly target_key: string;
+  readonly worker_id: string;
+  readonly public_context: string;
+  readonly data_classification: "PUBLIC";
+  readonly approved_by_principal_id: string;
+  readonly created_at: string;
+}
+export interface TargetDispatchRecord {
+  readonly lease_id: string;
+  readonly project_id: string;
+  readonly task_id: string;
+  readonly assignment_id: string;
+  readonly execution_request_id: string;
+  readonly status: "PENDING" | "SENDING" | "IMPORTED" | "UNKNOWN" | "REJECTED";
+  readonly health_sha256: string | null;
+  readonly submission_id: string | null;
+  readonly error_code: string | null;
+  readonly claimed_at: string | null;
+  readonly completed_at: string | null;
 }

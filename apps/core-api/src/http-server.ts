@@ -1,3 +1,4 @@
+import type { AssignExecutionTargetInput } from "./execution-target-broker.ts";
 import type { ApproveReconciliationInput, ExecuteReconciliationInput } from "./deployment-reconciliation.ts";
 import type { ApproveProductionDeploymentInput, ExecuteProductionDeploymentInput } from "./production-deployment.ts";
 import { FactoryTelemetry, extractHttpTraceContext, formatTraceparent } from "@software-factory/observability";
@@ -1208,6 +1209,15 @@ export class CoreApiHttpServer {
           this.sendJson(res, 201, pkg);
           return;
         }
+      }
+
+      const targetMatch=pathname.match(/^\/api\/v1\/projects\/([^/]+)\/tasks\/([^/]+)\/(execution-target|execute-target|target-dispatches)$/);
+      if(targetMatch?.[1]&&targetMatch[2]){
+        const projectId=decodeURIComponent(targetMatch[1]),taskId=decodeURIComponent(targetMatch[2]),action=targetMatch[3];
+        if(action==="execution-target"&&method==="POST"){const body=await this.readJsonBody<AssignExecutionTargetInput>(req);this.sendJson(res,201,await this.coreApi.assignTaskExecutionTarget(projectId,auth,taskId,body));return;}
+        if(action==="execution-target"&&method==="GET"){const assignment=await this.coreApi.getTaskExecutionTarget(projectId,auth,taskId);this.sendJson(res,assignment?200:404,assignment??{error_code:"ERR_NOT_FOUND"});return;}
+        if(action==="execute-target"&&method==="POST"){const body=await this.readJsonBody<{execution_request_id:string}>(req);this.sendJson(res,200,await this.coreApi.executeTaskOnTarget(projectId,auth,taskId,body));return;}
+        if(action==="target-dispatches"&&method==="GET"){this.sendJson(res,200,{dispatches:await this.coreApi.listTaskTargetDispatches(projectId,auth,taskId)});return;}
       }
 
       const taskActionMatch = pathname.match(

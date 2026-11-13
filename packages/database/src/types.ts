@@ -60,6 +60,8 @@ import type {
   TaskDependencyKind,
   TaskDependencyRecord,
   TaskLeaseRecord,
+  TaskExecutionAssignmentRecord,
+  TargetDispatchRecord,
   TaskPlanLinkRecord,
   TaskRecord,
   TaskStatus,
@@ -564,6 +566,8 @@ export interface ControlPlaneStore {
     heartbeat_interval_ms?: number;
     lease_ttl_ms?: number;
     reject_overlapping_active_files?: boolean;
+    execution_target_assignment_id?: string;
+    execution_target_request_id?: string;
   }): Promise<TaskLeaseRecord>;
   getLeaseById(leaseId: string): TaskLeaseRecord | null | Promise<TaskLeaseRecord | null>;
   listTaskLeasesForTask(taskId: string): TaskLeaseRecord[] | Promise<TaskLeaseRecord[]>;
@@ -886,6 +890,12 @@ export interface ControlPlaneStore {
     pipelineSessionId: string
   ): ProductPipelineBundle | null | Promise<ProductPipelineBundle | null>;
 
+  createTaskExecutionAssignment(input: Omit<TaskExecutionAssignmentRecord,"created_at">): TaskExecutionAssignmentRecord | Promise<TaskExecutionAssignmentRecord>;
+  getTaskExecutionAssignment(taskId:string): TaskExecutionAssignmentRecord|null|Promise<TaskExecutionAssignmentRecord|null>;
+  getTargetDispatchByRequest(requestId:string):TargetDispatchRecord|null|Promise<TargetDispatchRecord|null>;
+  listTargetDispatches(taskId:string):TargetDispatchRecord[]|Promise<TargetDispatchRecord[]>;
+  claimTargetDispatch(projectId:string,leaseId:string,healthSha:string): {record:TargetDispatchRecord;created:boolean}|Promise<{record:TargetDispatchRecord;created:boolean}>;
+  finishTargetDispatch(input:{project_id:string;lease_id:string;status:"IMPORTED"|"UNKNOWN"|"REJECTED";submission_id?:string;error_code?:string}):TargetDispatchRecord|Promise<TargetDispatchRecord>;
   createProductionReconciliationApproval(input: ProductionReconciliationApprovalRecord): ProductionReconciliationApprovalRecord | Promise<ProductionReconciliationApprovalRecord>;
   revokeProductionReconciliationApproval(projectId: string, id: string): void | Promise<void>;
   getProductionReconciliationApproval(id: string): ProductionReconciliationApprovalRecord | null | Promise<ProductionReconciliationApprovalRecord | null>;

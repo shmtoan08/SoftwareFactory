@@ -1,3 +1,5 @@
+import { ExecutionTargetBroker, validateTargetId, type ExecutionTargetConfiguration, type AssignExecutionTargetInput } from "./execution-target-broker.ts";
+export * from "./execution-target-broker.ts";
 import { ProductionDeploymentReconciler, type ApproveReconciliationInput, type ExecuteReconciliationInput } from "./deployment-reconciliation.ts";
 export * from "./deployment-reconciliation.ts";
 import { ProductionDeploymentGate, validateProductionId, type ProductionDeploymentConfiguration, type ApproveProductionDeploymentInput, type ExecuteProductionDeploymentInput } from "./production-deployment.ts";
@@ -375,6 +377,7 @@ export class CoreApiService {
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
   public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
+  private readonly executionTargetBroker: ExecutionTargetBroker;
   private readonly productionDeploymentReconciler: ProductionDeploymentReconciler;
   private readonly productionDeploymentGate: ProductionDeploymentGate;
   private readonly onWarning?: (warning: CoreApiWarning) => void;
@@ -394,10 +397,12 @@ export class CoreApiService {
       modelPricingOverrides?: Readonly<Record<string, ModelPricingRate>>;
       pipelineService?: ProductPipelineService;
       productionDeployment?: ProductionDeploymentConfiguration;
+      executionTargets?: ExecutionTargetConfiguration;
       env?: NodeJS.ProcessEnv;
     }
   ) {
     this.store = store;
+    this.executionTargetBroker = new ExecutionTargetBroker(store,options?.executionTargets);
     this.productionDeploymentGate = new ProductionDeploymentGate(store, options?.productionDeployment);
     this.productionDeploymentReconciler = new ProductionDeploymentReconciler(store, options?.productionDeployment);
     this.telemetry = options?.telemetry ?? createFactoryTelemetryFromEnv(options?.env ?? process.env);
@@ -766,6 +771,11 @@ export class CoreApiService {
     );
   }
 
+  public async assignTaskExecutionTarget(projectId:string,auth:CoreApiAuthContext,taskId:string,input:AssignExecutionTargetInput){const actor=await this.authorize(auth,projectId,APPROVAL_ROLES);return this.executionTargetBroker.assign(projectId,actor.principalId,taskId,input);}
+  public async executeTaskOnTarget(projectId:string,auth:CoreApiAuthContext,taskId:string,input:{execution_request_id:string}){const actor=await this.authorize(auth,projectId,MUTATION_ROLES);return this.executionTargetBroker.execute(projectId,actor.principalId,taskId,input,(lease_id,lease_epoch,submission)=>this.submitCodeImport(projectId,auth,{task_id:taskId,lease_id,lease_epoch,submission}));}
+  public getTaskExecutionTarget(projectId:string,auth:CoreApiAuthContext,taskId:string){return this.withAuthorizedRlsTransaction(auth,projectId,READ_ROLES,()=>{validateTargetId(taskId);return this.store.getTaskExecutionAssignment(taskId);});}
+  public listTaskTargetDispatches(projectId:string,auth:CoreApiAuthContext,taskId:string){return this.withAuthorizedRlsTransaction(auth,projectId,READ_ROLES,()=>{validateTargetId(taskId);return this.store.listTargetDispatches(taskId);});}
+
   public async previewProductionReconciliation(projectId:string,auth:CoreApiAuthContext,originalApprovalId:string){
     const actor=await this.authorize(auth,projectId,APPROVAL_ROLES);return this.productionDeploymentReconciler.preview(projectId,actor.principalId,originalApprovalId);
   }
@@ -810,7 +820,7 @@ export class CoreApiService {
     return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
       this.store.grantTaskLease({
         project_id: projectId,
-        ...input,
+        task_id:input.task_id,worker_id:input.worker_id,heartbeat_interval_ms:input.heartbeat_interval_ms,lease_ttl_ms:input.lease_ttl_ms,
         reject_overlapping_active_files: true,
       })
     );
@@ -1350,7 +1360,7 @@ export class CoreApiService {
   }> {
     const verified = await this.authorize(auth, projectId, MUTATION_ROLES);
 
-    const { task, candidate, resolvedRepoPath } = await this.store.withRlsTransaction(
+    const { task, candidate, resolvedRepoPath, requiresTargetIsolation } = await this.store.withRlsTransaction(
       {
         currentProjectId: projectId,
         currentPrincipalId: verified.principalId,
@@ -1377,7 +1387,13 @@ export class CoreApiService {
           (project && this.isRealGitRepoOnDisk(project.repo_bare_path, undefined)
             ? project.repo_bare_path
             : undefined);
-        return { task: t, candidate: mc, resolvedRepoPath };
+        const source=(await this.store.getVerifiedImportsForTask(t.task_id)).find((record)=>record.import_id===mc.import_id);
+        const lease=source?await this.store.getLeaseById(source.lease_id):null;
+        const assignment=await this.store.getTaskExecutionAssignment(t.task_id);
+        const plan=(await this.store.listProjectTaskPlanLinks()).find((link)=>link.task_id===t.task_id);
+        const planned=plan?.assigned_profile_id?await this.store.getAgentOrganizationProfileById(plan.assigned_profile_id):null;
+        if(assignment&&lease?.execution_target_assignment_id!==assignment.assignment_id||!lease?.execution_target_assignment_id&&planned&&planned.execution_target_type!=="factory_managed_worker")throw new PostgresRlsError("23514","External candidate is missing approved lease provenance");
+        return { task: t, candidate: mc, resolvedRepoPath, requiresTargetIsolation:Boolean(lease?.execution_target_assignment_id) };
       }
     );
 
@@ -1400,8 +1416,8 @@ export class CoreApiService {
       dockerImage: input.docker_image,
       executionMode: input.execution_mode,
       requireDocker: input.require_docker,
-      requireKernelIsolation: input.require_kernel_isolation,
-      networkDisabled: input.network_disabled,
+      requireKernelIsolation: requiresTargetIsolation || input.require_kernel_isolation,
+      networkDisabled: requiresTargetIsolation ? true : input.network_disabled,
       stepTimeoutMs: input.step_timeout_ms,
       maxInfraRetries: input.max_infra_retries,
       tier1Command: input.tier1_command,

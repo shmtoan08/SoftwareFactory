@@ -570,3 +570,5 @@ export function applyWorkspaceEditsSync(
 }
 
 export * from "./runtime-adapters.ts";
+
+export * from "./execution-targets.ts";

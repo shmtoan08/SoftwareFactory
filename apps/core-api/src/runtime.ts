@@ -1,3 +1,4 @@
+import { validateExecutionTargetConfiguration, type ExecutionTargetConfiguration } from "./execution-target-broker.ts";
 import { validateDeploymentConfiguration, validateDeploymentStore, type ProductionDeploymentConfiguration } from "./production-deployment.ts";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -55,6 +56,7 @@ export interface CreateCoreApiRuntimeOptions {
   readonly clockFn?: () => Date;
   readonly startServer?: boolean;
   readonly productionDeployment?: ProductionDeploymentConfiguration;
+  readonly executionTargets?:ExecutionTargetConfiguration;
 }
 
 export interface CoreApiRuntime {
@@ -119,8 +121,10 @@ export async function createCoreApiRuntime(
   const productionDeployment = { ...options?.productionDeployment, signingSecret: options?.productionDeployment?.signingSecret ?? env.SF_DEPLOYMENT_APPROVAL_SECRET };
   validateDeploymentConfiguration(productionDeployment);
   if (options?.store) validateDeploymentStore(options.store,productionDeployment);
+  validateExecutionTargetConfiguration(options?.executionTargets??{},options?.store);
+  const targetsRequirePostgres=Object.keys(options?.executionTargets?.connectors??{}).length>0&&options?.executionTargets?.testOnlyEmulator!==true;
   const productionRequiresPostgres = (Object.keys(productionDeployment.executors ?? {}).length > 0 || Object.keys(productionDeployment.resolutionVerifiers ?? {}).length > 0) && productionDeployment.testOnlyEmulator !== true;
-  const requirePostgres = productionRequiresPostgres || (options?.requirePostgres ?? env.SF_REQUIRE_POSTGRES === "1");
+  const requirePostgres = targetsRequirePostgres || productionRequiresPostgres || (options?.requirePostgres ?? env.SF_REQUIRE_POSTGRES === "1");
 
   const ownedHandle = options?.store
     ? null
@@ -172,6 +176,7 @@ export async function createCoreApiRuntime(
   const coreApi = new CoreApiService(store, {
     authenticator,
     productionDeployment,
+    executionTargets:options?.executionTargets,
     clockFn: options?.clockFn,
     snapshotStore,
     defaultModelConfig: resolvedModelConfig,

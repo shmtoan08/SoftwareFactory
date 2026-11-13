@@ -1,3 +1,5 @@
+import { validateTargetAssignment, validateTargetLease, validateTargetVerification } from "./execution-target-validation.ts";
+export { executionProfileSnapshot, executionProfileSha } from "./execution-target-validation.ts";
 import { validateReconciliationApproval } from "./reconciliation-validation.ts";
 export { deploymentBindingSha256, validateResolutionEvidence } from "./reconciliation-validation.ts";
 import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
@@ -61,6 +63,8 @@ import {
   type TaskDependencyKind,
   type TaskDependencyRecord,
   type TaskLeaseRecord,
+  type TaskExecutionAssignmentRecord,
+  type TargetDispatchRecord,
   type TaskPlanLinkRecord,
   type TaskRecord,
   type TaskStatus,
@@ -215,6 +219,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   private devUserStories: Map<string, DevUserStoryRecord> = new Map();
   private taskPlanLinks: Map<string, TaskPlanLinkRecord> = new Map();
   private changeRequests: Map<string, ChangeRequestRecord> = new Map();
+  private executionAssignments = new Map<string,TaskExecutionAssignmentRecord>();
+  private targetDispatches = new Map<string,TargetDispatchRecord>();
   private reconciliationApprovals = new Map<string, ProductionReconciliationApprovalRecord>();
   private reconciliations = new Map<string, ProductionReconciliationRecord>();
   private productionApprovals = new Map<string, ProductionDeploymentApprovalRecord>();
@@ -695,6 +701,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     heartbeat_interval_ms?: number;
     lease_ttl_ms?: number;
     reject_overlapping_active_files?: boolean;
+    execution_target_assignment_id?: string;
+    execution_target_request_id?: string;
   }): Promise<TaskLeaseRecord> {
     this.assertWritePermissionForProject(input.project_id);
     const taskCheck = this.tasks.get(input.task_id);
@@ -704,7 +712,14 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
 
     return this.withSerializedLock(`budget:${input.project_id}`, () =>
       this.withSerializedLock(`task:${input.task_id}`, () => {
-        const task = this.tasks.get(input.task_id);
+        const assignment=this.getTaskExecutionAssignment(input.task_id);
+        const current=this.tasks.get(input.task_id);
+        const task=assignment&&current?{...current}:current;
+        const planned=[...this.taskPlanLinks.values()].find((link)=>link.task_id===input.task_id&&link.project_id===input.project_id)?.assigned_profile_id;
+        const profileId=assignment?.profile_id??planned;
+        const profile=profileId?this.getAgentOrganizationProfileById(profileId):null;
+        if (task) validateTargetLease(task,assignment,profile,input);
+        if(input.execution_target_request_id&&[...this.targetDispatches.values()].some((d)=>d.project_id===input.project_id&&d.execution_request_id===input.execution_target_request_id))throw new PostgresRlsError("23505","Execution request already exists");
         if (!task || task.project_id !== input.project_id) {
           throw new PostgresRlsError("23503", `Task ${input.task_id} not found in project ${input.project_id}`);
         }
@@ -799,6 +814,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         const expiresAtIso = new Date(nowDate.getTime() + leaseTtlMs).toISOString();
 
         const lease: TaskLeaseRecord = {
+          ...(assignment?{execution_target_assignment_id:assignment.assignment_id,execution_target_request_id:input.execution_target_request_id!}:{}),
           lease_id,
           project_id: input.project_id,
           task_id: input.task_id,
@@ -822,12 +838,16 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           completed_at: null,
         };
 
-        this.taskLeases.set(lease_id, lease);
+        if(assignment){
+          this.setInMap(this.taskLeases,lease_id,lease);
+          this.setInMap(this.targetDispatches,lease_id,{lease_id,project_id:input.project_id,task_id:input.task_id,assignment_id:assignment.assignment_id,execution_request_id:input.execution_target_request_id!,status:"PENDING",health_sha256:null,submission_id:null,error_code:null,claimed_at:null,completed_at:null});
+        }else this.taskLeases.set(lease_id, lease);
         task.status = "Leased";
         task.current_attempt_no = nextAttemptNo;
         task.active_lease_id = lease_id;
         task.active_lease_epoch = nextEpoch;
         task.updated_at = nowIso;
+        if(assignment)this.setInMap(this.tasks,task.task_id,task);
 
         this.insertOutboxEventInternal(input.project_id, "task_lease", lease_id, "lease.granted", {
           task_id: task.task_id,
@@ -2114,6 +2134,11 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       );
     }
 
+    const assignment=this.getTaskExecutionAssignment(input.task_id);
+    const source=this.verifiedCodeImports.get(mc.import_id);
+    const lease=source?this.taskLeases.get(source.lease_id)??null:null;
+    const planned=[...this.taskPlanLinks.values()].find((link)=>link.project_id===input.project_id&&link.task_id===input.task_id)?.assigned_profile_id;
+    validateTargetVerification(lease,assignment,planned?this.getAgentOrganizationProfileById(planned):null,input);
     const overallStatus: VerificationOverallStatus =
       input.overall_status ?? (input.verdict === "PASS" ? "PASSED" : "FAILED_ACCEPTANCE");
     const tamperDetected = input.tier2_baseline_tamper_detected ?? false;
@@ -5620,6 +5645,49 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         };
       })
     );
+  }
+
+  public async createTaskExecutionAssignment(input:Omit<TaskExecutionAssignmentRecord,"created_at">):Promise<TaskExecutionAssignmentRecord>{
+    this.assertCoreApiWritePermissionForProject(input.project_id);
+    return this.withSerializedLock(`budget:${input.project_id}`,()=>this.withSerializedLock(`task:${input.task_id}`,()=>{
+      const member=this.getProjectMembership(input.project_id,input.approved_by_principal_id);
+      if(input.approved_by_principal_id!==this.getCurrentRlsSession().currentPrincipalId||!member||!["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role))throw new PostgresRlsError("42501","Execution assignment requires project approver");
+      const planned=[...this.taskPlanLinks.values()].find((link)=>link.project_id===input.project_id&&link.task_id===input.task_id)?.assigned_profile_id??null;
+      validateTargetAssignment(input,this.getTaskById(input.task_id),this.getAgentOrganizationProfileById(input.profile_id),[...this.taskLeases.values()].some((l)=>l.task_id===input.task_id),planned);
+      if(this.executionAssignments.has(input.task_id)||[...this.executionAssignments.values()].some((a)=>a.assignment_id===input.assignment_id))throw new PostgresRlsError("23505","Task execution assignment is immutable");
+      const record={...structuredClone(input),created_at:this.clockTimestampIso()};this.setInMap(this.executionAssignments,input.task_id,record);
+      this.insertOutboxEventInternal(input.project_id,"execution_target",input.assignment_id,"target.assigned",{task_id:input.task_id,profile_id:input.profile_id,profile_sha256:input.profile_sha256});return structuredClone(record);
+    }));
+  }
+  public getTaskExecutionAssignment(taskId:string):TaskExecutionAssignmentRecord|null{
+    const record=this.executionAssignments.get(taskId);return record?.project_id===this.requireCurrentProjectId()?structuredClone(record):null;
+  }
+  public getTargetDispatchByRequest(requestId:string):TargetDispatchRecord|null{
+    const record=[...this.targetDispatches.values()].find((d)=>d.project_id===this.requireCurrentProjectId()&&d.execution_request_id===requestId);return record&&this.getCurrentRlsSession().currentRole==="core_api_service"?structuredClone(record):null;
+  }
+  public listTargetDispatches(taskId:string):TargetDispatchRecord[]{return this.getCurrentRlsSession().currentRole==="core_api_service"?[...this.targetDispatches.values()].filter((d)=>d.project_id===this.requireCurrentProjectId()&&d.task_id===taskId).map((d)=>structuredClone(d)):[];}
+  public async claimTargetDispatch(projectId:string,leaseId:string,healthSha:string):Promise<{record:TargetDispatchRecord;created:boolean}>{
+    this.assertCoreApiWritePermissionForProject(projectId);
+    return this.withSerializedLock(`target-dispatch:${leaseId}`,()=>{
+      const record=this.targetDispatches.get(leaseId);if(!record||record.project_id!==projectId)throw new PostgresRlsError("23503","Target dispatch not found");
+      if(record.status!=="PENDING")return{record:structuredClone(record),created:false};
+      const lease=this.taskLeases.get(leaseId),task=this.tasks.get(record.task_id);
+      if(!lease||lease.status!=="ACTIVE"||Date.parse(lease.expires_at)<=Date.parse(this.clockTimestampIso())||task?.active_lease_id!==leaseId||!/^[a-f0-9]{64}$/.test(healthSha))throw new PostgresRlsError("23514","Target dispatch requires a live lease and health evidence");
+      const assignment=this.getTaskExecutionAssignment(record.task_id);
+      validateTargetLease(task!,assignment,assignment?this.getAgentOrganizationProfileById(assignment.profile_id):null,lease);
+      const claimed={...record,status:"SENDING" as const,health_sha256:healthSha,claimed_at:this.clockTimestampIso()};this.setInMap(this.targetDispatches,leaseId,claimed);
+      this.insertOutboxEventInternal(projectId,"target_dispatch",leaseId,"target.dispatch_claimed",{lease_id:leaseId,health_sha256:healthSha});return{record:structuredClone(claimed),created:true};
+    });
+  }
+  public finishTargetDispatch(input:{project_id:string;lease_id:string;status:"IMPORTED"|"UNKNOWN"|"REJECTED";submission_id?:string;error_code?:string}):TargetDispatchRecord{
+    this.assertCoreApiWritePermissionForProject(input.project_id);const record=this.targetDispatches.get(input.lease_id);
+    if(!record||record.project_id!==input.project_id)throw new PostgresRlsError("23503","Target dispatch not found");
+    if(record.status===input.status&&record.submission_id===(input.submission_id??null))return structuredClone(record);
+    if(record.status!=="SENDING"&&!(record.status==="UNKNOWN"&&input.status==="IMPORTED"))throw new PostgresRlsError("23514","Invalid target dispatch completion");
+    const receipt=this.getCodeImportSubmission(input.lease_id);
+    if(input.status==="IMPORTED"?(!receipt||receipt.submission_id!==input.submission_id||receipt.task_id!==record.task_id||input.error_code!==undefined):input.submission_id!==undefined||!["ERR_TARGET_UNCERTAIN","ERR_TARGET_IMPORT_REJECTED"].includes(input.error_code??""))throw new PostgresRlsError("23514","Target completion requires controlled receipt or failure code");
+    const completed={...record,status:input.status,submission_id:input.submission_id??null,error_code:input.error_code??null,completed_at:this.clockTimestampIso()};this.setInMap(this.targetDispatches,input.lease_id,completed);
+    this.insertOutboxEventInternal(input.project_id,"target_dispatch",input.lease_id,"target.dispatch_completed",{lease_id:input.lease_id,status:input.status,submission_id:completed.submission_id,error_code:completed.error_code});return structuredClone(completed);
   }
 
   public createProductionReconciliationApproval(input: ProductionReconciliationApprovalRecord): ProductionReconciliationApprovalRecord {

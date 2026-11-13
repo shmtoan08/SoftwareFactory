@@ -18,7 +18,7 @@
     "start:core-api": "node apps/core-api/src/main.ts",
     "start:gateway": "node apps/agent-gateway/src/main.ts",
     "start:web": "node apps/web/src/main.ts",
-    "test": "node --test --test-concurrency=1 packages/test-harness/src/m1-acceptance.test.ts packages/test-harness/src/m2-acceptance.test.ts packages/test-harness/src/m3-acceptance.test.ts packages/test-harness/src/m4-acceptance.test.ts packages/test-harness/src/m5-acceptance.test.ts packages/test-harness/src/m6a-acceptance.test.ts packages/test-harness/src/m6b-acceptance.test.ts packages/test-harness/src/m6c-acceptance.test.ts packages/test-harness/src/m6c-import-adapters.test.ts packages/test-harness/src/m6c-review-fixes.test.ts packages/test-harness/src/m6c-notes.test.ts packages/test-harness/src/m6c3-verifier.test.ts packages/test-harness/src/m6c3-deployment.test.ts packages/test-harness/src/m6c3-reconciliation.test.ts",
+    "test": "node --test --test-concurrency=1 packages/test-harness/src/m1-acceptance.test.ts packages/test-harness/src/m2-acceptance.test.ts packages/test-harness/src/m3-acceptance.test.ts packages/test-harness/src/m4-acceptance.test.ts packages/test-harness/src/m5-acceptance.test.ts packages/test-harness/src/m6a-acceptance.test.ts packages/test-harness/src/m6b-acceptance.test.ts packages/test-harness/src/m6c-acceptance.test.ts packages/test-harness/src/m6c-import-adapters.test.ts packages/test-harness/src/m6c-review-fixes.test.ts packages/test-harness/src/m6c-notes.test.ts packages/test-harness/src/m6c3-verifier.test.ts packages/test-harness/src/m6c3-deployment.test.ts packages/test-harness/src/m6c3-reconciliation.test.ts packages/test-harness/src/m6c3-targets.test.ts",
     "test:m1": "node --test packages/test-harness/src/m1-acceptance.test.ts",
     "test:m2": "node --test packages/test-harness/src/m2-acceptance.test.ts",
     "test:m3": "node --test packages/test-harness/src/m3-acceptance.test.ts",
@@ -35,6 +35,7 @@
     "test:m6c3": "node --test packages/test-harness/src/m6c3-verifier.test.ts",
     "test:m6c3:gvisor": "node --test packages/test-harness/src/m6c3-gvisor-smoke.ts",
     "test:m6c3:deployment": "node --test packages/test-harness/src/m6c3-deployment.test.ts",
+    "test:m6c3:targets": "node --test packages/test-harness/src/m6c3-targets.test.ts",
     "test:m6c3:reconciliation": "node --test packages/test-harness/src/m6c3-reconciliation.test.ts"
   },
   "devDependencies": {

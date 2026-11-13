@@ -2001,6 +2001,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0014_m6c3_production_deployment_gate.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_upgrade_test;"
@@ -2284,6 +2286,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0014_m6c3_production_deployment_gate.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6a_upgrade_test;"
@@ -2645,6 +2649,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0014_m6c3_production_deployment_gate.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
           PGDATABASE=postgres psql -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS software_factory_m6b_upgrade_test;"
@@ -2667,6 +2673,8 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0014_m6c3_production_deployment_gate.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
           psql -v ON_ERROR_STOP=1 -c 'SELECT sf_verify_m6c_constraint_definitions();'
 
       - name: Prepare Optional Docker Verifier Base Image

@@ -1,3 +1,4 @@
+import { validateTargetAssignment, validateTargetLease } from "./execution-target-validation.ts";
 import { validateReconciliationApproval } from "./reconciliation-validation.ts";
 import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
 import { validateVerificationIsolation } from "./m6c3-validation.ts";
@@ -72,6 +73,8 @@ import {
   type TaskDependencyKind,
   type TaskDependencyRecord,
   type TaskLeaseRecord,
+  type TaskExecutionAssignmentRecord,
+  type TargetDispatchRecord,
   type TaskPlanLinkRecord,
   type TaskRecord,
   type TaskStatus,
@@ -1604,6 +1607,8 @@ function mapTaskRow(row: Record<string, unknown>): TaskRecord {
 
 function mapLeaseRow(row: Record<string, unknown>): TaskLeaseRecord {
   return {
+    execution_target_assignment_id: row.execution_target_assignment_id ? String(row.execution_target_assignment_id) : null,
+    execution_target_request_id: row.execution_target_request_id ? String(row.execution_target_request_id) : null,
     lease_id: String(row.lease_id),
     project_id: String(row.project_id),
     task_id: String(row.task_id),
@@ -2230,6 +2235,14 @@ function mapChangeRequestRow(row: Record<string, unknown>): ChangeRequestRecord 
   return record;
 }
 
+function mapExecutionAssignment(row:Record<string,unknown>):TaskExecutionAssignmentRecord{
+  return {assignment_id:String(row.assignment_id),project_id:String(row.project_id),task_id:String(row.task_id),profile_id:String(row.profile_id),profile_snapshot:row.profile_snapshot as Record<string,unknown>,
+    profile_sha256:String(row.profile_sha256),task_contract_sha256:String(row.task_contract_sha256),target_key:String(row.target_key),worker_id:String(row.worker_id),public_context:String(row.public_context),data_classification:"PUBLIC",approved_by_principal_id:String(row.approved_by_principal_id),created_at:String(row.created_at)};
+}
+function mapTargetDispatch(row:Record<string,unknown>):TargetDispatchRecord{
+  return {lease_id:String(row.lease_id),project_id:String(row.project_id),task_id:String(row.task_id),assignment_id:String(row.assignment_id),execution_request_id:String(row.execution_request_id),status:row.status as TargetDispatchRecord["status"],health_sha256:row.health_sha256?String(row.health_sha256):null,
+    submission_id:row.submission_id?String(row.submission_id):null,error_code:row.error_code?String(row.error_code):null,claimed_at:row.claimed_at?String(row.claimed_at):null,completed_at:row.completed_at?String(row.completed_at):null};
+}
 function mapReconciliationApproval(row:Record<string,unknown>):ProductionReconciliationApprovalRecord{
   return {reconciliation_approval_id:String(row.reconciliation_approval_id),project_id:String(row.project_id),deployment_id:String(row.deployment_id),original_approval_id:String(row.original_approval_id),
     deployment_binding_sha256:String(row.deployment_binding_sha256),expected_status:row.expected_status as ProductionReconciliationApprovalRecord["expected_status"],evidence:row.evidence as ProductionReconciliationApprovalRecord["evidence"],
@@ -2716,6 +2729,8 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
     heartbeat_interval_ms?: number;
     lease_ttl_ms?: number;
     reject_overlapping_active_files?: boolean;
+    execution_target_assignment_id?: string;
+    execution_target_request_id?: string;
   }): Promise<TaskLeaseRecord> {
     return this.withExistingOrRlsTransaction(
       {
@@ -2763,6 +2778,11 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             );
           }
           const task = mapTaskRow(taskRow);
+          const assignment=await this.getTaskExecutionAssignment(input.task_id);
+          const planned=(await this.pool.queryInActiveTx("SELECT assigned_profile_id FROM task_plan_links WHERE task_id=$1::uuid AND project_id=$2::uuid;",[input.task_id,input.project_id])).rows[0]?.assigned_profile_id;
+          const profileId=assignment?.profile_id??(planned?String(planned):null);
+          validateTargetLease(task,assignment,profileId?await this.getAgentOrganizationProfileById(profileId):null,input);
+
 
           const blockingDepsRes = await this.pool.queryInActiveTx<{ depends_on_task_id: string }>(
             `SELECT td.depends_on_task_id
@@ -2855,13 +2875,13 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
             `INSERT INTO task_leases (
               lease_id, project_id, task_id, attempt_no, lease_epoch, worker_id, status,
               task_execution_idempotency_key, last_processed_seq, heartbeat_interval_ms,
-              lease_ttl_ms, leased_at, last_heartbeat_at, expires_at
+              lease_ttl_ms, leased_at, last_heartbeat_at, expires_at, execution_target_assignment_id, execution_target_request_id
             ) VALUES (
               $1::uuid, $2::uuid, $3::uuid, $4::integer, $5::bigint, $6::text, 'ACTIVE',
               $7::text, 0, $8::integer, $9::integer, clock_timestamp(), clock_timestamp(),
-              clock_timestamp() + ($9::bigint * interval '1 millisecond')
+              clock_timestamp() + ($9::bigint * interval '1 millisecond'), $10::uuid, $11::uuid
             ) RETURNING *;`,
-            [leaseId, input.project_id, input.task_id, nextAttemptNo, nextEpoch, input.worker_id, idempotencyKey, hbMs, ttlMs]
+            [leaseId, input.project_id, input.task_id, nextAttemptNo, nextEpoch, input.worker_id, idempotencyKey, hbMs, ttlMs,input.execution_target_assignment_id??null,input.execution_target_request_id??null]
           );
           const lease = mapLeaseRow(leaseRes.rows[0]!);
 
@@ -7486,6 +7506,41 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
 
   public assertOutsideTransaction(): void {
     if (this.pool.getActiveTxSession()) throw new PostgresRlsError("23514", "Production execution requires its own committed transaction");
+  }
+
+  public async createTaskExecutionAssignment(input:Omit<TaskExecutionAssignmentRecord,"created_at">):Promise<TaskExecutionAssignmentRecord>{
+    const taskRow=(await this.pool.queryInActiveTx("SELECT * FROM tasks WHERE task_id=$1::uuid AND project_id=$2::uuid FOR UPDATE;",[input.task_id,input.project_id])).rows[0];
+    const member=await this.getProjectMembership(input.project_id,input.approved_by_principal_id);
+    if(input.approved_by_principal_id!==this.pool.getActiveTxSession()?.currentPrincipalId||!member||!["PROJECT_APPROVER","ORG_ADMIN"].includes(member.member_role))throw new PostgresRlsError("42501","Execution assignment requires project approver");
+    const planned=(await this.pool.queryInActiveTx("SELECT assigned_profile_id FROM task_plan_links WHERE task_id=$1::uuid AND project_id=$2::uuid;",[input.task_id,input.project_id])).rows[0]?.assigned_profile_id;
+    validateTargetAssignment(input,taskRow?mapTaskRow(taskRow):null,await this.getAgentOrganizationProfileById(input.profile_id),(await this.listTaskLeasesForTask(input.task_id)).length>0,planned?String(planned):null);
+    const columns=["assignment_id","project_id","task_id","profile_id","profile_snapshot","profile_sha256","task_contract_sha256","target_key","worker_id","public_context","data_classification","approved_by_principal_id"] as const;
+    const result=await this.pool.queryInActiveTx(`INSERT INTO task_execution_assignments(${columns.join(",")}) VALUES(${columns.map((_,i)=>`$${i+1}`).join(",")}) RETURNING *;`,columns.map((c)=>input[c]));
+    await this.insertOutboxEventSql(input.project_id,"execution_target",input.assignment_id,"target.assigned",{task_id:input.task_id,profile_id:input.profile_id,profile_sha256:input.profile_sha256});return mapExecutionAssignment(result.rows[0]!);
+  }
+  public async getTaskExecutionAssignment(taskId:string):Promise<TaskExecutionAssignmentRecord|null>{
+    const result=await this.pool.queryInActiveTx("SELECT * FROM task_execution_assignments WHERE task_id=$1::uuid;",[taskId]);return result.rows[0]?mapExecutionAssignment(result.rows[0]):null;
+  }
+  public async getTargetDispatchByRequest(requestId:string):Promise<TargetDispatchRecord|null>{
+    const result=await this.pool.queryInActiveTx("SELECT * FROM target_dispatches WHERE execution_request_id=$1::uuid;",[requestId]);return result.rows[0]?mapTargetDispatch(result.rows[0]):null;
+  }
+  public async listTargetDispatches(taskId:string):Promise<TargetDispatchRecord[]>{return(await this.pool.queryInActiveTx("SELECT * FROM target_dispatches WHERE task_id=$1::uuid ORDER BY claimed_at NULLS FIRST,lease_id;",[taskId])).rows.map(mapTargetDispatch);}
+  public async claimTargetDispatch(projectId:string,leaseId:string,healthSha:string):Promise<{record:TargetDispatchRecord;created:boolean}>{
+    const row=(await this.pool.queryInActiveTx("SELECT d.* FROM task_leases l JOIN tasks t ON t.task_id=l.task_id AND t.project_id=l.project_id JOIN target_dispatches d ON d.lease_id=l.lease_id AND d.project_id=l.project_id WHERE d.project_id=$1::uuid AND d.lease_id=$2::uuid FOR UPDATE OF l,t,d;",[projectId,leaseId])).rows[0];
+    if(!row)throw new PostgresRlsError("23503","Target dispatch not found");const record=mapTargetDispatch(row);
+    if(record.status!=="PENDING")return{record,created:false};
+    const lease=await this.getLeaseById(leaseId),task=await this.getTaskById(record.task_id),assignment=await this.getTaskExecutionAssignment(record.task_id);
+    if(!lease||!task||lease.status!=="ACTIVE"||Date.parse(lease.expires_at)<=Date.parse(await this.clockTimestampIso())||task.active_lease_id!==leaseId||!/^[a-f0-9]{64}$/.test(healthSha))throw new PostgresRlsError("23514","Target dispatch requires a live lease and health evidence");
+    validateTargetLease(task,assignment,assignment?await this.getAgentOrganizationProfileById(assignment.profile_id):null,lease);
+    const claimed=(await this.pool.queryInActiveTx("UPDATE target_dispatches SET status='SENDING',health_sha256=$3,claimed_at=clock_timestamp() WHERE project_id=$1::uuid AND lease_id=$2::uuid RETURNING *;",[projectId,leaseId,healthSha])).rows[0]!;
+    await this.insertOutboxEventSql(projectId,"target_dispatch",leaseId,"target.dispatch_claimed",{lease_id:leaseId,health_sha256:healthSha});return{record:mapTargetDispatch(claimed),created:true};
+  }
+  public async finishTargetDispatch(input:{project_id:string;lease_id:string;status:"IMPORTED"|"UNKNOWN"|"REJECTED";submission_id?:string;error_code?:string}):Promise<TargetDispatchRecord>{
+    const row=(await this.pool.queryInActiveTx("SELECT * FROM target_dispatches WHERE lease_id=$1::uuid AND project_id=$2::uuid FOR UPDATE;",[input.lease_id,input.project_id])).rows[0];
+    if(!row)throw new PostgresRlsError("23503","Target dispatch not found");const record=mapTargetDispatch(row);
+    if(record.status===input.status&&record.submission_id===(input.submission_id??null))return record;
+    const result=await this.pool.queryInActiveTx("UPDATE target_dispatches SET status=$3,submission_id=$4::uuid,error_code=$5,completed_at=clock_timestamp() WHERE project_id=$1::uuid AND lease_id=$2::uuid RETURNING *;",[input.project_id,input.lease_id,input.status,input.submission_id??null,input.error_code??null]);
+    await this.insertOutboxEventSql(input.project_id,"target_dispatch",input.lease_id,"target.dispatch_completed",{lease_id:input.lease_id,status:input.status,submission_id:input.submission_id??null,error_code:input.error_code??null});return mapTargetDispatch(result.rows[0]!);
   }
 
   public async createProductionReconciliationApproval(input:ProductionReconciliationApprovalRecord):Promise<ProductionReconciliationApprovalRecord>{

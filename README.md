@@ -16,7 +16,7 @@ Deterministic, lease-coordinated AI Software Factory Control Plane with 4-tier P
 - **Slice `M6C-1` (Parallel Core, Serialized CAS Queue, Budget Auto-Pause `AC-12c`, Telemetry):** Implemented; `test:m6c` covers concurrent DAG/path-safe dispatch, real Git FIFO merge/crash recovery/rebase, project/task budgets, HTTP RBAC, trace propagation, OTLP export and real PostgreSQL `0009` RLS. Local M6C gate: **8/8 passing on PostgreSQL 17**. Linux isolation remains covered by the Linux CI matrix.
 - **M6C-1 validation (2026-11-12):** Earlier full PostgreSQL regression **102/102 passing**, followed by final M6C glob regression **8/8 passing**; details and limits: [M6C-1 validation report](./m6c1-validation-report.md).
 - **Slice `M6C-2` (Second Runtime & Extended Imports):** Codex CLI adapter, WNA runtime selection, Bundle/Patch/Artifact normalization, lease-fenced immutable receipts and candidate-bound provenance implemented. Final M6C-2 **9/9**, native sandbox/WNA **2/2**; full regression **108/111**, with the three M5 failures passing an isolated **3/3** rerun. Validation and limits: [M6C-2 report](./m6c2-validation-report.md).
-- **Slice `M6C-3`:** Pending (external target connectors, kernel-isolated verifier, Lima/WSL2 and production deployment approval). **M6C / G7 is not yet complete.**
+- **Slice `M6C-3`:** In progress: gVisor verifier, signed deployment/recovery gates and approved Tier 2/3/4 HTTP execution clients. Concrete remote supervisors, VM backends and provider adapters remain pending. **M6C / G7 is not yet complete.**
 - **M6C review fixes (issue #8):** M6C-FIX-01..05 implemented on `review/m6c-1-2`, awaiting reviewer acceptance. Final local PostgreSQL 17 regression: **115/115 passing, 0 skipped** on Node 24.16.0; lint/TypeScript and secret scan passed. Scope, fixture compatibility and transaction-end retry boundaries: [review-fix report](./m6c-review-fixes-validation.md). Linux PG16/17 CI must still pass after acceptance and merge into `main`.
 
 ## Quick Start
@@ -62,6 +62,7 @@ psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0012_durable_budget_deni
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0013_m6c3_verifier_isolation_runtime.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0014_m6c3_production_deployment_gate.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0015_m6c3_deployment_reconciliation.sql
+psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0016_m6c3_execution_targets.sql
 psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0002_rls_verification_matrix.sql
 ```
 
@@ -167,7 +168,7 @@ Both `/scheduler/dispatch` and `/tasks/:taskId/dispatch` enforce project capacit
 
 ## M6C-2 Runtime & Import API
 
-Apply migrations through `0015` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
+Apply migrations through `0016` before starting the updated API. Run `npm run test:m6c2` with PostgreSQL configured for the complete nine-test acceptance set; without PostgreSQL the database test explicitly skips.
 
 Production `SF_AGENT_RUNTIME=codex-cli` is disabled with `ERR_UNMETERED_CODEX_DISABLED` until trusted Cost Guard metering is integrated (explicit project-owner decision for issue #8 note 9). There is no environment flag to enable unmetered production calls. Provider-free fixtures explicitly pass `testOnlyEmulator: true`, an emulator binary and the fixed `CODEX_EMULATOR_CREDENTIAL`; live credentials and resolver callbacks are rejected in that mode. The detached-worktree permission profile and controlled push remain tested by a mandatory native Codex sandbox CI job. Runtime timeout belongs to WNA, which enforces the adapter's `timeoutMs` and reaps/cleans the invocation. See [remaining-note validation](./m6c-review-notes-validation.md).
 
@@ -220,7 +221,7 @@ Production execution is disabled by default and requires PostgreSQL; configured 
 
 A successful executor returns a SHA-256 receipt. Timeout, exception or malformed receipt produces UNKNOWN; raw provider errors are not exposed. RUNNING and UNKNOWN both hold the `(project, target_key)` exclusion lock, so a fresh approval cannot bypass unresolved work. If the process dies or terminal persistence fails, RUNNING survives; there is no automatic retry, unlock or claim of exactly-once external effect. Outcomes require operator investigation. Recovery now requires the separately approved, provider-evidence-bound reconciliation workflow below; without its configured verifier and approval the target stays closed. Concrete cloud deployment executors remain future work. Removing/relabeling a target is not a supported recovery mechanism.
 
-`npm run test:m6c3:deployment` covers memory/HTTP/PostgreSQL, signatures/RBAC, exact binding, concurrency, timeout/revoke/expiry, unresolved target holds, commit-before-effect, process death and restart. It uses local test executors only, not production infrastructure. See [deployment validation](./m6c3-deployment-validation.md). External execution connectors, VM backends and M6C/G7 acceptance remain pending.
+`npm run test:m6c3:deployment` covers memory/HTTP/PostgreSQL, signatures/RBAC, exact binding, concurrency, timeout/revoke/expiry, unresolved target holds, commit-before-effect, process death and restart. It uses local test executors only, not production infrastructure. See [deployment validation](./m6c3-deployment-validation.md). The approved HTTP execution clients are described below; concrete remote supervision, VM backends and M6C/G7 acceptance remain pending.
 
 ### M6C-3 in progress: approved deployment reconciliation
 
@@ -236,4 +237,13 @@ All paths above are relative to `/api/v1/projects/:projectId`. Developers/audito
 
 There is no force-unlock or automatic redispatch. `SUCCEEDED` evidence must identify the exact approved artifact; `NOT_DEPLOYED` requires a terminal provider fence/tombstone, not NOT_FOUND. Changed evidence/status, failed lookup, timeout, expired/revoked approval or transaction failure retains HOLD. A late completion from the old executor cannot overwrite reconciliation. The new `reconciled_at` marks closure while original RUNNING/UNKNOWN execution status is retained as history.
 
-`npm run test:m6c3:reconciliation` covers the workflow on memory, HTTP and PostgreSQL; [recovery validation and trust boundaries](./m6c3-reconciliation-validation.md) distinguish test fence evidence from a real cloud adapter. Concrete provider fencing/verifier adapters, external targets, VM backends and M6C/G7 acceptance remain pending.
+`npm run test:m6c3:reconciliation` covers the workflow on memory, HTTP and PostgreSQL; [recovery validation and trust boundaries](./m6c3-reconciliation-validation.md) distinguish test fence evidence from a real cloud adapter. The approved HTTP target clients are described below; concrete provider fencing/verifier adapters, VM backends and M6C/G7 acceptance remain pending.
+
+
+### M6C-3 in progress: approved external execution targets
+
+Apply migration `0016`. Operator-injected `executionTargets.connectors` can register signed HTTP clients for user-managed workers, provider VM endpoints and remote sessions. No endpoint is enabled by default; real deployment requires PostgreSQL and a compatible operator-owned remote service. The clients do not provision VMs or install a WNA HTTP server.
+
+An approver creates an immutable per-task profile/contract/context assignment via `POST /tasks/:taskId/execution-target`. Only reviewed PUBLIC context is exported. `POST /tasks/:taskId/execute-target` accepts only `execution_request_id`; authenticated health checks, existing budget/dependency/conflict limits and a committed dispatch intent precede the remote call. Replays never resend SENDING/UNKNOWN executions. Signed results use the existing bundle/patch/artifact controlled importer. An exact import receipt can recover a lost completion acknowledgement without another remote request.
+
+Every assigned external candidate requires network-disabled runsc verification even after mutable profile edits. The scheduler/direct lease path cannot bypass assignment; SQL protects provenance and isolation. Source code, full contracts, private repository access and Factory credentials are not exported. Remote supervision, billing/cleanup and provisioning remain future work; Codex connectors without trusted metering stay blocked. See [protocol, validation and limitations](./m6c3-execution-targets-validation.md); run `npm run test:m6c3:targets`. M6C/G7 remains open.
