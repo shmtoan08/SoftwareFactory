@@ -267,6 +267,8 @@ Issue #12 đã được team review **ĐẠT**, tick 5/5 và đóng cho baseline
 
 Bước 6 / issue #16: đã triển khai WSL2 backend foundation (operator-pinned distro/version 2, scoped lifecycle, diagnostic pre-probe và bounded CLI execution), xem [báo cáo WSL2](./m6c3-vm-wsl2-validation.md). Kiểm thử CLI fixture cục bộ **52/52**, không skip; suite được nối vào npm test/CI. Chưa có bằng chứng native Windows/WSL2 hoặc kernel isolation và chưa nối vào production dispatcher. Đã bổ sung [Lima foundation](./m6c3-vm-lima-validation.md) với parser/schema/state validation và host-env snapshot; native start/diagnostic bị chặn cho đến khi bảo đảm existing-only start và SSH/login boundary. Fixture không chứng minh native VM/kernel isolation; issue #16 và M6C/G7 chưa nghiệm thu.
 
+G7 readiness audit ngày **2026-11-14**: [bảng bằng chứng và phần còn thiếu](./g7-release-readiness.md). Main `78f1b7c` được review **ĐẠT**, CI5/5 xanh, PG16/17 mỗi job287/287 không skip. Tuy nhiên native worker/isolation trong Lima/WSL2 và đường native Lima start/diagnostic vẫn chưa hoàn tất; **G7 = HOLD**, không đồng nhất source review PASS với release acceptance. Firecracker và cloud vendor không tự động trở thành blocker bổ sung nếu là lựa chọn ngoài release profile; scope cần được ghi rõ.
+
 Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
 
 - **Triển khai:**
