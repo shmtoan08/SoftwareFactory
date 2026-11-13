@@ -1,28 +1,32 @@
 /**
  * @file vm-lima-backend.ts
- * @description Lima VM Backend Foundation for Software Factory M6C-3.
+ * @description Lima VM Backend Foundation for Software Factory M6C-3 (Step 6).
  *
- * Implements operator-pinned Lima instance lifecycle and diagnostic execution
- * according to the structural VM contract (M6C-3 Step 5 / Issue #16).
+ * Implements operator-pinned Lima instance probing, lifecycle, and diagnostic
+ * execution foundation according to the structural VM contract (Issue #16).
  *
- * Primary Documentation & Reference:
- * - Lima Reference: https://lima-vm.io/docs/reference/limactl/
- * - GitHub Repository: https://github.com/lima-vm/lima
+ * Primary Documentation & Reference (Pinned to Lima v2.0.3):
+ * - Lima CLI Reference: https://lima-vm.io/docs/reference/limactl_shell/
+ * - shell.go (v2.0.3): https://raw.githubusercontent.com/lima-vm/lima/v2.0.3/cmd/limactl/shell.go
+ * - start.go (v2.0.3): https://raw.githubusercontent.com/lima-vm/lima/v2.0.3/cmd/limactl/start.go
  *
  * Features & Invariants:
- * - Operator configuration pinning: absolute binary path, instance identity, optional LIMA_HOME root, optional guest user.
+ * - Operator configuration pinning: absolute binary path, instance identity, optional LIMA_HOME root.
+ *   Host environment is snapshotted at construction time so later process.env mutations cannot alter targets.
  * - Strict boolean type validation: testOnlyEmulator, allowLifecycle, dedicatedInstance must be booleans at runtime.
- * - Structured JSON probing: Uses `limactl list --json`, supporting both JSON Lines stream and JSON array formats.
- *   Validates exact instance identity and status; rejects missing instances, ambiguous duplicates, and corrupt schemas without default fallback.
- * - Targeted lifecycle operations: 'start' boots registered instance via `limactl start --tty=false <instance>`,
- *   'stop' invokes `limactl stop <instance>`. Strictly forbids global shutdown, creation from template, image downloads, or configuration mutations.
- * - Diagnostic execution pre-probe: Probes instance existence and status before guest execution.
- * - Bounded operator execution: Direct argv array spawn with shell: false, guest env -i isolation,
- *   minimal host environment stripped of credentials, and SSH_AUTH_SOCK explicitly purged to prevent SSH agent forwarding.
+ * - Unsupported flag rejection: guestUser is rejected because Lima v2.0.3 `limactl shell` has no `--user` flag.
+ * - Structured JSON probing: Uses `limactl list --json` (JSONL or JSON array). Validates exact instance identity,
+ *   official Lima status enum (Running/Stopped/Installing/Broken/Uninitialized), and optional field types/bounds.
+ *   Fails closed on missing, ambiguous, unknown/empty status, or corrupt schema without default fallback.
+ * - Native boundary fail-closed (v2.0.3):
+ *   - `start` is fail-closed in native mode (`testOnlyEmulator !== true`) because Lima v2.0.3 `limactl start`
+ *     lacks an existing-only flag to eliminate template auto-create TOCTOU if an instance disappears after probe.
+ *   - `execOperatorCommand` is fail-closed in native mode (`testOnlyEmulator !== true`) because Lima v2.0.3
+ *     `limactl shell` uses instance ssh.config (ControlMaster/ForwardAgent) and runs a guest login shell before `/usr/bin/env -i`.
+ * - Diagnostic precondition: Requires `status === "Running"` from `probe()` before invoking `limactl shell`.
  * - Bounded timeouts, output caps & inherited pipe hang defense: Single-pass cleanup, stream destruction,
- *   and bounded settlement preventing indefinite promise hangs when background descendants retain file descriptors.
- * - Uncertain outcome reporting: Abort, timeout, or guest output overflow terminates host transport (limactl)
- *   and reports uncertain guest state, never faking process cleanup or auto-stopping the instance.
+ *   and bounded settlement. Keeps execution deadline armed until pipe closure ('close') so exited CLI processes
+ *   with open descendant pipes do not falsely succeed.
  * - Strict platform gating: Production requires darwin host platform; emulator mode requires explicit boolean testOnlyEmulator: true.
  */
 
@@ -33,11 +37,21 @@ import { isAbsolute, win32 } from "node:path";
 // Structural Contract Types (Issue #16 / INTERFACE.md)
 // ============================================================================
 
+export type LimaInstanceStatus = "Running" | "Stopped" | "Installing" | "Broken" | "Uninitialized";
+
+export const SUPPORTED_LIMA_STATUSES: ReadonlySet<string> = new Set<LimaInstanceStatus>([
+  "Running",
+  "Stopped",
+  "Installing",
+  "Broken",
+  "Uninitialized",
+]);
+
 export interface VmProbeResult {
   readonly backend: "lima";
   readonly identity: string;
   readonly present: true;
-  readonly status: string;
+  readonly status: LimaInstanceStatus;
   readonly dir?: string;
   readonly arch?: string;
   readonly vmType?: string;
@@ -54,7 +68,6 @@ export interface LimaVmBackendConfig {
   readonly binaryPath: string;
   readonly instanceName: string;
   readonly limaHome?: string;
-  readonly guestUser?: string;
   readonly allowLifecycle?: boolean;
   readonly dedicatedInstance?: boolean;
   readonly commandTimeoutMs?: number;
@@ -64,12 +77,11 @@ export interface LimaVmBackendConfig {
 
 export interface LimaInstanceEntry {
   readonly name: string;
-  readonly status: string;
+  readonly status: LimaInstanceStatus;
   readonly dir?: string;
   readonly arch?: string;
   readonly vmType?: string;
   readonly sshLocalPort?: number;
-  readonly [key: string]: unknown;
 }
 
 // ============================================================================
@@ -85,7 +97,6 @@ const SENSITIVE_KEY_PATTERN = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AU
 const SENSITIVE_PREFIX_PATTERN = /^(?:SF_|GITHUB_|DATABASE_|OPENAI_|ANTHROPIC_|AWS_|AZURE_)/i;
 
 const VALID_INSTANCE_NAME_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
-const VALID_USERNAME_REGEX = /^[a-zA-Z0-9_][a-zA-Z0-9._-]*[$]?$/;
 
 // ============================================================================
 // Output & Environment Helpers
@@ -105,8 +116,8 @@ export function sanitizeErrorOutput(output: string): string {
 
 /**
  * Constructs minimal sanitized host environment for spawning limactl.
- * Strips SSH_AUTH_SOCK and SSH_AGENT_PID to prevent SSH agent forwarding into the VM.
- * Purges all Factory/Gateway/DB/Git/model credentials.
+ * Strips SSH_AUTH_SOCK and SSH_AGENT_PID from the host env snapshot and purges
+ * Factory/Gateway/DB/Git/model credentials. Uses official LIMA_HOME env var.
  */
 export function buildMinimalHostEnv(limaHome?: string): NodeJS.ProcessEnv {
   const minimal: NodeJS.ProcessEnv = {
@@ -119,12 +130,16 @@ export function buildMinimalHostEnv(limaHome?: string): NodeJS.ProcessEnv {
     LOGNAME: process.env.LOGNAME || "lima",
   };
 
-  if (limaHome) {
-    minimal.LIMA_HOME = limaHome;
-    minimal.LIMAHOME = limaHome;
+  const resolvedLimaHome = limaHome ?? (
+    typeof process.env.LIMA_HOME === "string" && process.env.LIMA_HOME.trim().length > 0
+      ? process.env.LIMA_HOME
+      : undefined
+  );
+  if (resolvedLimaHome) {
+    minimal.LIMA_HOME = resolvedLimaHome;
   }
 
-  // Explicitly purge SSH agent forwarding credentials
+  // Explicitly purge SSH agent forwarding env vars from host env
   delete minimal.SSH_AUTH_SOCK;
   delete minimal.SSH_AGENT_PID;
 
@@ -139,8 +154,59 @@ export function buildMinimalHostEnv(limaHome?: string): NodeJS.ProcessEnv {
 }
 
 /**
- * Parses the structured JSON output of `limactl list --json`.
- * Supports both JSON Lines stream format and JSON array format according to official Lima schemas.
+ * Validates a single parsed JSON object against the official Lima v2.0.3 `limactl list --json` schema.
+ * Rejects unknown/empty status values and invalid optional field types/bounds.
+ */
+function validateLimaInstanceEntry(raw: unknown, context: string): LimaInstanceEntry {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid instance entry (expected object) in ${context}`);
+  }
+
+  const obj = raw as Record<string, unknown>;
+
+  if (typeof obj.name !== "string" || obj.name.trim().length === 0) {
+    throw new Error(`ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid or empty instance name in ${context}`);
+  }
+
+  if (typeof obj.status !== "string" || !SUPPORTED_LIMA_STATUSES.has(obj.status)) {
+    throw new Error(
+      `ERR_LIMA_OUTPUT_UNRECOGNIZED: Unsupported or empty instance status in ${context} (expected one of Running, Stopped, Installing, Broken, Uninitialized)`
+    );
+  }
+
+  if (obj.dir !== undefined && (typeof obj.dir !== "string" || obj.dir.trim().length === 0)) {
+    throw new Error(`ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid optional field 'dir' in ${context}`);
+  }
+  if (obj.arch !== undefined && (typeof obj.arch !== "string" || obj.arch.trim().length === 0)) {
+    throw new Error(`ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid optional field 'arch' in ${context}`);
+  }
+  if (obj.vmType !== undefined && (typeof obj.vmType !== "string" || obj.vmType.trim().length === 0)) {
+    throw new Error(`ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid optional field 'vmType' in ${context}`);
+  }
+  if (
+    obj.sshLocalPort !== undefined &&
+    (typeof obj.sshLocalPort !== "number" ||
+      !Number.isInteger(obj.sshLocalPort) ||
+      obj.sshLocalPort < 0 ||
+      obj.sshLocalPort > 65535)
+  ) {
+    throw new Error(`ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid optional field 'sshLocalPort' in ${context}`);
+  }
+
+  return {
+    name: obj.name,
+    status: obj.status as LimaInstanceStatus,
+    ...(obj.dir !== undefined ? { dir: obj.dir } : {}),
+    ...(obj.arch !== undefined ? { arch: obj.arch } : {}),
+    ...(obj.vmType !== undefined ? { vmType: obj.vmType } : {}),
+    ...(obj.sshLocalPort !== undefined ? { sshLocalPort: obj.sshLocalPort } : {}),
+  };
+}
+
+/**
+ * Parses the structured JSON output of `limactl list --json` (Lima v2.0.3).
+ * Supports both JSON Lines stream format and JSON array format.
+ * Never echoes raw unparsed JSON lines in error messages to avoid leaking embedded secrets.
  */
 export function parseLimaListJsonOutput(rawOutput: string, targetInstance: string): VmProbeResult {
   const trimmed = rawOutput.trim();
@@ -154,25 +220,14 @@ export function parseLimaListJsonOutput(rawOutput: string, targetInstance: strin
     let parsed: unknown;
     try {
       parsed = JSON.parse(trimmed);
-    } catch (err) {
-      throw new Error(
-        `ERR_LIMA_OUTPUT_UNRECOGNIZED: Failed to parse JSON array from limactl list: ${sanitizeErrorOutput(String(err))}`
-      );
+    } catch {
+      throw new Error("ERR_LIMA_OUTPUT_UNRECOGNIZED: Failed to parse JSON array from limactl list");
     }
     if (!Array.isArray(parsed)) {
       throw new Error("ERR_LIMA_OUTPUT_UNRECOGNIZED: Expected JSON array from limactl list");
     }
-    for (const item of parsed) {
-      if (
-        typeof item === "object" &&
-        item !== null &&
-        typeof (item as Record<string, unknown>)["name"] === "string" &&
-        typeof (item as Record<string, unknown>)["status"] === "string"
-      ) {
-        entries.push(item as LimaInstanceEntry);
-      } else {
-        throw new Error("ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid instance schema in limactl list JSON array");
-      }
+    for (let i = 0; i < parsed.length; i++) {
+      entries.push(validateLimaInstanceEntry(parsed[i], `limactl list JSON array index ${i}`));
     }
   } else {
     const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
@@ -182,21 +237,12 @@ export function parseLimaListJsonOutput(rawOutput: string, targetInstance: strin
       let obj: unknown;
       try {
         obj = JSON.parse(line);
-      } catch (err) {
+      } catch {
         throw new Error(
-          `ERR_LIMA_OUTPUT_UNRECOGNIZED: Failed to parse JSON line ${i + 1} from limactl list: ${sanitizeErrorOutput(line)}`
+          `ERR_LIMA_OUTPUT_UNRECOGNIZED: Failed to parse JSON line ${i + 1} from limactl list`
         );
       }
-      if (
-        typeof obj === "object" &&
-        obj !== null &&
-        typeof (obj as Record<string, unknown>)["name"] === "string" &&
-        typeof (obj as Record<string, unknown>)["status"] === "string"
-      ) {
-        entries.push(obj as LimaInstanceEntry);
-      } else {
-        throw new Error(`ERR_LIMA_OUTPUT_UNRECOGNIZED: Invalid instance schema at line ${i + 1} of limactl list output`);
-      }
+      entries.push(validateLimaInstanceEntry(obj, `limactl list line ${i + 1}`));
     }
   }
 
@@ -225,10 +271,10 @@ export function parseLimaListJsonOutput(rawOutput: string, targetInstance: strin
     identity: entry.name,
     present: true,
     status: entry.status,
-    dir: entry.dir,
-    arch: entry.arch,
-    vmType: entry.vmType,
-    sshLocalPort: entry.sshLocalPort,
+    ...(entry.dir !== undefined ? { dir: entry.dir } : {}),
+    ...(entry.arch !== undefined ? { arch: entry.arch } : {}),
+    ...(entry.vmType !== undefined ? { vmType: entry.vmType } : {}),
+    ...(entry.sshLocalPort !== undefined ? { sshLocalPort: entry.sshLocalPort } : {}),
   };
 }
 
@@ -240,6 +286,7 @@ export class LimaVmBackend {
   readonly config: LimaVmBackendConfig;
   readonly commandTimeoutMs: number;
   readonly maxOutputBytes: number;
+  private readonly pinnedHostEnv: Readonly<NodeJS.ProcessEnv>;
 
   constructor(config: LimaVmBackendConfig) {
     if (!config || typeof config !== "object") {
@@ -286,20 +333,11 @@ export class LimaVmBackend {
       }
     }
 
-    // 4. Validate optional guestUser
-    if (config.guestUser !== undefined) {
-      if (typeof config.guestUser !== "string" || config.guestUser.trim().length === 0) {
-        throw new Error("ERR_LIMA_CONFIG_INVALID: guestUser must be a non-empty string if provided");
-      }
-      if (config.guestUser.includes("\0") || config.guestUser.includes("\n")) {
-        throw new Error("ERR_LIMA_CONFIG_INVALID: guestUser must not contain null bytes or newlines");
-      }
-      if (config.guestUser.startsWith("-")) {
-        throw new Error("ERR_LIMA_CONFIG_INVALID: guestUser must not start with a hyphen (-)");
-      }
-      if (!VALID_USERNAME_REGEX.test(config.guestUser)) {
-        throw new Error(`ERR_LIMA_CONFIG_INVALID: guestUser contains invalid characters: "${config.guestUser}"`);
-      }
+    // 4. Reject unsupported guestUser option (Lima v2.0.3 limactl shell has no --user flag)
+    if ((config as unknown as Record<string, unknown>)["guestUser"] !== undefined) {
+      throw new Error(
+        "ERR_LIMA_UNSUPPORTED_OPTION: guestUser is not supported by limactl shell in Lima v2.0.3"
+      );
     }
 
     // 5. Validate strict boolean options
@@ -358,8 +396,13 @@ export class LimaVmBackend {
       }
     }
 
+    // 8. Snapshot minimal host environment once at construction time
+    this.pinnedHostEnv = Object.freeze(buildMinimalHostEnv(config.limaHome));
+
     this.config = Object.freeze({
-      ...config,
+      binaryPath: config.binaryPath,
+      instanceName: config.instanceName,
+      ...(config.limaHome !== undefined ? { limaHome: config.limaHome } : {}),
       allowLifecycle: config.allowLifecycle === true,
       dedicatedInstance: config.dedicatedInstance === true,
       commandTimeoutMs: this.commandTimeoutMs,
@@ -397,7 +440,7 @@ export class LimaVmBackend {
 
       const child = spawn(this.config.binaryPath, args, {
         shell: false,
-        env: buildMinimalHostEnv(this.config.limaHome),
+        env: { ...this.pinnedHostEnv },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -556,14 +599,10 @@ export class LimaVmBackend {
       child.on("exit", (code, signalStr) => {
         if (terminating) {
           finalizeSettlement(code, signalStr);
-        } else {
-          if (!forceSettlementTimer) {
-            forceSettlementTimer = setTimeout(() => {
-              finalizeSettlement(code, signalStr);
-            }, 300);
-            forceSettlementTimer.unref();
-          }
         }
+        // Otherwise wait for complete pipe closure ('close'). The original executionTimer
+        // remains armed: an exited CLI with inherited open pipes must not turn
+        // incomplete output into a successful result after an arbitrary grace period.
       });
 
       child.on("close", (code, signalStr) => {
@@ -591,7 +630,11 @@ export class LimaVmBackend {
   /**
    * Starts the configured dedicated instance.
    * Lifecycle operations strictly require allowLifecycle=true AND dedicatedInstance=true.
-   * Probes instance existence first to avoid limactl auto-creating a new instance from template.
+   *
+   * Native boundary (Lima v2.0.3):
+   * `limactl start` lacks an existing-only flag to eliminate template auto-create TOCTOU
+   * if the instance disappears between probe() and start(). Therefore native start
+   * fails closed unless running under explicit testOnlyEmulator: true.
    */
   async start(signal?: AbortSignal): Promise<void> {
     if (!this.config.allowLifecycle || !this.config.dedicatedInstance) {
@@ -600,10 +643,21 @@ export class LimaVmBackend {
       );
     }
 
-    // Pre-probe to verify existence
+    if (!this.config.testOnlyEmulator) {
+      throw new Error(
+        "ERR_LIMA_NATIVE_BOUNDARY_UNSUPPORTED: Native limactl start is fail-closed in foundation (Lima v2.0.3 start lacks an existing-only flag to eliminate template auto-create TOCTOU)"
+      );
+    }
+
+    // Pre-probe to verify existence and state
     const current = await this.probe(signal);
-    if (current.status.toLowerCase() === "running") {
+    if (current.status === "Running") {
       return; // Already running
+    }
+    if (current.status !== "Stopped") {
+      throw new Error(
+        `ERR_VM_START_FAILED: Cannot start instance "${this.config.instanceName}" from state "${current.status}"`
+      );
     }
 
     // Start existing instance without interactive TTY
@@ -627,8 +681,16 @@ export class LimaVmBackend {
       );
     }
 
-    // Recheck probe and pinned identity
-    await this.probe(signal);
+    // Recheck probe and pinned identity/state
+    const current = await this.probe(signal);
+    if (current.status === "Stopped") {
+      return; // Already stopped
+    }
+    if (current.status !== "Running") {
+      throw new Error(
+        `ERR_VM_STOP_FAILED: Cannot stop instance "${this.config.instanceName}" from state "${current.status}"`
+      );
+    }
 
     const stopArgs = ["stop", this.config.instanceName];
     const result = await this.runHostCli(stopArgs, signal);
@@ -640,12 +702,13 @@ export class LimaVmBackend {
   }
 
   /**
-   * Executes internal operator diagnostic command in the guest.
+   * Executes internal operator diagnostic command in the guest (emulator-verified argv path).
    * - `command` must be an absolute path inside guest (e.g. /usr/bin/uptime).
-   * - Probes instance existence and status using the same AbortSignal before execution.
+   * - Native boundary (Lima v2.0.3): fails closed when testOnlyEmulator !== true because
+   *   `limactl shell` uses instance ssh.config (ControlMaster/ForwardAgent) and runs a guest
+   *   login shell before `/usr/bin/env -i`.
+   * - Probes instance existence and requires status === "Running" before invoking `limactl shell`.
    * - Direct argv array execution via `limactl shell` with shell: false.
-   * - Executes under guest `env -i` clean environment.
-   * - Host environment is sanitized and SSH_AUTH_SOCK is stripped.
    */
   async execOperatorCommand(
     command: string,
@@ -674,17 +737,22 @@ export class LimaVmBackend {
       }
     }
 
-    // Diagnostic must verify target instance existence before execution
-    await this.probe(signal);
-
-    // Construct argv for limactl shell
-    const spawnArgs: string[] = ["shell"];
-
-    if (this.config.guestUser) {
-      spawnArgs.push("--user", this.config.guestUser);
+    if (!this.config.testOnlyEmulator) {
+      throw new Error(
+        "ERR_LIMA_NATIVE_BOUNDARY_UNSUPPORTED: Native limactl shell diagnostic execution is fail-closed in foundation (Lima v2.0.3 shell uses instance ssh.config ControlMaster/ForwardAgent and guest login shell before env -i; boundary not yet enforced)"
+      );
     }
 
-    spawnArgs.push(this.config.instanceName);
+    // Diagnostic must verify target instance existence and Running state before execution
+    const probeResult = await this.probe(signal);
+    if (probeResult.status !== "Running") {
+      throw new Error(
+        `ERR_LIMA_INSTANCE_NOT_RUNNING: Instance "${this.config.instanceName}" is in state "${probeResult.status}"; diagnostic execution requires Running state`
+      );
+    }
+
+    // Construct argv for limactl shell (Lima v2.0.3: no --user flag)
+    const spawnArgs: string[] = ["shell", this.config.instanceName];
 
     // Wrap with /usr/bin/env -i to enforce clean guest environment
     if (command === "/usr/bin/env" && args[0] === "-i") {

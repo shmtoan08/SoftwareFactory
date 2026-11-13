@@ -84,7 +84,7 @@ function readRecordedInvocation(recordFile: string): RecordedInvocation {
 // Test Suite
 // ============================================================================
 
-describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
+describe("M6C-3 Step 6 — Lima VM Backend Foundation (LimaVmBackend)", () => {
 
   // --------------------------------------------------------------------------
   // Group 1: Production Platform Guard & Configuration Validation
@@ -236,27 +236,40 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
       );
     });
 
-    it("constructor rejects invalid guestUser", () => {
+    it("constructor rejects unsupported guestUser option (Lima v2.0.3 shell has no --user flag)", () => {
       assert.throws(
         () =>
           new LimaVmBackend({
             binaryPath: "/bin/limactl",
             instanceName: "worker-vm",
-            guestUser: "-root",
+            guestUser: "sf-runner",
             testOnlyEmulator: true,
-          }),
-        /ERR_LIMA_CONFIG_INVALID.*guestUser must not start with a hyphen/
+          } as unknown as import("../../wna/src/vm-lima-backend.ts").LimaVmBackendConfig),
+        /ERR_LIMA_UNSUPPORTED_OPTION.*guestUser is not supported by limactl shell in Lima v2\.0\.3/
+      );
+    });
+
+    it("native mode (testOnlyEmulator: false) fails closed on start() and execOperatorCommand() on darwin", async () => {
+      if (process.platform !== "darwin") {
+        return;
+      }
+
+      const backend = new LimaVmBackend({
+        binaryPath: "/usr/local/bin/limactl",
+        instanceName: "worker-vm",
+        allowLifecycle: true,
+        dedicatedInstance: true,
+        testOnlyEmulator: false,
+      });
+
+      await assert.rejects(
+        async () => backend.start(),
+        /ERR_LIMA_NATIVE_BOUNDARY_UNSUPPORTED.*existing-only flag/
       );
 
-      assert.throws(
-        () =>
-          new LimaVmBackend({
-            binaryPath: "/bin/limactl",
-            instanceName: "worker-vm",
-            guestUser: "user\0name",
-            testOnlyEmulator: true,
-          }),
-        /ERR_LIMA_CONFIG_INVALID.*guestUser must not contain null bytes/
+      await assert.rejects(
+        async () => backend.execOperatorCommand("/usr/bin/uptime", []),
+        /ERR_LIMA_NATIVE_BOUNDARY_UNSUPPORTED.*ControlMaster\/ForwardAgent/
       );
     });
 
@@ -399,11 +412,15 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
       );
     });
 
-    it("parseLimaListJsonOutput rejects corrupt or invalid JSON lines", () => {
-      const corrupt = "not a valid json string\n";
+    it("parseLimaListJsonOutput rejects corrupt or invalid JSON lines without echoing raw line", () => {
+      const corrupt = "not a valid json string secret-canary-raw-payload-12345\n";
       assert.throws(
         () => parseLimaListJsonOutput(corrupt, "worker-vm"),
-        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Failed to parse JSON/
+        (err: Error) => {
+          assert.match(err.message, /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Failed to parse JSON/);
+          assert.strictEqual(err.message.includes("secret-canary-raw-payload-12345"), false);
+          return true;
+        }
       );
     });
 
@@ -411,7 +428,41 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
       const invalidSchema = JSON.stringify({ dir: "/lima/broken" });
       assert.throws(
         () => parseLimaListJsonOutput(invalidSchema, "worker-vm"),
-        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Invalid instance schema/
+        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Invalid or empty instance name/
+      );
+    });
+
+    it("parseLimaListJsonOutput rejects unknown or empty status values", () => {
+      assert.throws(
+        () => parseLimaListJsonOutput(JSON.stringify({ name: "worker-vm", status: "NOT_A_STATE" }), "worker-vm"),
+        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Unsupported or empty instance status/
+      );
+
+      assert.throws(
+        () => parseLimaListJsonOutput(JSON.stringify({ name: "worker-vm", status: "" }), "worker-vm"),
+        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Unsupported or empty instance status/
+      );
+    });
+
+    it("parseLimaListJsonOutput rejects invalid optional field types and out-of-bounds sshLocalPort", () => {
+      assert.throws(
+        () => parseLimaListJsonOutput(JSON.stringify({ name: "worker-vm", status: "Running", sshLocalPort: "bad" }), "worker-vm"),
+        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Invalid optional field 'sshLocalPort'/
+      );
+
+      assert.throws(
+        () => parseLimaListJsonOutput(JSON.stringify({ name: "worker-vm", status: "Running", sshLocalPort: -1 }), "worker-vm"),
+        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Invalid optional field 'sshLocalPort'/
+      );
+
+      assert.throws(
+        () => parseLimaListJsonOutput(JSON.stringify({ name: "worker-vm", status: "Running", sshLocalPort: 70000 }), "worker-vm"),
+        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Invalid optional field 'sshLocalPort'/
+      );
+
+      assert.throws(
+        () => parseLimaListJsonOutput(JSON.stringify({ name: "worker-vm", status: "Running", dir: "" }), "worker-vm"),
+        /ERR_LIMA_OUTPUT_UNRECOGNIZED.*Invalid optional field 'dir'/
       );
     });
 
@@ -718,6 +769,45 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
         }
       );
     });
+
+    it("start() and stop() reject Broken or Installing instances without invoking start/stop CLI", async () => {
+      for (const state of ["Broken", "Installing"] as const) {
+        await withTempFixture(
+          (testDir) => `#!/usr/bin/env node
+            import { appendFileSync } from 'node:fs';
+            const args = process.argv.slice(2);
+            appendFileSync(${JSON.stringify(join(testDir, "invocations.log"))}, JSON.stringify(args) + '\\n');
+            if (args.includes('list')) {
+              process.stdout.write(JSON.stringify({ name: "worker-vm", status: ${JSON.stringify(state)} }) + '\\n');
+            }
+          `,
+          async (fixturePath, testDir) => {
+            const logFile = join(testDir, "invocations.log");
+            const backend = new LimaVmBackend({
+              binaryPath: fixturePath,
+              instanceName: "worker-vm",
+              allowLifecycle: true,
+              dedicatedInstance: true,
+              testOnlyEmulator: true,
+            });
+
+            await assert.rejects(
+              async () => backend.start(),
+              new RegExp(`ERR_VM_START_FAILED.*from state "${state}"`)
+            );
+            await assert.rejects(
+              async () => backend.stop(),
+              new RegExp(`ERR_VM_STOP_FAILED.*from state "${state}"`)
+            );
+
+            const lines = readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+            assert.strictEqual(lines.length, 2);
+            assert.deepStrictEqual(lines[0], ["list", "--json"]);
+            assert.deepStrictEqual(lines[1], ["list", "--json"]);
+          }
+        );
+      }
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -765,43 +855,38 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
       );
     });
 
-    it("execOperatorCommand includes --user <guestUser> when configured", async () => {
-      await withTempFixture(
-        (testDir) => `#!/usr/bin/env node
-          import { writeFileSync } from 'node:fs';
-          const args = process.argv.slice(2);
-          if (args.includes('list')) {
-            process.stdout.write(JSON.stringify({ name: "worker-vm", status: "Running" }) + '\\n');
-            process.exit(0);
+    it("execOperatorCommand rejects Stopped/Installing/Broken instances without invoking limactl shell", async () => {
+      for (const state of ["Stopped", "Installing", "Broken"] as const) {
+        await withTempFixture(
+          (testDir) => `#!/usr/bin/env node
+            import { appendFileSync } from 'node:fs';
+            const args = process.argv.slice(2);
+            appendFileSync(${JSON.stringify(join(testDir, "invocations.log"))}, JSON.stringify(args) + '\\n');
+            if (args.includes('list')) {
+              process.stdout.write(JSON.stringify({ name: "worker-vm", status: ${JSON.stringify(state)} }) + '\\n');
+            } else {
+              process.stdout.write("unexpected-shell-invocation\\n");
+            }
+          `,
+          async (fixturePath, testDir) => {
+            const logFile = join(testDir, "invocations.log");
+            const backend = new LimaVmBackend({
+              binaryPath: fixturePath,
+              instanceName: "worker-vm",
+              testOnlyEmulator: true,
+            });
+
+            await assert.rejects(
+              async () => backend.execOperatorCommand("/usr/bin/uptime", []),
+              new RegExp(`ERR_LIMA_INSTANCE_NOT_RUNNING.*in state "${state}"`)
+            );
+
+            const lines = readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+            assert.strictEqual(lines.length, 1);
+            assert.deepStrictEqual(lines[0], ["list", "--json"]);
           }
-          writeFileSync(${JSON.stringify(join(testDir, "user-record.json"))}, JSON.stringify(args));
-          process.stdout.write("1001\\n");
-        `,
-        async (fixturePath, testDir) => {
-          const recordFile = join(testDir, "user-record.json");
-          const backend = new LimaVmBackend({
-            binaryPath: fixturePath,
-            instanceName: "worker-vm",
-            guestUser: "sf-runner",
-            testOnlyEmulator: true,
-          });
-
-          const result = await backend.execOperatorCommand("/usr/bin/id", ["-u"]);
-          assert.strictEqual(result.exitCode, 0);
-
-          const argv = JSON.parse(readFileSync(recordFile, "utf8"));
-          assert.deepStrictEqual(argv, [
-            "shell",
-            "--user",
-            "sf-runner",
-            "worker-vm",
-            "/usr/bin/env",
-            "-i",
-            "/usr/bin/id",
-            "-u",
-          ]);
-        }
-      );
+        );
+      }
     });
 
     it("execOperatorCommand handles commands that already use /usr/bin/env -i without duplicating", async () => {
@@ -1035,7 +1120,7 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
       );
     });
 
-    it("host environment propagates configured limaHome to child process", async () => {
+    it("host environment propagates configured limaHome (LIMA_HOME only, no LIMAHOME)", async () => {
       await withTempFixture(
         (testDir) => `#!/usr/bin/env node
           import { writeFileSync } from 'node:fs';
@@ -1061,7 +1146,71 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
 
           const env = JSON.parse(readFileSync(recordFile, "utf8"));
           assert.strictEqual(env.LIMA_HOME, customLimaHome);
-          assert.strictEqual(env.LIMAHOME, customLimaHome);
+          assert.strictEqual(env.LIMAHOME, undefined);
+        }
+      );
+    });
+
+    it("snapshots pinned host env at construction; subsequent process.env mutations do not affect probe or exec", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { appendFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          appendFileSync(${JSON.stringify(join(testDir, "env-snapshot.log"))}, JSON.stringify({ args, env: process.env }) + '\\n');
+          if (args.includes('list')) {
+            process.stdout.write(JSON.stringify({ name: "worker-vm", status: "Running" }) + '\\n');
+          } else {
+            process.stdout.write("ok\\n");
+          }
+        `,
+        async (fixturePath, testDir) => {
+          const logFile = join(testDir, "env-snapshot.log");
+          const origHome = process.env.HOME;
+          const origLimaHome = process.env.LIMA_HOME;
+          const origPath = process.env.PATH;
+          const origSshAuth = process.env.SSH_AUTH_SOCK;
+
+          const initialHome = join(testDir, "initial-home");
+          const initialLimaHome = join(testDir, "initial-lima-home");
+          process.env.HOME = initialHome;
+          process.env.LIMA_HOME = initialLimaHome;
+
+          try {
+            const backend = new LimaVmBackend({
+              binaryPath: fixturePath,
+              instanceName: "worker-vm",
+              testOnlyEmulator: true,
+            });
+
+            // Mutate process.env after construction
+            process.env.HOME = join(testDir, "mutated-home");
+            process.env.LIMA_HOME = join(testDir, "mutated-lima-home");
+            process.env.PATH = "/mutated/path";
+            process.env.SSH_AUTH_SOCK = "/mutated/ssh.sock";
+
+            await backend.execOperatorCommand("/usr/bin/uptime", []);
+
+            const records = readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l)) as Array<{
+              args: string[];
+              env: Record<string, string | undefined>;
+            }>;
+            assert.strictEqual(records.length, 2); // probe + shell
+            for (const rec of records) {
+              assert.strictEqual(rec.env.HOME, initialHome);
+              assert.strictEqual(rec.env.LIMA_HOME, initialLimaHome);
+              assert.strictEqual(rec.env.PATH, origPath);
+              assert.strictEqual(rec.env.SSH_AUTH_SOCK, undefined);
+            }
+          } finally {
+            if (origHome !== undefined) process.env.HOME = origHome;
+            else delete process.env.HOME;
+            if (origLimaHome !== undefined) process.env.LIMA_HOME = origLimaHome;
+            else delete process.env.LIMA_HOME;
+            if (origPath !== undefined) process.env.PATH = origPath;
+            else delete process.env.PATH;
+            if (origSshAuth !== undefined) process.env.SSH_AUTH_SOCK = origSshAuth;
+            else delete process.env.SSH_AUTH_SOCK;
+          }
         }
       );
     });
@@ -1177,7 +1326,7 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
       });
     });
 
-    it("execOperatorCommand settles within bounded time when background descendant inherits and keeps pipe open", async () => {
+    it("execOperatorCommand settles within bounded time when existing parent is alive and descendant inherits pipe", async () => {
       await withTempFixture(
         (testDir) => `#!/usr/bin/env node
           import { spawn } from 'node:child_process';
@@ -1215,6 +1364,62 @@ describe("M6C-3 Step 5 — Lima VM Backend Foundation (LimaVmBackend)", () => {
               }
             );
             const durationMs = Date.now() - startTime;
+            assert.ok(durationMs < 2000, `Expected bounded settlement < 2000ms, took ${durationMs}ms`);
+          } finally {
+            try {
+              if (existsSync(pidFile)) {
+                bgPid = Number(readFileSync(pidFile, "utf8").trim());
+                if (bgPid && !Number.isNaN(bgPid)) {
+                  process.kill(bgPid, "SIGKILL");
+                }
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+      );
+    });
+
+    it("execOperatorCommand rejects with ERR_VM_COMMAND_TIMEOUT (never false exitCode 0) when direct parent exits 0 while descendant holds pipe open", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { spawn } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          if (args.includes('list')) {
+            process.stdout.write(JSON.stringify({ name: "worker-vm", status: "Running" }) + '\\n');
+            process.exit(0);
+          }
+          // Spawn detached-free descendant holding inherited stdout/stderr pipes open, then exit 0 immediately!
+          const bg = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            stdio: ['ignore', 'inherit', 'inherit'],
+          });
+          writeFileSync(${JSON.stringify(join(testDir, "bg-exit0.pid"))}, String(bg.pid));
+          process.exit(0);
+        `,
+        async (fixturePath, testDir) => {
+          const pidFile = join(testDir, "bg-exit0.pid");
+          let bgPid: number | null = null;
+          try {
+            const backend = new LimaVmBackend({
+              binaryPath: fixturePath,
+              instanceName: "worker-vm",
+              commandTimeoutMs: 300,
+              testOnlyEmulator: true,
+            });
+
+            const startTime = Date.now();
+            await assert.rejects(
+              async () => backend.execOperatorCommand("/usr/bin/sleep", ["60"]),
+              (err: Error) => {
+                assert.match(err.message, /^ERR_VM_COMMAND_TIMEOUT/);
+                assert.match(err.message, /guest process state is uncertain/);
+                return true;
+              }
+            );
+            const durationMs = Date.now() - startTime;
+            assert.ok(durationMs >= 250, `Expected timeout to remain armed >= 250ms, settled in ${durationMs}ms`);
             assert.ok(durationMs < 2000, `Expected bounded settlement < 2000ms, took ${durationMs}ms`);
           } finally {
             try {
