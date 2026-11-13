@@ -207,7 +207,7 @@ Run `npm run test:m6c3` for policy, failure, persistence and RLS checks. `npm ru
 
 Repository settings verified on 2026-11-13: `main` reports `protected=false` and the effective branch rules list is empty. The development token observed HTTP 404 at the protection endpoint; restricted tokens can instead receive HTTP 403, so that endpoint status alone is not evidence of protection state. The gVisor job runs in CI, but no required-check rule currently blocks a merge or direct push. Enabling branch protection/required checks is a separate repository administration change; the existing direct-to-main review workflow remains in effect.
 
-This is the first M6C-3 implementation slice. External target connectors, automatic trust-tier routing, Firecracker, Lima/WSL2 and the signed production deployment gate remain pending; M6C/G7 is not accepted. See [the M6C-3 report](./m6c3-validation-report.md).
+This is the first M6C-3 implementation slice. External target connectors, automatic trust-tier routing, Firecracker, Lima/WSL2 and production rollout remain pending; the signed deployment gate foundation is described below; M6C/G7 is not accepted. See [the M6C-3 report](./m6c3-validation-report.md).
 
 ### M6C-3 in progress: signed production deployment gate
 
