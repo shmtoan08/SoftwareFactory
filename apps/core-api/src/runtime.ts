@@ -1,4 +1,4 @@
-import { validateDeploymentConfiguration, type ProductionDeploymentConfiguration } from "./production-deployment.ts";
+import { validateDeploymentConfiguration, validateDeploymentStore, type ProductionDeploymentConfiguration } from "./production-deployment.ts";
 import { chmodSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -118,7 +118,9 @@ export async function createCoreApiRuntime(
   const isolationPolicy = parseVerifierIsolationPolicy(env.SF_VERIFIER_ISOLATION);
   const productionDeployment = { ...options?.productionDeployment, signingSecret: options?.productionDeployment?.signingSecret ?? env.SF_DEPLOYMENT_APPROVAL_SECRET };
   validateDeploymentConfiguration(productionDeployment);
-  const requirePostgres = options?.requirePostgres ?? env.SF_REQUIRE_POSTGRES === "1";
+  if (options?.store) validateDeploymentStore(options.store,productionDeployment);
+  const productionRequiresPostgres = Object.keys(productionDeployment.executors ?? {}).length > 0 && productionDeployment.testOnlyEmulator !== true;
+  const requirePostgres = productionRequiresPostgres || (options?.requirePostgres ?? env.SF_REQUIRE_POSTGRES === "1");
 
   const ownedHandle = options?.store
     ? null

@@ -1,7 +1,7 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { canonicalizeJson, sha256Hex, type ProductionDeploymentApprovalRecord, type ProductionDeploymentRecord } from "@software-factory/shared-types";
-import { PostgresRlsError, type ControlPlaneStore } from "@software-factory/database";
+import { PostgresControlPlaneRepository, PostgresRlsError, type ControlPlaneStore } from "@software-factory/database";
 
 export interface ProductionDeploymentAction {
   readonly deployment_id: string;
@@ -18,6 +18,8 @@ export interface ProductionDeploymentConfiguration {
   readonly signingSecret?: string;
   readonly executors?: Readonly<Record<string, ProductionDeploymentExecutor>>;
   readonly timeoutMs?: number;
+  /** Explicit provider-free unit-test mode; never enabled through environment variables. */
+  readonly testOnlyEmulator?: boolean;
 }
 export interface ApproveProductionDeploymentInput {
   readonly pipeline_session_id: string;
@@ -41,6 +43,11 @@ export function validateDeploymentConfiguration(config: ProductionDeploymentConf
 export function validateProductionId(value: string): void {
   if (typeof value !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value)) throw new PostgresRlsError("23514", "Production identifiers must be canonical UUIDs");
 }
+export function validateDeploymentStore(store: ControlPlaneStore, config: ProductionDeploymentConfiguration): void {
+  if (Object.keys(config.executors ?? {}).length && config.testOnlyEmulator !== true && !(store instanceof PostgresControlPlaneRepository)) {
+    throw new Error("Production deployment requires PostgreSQL; in-memory execution is test-only");
+  }
+}
 function strictKeys(value: object, keys: readonly string[]): void {
   if (!value || Array.isArray(value) || Object.keys(value).some((key) => !keys.includes(key))) throw new PostgresRlsError("23514", "Unknown production deployment request fields");
 }
@@ -55,7 +62,7 @@ export class ProductionDeploymentGate {
   private readonly timeoutMs: number;
   private readonly store: ControlPlaneStore;
   constructor(store: ControlPlaneStore, config: ProductionDeploymentConfiguration = {}) {
-    this.store = store; validateDeploymentConfiguration(config); this.secret = config.signingSecret;
+    this.store = store; validateDeploymentConfiguration(config); validateDeploymentStore(store,config); this.secret = config.signingSecret;
     this.executors = new Map(Object.entries(config.executors ?? {})); this.timeoutMs = config.timeoutMs ?? 30_000;
   }
   private sign(payload: string): string {

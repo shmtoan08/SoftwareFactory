@@ -6,6 +6,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { createCoreApiRuntime } from "../../../apps/core-api/src/runtime.ts";
 import { CoreApiService, CoreApiHttpServer, encodeCoreApiAuthHeader, CORE_API_AUTH_HEADER, type ProductionDeploymentConfiguration } from "@software-factory/core-api";
 import { PostgresControlPlaneRepository, PostgresRuntimePool, SoftwareFactoryControlPlaneStore, buildPostgresPoolConfigFromEnv, type ControlPlaneStore } from "@software-factory/database";
 import { sha256Hex, type PipelineStageName, type StageArtifactKind } from "@software-factory/shared-types";
@@ -34,7 +35,7 @@ async function fixture(store: ControlPlaneStore, config: ProductionDeploymentCon
     const frozen=await store.freezeBaselineSpec({project_id:projectId,pipeline_session_id:sid,stage1_artifact_id:s1.artifact_id,stage1_artifact_sha256:s1.artifact_sha256,stage2_artifact_id:s2.artifact_id,stage2_artifact_sha256:s2.artifact_sha256,stage3_artifact_id:s3.artifact_id,stage3_artifact_sha256:s3.artifact_sha256,validation_report_artifact_id:s4.artifact_id,validation_report_sha256:s4.artifact_sha256,approval_gate_id:gate.gate_id,frozen_by_principal_id:"human"});
     return store.recordReleaseAcceptancePackage({project_id:projectId,pipeline_session_id:sid,baseline_id:frozen.baseline_id,traceability_sha256:sha256Hex("fixture trace"),coverage_percent:100,complete:true,total_requirements:1,merged_task_ids:[randomUUID()],applied_cr_ids:[],main_head_commit_hash:commit,summary_markdown:"Trusted fixture release",package_json:{fixture:true},accepted_by_principal_id:"human"});
   });
-  const core=new CoreApiService(store,{productionDeployment:config});
+  const core=new CoreApiService(store,{productionDeployment:{...config,testOnlyEmulator:store instanceof SoftwareFactoryControlPlaneStore}});
   const human=core.issueAuthContext({projectId,principalId:"human",roles:["PROJECT_APPROVER"]});
   const developer=core.issueAuthContext({projectId,principalId:"developer",roles:["DEVELOPER"]});
   const auditor=core.issueAuthContext({projectId,principalId:"auditor",roles:["AUDITOR"]});
@@ -93,15 +94,15 @@ async function faultGate(store: ControlPlaneStore) {
     const expired=await fx.core.approveProductionDeployment(fx.projectId,fx.human,{...fx.input,ttl_ms:250}); await new Promise((r)=>setTimeout(r,300)); await assert.rejects(fx.core.executeProductionDeployment(fx.projectId,fx.developer,request(expired))); assert.equal(calls,0);
     const failure=await approve(); const unknown=await fx.core.executeProductionDeployment(fx.projectId,fx.developer,request(failure)); assert.equal(unknown.status,"UNKNOWN"); assert.equal(JSON.stringify(unknown).includes("provider-secret"),false);
     await fx.core.executeProductionDeployment(fx.projectId,fx.developer,request(failure)); assert.equal(calls,1);
-    const timeoutCore=new CoreApiService(store,{authenticator:fx.core.authenticator,productionDeployment:{signingSecret:secret,timeoutMs:10,executors:{timeout:async(_action,signal)=>new Promise((_resolve,reject)=>{calls++;signal.addEventListener("abort",()=>reject(new Error("aborted")),{once:true});})}}});
+    const timeoutCore=new CoreApiService(store,{authenticator:fx.core.authenticator,productionDeployment:{signingSecret:secret,testOnlyEmulator:store instanceof SoftwareFactoryControlPlaneStore,timeoutMs:10,executors:{timeout:async(_action,signal)=>new Promise((_resolve,reject)=>{calls++;signal.addEventListener("abort",()=>reject(new Error("aborted")),{once:true});})}}});
     const blocked=await approve(); await assert.rejects(fx.core.executeProductionDeployment(fx.projectId,fx.developer,request(blocked))); assert.equal(calls,1);
     const timeout=await approve("timeout"); assert.equal((await timeoutCore.executeProductionDeployment(fx.projectId,fx.developer,request(timeout))).status,"UNKNOWN"); assert.equal(calls,2);
     // Effect succeeded but terminal persistence was unavailable: restart must not redeploy.
-    const successCore=new CoreApiService(store,{authenticator:fx.core.authenticator,productionDeployment:{signingSecret:secret,executors:{terminal:async()=>{calls++;return{receipt_sha256:receipt};}}}});
+    const successCore=new CoreApiService(store,{authenticator:fx.core.authenticator,productionDeployment:{signingSecret:secret,testOnlyEmulator:store instanceof SoftwareFactoryControlPlaneStore,executors:{terminal:async()=>{calls++;return{receipt_sha256:receipt};}}}});
     const lost=await approve("terminal"); const complete=store.completeProductionDeployment;
     store.completeProductionDeployment=async()=>{throw new Error("terminal transaction unavailable");};
     try{await assert.rejects(successCore.executeProductionDeployment(fx.projectId,fx.developer,request(lost)),/unavailable/);}finally{store.completeProductionDeployment=complete;}
-    const restarted=new CoreApiService(store,{authenticator:fx.core.authenticator,productionDeployment:{signingSecret:secret,executors:{terminal:async()=>{throw new Error("must not redeploy");}}}});
+    const restarted=new CoreApiService(store,{authenticator:fx.core.authenticator,productionDeployment:{signingSecret:secret,testOnlyEmulator:store instanceof SoftwareFactoryControlPlaneStore,executors:{terminal:async()=>{throw new Error("must not redeploy");}}}});
     assert.equal((await restarted.executeProductionDeployment(fx.projectId,fx.developer,request(lost))).status,"RUNNING"); assert.equal(calls,3);
     assert.equal((await fx.core.getProductionDeployment(fx.projectId,fx.auditor,lost.approval.approval_id))?.status,"RUNNING");
     const stale=await approve(); fx.git(["commit","--allow-empty","-m","new main"]);
@@ -115,6 +116,10 @@ describe("M6C-3 signed production deployment gate",()=>{
   it("HTTP: server-selected backend and signed approver action; request cannot inject deploy parameters",async()=>{
     assert.throws(()=>new CoreApiService(new SoftwareFactoryControlPlaneStore(),{productionDeployment:{signingSecret:"short"}}),/at least 32 bytes/);
     assert.throws(()=>new CoreApiService(new SoftwareFactoryControlPlaneStore(),{productionDeployment:{executors:{production:async()=>({receipt_sha256:receipt})}}}),/explicit approval signing secret/);
+    assert.throws(()=>new CoreApiService(new SoftwareFactoryControlPlaneStore(),{productionDeployment:{signingSecret:secret,executors:{production:async()=>({receipt_sha256:receipt})}}}),/requires PostgreSQL/);
+    const productionConfig={signingSecret:secret,executors:{production:async()=>({receipt_sha256:receipt})}};
+    await assert.rejects(createCoreApiRuntime({env:{},requirePostgres:false,productionDeployment:productionConfig}),/PostgreSQL runtime is required/);
+    await assert.rejects(createCoreApiRuntime({env:{},store:new SoftwareFactoryControlPlaneStore(),productionDeployment:productionConfig}),/requires PostgreSQL/);
     let calls=0; const fx=await fixture(new SoftwareFactoryControlPlaneStore(),{signingSecret:secret,executors:{production:async()=>{calls++;return{receipt_sha256:receipt};}}});
     const server=new CoreApiHttpServer({coreApi:fx.core}); const endpoint=await server.start();
     const post=async(path:string,body:unknown,auth=fx.human)=>fetch(`${endpoint.baseUrl}/api/v1/projects/${fx.projectId}/${path}`,{method:"POST",headers:{"content-type":"application/json",[CORE_API_AUTH_HEADER]:encodeCoreApiAuthHeader(auth)},body:JSON.stringify(body)});
