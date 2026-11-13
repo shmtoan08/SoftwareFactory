@@ -50,3 +50,5 @@ The team marked the commit **ĐẠT** ([review](https://github.com/shmtoan08/Sof
 - Cross-host pending-ref cleanup and PID reuse retain conservative ownership handling. No cross-host liveness or PID-generation identity was added; foreign-host or reused-live-PID refs may require operator cleanup after ownership verification.
 
 This follow-up addresses the new actionable notes before starting M6C-3; it does not claim external target, VM backend or production deployment gate acceptance.
+
+The f963c6d review follow-up adds a defensive convergence bound (two policy transitions plus the final read; failure rolls back the usage transaction) and makes the fake compiler parse `-o` independently of argument order. See [the current review report](./m6c3-validation-report.md#review-follow-up--f963c6d) for regression coverage and repository required-check verification.

@@ -7997,11 +7997,14 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
   }
 
   private async evaluatePostSpendBudgetPauseSql(input: { project_id: string; task_id?: string | null }): Promise<void> {
-    // A pause covers every budget dimension of its project/task policy.
-    // Re-evaluate until no active policy violates its ceiling.
-    while (true) {
+    // At most two policies (project + task) can transition; a third read
+    // verifies convergence. A future persistence/state mismatch must fail closed.
+    for (let transitions = 0; transitions <= 2; transitions++) {
       const violation = await this.detectBudgetViolationSql(input, true);
-      if (!violation) break;
+      if (!violation) return;
+      if (transitions === 2) {
+        throw new PostgresRlsError("23514", "Budget auto-pause failed to converge after two policy transitions");
+      }
       await this.persistBudgetViolationSql(input.project_id, violation);
     }
   }

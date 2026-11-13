@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir, hostname } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -84,7 +84,25 @@ describe("M6C remaining review notes", () => {
     try {
       // A successful compiler whose output has a missing interpreter forces ENOENT
       // at spawn time, after compilation, independently of the host toolchain.
-      writeFileSync(join(root, "cc"), '#!/bin/sh\nfor arg do output="$arg"; done\nprintf "#!/sf-nonexistent-lock-interpreter\\n" > "$output"\nchmod +x "$output"\n', { mode: 0o700 });
+      writeFileSync(join(root, "cc"), `#!/bin/sh
+output=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    shift
+    [ "$#" -gt 0 ] || exit 2
+    output="$1"
+  fi
+  shift
+done
+[ -n "$output" ] || exit 2
+printf '#!/sf-nonexistent-lock-interpreter\\n' > "$output"
+chmod +x "$output"
+`, { mode: 0o700 });
+      const output = join(root, "probe");
+      for (const args of [["-o", output, "-Wall", "source.c"], ["source.c", "-Wall", "-o", output]]) {
+        execFileSync(join(root, "cc"), args);
+        assert.equal(readFileSync(output, "utf8"), "#!/sf-nonexistent-lock-interpreter\n");
+      }
       const module = pathToFileURL(resolve("packages/product-pipeline/src/bootstrap-lock.ts")).href;
       const script = `import assert from "node:assert/strict"; import { acquireBootstrapLock } from ${JSON.stringify(module)}; await assert.rejects(acquireBootstrapLock(${JSON.stringify(join(root, "lock"))}), (error) => error.code === "ENOENT");`;
       execFileSync(process.execPath, ["--input-type=module", "-e", script], {
@@ -141,6 +159,27 @@ describe("M6C remaining review notes", () => {
       }));
       assert.match(String((await pool.queryInActiveTx("SELECT pg_get_indexdef(indexrelid) AS definition FROM pg_index WHERE indexrelid='idx_code_import_submissions_lease'::regclass;")).rows[0]!.definition), /\(lease_id\)/);
       await assert.rejects(repo.withRlsTransaction(scope(f.projectId), () => repo.recordCodeImportSubmission({ source_type: "invalid" } as never)), /receipt metadata/);
+      // Inject persistence drift while using real SQL detection: the new guard
+      // must roll the usage transaction back instead of spinning indefinitely.
+      const drift = await fixture(repo);
+      const driftTask = await drift.core.createTask(drift.projectId, drift.auth, { title: "pause drift", task_contract: { allowed_files: ["src/**"] } });
+      await drift.core.updateProjectBudget(drift.projectId, drift.auth, { max_project_wall_time_ms: 1 });
+      const internals = repo as unknown as { persistBudgetViolationSql: (...args: unknown[]) => Promise<void> };
+      const persist = internals.persistBudgetViolationSql;
+      let transitions = 0;
+      internals.persistBudgetViolationSql = async () => { transitions++; };
+      try {
+        await assert.rejects(drift.core.recordResourceUsageMetric(drift.projectId, drift.auth, {
+          task_id: driftTask.task_id, lease_epoch: 0, phase: "DEVELOPER", wall_time_ms: 1,
+          cpu_usage_usec: 0, peak_memory_bytes: 0, sandbox_backend_mode: "test", metrics_source: "wall-clock-only",
+        }), /Budget auto-pause failed to converge/);
+        assert.equal(transitions, 2);
+      } finally { internals.persistBudgetViolationSql = persist; }
+      const rolledBack = await drift.core.getBudgetSnapshot(drift.projectId, drift.auth);
+      assert.equal(rolledBack.policy?.status, "ACTIVE");
+      assert.equal(rolledBack.events.filter((e) => e.event_type === "AUTO_PAUSED").length, 0);
+      const usage = await repo.withRlsTransaction(scope(drift.projectId), () => pool.queryInActiveTx("SELECT count(*) AS n FROM resource_usage_metrics WHERE project_id=$1;", [drift.projectId]));
+      assert.equal(Number(usage.rows[0]!.n), 0);
       const naked = await fixture(repo); await naked.core.updateProjectBudget(naked.projectId, naked.auth, { max_project_tokens: 1 });
       const holderPool = new PostgresRuntimePool(config); let entered!: () => void; let release!: () => void;
       const locked = new Promise<void>((r) => { entered = r; }); const released = new Promise<void>((r) => { release = r; });
