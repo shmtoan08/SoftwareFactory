@@ -1,4 +1,4 @@
-# M6C-3 Step 5 — WSL2 VM Backend Foundation Technical Validation Report
+# M6C-3 Step 6 — WSL2 VM Backend Foundation Technical Validation Report
 
 **Author**: Agent B  
 **Tracker**: [Issue #16 — VM Backend Foundation](https://github.com/shmtoan08/SoftwareFactory/issues/16)  
@@ -152,3 +152,11 @@ Passed: **51** | Failed: **0** | Skipped: **0**
   - **Native Windows Kernel / WSL2 Hyper-V Isolation**: **PENDING** real Windows host with WSL2 virtualization enabled.
   - **Production Platform Guard**: Verified fail-closed on Darwin when `testOnlyEmulator: false`.
   - **Dispatcher Integration**: In accordance with Issue #16 instructions, `Wsl2VmBackend` is foundation-only and is NOT activated in production dispatcher or endpoint runtimes during this milestone.
+
+## 5. Agent A integration verification
+
+B delivered commits `82a09aa` and `eb97c36` with 51 passing tests. A cherry-picked both, exported only the backend and aliased contract types from WNA, and added `test:m6c3:vm-wsl2` plus the suite to the default `npm test` command used by the existing Linux PostgreSQL 16/17 CI matrix. This does not activate the backend in the dispatcher.
+
+A removed the 300 ms successful settlement fallback after host CLI exit: if a descendant retains output pipes, an incomplete stream must not be reported as success. The existing execution deadline now remains in force until pipe closure; timeout reports uncertain outcome. A second process fixture exits the direct CLI with code zero while a descendant retains pipes, asserts timeout rejection, and kills its recorded descendant in cleanup.
+
+Local integration validation on macOS with Node 24.16.0: **52 tests, 9 suites, 52 pass, 0 fail/cancelled/skipped/todo**. Typecheck, lint and secret scan are recorded separately in the integration handoff. Native Windows/WSL2, guest cleanup and kernel isolation remain **PENDING**. Lima is not implemented in this integration; issue #16 and M6C/G7 remain open.

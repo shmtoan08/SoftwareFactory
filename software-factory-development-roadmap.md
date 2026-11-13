@@ -265,6 +265,8 @@ Vòng sửa issue #8 đã merge `main`, được team review **ĐẠT** và issu
 
 Issue #12 đã được team review **ĐẠT**, tick 5/5 và đóng cho baseline `923bfc2c`; CI exact commit đạt PG16/17 **137/137** mỗi job và hai runtime jobs **2/2**. Bước kế tiếp được chuẩn bị tại [kế hoạch worker endpoint / Linux supervisor](./m6c3-worker-endpoint-implementation-plan.md): hoàn thiện server-side execution và cleanup trước khi đưa cùng runner vào Lima/WSL2. Bản endpoint/journal/runner bước 5 đang được triển khai và kiểm chứng trên branch riêng; xem [báo cáo worker endpoint](./m6c3-worker-endpoint-validation.md). Chưa nghiệm thu bước 5; M6C/G7 vẫn mở.
 
+Bước 6 / issue #16: đã triển khai WSL2 backend foundation (operator-pinned distro/version 2, scoped lifecycle, diagnostic pre-probe và bounded CLI execution), xem [báo cáo WSL2](./m6c3-vm-wsl2-validation.md). Kiểm thử CLI fixture cục bộ **52/52**, không skip; suite được nối vào npm test/CI. Chưa có bằng chứng native Windows/WSL2 hoặc kernel isolation và chưa nối vào production dispatcher. Lima vẫn chưa triển khai; issue #16 và M6C/G7 chưa nghiệm thu.
+
 Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
 
 - **Triển khai:**

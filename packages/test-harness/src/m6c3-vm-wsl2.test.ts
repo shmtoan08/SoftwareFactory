@@ -85,7 +85,7 @@ function readRecordedInvocation(recordFile: string): RecordedInvocation {
 // Test Suite
 // ============================================================================
 
-describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
+describe("M6C-3 Step 6 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
 
   // --------------------------------------------------------------------------
   // Group 1: Production Platform Guard & Configuration Validation
@@ -1315,6 +1315,65 @@ describe("M6C-3 Step 5 — WSL2 VM Backend Foundation (Wsl2VmBackend)", () => {
               binaryPath: fixturePath,
               distributionName: "Ubuntu-22.04",
               commandTimeoutMs: 200,
+              testOnlyEmulator: true,
+            });
+
+            const startTime = Date.now();
+            await assert.rejects(
+              async () => backend.execOperatorCommand("/usr/bin/sleep", ["60"]),
+              (err: Error) => {
+                assert.match(err.message, /^ERR_VM_COMMAND_TIMEOUT/);
+                assert.match(err.message, /guest process state is uncertain/);
+                return true;
+              }
+            );
+            const durationMs = Date.now() - startTime;
+            // Must settle bounded (< 2000ms), proving it did NOT hang waiting for descendant pipe close
+            assert.ok(durationMs < 2000, `Expected bounded settlement < 2000ms, took ${durationMs}ms`);
+          } finally {
+            // Watchdog & cleanup: kill background descendant process if created
+            try {
+              if (existsSync(pidFile)) {
+                bgPid = Number(readFileSync(pidFile, "utf8").trim());
+                if (bgPid && !Number.isNaN(bgPid)) {
+                  process.kill(bgPid, "SIGKILL");
+                }
+              }
+            } catch {
+              // ignore process kill error if already exited
+            }
+          }
+        }
+      );
+    });
+
+    it("execOperatorCommand settles within bounded time when exited CLI leaves descendant pipes open", async () => {
+      await withTempFixture(
+        (testDir) => `#!/usr/bin/env node
+          import { spawn } from 'node:child_process';
+          import { writeFileSync } from 'node:fs';
+          const args = process.argv.slice(2);
+          if (args.includes('--list')) {
+            process.stdout.write("  NAME            STATE           VERSION\\n* Ubuntu-22.04    Running         2\\n");
+            process.exit(0);
+          }
+          // In exec: spawn a background descendant that inherits stdout/stderr
+          const bg = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+            stdio: ['ignore', 'inherit', 'inherit'],
+          });
+          writeFileSync(${JSON.stringify(join(testDir, "bg.pid"))}, String(bg.pid));
+          // Direct CLI exits successfully, leaving inherited pipes open.
+          bg.unref();
+          process.exit(0);
+        `,
+        async (fixturePath, testDir) => {
+          const pidFile = join(testDir, "bg.pid");
+          let bgPid: number | null = null;
+          try {
+            const backend = new Wsl2VmBackend({
+              binaryPath: fixturePath,
+              distributionName: "Ubuntu-22.04",
+              commandTimeoutMs: 800,
               testOnlyEmulator: true,
             });
 

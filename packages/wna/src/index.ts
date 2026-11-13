@@ -1829,3 +1829,11 @@ export * from "./daemon.ts";
 export * from "./worker-endpoint.ts";
 export * from "./worker-execution-journal.ts";
 export * from "./worker-endpoint-runner.ts";
+
+// VM foundation only; not wired into task dispatch or production sandbox selection.
+export {
+  Wsl2VmBackend,
+  type Wsl2VmBackendConfig,
+  type VmProbeResult as Wsl2VmProbeResult,
+  type VmCommandResult as Wsl2VmCommandResult,
+} from "./vm-wsl2-backend.ts";

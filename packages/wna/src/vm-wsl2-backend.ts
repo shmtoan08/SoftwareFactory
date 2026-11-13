@@ -3,7 +3,7 @@
  * @description Windows Subsystem for Linux (WSL2) VM Backend Foundation for Software Factory M6C-3.
  *
  * Implements operator-pinned WSL2 distribution lifecycle and diagnostic execution
- * according to the structural VM contract (M6C-3 Step 5 / Issue #16).
+ * according to the structural VM contract (M6C-3 Step 6 / Issue #16).
  *
  * Features & Invariants:
  * - Operator configuration pinning: absolute binary path, distribution identity, guest user.
@@ -581,14 +581,10 @@ export class Wsl2VmBackend {
         // bounded force settlement will ensure we do not hang!
         if (terminating) {
           finalizeSettlement(code, signalStr);
-        } else {
-          if (!forceSettlementTimer) {
-            forceSettlementTimer = setTimeout(() => {
-              finalizeSettlement(code, signalStr);
-            }, 300);
-            forceSettlementTimer.unref();
-          }
         }
+        // Otherwise wait for complete pipe closure. The original execution deadline
+        // remains armed: an exited CLI with inherited open pipes must not turn
+        // incomplete output into a successful result after an arbitrary grace period.
       });
 
       child.on("close", (code, signalStr) => {
