@@ -67,8 +67,13 @@ describe("M6C-3 worker endpoint and durable journal", () => {
     const fx = await fixture({ config: { testOnlyHooks: { beforeTerminalPersist: () => { throw new Error("private-injected-error"); } } } }); const a = action();
     try {
       const response = await post(fx.endpoint, "execute", a, {}, a.execution_id); assert.equal(response.ok, false); assert.equal((await response.text()).includes("private-injected-error"), false); assert.equal(fx.calls(), 1);
-      const restarted = await fixture({ stateDir: fx.stateDir });
-      try { await assert.rejects(restarted.connector.execute(a, AbortSignal.timeout(3000))); assert.equal(restarted.calls(), 0); } finally { await restarted.close(); }
+      const restarted = await fixture({ stateDir: fx.stateDir, runner: { health: async () => { throw new Error("Unavailable kernel must not hide durable HOLD"); }, execute: async () => { throw new Error("Must not re-execute claim"); } } });
+      try {
+        assert.equal((await post(restarted.endpoint, "execute", a, {}, a.execution_id)).status, 409);
+        const expired = { ...action(), deadline: new Date(Date.now() - 1000).toISOString() };
+        new WorkerExecutionJournal(fx.stateDir, "tenant-a").claim(expired);
+        assert.equal((await post(restarted.endpoint, "execute", expired, {}, expired.execution_id)).status, 409);
+      } finally { await restarted.close(); }
     } finally { await fx.close(); }
   });
   it("shutdown stops accepting requests, signals cancellation and waits for cleanup before returning", async () => {

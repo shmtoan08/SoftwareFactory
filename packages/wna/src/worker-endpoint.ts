@@ -97,6 +97,8 @@ export class WorkerEndpointServer {
       if (req.headers["idempotency-key"] !== action.execution_id) throw new Error("Idempotency key mismatch");
       const existing = this.journal.read(action);
       if (existing?.status === "COMPLETED") { assertWorkerCleanup(existing.cleanupEvidence!, action, this.config.testOnlyEmulator); send({ ...identity, execution_id: action.execution_id, lease_epoch: action.lease_epoch, submission: existing.submission }); return; }
+      // A durable claim remains HOLD regardless of current kernel health or an elapsed deadline.
+      if (existing) throw new WorkerJournalConflict("HOLD");
       const remaining = Date.parse(action.deadline) - Date.now();
       if (remaining <= 0 || remaining > 125000 || controller.signal.aborted) throw new Error("Worker deadline rejected");
       const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(remaining)]);
