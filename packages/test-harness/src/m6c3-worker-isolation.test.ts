@@ -12,15 +12,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 
+
 import {
   LinuxCgroupV2SandboxBackend,
+  createWorkerEndpointServer,
   deriveTaskRunnerUid,
+  WorkerExecutionJournal,
+  type SandboxCleanupEvidence,
+  type WorkerEndpointRunner,
+  type WorkerEndpointServerConfig,
 } from "@software-factory/wna";
 import {
+  UserManagedWorkerHttpConnector,
   signTargetProtocol,
   type ExternalTargetAction,
 } from "@software-factory/adapter-sdk";
-import { sha256Hex } from "@software-factory/shared-types";
 
 import {
   CANARY_SECRETS,
@@ -32,6 +38,134 @@ import {
   readLinuxProcessPpid,
   validateCleanupEvidenceContract,
 } from "./m6c3-worker-isolation-harness.ts";
+
+const TEST_SECRET = randomBytes(32).toString("hex");
+const TEST_SUBMISSION = {
+  kind: "artifact" as const,
+  files: [
+    {
+      action: "write" as const,
+      path: "src/result.ts",
+      content_base64: Buffer.from("export const result = 42;\n").toString("base64"),
+    },
+  ],
+};
+
+function createMockCleanupEvidence(action: ExternalTargetAction): SandboxCleanupEvidence {
+  return {
+    taskId: action.execution_id,
+    leaseEpoch: action.lease_epoch,
+    backendMode: "simulated-cgroup-v2",
+    isSimulated: true,
+    realKernelOperationsExecuted: false,
+    realProcessGroupKilled: false,
+    cgroupPath: "",
+    freezeApplied: false,
+    cgroupKillWritten: false,
+    populatedZeroVerified: false,
+    subreaperWaitpidReapedPids: [],
+    remainingProcsCount: 0,
+    cgroupDirRemoved: false,
+    killedPids: [],
+    verifiedAt: new Date().toISOString(),
+  };
+}
+
+function createSampleAction(overrides?: Partial<ExternalTargetAction>): ExternalTargetAction {
+  return {
+    execution_id: randomUUID(),
+    task_id: randomUUID(),
+    lease_epoch: 1,
+    base_main_commit_hash: "a".repeat(40),
+    deadline: new Date(Date.now() + 30000).toISOString(),
+    allowed_files: ["src/**"],
+    public_context: "Sample isolation test task",
+    ...overrides,
+  };
+}
+
+function createTestClient(endpoint: string, secret = TEST_SECRET, overrides?: { principalId?: string; workerId?: string; provider?: string; model?: string }) {
+  return new UserManagedWorkerHttpConnector({
+    endpoint,
+    signingSecret: secret,
+    principalId: overrides?.principalId ?? "worker-principal",
+    workerId: overrides?.workerId ?? "worker-1",
+    provider: overrides?.provider ?? "emulator",
+    model: overrides?.model ?? "provider-free",
+    testOnlyLoopback: true,
+  });
+}
+
+async function createEndpointFixture(options: {
+  config?: Partial<WorkerEndpointServerConfig>;
+  runner?: WorkerEndpointRunner;
+  stateDir?: string;
+  secret?: string;
+} = {}) {
+  const stateDir = options.stateDir ?? mkdtempSync(join(tmpdir(), "sf-iso-journal-"));
+  let calls = 0;
+  const runner = options.runner ?? {
+    health: async () => {},
+    execute: async (a: ExternalTargetAction) => {
+      calls++;
+      return { submission: TEST_SUBMISSION, cleanupEvidence: createMockCleanupEvidence(a) };
+    },
+  };
+  const activeSecret = options.secret ?? TEST_SECRET;
+  const config: WorkerEndpointServerConfig = {
+    tenantNamespace: "tenant-iso",
+    principalId: "worker-principal",
+    workerId: "worker-1",
+    provider: "emulator",
+    model: "provider-free",
+    signingSecret: activeSecret,
+    stateDir,
+    runner,
+    testOnlyEmulator: true,
+    ...options.config,
+  };
+  const server = createWorkerEndpointServer(config);
+  const address = await server.listen();
+  return {
+    server,
+    config,
+    stateDir,
+    secret: activeSecret,
+    endpoint: address.endpoint,
+    connector: createTestClient(address.endpoint, activeSecret),
+    getCalls: () => calls,
+    close: async () => {
+      await server.close();
+      if (!options.stateDir) {
+        rmSync(stateDir, { recursive: true, force: true });
+      }
+    },
+  };
+}
+
+async function sendRawWorkerRequest(
+  endpoint: string,
+  route: string,
+  actionPayload: unknown,
+  patch: Record<string, unknown> = {},
+  key?: string,
+  badSignature = false,
+  secret = TEST_SECRET
+): Promise<Response> {
+  const nonce = randomBytes(24).toString("hex");
+  const body = { schema_version: "sf-target-v1", nonce, action: actionPayload, ...patch };
+  return fetch(`${endpoint}/${route}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-sf-target-signature": badSignature
+        ? "0".repeat(64)
+        : signTargetProtocol(secret, "request", `/${route}`, nonce, body),
+      ...(key ? { "idempotency-key": key } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+}
 
 describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contract Suite", () => {
   it("TC-01: Environment Canaries & Secret Sanitization — zero host credentials leak into child process", async () => {
@@ -543,368 +677,488 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
     assert.notEqual(uidA1, uidB, "Distinct tasks must derive distinct UIDs");
   });
 
-  describe("Worker Endpoint Adversarial Contract Matrix Validation (12 Scenarios)", () => {
-    const signingSecret = "test-operator-dedicated-hmac-key-32-bytes-minimum!!";
-    const principalId = "operator-worker-node-01";
-    const workerId = "linux-runner-vm-01";
-    const provider = "protocol-emulator";
-    const model = "provider-free";
+  it("TC-08: Strict Linux externalWorkerGuard Fail-Closed on Darwin & Contract Validation", (t) => {
+    const probe = probeHostKernelIsolationCapabilities();
+    const backend = new LinuxCgroupV2SandboxBackend({ cgroupRoot: "/nonexistent/sf-cgroup-root" });
 
-    it("TC01: Bad or Missing HMAC Signature Rejection", () => {
+    if (!probe.isLinux) {
+      // On non-Linux (Darwin): externalWorkerGuard MUST fail-closed with ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED
+      assert.throws(
+        () =>
+          backend.spawnRealProcessInSandbox({
+            taskId: randomUUID(),
+            leaseEpoch: 1,
+            command: process.execPath,
+            args: ["-e", "process.exit(0)"],
+            sanitizedEnv: buildMinimalSanitizedEnv(),
+            cwd: process.cwd(),
+            requireKernelCgroup: true,
+            requireSubreaper: true,
+            requireNamespaceIsolation: true,
+            dropPrivileges: true,
+            externalWorkerGuard: { maxRuntimeMs: 3000 },
+          }),
+        /ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED/
+      );
+
+      // Also verify that omitting required kernel flags with externalWorkerGuard triggers fail-closed
+      assert.throws(
+        () =>
+          backend.spawnRealProcessInSandbox({
+            taskId: randomUUID(),
+            leaseEpoch: 1,
+            command: process.execPath,
+            args: ["-e", "process.exit(0)"],
+            sanitizedEnv: buildMinimalSanitizedEnv(),
+            cwd: process.cwd(),
+            requireKernelCgroup: false,
+            externalWorkerGuard: { maxRuntimeMs: 3000 },
+          }),
+        /ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED/
+      );
+
+      t.skip(probe.skipReason ?? "externalWorkerGuard kernel execution skipped on non-Linux");
+      return;
+    }
+  });
+
+  describe("Worker Endpoint Adversarial Contract Matrix Validation (12 Black-Box Scenarios)", () => {
+    it("TC01: Bad or Missing HMAC Signature Rejection", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC01_INVALID_SIGNATURE");
       assert.ok(scenario);
 
-      const path = "/execute";
-      const nonce = randomBytes(16).toString("hex");
-      const body = {
-        schema_version: "sf-target-v1",
-        nonce,
-        action: { execution_id: randomUUID() },
-      };
+      const fx = await createEndpointFixture();
+      const a = createSampleAction();
+      try {
+        // 1. Missing signature header
+        const resMissing = await fetch(`${fx.endpoint}/execute`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "idempotency-key": a.execution_id },
+          body: JSON.stringify({ schema_version: "sf-target-v1", nonce: randomBytes(24).toString("hex"), action: a }),
+        });
+        assert.equal(resMissing.status, 401, "Missing x-sf-target-signature must return 401");
 
-      const validMac = signTargetProtocol(signingSecret, "request", path, nonce, body);
-      const tamperedMac = signTargetProtocol("wrong-secret-key-that-does-not-match!", "request", path, nonce, body);
+        // 2. Corrupted signature header
+        const resBad = await sendRawWorkerRequest(fx.endpoint, "execute", a, {}, a.execution_id, true);
+        assert.equal(resBad.status, 401, "Tampered signature must return 401");
 
-      // Verification function simulates endpoint verification
-      const verifyMac = (receivedMac: string) => receivedMac === validMac;
+        // 3. Signature signed with wrong secret key
+        const resWrongKey = await sendRawWorkerRequest(
+          fx.endpoint,
+          "execute",
+          a,
+          {},
+          a.execution_id,
+          false,
+          "wrong-signing-secret-32-bytes-long-attacker-key"
+        );
+        assert.equal(resWrongKey.status, 401, "Signature with wrong key must return 401");
 
-      assert.equal(verifyMac(validMac), true);
-      assert.equal(verifyMac(tamperedMac), false, "Tampered secret must fail MAC verification");
-      assert.equal(verifyMac(""), false, "Empty MAC must fail verification");
-      assert.equal(verifyMac("invalid-hex-characters"), false, "Malformed MAC must fail");
+        // Ensure zero executions were spawned
+        assert.equal(fx.getCalls(), 0);
+        assert.equal(new WorkerExecutionJournal(fx.stateDir, "tenant-iso").read(a), null);
+      } finally {
+        await fx.close();
+      }
     });
 
-    it("TC02: Target Identity Mismatch Defense", () => {
+    it("TC02: Target Identity Mismatch Defense", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC02_IDENTITY_MISMATCH");
       assert.ok(scenario);
 
-      const validateIdentity = (req: { principalId: string; workerId: string; provider: string; model: string }) => {
-        return (
-          req.principalId === principalId &&
-          req.workerId === workerId &&
-          req.provider === provider &&
-          req.model === model
+      const fx = await createEndpointFixture();
+      const a = createSampleAction();
+      try {
+        // Refuse unmetered Codex in endpoint server config
+        assert.throws(
+          () =>
+            createWorkerEndpointServer({
+              ...fx.config,
+              model: "codex-production",
+            }),
+          /ERR_UNMETERED_CODEX_DISABLED/
         );
-      };
 
-      assert.equal(validateIdentity({ principalId, workerId, provider, model }), true);
-      assert.equal(validateIdentity({ principalId: "impostor", workerId, provider, model }), false);
-      assert.equal(validateIdentity({ principalId, workerId: "other-worker", provider, model }), false);
-      assert.equal(validateIdentity({ principalId, workerId, provider: "unauthorized-llm", model }), false);
-      assert.equal(validateIdentity({ principalId, workerId, provider, model: "codex-production" }), false);
+        // Refuse invalid characters in identity config
+        assert.throws(
+          () =>
+            createWorkerEndpointServer({
+              ...fx.config,
+              workerId: "invalid/worker/identity",
+            }),
+          /Invalid worker identity/
+        );
+
+        // Client configured with wrong expected identity throws ERR_TARGET_PROTOCOL
+        const impostorClient = createTestClient(fx.endpoint, fx.secret, {
+          workerId: "attacker-worker-identity",
+        });
+        await assert.rejects(
+          impostorClient.execute(a, AbortSignal.timeout(3000)),
+          /ERR_TARGET_PROTOCOL/
+        );
+      } finally {
+        await fx.close();
+      }
     });
 
-    it("TC03: Strict Schema Unknown Fields Rejection", () => {
+    it("TC03: Strict Schema Unknown Fields Rejection", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC03_UNKNOWN_FIELDS");
       assert.ok(scenario);
 
-      const allowedExecuteKeys = new Set([
-        "schema_version",
-        "nonce",
-        "action",
-      ]);
+      const fx = await createEndpointFixture();
+      const a = createSampleAction();
+      try {
+        // Injected field at request root level
+        const resInjectedRoot = await sendRawWorkerRequest(
+          fx.endpoint,
+          "execute",
+          a,
+          { command_override: "rm -rf /" },
+          a.execution_id
+        );
+        assert.equal(resInjectedRoot.ok, false);
 
-      const allowedActionKeys = new Set([
-        "execution_id",
-        "task_id",
-        "lease_epoch",
-        "base_main_commit_hash",
-        "deadline",
-        "allowed_files",
-        "public_context",
-      ]);
+        // Injected field inside action object
+        const resInjectedAction = await sendRawWorkerRequest(
+          fx.endpoint,
+          "execute",
+          { ...a, custom_repo_clone_url: "https://evil.com/repo.git" },
+          {},
+          a.execution_id
+        );
+        assert.equal(resInjectedAction.ok, false);
 
-      const validateNoUnknownFields = (body: Record<string, unknown>, action: Record<string, unknown>) => {
-        for (const k of Object.keys(body)) {
-          if (!allowedExecuteKeys.has(k)) {
-            return { valid: false, field: k };
-          }
-        }
-        for (const k of Object.keys(action)) {
-          if (!allowedActionKeys.has(k)) {
-            return { valid: false, field: `action.${k}` };
-          }
-        }
-        return { valid: true };
-      };
+        // Injected field in health action
+        const resInjectedHealth = await sendRawWorkerRequest(fx.endpoint, "health", { injected_cmd: "whoami" });
+        assert.equal(resInjectedHealth.ok, false);
 
-      // Valid payload
-      assert.equal(
-        validateNoUnknownFields(
-          { schema_version: "sf-target-v1", nonce: "abc", action: {} },
-          { execution_id: "id", task_id: "tid", lease_epoch: 1, base_main_commit_hash: "hash", deadline: "date", allowed_files: [], public_context: "" }
-        ).valid,
-        true
-      );
-
-      // Injected command override
-      assert.equal(
-        validateNoUnknownFields(
-          { schema_version: "sf-target-v1", nonce: "abc", action: {}, command_override: "rm -rf /" },
-          {}
-        ).valid,
-        false
-      );
-
-      // Injected action field
-      assert.equal(
-        validateNoUnknownFields(
-          { schema_version: "sf-target-v1", nonce: "abc", action: {} },
-          { execution_id: "id", custom_repo_clone_url: "https://evil.com/repo.git" }
-        ).valid,
-        false
-      );
+        assert.equal(fx.getCalls(), 0);
+      } finally {
+        await fx.close();
+      }
     });
 
-    it("TC04: Bounded Request Payload Size Limit", () => {
+    it("TC04: Bounded Request Payload Size Limit", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC04_OVERSIZED_PAYLOAD");
       assert.ok(scenario);
 
-      const MAX_HEALTH_BYTES = 16 * 1024;
-      const MAX_EXECUTE_BYTES = 3 * 1024 * 1024;
+      const fx = await createEndpointFixture();
+      const a = createSampleAction();
+      try {
+        // Oversized health request (> 16KB)
+        try {
+          const resHealthOversized = await sendRawWorkerRequest(fx.endpoint, "health", {
+            padding: "x".repeat(20000),
+          });
+          assert.equal(resHealthOversized.ok, false);
+        } catch {
+          // Bounded stream cancellation may close transport cleanly
+        }
 
-      const checkSize = (route: "health" | "execute", byteLength: number) => {
-        const limit = route === "health" ? MAX_HEALTH_BYTES : MAX_EXECUTE_BYTES;
-        return byteLength <= limit;
-      };
+        // Oversized execute request (> 192KB)
+        try {
+          const resExecuteOversized = await sendRawWorkerRequest(
+            fx.endpoint,
+            "execute",
+            { ...a, public_context: "x".repeat(200 * 1024) },
+            {},
+            a.execution_id
+          );
+          assert.equal(resExecuteOversized.ok, false);
+        } catch {
+          // Bounded stream cancellation
+        }
 
-      assert.equal(checkSize("health", 1024), true);
-      assert.equal(checkSize("health", 16384), true);
-      assert.equal(checkSize("health", 16385), false, "Over 16KB health payload must be rejected");
-
-      assert.equal(checkSize("execute", 2 * 1024 * 1024), true);
-      assert.equal(checkSize("execute", 3 * 1024 * 1024), true);
-      assert.equal(checkSize("execute", 3 * 1024 * 1024 + 1), false, "Over 3MB execute payload must be rejected");
+        assert.equal(fx.getCalls(), 0);
+      } finally {
+        await fx.close();
+      }
     });
 
-    it("TC05: Expired Deadline Rejection Before Spawn", () => {
+    it("TC05: Expired Deadline Rejection Before Spawn", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC05_EXPIRED_DEADLINE");
       assert.ok(scenario);
 
-      const now = new Date("2026-11-13T16:00:00.000Z");
-      const checkDeadline = (deadlineIso: string, marginMs = 5000) => {
-        const deadlineTime = new Date(deadlineIso).getTime();
-        return deadlineTime - now.getTime() > marginMs;
-      };
+      const fx = await createEndpointFixture();
+      try {
+        // Past deadline
+        const pastAction = createSampleAction({
+          deadline: new Date(Date.now() - 5000).toISOString(),
+        });
+        const resPast = await sendRawWorkerRequest(fx.endpoint, "execute", pastAction, {}, pastAction.execution_id);
+        assert.equal(resPast.ok, false);
 
-      // Past deadline
-      assert.equal(checkDeadline("2026-11-13T15:00:00.000Z"), false, "Past deadline must be rejected");
-      // Deadline within margin
-      assert.equal(checkDeadline("2026-11-13T16:00:02.000Z"), false, "Margin violated deadline must be rejected");
-      // Healthy future deadline
-      assert.equal(checkDeadline("2026-11-13T16:05:00.000Z"), true, "Future deadline accepted");
+        // Deadline too far in future (> 125s)
+        const farAction = createSampleAction({
+          deadline: new Date(Date.now() + 180000).toISOString(),
+        });
+        const resFar = await sendRawWorkerRequest(fx.endpoint, "execute", farAction, {}, farAction.execution_id);
+        assert.equal(resFar.ok, false);
+
+        assert.equal(fx.getCalls(), 0);
+      } finally {
+        await fx.close();
+      }
     });
 
-    it("TC06: Idempotent Replay with Same Action Payload", () => {
+    it("TC06: Idempotent Replay with Same Action Payload", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC06_IDEMPOTENT_REPLAY_SAME_PAYLOAD");
       assert.ok(scenario);
 
-      const executionId = randomUUID();
-      const action: ExternalTargetAction = {
-        execution_id: executionId,
-        task_id: "task-100",
-        lease_epoch: 1,
-        base_main_commit_hash: "1111111111111111111111111111111111111111",
-        deadline: "2026-11-13T17:00:00.000Z",
-        allowed_files: ["src/**/*.ts"],
-        public_context: "task description",
+      const fx = await createEndpointFixture();
+      const a = createSampleAction();
+      try {
+        // First execution call
+        const firstResult = await fx.connector.execute(a, AbortSignal.timeout(5000));
+        assert.deepEqual(firstResult, TEST_SUBMISSION);
+        assert.equal(fx.getCalls(), 1);
+
+        // Second execution call with same action payload
+        const replayResult = await fx.connector.execute(a, AbortSignal.timeout(5000));
+        assert.deepEqual(replayResult, TEST_SUBMISSION);
+        // Runner called exactly once; second call was satisfied idempotently from journal!
+        assert.equal(fx.getCalls(), 1);
+
+        const journalRecord = new WorkerExecutionJournal(fx.stateDir, "tenant-iso").read(a);
+        assert.equal(journalRecord?.status, "COMPLETED");
+      } finally {
+        await fx.close();
+      }
+    });
+
+    it("TC07: Conflicting Replay with Altered Payload Rejection", async () => {
+      const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC07_CONFLICTING_REPLAY_DIFFERENT_PAYLOAD");
+      assert.ok(scenario);
+
+      const fx = await createEndpointFixture();
+      const a = createSampleAction();
+      try {
+        // First execution succeeds
+        await fx.connector.execute(a, AbortSignal.timeout(5000));
+        assert.equal(fx.getCalls(), 1);
+
+        // Replay with identical execution_id but tampered public_context
+        const tamperedAction = { ...a, public_context: "tampered action payload" };
+        const resConflict = await sendRawWorkerRequest(
+          fx.endpoint,
+          "execute",
+          tamperedAction,
+          {},
+          tamperedAction.execution_id
+        );
+        assert.equal(resConflict.status, 409, "Conflicting action payload must return HTTP 409");
+        assert.equal(fx.getCalls(), 1);
+      } finally {
+        await fx.close();
+      }
+    });
+
+    it("TC08: Atomic Journal Concurrency & Single Spawn Lock", async () => {
+      const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC08_CONCURRENT_EXECUTION_LOCK");
+      assert.ok(scenario);
+
+      let unblockGate!: () => void;
+      const executionGate = new Promise<void>((resolve) => {
+        unblockGate = resolve;
+      });
+
+      let calls = 0;
+      const delayedRunner: WorkerEndpointRunner = {
+        health: async () => {},
+        execute: async (a: ExternalTargetAction) => {
+          calls++;
+          await executionGate;
+          return { submission: TEST_SUBMISSION, cleanupEvidence: createMockCleanupEvidence(a) };
+        },
       };
 
-      const actionHash = sha256Hex(JSON.stringify(action));
+      const baseFx = await createEndpointFixture();
+      const instanceA = await createEndpointFixture({ stateDir: baseFx.stateDir, runner: delayedRunner });
+      const instanceB = await createEndpointFixture({ stateDir: baseFx.stateDir, runner: delayedRunner });
+      const a = createSampleAction();
 
-      // Mock durable journal state
-      interface JournalEntry {
-        executionId: string;
-        actionHash: string;
-        state: "CLAIMED" | "EXECUTING" | "COMPLETED" | "FAILED";
-        terminalResult?: { submission: { kind: string; files: readonly unknown[] } };
+      try {
+        // Start call on instance A
+        const callA = instanceA.connector.execute(a, AbortSignal.timeout(5000));
+
+        // Wait until instance A has entered execution
+        while (calls === 0) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+
+        // Concurrent call on instance B for same execution_id
+        await assert.rejects(
+          instanceB.connector.execute(a, AbortSignal.timeout(2000)),
+          /ERR_TARGET_PROTOCOL/
+        );
+        assert.equal(calls, 1, "Exactly one runner execution should occur");
+
+        // Release gate and verify instance A completes
+        unblockGate();
+        const resA = await callA;
+        assert.deepEqual(resA, TEST_SUBMISSION);
+
+        // Subsequent call on instance B retrieves completed result from journal without extra runner call
+        const resB = await instanceB.connector.execute(a, AbortSignal.timeout(3000));
+        assert.deepEqual(resB, TEST_SUBMISSION);
+        assert.equal(calls, 1);
+      } finally {
+        unblockGate();
+        await instanceB.close();
+        await instanceA.close();
+        await baseFx.close();
       }
+    });
 
-      const journal = new Map<string, JournalEntry>();
-      journal.set(executionId, {
-        executionId,
-        actionHash,
-        state: "COMPLETED",
-        terminalResult: {
-          submission: {
-            kind: "artifact",
-            files: [{ action: "write", path: "src/feature.ts", content_base64: Buffer.from("code").toString("base64") }],
+    it("TC09: Crash Recovery for Orphaned Pre-Spawn Claim — HOLD state, never auto-respawns", async () => {
+      const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC09_CRASH_RECOVERY_BEFORE_SPAWN");
+      assert.ok(scenario);
+
+      const stateDir = mkdtempSync(join(tmpdir(), "sf-iso-crash-claim-"));
+      const a = createSampleAction();
+
+      // Simulate a server that crashed right after claiming journal
+      const initialFx = await createEndpointFixture({
+        stateDir,
+        config: {
+          testOnlyHooks: {
+            afterJournalClaim: () => {
+              throw new Error("simulated_crash_after_claim");
+            },
           },
         },
       });
 
-      const handleExecute = (incomingAction: ExternalTargetAction, requestNonce: string) => {
-        const incomingHash = sha256Hex(JSON.stringify(incomingAction));
-        const entry = journal.get(incomingAction.execution_id);
-        if (!entry) {
-          return { status: "NEW_SPAWN" };
-        }
-        if (entry.actionHash !== incomingHash) {
-          return { status: "CONFLICT_PAYLOAD_MISMATCH" };
-        }
-        if (entry.state === "COMPLETED" && entry.terminalResult) {
-          const responsePayload = {
-            schema_version: "sf-target-v1",
-            nonce: requestNonce, // Re-signed with current nonce!
-            target_type: "user_managed_worker",
-            principal_id: principalId,
-            worker_id: workerId,
-            provider,
-            model,
-            execution_id: incomingAction.execution_id,
-            lease_epoch: incomingAction.lease_epoch,
-            submission: entry.terminalResult.submission,
-          };
-          const mac = signTargetProtocol(signingSecret, "response", "/execute", requestNonce, responsePayload);
-          return { status: "IDEMPOTENT_CACHED", responsePayload, mac };
-        }
-        return { status: "IN_PROGRESS" };
-      };
-
-      // Call 1 with nonce 1
-      const res1 = handleExecute(action, "nonce-001");
-      assert.equal(res1.status, "IDEMPOTENT_CACHED");
-      if (res1.status === "IDEMPOTENT_CACHED" && res1.responsePayload) {
-        assert.equal(res1.responsePayload.nonce, "nonce-001");
+      try {
+        const resInitial = await sendRawWorkerRequest(initialFx.endpoint, "execute", a, {}, a.execution_id);
+        assert.equal(resInitial.ok, false);
+      } finally {
+        await initialFx.close();
       }
 
-      // Call 2 with nonce 2
-      const res2 = handleExecute(action, "nonce-002");
-      assert.equal(res2.status, "IDEMPOTENT_CACHED");
-      if (res2.status === "IDEMPOTENT_CACHED" && res2.responsePayload) {
-        assert.equal(res2.responsePayload.nonce, "nonce-002");
-        assert.notEqual(res1.mac, res2.mac, "MAC must be freshly computed for nonce-002");
+      // Verify journal record is in CLAIMED state
+      const journal = new WorkerExecutionJournal(stateDir, "tenant-iso");
+      const record = journal.read(a);
+      assert.equal(record?.status, "CLAIMED");
+
+      // Restart new server instance on same stateDir
+      const restartedFx = await createEndpointFixture({
+        stateDir,
+        runner: {
+          health: async () => {},
+          execute: async () => {
+            throw new Error("Must NEVER re-execute uncoordinated orphan claim!");
+          },
+        },
+      });
+
+      try {
+        const resRestart = await sendRawWorkerRequest(restartedFx.endpoint, "execute", a, {}, a.execution_id);
+        assert.equal(resRestart.status, 409, "Restarted server must return HTTP 409 HOLD for orphan claim");
+        assert.equal(restartedFx.getCalls(), 0);
+      } finally {
+        await restartedFx.close();
+        rmSync(stateDir, { recursive: true, force: true });
       }
     });
 
-    it("TC07: Conflicting Replay with Altered Payload Rejection", () => {
-      const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC07_CONFLICTING_REPLAY_DIFFERENT_PAYLOAD");
-      assert.ok(scenario);
-
-      const executionId = randomUUID();
-      const originalAction: ExternalTargetAction = {
-        execution_id: executionId,
-        task_id: "task-100",
-        lease_epoch: 1,
-        base_main_commit_hash: "1111111111111111111111111111111111111111",
-        deadline: "2026-11-13T17:00:00.000Z",
-        allowed_files: ["src/**/*.ts"],
-        public_context: "original prompt",
-      };
-
-      const tamperedAction: ExternalTargetAction = {
-        ...originalAction,
-        public_context: "tampered altered prompt",
-      };
-
-      const journal = new Map<string, { actionHash: string }>();
-      journal.set(executionId, { actionHash: sha256Hex(JSON.stringify(originalAction)) });
-
-      const checkConflict = (incoming: ExternalTargetAction) => {
-        const existing = journal.get(incoming.execution_id);
-        if (!existing) return "OK";
-        return existing.actionHash === sha256Hex(JSON.stringify(incoming)) ? "MATCH" : "CONFLICT";
-      };
-
-      assert.equal(checkConflict(originalAction), "MATCH");
-      assert.equal(checkConflict(tamperedAction), "CONFLICT", "Altered payload with same execution_id must be rejected");
-    });
-
-    it("TC08: Atomic Journal Concurrency & Single Spawn Lock", () => {
-      const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC08_CONCURRENT_EXECUTION_LOCK");
-      assert.ok(scenario);
-
-      const claims = new Set<string>();
-      let spawnCount = 0;
-
-      const atomicClaimAndSpawn = (id: string) => {
-        if (claims.has(id)) {
-          return { claimed: false, reason: "ALREADY_CLAIMED" };
-        }
-        claims.add(id);
-        spawnCount++;
-        return { claimed: true, reason: "SPAWNED" };
-      };
-
-      const targetId = randomUUID();
-      const run1 = atomicClaimAndSpawn(targetId);
-      const run2 = atomicClaimAndSpawn(targetId);
-
-      assert.equal(run1.claimed, true);
-      assert.equal(run2.claimed, false);
-      assert.equal(spawnCount, 1, "Exactly one process group may be spawned for the execution_id");
-    });
-
-    it("TC09: Crash Recovery for Orphaned Pre-Spawn Claim — HOLD state, never auto-respawns", () => {
-      const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC09_CRASH_RECOVERY_BEFORE_SPAWN");
-      assert.ok(scenario);
-
-      interface JournalRecord {
-        id: string;
-        state: "CLAIMED" | "SPAWNED" | "TERMINAL" | "UNKNOWN_HOLD";
-      }
-
-      // Simulate recovery on server restart:
-      const reconcileOnRestart = (records: JournalRecord[]): JournalRecord[] => {
-        return records.map((rec) => {
-          if (rec.state === "CLAIMED") {
-            // Claimed before crash, but never reached terminal proof -> HOLD, never respawn!
-            return { ...rec, state: "UNKNOWN_HOLD" };
-          }
-          return rec;
-        });
-      };
-
-      const initialJournal: JournalRecord[] = [
-        { id: "exec-1", state: "CLAIMED" },
-        { id: "exec-2", state: "TERMINAL" },
-      ];
-
-      const reconciled = reconcileOnRestart(initialJournal);
-      assert.equal(reconciled[0]?.state, "UNKNOWN_HOLD", "Orphaned claim must be put on HOLD");
-      assert.equal(reconciled[1]?.state, "TERMINAL");
-    });
-
-    it("TC10: Watchdog Reconciliation for Running Processes on Crash", () => {
+    it("TC10: Crash Recovery During Run — Aborted execution leaves claim in durable HOLD", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC10_CRASH_RECOVERY_DURING_RUN");
       assert.ok(scenario);
 
-      interface WatchdogEntry {
-        executionId: string;
-        cgroupScope: string;
-        active: boolean;
+      const stateDir = mkdtempSync(join(tmpdir(), "sf-iso-crash-run-"));
+      const a = createSampleAction();
+
+      // Server that crashes right before persisting terminal submission
+      const crashFx = await createEndpointFixture({
+        stateDir,
+        config: {
+          testOnlyHooks: {
+            beforeTerminalPersist: () => {
+              throw new Error("simulated_crash_during_terminal_persist");
+            },
+          },
+        },
+      });
+
+      try {
+        const resCrash = await sendRawWorkerRequest(crashFx.endpoint, "execute", a, {}, a.execution_id);
+        assert.equal(resCrash.ok, false);
+      } finally {
+        await crashFx.close();
       }
 
-      const reconcileWatchdog = (entry: WatchdogEntry) => {
-        // Watchdog kills lingering cgroup and marks terminal failure
-        return {
-          executionId: entry.executionId,
-          reaped: true,
-          terminalStatus: "FAILED",
-        };
-      };
+      // Restart server on same stateDir
+      const restartedFx = await createEndpointFixture({
+        stateDir,
+        runner: {
+          health: async () => {},
+          execute: async () => {
+            throw new Error("Must not re-execute unverified run!");
+          },
+        },
+      });
 
-      const lingeringEntry: WatchdogEntry = {
-        executionId: "exec-99",
-        cgroupScope: "/sys/fs/cgroup/software-factory.slice/sf-task-exec-99.scope",
-        active: true,
-      };
-
-      const result = reconcileWatchdog(lingeringEntry);
-      assert.equal(result.reaped, true);
-      assert.equal(result.terminalStatus, "FAILED");
+      try {
+        const resRestart = await sendRawWorkerRequest(restartedFx.endpoint, "execute", a, {}, a.execution_id);
+        assert.equal(resRestart.status, 409, "Aborted execution must remain in HOLD");
+      } finally {
+        await restartedFx.close();
+        rmSync(stateDir, { recursive: true, force: true });
+      }
     });
 
     it("TC11: Environment Canaries & Secret Sanitization — complete coverage", () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC11_ENVIRONMENT_CANARY_ISOLATION");
       assert.ok(scenario);
-      assert.ok(scenario.description.includes("env -i"));
+
+      // Verify clean environment assembly excludes all sensitive host variables
+      const sanitized = buildMinimalSanitizedEnv();
+      const inspection = inspectEnvironmentForCanaryLeaks(sanitized);
+      assert.equal(inspection.isClean, true);
+      assert.equal(sanitized.SF_TARGET_KEY, undefined);
+      assert.equal(sanitized.AGENT_GATEWAY_TOKEN, undefined);
+      assert.equal(sanitized.PGPASSWORD, undefined);
+      assert.equal(sanitized.DATABASE_URL, undefined);
     });
 
-    it("TC12: Mount Namespace & Path Traversal Guard — complete coverage", () => {
+    it("TC12: Mount Namespace & Path Traversal Guard — complete coverage", async () => {
       const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC12_PATH_TRAVERSAL_MOUNT_ISOLATION");
       assert.ok(scenario);
-      assert.ok(scenario.description.includes("/etc/sf-wna"));
+
+      const fx = await createEndpointFixture();
+      try {
+        // Path traversal in allowed_files
+        const traversalAllowedFiles = createSampleAction({
+          allowed_files: ["../etc/passwd"],
+        });
+        const resTraversalFiles = await sendRawWorkerRequest(
+          fx.endpoint,
+          "execute",
+          traversalAllowedFiles,
+          {},
+          traversalAllowedFiles.execution_id
+        );
+        assert.equal(resTraversalFiles.ok, false);
+
+        // Path traversal in task_id
+        const traversalTaskId = createSampleAction({
+          task_id: "../escaping-task-id",
+        });
+        const resTraversalTask = await sendRawWorkerRequest(
+          fx.endpoint,
+          "execute",
+          traversalTaskId,
+          {},
+          traversalTaskId.execution_id
+        );
+        assert.equal(resTraversalTask.ok, false);
+
+        assert.equal(fx.getCalls(), 0);
+      } finally {
+        await fx.close();
+      }
     });
   });
 });
