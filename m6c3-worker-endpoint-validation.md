@@ -43,3 +43,8 @@ A dedicated strict Linux CI suite has three no-skip cases: concrete runner files
 The endpoint does not provision VMs, install a TLS proxy, deploy a cloud service, provide private repository access, implement vendor cancellation/fencing or enable Lima/WSL2/Firecracker. Tier 3/4 concrete supervisors and final M6C/G7 acceptance remain separate work.
 
 The initial `b51cf44` Linux CI job completed successfully in [run 43384128007](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43384128007), exercising all three strict cases on a real Linux host. Exact final source validation and independent-review status are recorded in issue #13 / PR #14; those records distinguish the subsequent shutdown refinement from this initial kernel evidence. Main remains the reviewed baseline until integration is accepted.
+
+
+## Independent acceptance integration
+
+Agent B's final handoff (`7451874`, `06a7edc`) is integrated on the PR branch. Its endpoint cases now exercise the production HTTP server/journal with a declared runner emulator. Integration review fixed TAP no-skip enforcement, dedicated cgroup root propagation and an empty Linux guard-test branch. See [independent validation](./m6c3-worker-isolation-validation.md). The existing strict Linux job also runs all 20 independent cases and an intentional skipped-TAP negative probe; the ordinary PG regression remains 145 cases, with Linux-only acceptance kept in its explicit kernel job. Completed exact-commit evidence and acceptance status are tracked in issue #13 / PR #14.

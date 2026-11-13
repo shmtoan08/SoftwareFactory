@@ -133,7 +133,7 @@ export interface KernelIsolationCapabilityReport {
  */
 export function probeHostKernelIsolationCapabilities(): KernelIsolationCapabilityReport {
   const isLinux = process.platform === "linux";
-  const cgroupsV2 = probeLinuxCgroupV2Support();
+  const cgroupsV2 = probeLinuxCgroupV2Support(process.env.SF_WORKER_TEST_CGROUP_ROOT);
   const subreaper = probeLinuxSubreaperSupport();
   const namespaces = probeLinuxNamespaceSupport({ testMaskMount: isLinux });
 

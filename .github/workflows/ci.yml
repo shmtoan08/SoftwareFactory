@@ -2751,3 +2751,22 @@ jobs:
           '
       - name: Verify real worker filesystem, parent-death, deadline and cleanup
         run: sudo env PATH="$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" npm run test:m6c3:worker-linux
+
+      - name: Verify independent worker adversarial and isolation acceptance without skips
+        run: sudo env PATH="$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash scripts/ci/worker-isolation-linux.sh --strict-linux
+
+      - name: Prove strict acceptance rejects a TAP run containing skips
+        run: |
+          SF_SKIP_PROBE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$SF_SKIP_PROBE_DIR"' EXIT
+          cat > "$SF_SKIP_PROBE_DIR/node" <<'SH'
+          #!/bin/sh
+          printf '# tests 1\n# fail 0\n# skipped 1\n'
+          SH
+          chmod +x "$SF_SKIP_PROBE_DIR/node"
+          if sudo env PATH="$SF_SKIP_PROBE_DIR:$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash scripts/ci/worker-isolation-linux.sh --strict-linux > "$SF_SKIP_PROBE_DIR/output" 2>&1; then
+            cat "$SF_SKIP_PROBE_DIR/output"
+            exit 1
+          fi
+          cat "$SF_SKIP_PROBE_DIR/output"
+          grep -q 'Strict acceptance requires an executed TAP summary' "$SF_SKIP_PROBE_DIR/output"

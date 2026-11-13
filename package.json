@@ -38,7 +38,8 @@
     "test:m6c3:targets": "node --test packages/test-harness/src/m6c3-targets.test.ts",
     "test:m6c3:reconciliation": "node --test packages/test-harness/src/m6c3-reconciliation.test.ts",
     "test:m6c3:worker-endpoint": "node --test packages/test-harness/src/m6c3-worker-endpoint.test.ts",
-    "test:m6c3:worker-linux": "node --test packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts"
+    "test:m6c3:worker-linux": "node --test packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts",
+    "test:m6c3:worker-isolation": "node --test packages/test-harness/src/m6c3-worker-isolation.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

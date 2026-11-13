@@ -664,7 +664,7 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
     }
   });
 
-  it("TC-07: Task Runner UID Derivation — distinct deterministic UIDs per task prevent user collisions", () => {
+  it("TC-07: Task Runner UID Derivation — stable mapping for the fixture task IDs", () => {
     const taskA = "11111111-1111-4111-8111-111111111111";
     const taskB = "22222222-2222-4222-8222-222222222222";
     const uidA1 = deriveTaskRunnerUid(taskA);
@@ -677,49 +677,17 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
     assert.notEqual(uidA1, uidB, "Distinct tasks must derive distinct UIDs");
   });
 
-  it("TC-08: Strict Linux externalWorkerGuard Fail-Closed on Darwin & Contract Validation", (t) => {
-    const probe = probeHostKernelIsolationCapabilities();
+  it("TC-08: Strict external worker guard rejects missing capabilities and invalid timeouts on every host", () => {
     const backend = new LinuxCgroupV2SandboxBackend({ cgroupRoot: "/nonexistent/sf-cgroup-root" });
-
-    if (!probe.isLinux) {
-      // On non-Linux (Darwin): externalWorkerGuard MUST fail-closed with ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED
-      assert.throws(
-        () =>
-          backend.spawnRealProcessInSandbox({
-            taskId: randomUUID(),
-            leaseEpoch: 1,
-            command: process.execPath,
-            args: ["-e", "process.exit(0)"],
-            sanitizedEnv: buildMinimalSanitizedEnv(),
-            cwd: process.cwd(),
-            requireKernelCgroup: true,
-            requireSubreaper: true,
-            requireNamespaceIsolation: true,
-            dropPrivileges: true,
-            externalWorkerGuard: { maxRuntimeMs: 3000 },
-          }),
-        /ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED/
-      );
-
-      // Also verify that omitting required kernel flags with externalWorkerGuard triggers fail-closed
-      assert.throws(
-        () =>
-          backend.spawnRealProcessInSandbox({
-            taskId: randomUUID(),
-            leaseEpoch: 1,
-            command: process.execPath,
-            args: ["-e", "process.exit(0)"],
-            sanitizedEnv: buildMinimalSanitizedEnv(),
-            cwd: process.cwd(),
-            requireKernelCgroup: false,
-            externalWorkerGuard: { maxRuntimeMs: 3000 },
-          }),
-        /ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED/
-      );
-
-      t.skip(probe.skipReason ?? "externalWorkerGuard kernel execution skipped on non-Linux");
-      return;
+    const input = { taskId: randomUUID(), leaseEpoch: 1, command: process.execPath, args: ["-e", "process.exit(0)"], sanitizedEnv: buildMinimalSanitizedEnv(), cwd: process.cwd(), requireKernelCgroup: true, requireSubreaper: true, requireNamespaceIsolation: true, dropPrivileges: true, externalWorkerGuard: { maxRuntimeMs: 3000 } };
+    for (const key of ["requireKernelCgroup", "requireSubreaper", "requireNamespaceIsolation", "dropPrivileges"] as const) {
+      assert.throws(() => backend.spawnRealProcessInSandbox({ ...input, [key]: false }), /ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED/);
     }
+    for (const maxRuntimeMs of [0, -1, 1.5, NaN, Infinity, 125001]) {
+      assert.throws(() => backend.spawnRealProcessInSandbox({ ...input, externalWorkerGuard: { maxRuntimeMs } }), /ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED/);
+    }
+    if (process.platform !== "linux") assert.throws(() => backend.spawnRealProcessInSandbox(input), /ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED/);
+    // Real guarded execution is exercised independently by the no-skip Linux endpoint suite.
   });
 
   describe("Worker Endpoint Adversarial Contract Matrix Validation (12 Black-Box Scenarios)", () => {
@@ -1109,18 +1077,31 @@ describe("M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contr
       }
     });
 
-    it("TC11: Environment Canaries & Secret Sanitization — complete coverage", () => {
-      const scenario = WORKER_ENDPOINT_ADVERSARIAL_MATRIX.find((s) => s.id === "TC11_ENVIRONMENT_CANARY_ISOLATION");
-      assert.ok(scenario);
-
-      // Verify clean environment assembly excludes all sensitive host variables
-      const sanitized = buildMinimalSanitizedEnv();
-      const inspection = inspectEnvironmentForCanaryLeaks(sanitized);
-      assert.equal(inspection.isClean, true);
-      assert.equal(sanitized.SF_TARGET_KEY, undefined);
-      assert.equal(sanitized.AGENT_GATEWAY_TOKEN, undefined);
-      assert.equal(sanitized.PGPASSWORD, undefined);
-      assert.equal(sanitized.DATABASE_URL, undefined);
+    it("TC11: Endpoint action, result and journal exclude service environment canaries", async () => {
+      const saved = new Map(Object.keys(CANARY_SECRETS).map((key) => [key, process.env[key]]));
+      for (const [key, value] of Object.entries(CANARY_SECRETS)) process.env[key] = value;
+      let captured: ExternalTargetAction | undefined;
+      const fx = await createEndpointFixture({ runner: { health: async () => {}, execute: async (action) => {
+        captured = action;
+        return { submission: TEST_SUBMISSION, cleanupEvidence: createMockCleanupEvidence(action) };
+      } } });
+      try {
+        const action = createSampleAction();
+        const response = await sendRawWorkerRequest(fx.endpoint, "execute", action, {}, action.execution_id);
+        assert.equal(response.status, 200); assert.ok(captured);
+        const result = await response.text();
+        const journal = new WorkerExecutionJournal(fx.stateDir, "tenant-iso").read(action);
+        assert.equal(journal?.status, "COMPLETED");
+        for (const secret of Object.values(CANARY_SECRETS)) {
+          assert.equal(JSON.stringify(captured).includes(secret), false);
+          assert.equal(result.includes(secret), false);
+          assert.equal(JSON.stringify(journal).includes(secret), false);
+        }
+        // This is payload confinement; child-process environment is checked by the real Linux runner job.
+      } finally {
+        await fx.close();
+        for (const [key, value] of saved) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+      }
     });
 
     it("TC12: Mount Namespace & Path Traversal Guard — complete coverage", async () => {
