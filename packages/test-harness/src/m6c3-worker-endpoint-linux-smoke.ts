@@ -4,9 +4,9 @@ import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
-import { LinuxWorkerEndpointRunner } from "@software-factory/wna";
-import type { AgentRuntimeAdapter, ExternalTargetAction } from "@software-factory/adapter-sdk";
+import { randomUUID, randomBytes } from "node:crypto";
+import { LinuxWorkerEndpointRunner, createWorkerEndpointServer, WorkerExecutionJournal, type WorkerEndpointServer } from "@software-factory/wna";
+import { UserManagedWorkerHttpConnector, type AgentRuntimeAdapter, type ExternalTargetAction } from "@software-factory/adapter-sdk";
 
 const cgroupRoot = process.env.SF_WORKER_TEST_CGROUP_ROOT;
 if (process.platform !== "linux" || process.getuid?.() !== 0 || !cgroupRoot) throw new Error("Strict Linux worker acceptance requires root and SF_WORKER_TEST_CGROUP_ROOT; skips are forbidden");
@@ -28,7 +28,7 @@ function adapter(script: string): AgentRuntimeAdapter {
 }
 describe("M6C-3 strict external Linux worker (no skips)", () => {
   it("actual runner enforces workspace-only writes, strips secrets and exports artifacts after kernel cleanup", async () => {
-    const fx = fixture(); const prior = process.env.SF_TARGET_SIGNING_KEY; process.env.SF_TARGET_SIGNING_KEY = "PARENT_SECRET_CANARY";
+    const fx = fixture(); let server: WorkerEndpointServer | undefined; const prior = process.env.SF_TARGET_SIGNING_KEY; process.env.SF_TARGET_SIGNING_KEY = "PARENT_SECRET_CANARY";
     try {
       const script = `const fs=require('node:fs'),assert=require('node:assert/strict');
         assert.equal(process.getuid()===0,false);
@@ -38,14 +38,21 @@ describe("M6C-3 strict external Linux worker (no skips)", () => {
         fs.appendFileSync('.git/config','\\n[core]\\n fsmonitor = touch ${join(fx.outside, "host-exec")}\\n');
         fs.writeFileSync('src/value.txt','implemented\\n');`;
       const runner = new LinuxWorkerEndpointRunner({ tenantNamespace: "kernel-test", stateDir: fx.stateDir, worktreeBaseDir: join(fx.root, "workspaces"), baselineCommitRegistry: { [fx.commit]: fx.repo }, cgroupRoot, adapter: adapter(script) });
-      await runner.health(AbortSignal.timeout(10000));
+      const signingSecret = randomBytes(32).toString("hex");
+      server = createWorkerEndpointServer({ tenantNamespace: "kernel-test", principalId: "real-worker", workerId: "real-worker", provider: "emulator", model: "provider-free", signingSecret, stateDir: fx.stateDir, runner });
+      const { endpoint } = await server.listen();
+      const connector = new UserManagedWorkerHttpConnector({ endpoint, signingSecret, principalId: "real-worker", workerId: "real-worker", provider: "emulator", model: "provider-free", testOnlyLoopback: true });
+      await connector.health(AbortSignal.timeout(10000));
       const action: ExternalTargetAction = { execution_id: randomUUID(), task_id: randomUUID(), lease_epoch: 1, base_main_commit_hash: fx.commit, deadline: new Date(Date.now() + 20000).toISOString(), allowed_files: ["src/**"], public_context: "Implement public value" };
-      const result = await runner.execute(action, AbortSignal.timeout(20000));
+      const imported = await connector.execute(action, AbortSignal.timeout(20000));
+      const record = new WorkerExecutionJournal(fx.stateDir, "kernel-test").read(action);
+      assert.equal(record?.status, "COMPLETED"); assert.ok(record?.cleanupEvidence);
+      const result = { submission: imported, cleanupEvidence: record.cleanupEvidence };
       assert.equal(result.submission.kind, "artifact"); assert.equal(result.cleanupEvidence.isSimulated, false); assert.equal(result.cleanupEvidence.realKernelOperationsExecuted, true); assert.equal(result.cleanupEvidence.populatedZeroVerified, true); assert.equal(result.cleanupEvidence.cgroupDirRemoved, true); assert.equal(result.cleanupEvidence.remainingProcsCount, 0);
       assert.equal(existsSync(join(fx.outside, "escape")), false); assert.equal(existsSync(join(fx.outside, "host-exec")), false);
       assert.equal(readFileSync(join(fx.repo, "src/value.txt"), "utf8"), "baseline\n");
       if (result.submission.kind === "artifact") assert.equal(Buffer.from((result.submission.files[0] as { content_base64: string }).content_base64, "base64").toString(), "implemented\n");
-    } finally { if (prior === undefined) delete process.env.SF_TARGET_SIGNING_KEY; else process.env.SF_TARGET_SIGNING_KEY = prior; fx.cleanup(); }
+    } finally { await server?.close(); if (prior === undefined) delete process.env.SF_TARGET_SIGNING_KEY; else process.env.SF_TARGET_SIGNING_KEY = prior; fx.cleanup(); }
   });
   for (const mode of ["coordinator-death", "native-timeout"] as const) {
     it(`native supervisor cleans its real cgroup after ${mode}, including detached descendants`, async () => {
