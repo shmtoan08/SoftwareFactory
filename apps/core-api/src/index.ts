@@ -1,3 +1,5 @@
+import { ProjectReadProjectionService, PROJECT_READ_ROLES } from "./project-read-projection.ts";
+export * from "./project-read-projection.ts";
 import { ExecutionTargetBroker, validateTargetId, type ExecutionTargetConfiguration, type AssignExecutionTargetInput } from "./execution-target-broker.ts";
 export * from "./execution-target-broker.ts";
 import { ProductionDeploymentReconciler, type ApproveReconciliationInput, type ExecuteReconciliationInput } from "./deployment-reconciliation.ts";
@@ -226,6 +228,11 @@ export class CoreApiTokenAuthenticator {
     return createHmac("sha256", this.signingSecret).update(canonical, "utf8").digest("hex");
   }
 
+  public signProjectReadCursor(data: string): string {
+    const key = createHmac("sha256", this.signingSecret).update("dashboard-read-cursor-v1").digest();
+    return createHmac("sha256", key).update(data).digest("hex");
+  }
+
   public issueAuthContext(input: {
     projectId: string;
     principalId: string;
@@ -377,6 +384,7 @@ export class CoreApiService {
   public readonly snapshotStore: ImmutableSourceSnapshotStore | null;
   public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
+  private readonly projectReads: ProjectReadProjectionService;
   private readonly executionTargetBroker: ExecutionTargetBroker;
   private readonly productionDeploymentReconciler: ProductionDeploymentReconciler;
   private readonly productionDeploymentGate: ProductionDeploymentGate;
@@ -428,6 +436,7 @@ export class CoreApiService {
             return new Date();
           }),
       });
+    this.projectReads = new ProjectReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES), (data) => this.authenticator.signProjectReadCursor(data));
     this.pipelineService =
       options?.pipelineService ??
       new ProductPipelineService({
@@ -438,6 +447,10 @@ export class CoreApiService {
         pricingOverrides: options?.modelPricingOverrides,
         env: options?.env,
       });
+  }
+
+  public readProjectProjection(auth: CoreApiAuthContext, projectId: string | undefined, query = new URLSearchParams()) {
+    return this.projectReads.read(auth, projectId, query);
   }
 
   private emitWarning(warning: CoreApiWarning): void {

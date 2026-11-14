@@ -1,0 +1,38 @@
+# Project reader P1 — implementation and validation
+
+Date: 2026-11-14 (Asia/Tokyo). Tracker: [issue22](https://github.com/shmtoan08/SoftwareFactory/issues/22). P0/D-01/D-02 were [approved by owner/team](https://github.com/shmtoan08/SoftwareFactory/issues/22#issuecomment-6874880334). This implementation is submitted for its own review, not self-certified ĐẠT. Dashboard consumption remains gated on that review; P2/P3 are separate work.
+
+## Contract and implementation
+
+GET `/api/v1/projects/:projectId` returns `{schemaVersion,fetchedAt,project}`; GET `/api/v1/projects` returns `{schemaVersion,fetchedAt,scope,items,page}`. `schemaVersion` is `dashboard-read-v1`; `scope` is `{kind:"project-token",projectId}`. A collection contains only the signed project scope, normally one item. This deliberately does not create a project picker across memberships. `page` contains `limit`, `hasMore`, `nextCursor`; no total is claimed.
+
+DTO fields are exactly `{projectId,slug,name,defaultBranch,createdAt,updatedAt}` from projects. Private Git paths, memberships, configuration, and raw records are excluded. Default/max limits20/100 reject invalid, duplicate and unknown query fields400; detail accepts no query. SQL orders `(updated_at DESC,project_id DESC)`, compares the same tuple, and fetches limit+1. Source/cursor timestamps retain six fractional UTC digits, including PG microseconds. Memory pads its millisecond source without inventing precision.
+
+Project/principal/role/lifetime/signature validation is pure and precedes query handling. Membership is independently rechecked inside the same transaction snapshot as the data, with the same existing READ roles and signed-role match. ORG_ADMIN has no scope bypass. Foreign existing/absent project targets both403; missing/malformed transport auth401; valid-shaped failing auth/membership403; missing resource inside authorized scope404. Malformed/forged cursors400; signed context or expiry mismatch409 only after membership validation. Errors contain only generic error codes. No cursor grants rights.
+
+Cursor codec uses canonical JSON, canonical base64url and a constant-time HMAC-SHA256 check, separate purpose-derived signing material, resource kind, project/principal, normalized empty Project filters, limit, exact timestamp+UUID anchor and15-minute expiry; serialized cap2048bytes. P1's one-project scope normally never needs a next cursor; boundary/context/expiry tests use the server codec rather than pretending to enumerate additional projects.
+
+[Core projection service](../src/project-read-projection.ts) calls the new store read DAO directly. [PG repository and pool](../../../packages/database/src/postgres-pool.ts) establish an independent `REPEATABLE READ READ ONLY` transaction and set existing `app_runtime`/RLS context. The first SELECT establishes the snapshot and captures its `statement_timestamp()` as fetchedAt; all subsequent membership/existence/DTO SELECTs share that snapshot. fetchedAt is neither a row update time nor a later SELECT/commit time. The memory DAO synchronously copies only allowlisted primitive fields from private maps, rejects nested transaction contexts, and never uses legacy getters or transaction callbacks.
+
+The read pool rejects inherited transactions, nested legacy/autonomous transactions and after-end registrations. Setup/reset are fixed trusted statements; DAO SQL is fixed parameterized SELECT with named columns and reviewed built-ins. Statement timeout2s, lock250ms, acquire1s including cold startup, whole-operation5s and JSON response1MiB are enforced. Expired whole-operation connections are destroyed and discarded; teardown resets sessions. Pool acquisition also accounts for in-flight connections and releases a connection delivered to an already-settled waiter, avoiding oversubscription/leaks under concurrent acquisition.
+
+No migrations, indexes, RLS/grants or existing endpoints change. Legacy budget recovery is intentionally preserved and trapped if the new path attempts to call it. There are no Git/provider/worker/model actions, UI changes or new production activation.
+
+## Executed evidence and matrix mapping
+
+Harness: [dashboard-project-reader.test.ts](../../../packages/test-harness/src/dashboard-project-reader.test.ts), included in `npm test` and separately runnable with `npm run test:dashboard:projects`. Real PostgreSQL is supplied by mandatory PG16/17 CI; optional local execution without PG explicitly skips the PG tests and is not acceptance evidence. Local evidence below used actual PG17 on the agent's dedicated database/port55441, Node24.16.0, and every existing application migration. No fixtures/grants are substituted for production behavior.
+
+| Matrix | Evidence |
+|---|---|
+| RO-01/02 | Actual transaction flags `on`/`repeatable read`, role `app_runtime`, exact project/principal, statement2s/lock250ms; attempted UPDATE fails SQLSTATE25006 |
+| RO-03 | Captured DAO statements are exactly membership/existence/DTO SELECTs, no SELECT-star or commands/locks; legacy transaction/getters/budget/recovery throw if invoked; inherited/autonomous/afterEnd paths rejected |
+| RO-04/05/06 | Full JSON row-content snapshots of every visible public table with project_id, for both fixture projects, compare equal before/after success, denied/query errors, timeout, handler/invalid DTO and oversize serialization. Seeded task, ACTIVE lease and replay-eligible PENDING denial remain unchanged; audit/outbox/intents included, not counts alone |
+| RO-07 | Hash-equivalent serialization of every memory map, including nested Git maps; fixed-clock repeated reads equal; mutating response cannot change storage; oversize/missing/denied reads preserve source |
+| RO-08/12 | HTTP DTO/envelope allowlists, all four roles, no private paths; malformed transport/signature/member mismatch, cross-project privacy,20/100 limits, duplicates/unknowns, cursor signature/scope/principal/limit/expiry and exact timestamp boundaries |
+| RO-09 | Stalled startup, exhausted pool, SQL statement timeout, whole deadline, lock timeout, handler and serialization failures clean up; next request succeeds; pool active/waiting and async scope return to baseline; cold concurrent acquisitions stay at max1 |
+| RO-10 | Separate administrator fixture writer commits project-name/update-time change and membership revocation between membership SELECT and DTO SELECT. Current read returns the old coherent snapshot; next read rejects revoked caller and another authorized caller sees the new name. fetchedAt predates the writer's updatedAt |
+| RO-11 | Public relation/owner/table+column ACL/RLS flags, column/default/view/index/constraint definitions and policies compare equal; source diff contains no migrations/schema/permission edits |
+
+The concurrent writer uses the existing CI database administrator solely to prepare fixture changes outside the reader (runtime is intentionally not granted project UPDATE). Lock/oversize fixture preparation likewise uses that existing administrator; comparisons bracket the reader separately. Physical read-only checks and actual projections still execute as app_runtime with current RLS.
+
+Local focused result: **9/9 tests,2 suites,0 failed/cancelled/skipped/todo**. Local `npm test` also passed **332/332 tests,50 suites,0 failed/cancelled/skipped/todo**; typecheck, lint, secret scan and diff checks passed. The final focused run repeated9/9 after strengthening the catalog/context checks. Exact main CI is published in issue22 with the source commit after integration. Required acceptance additionally needs the exact-source PG16/17 CI plus all other jobs green and team review. This report does not claim native VM/KVM acceptance or G7 completion.

@@ -265,3 +265,9 @@ The owner has deferred native Lima/WSL2 acceptance without waiving G7. Developme
 Dashboard mode is at Slice 0 (proposal only): [Core API capability/read-only audit](./apps/web/docs/api-capability-matrix.md) and [data mapping specification](./apps/web/docs/data-mapping-spec.md), tracked in [issue #20](https://github.com/shmtoan08/SoftwareFactory/issues/20). UI implementation waits for the required review of both documents and confirmation of unsupported panels.
 
 Dashboard read-projection program ([issue #22](https://github.com/shmtoan08/SoftwareFactory/issues/22)): [P0 contract/capability re-audit](./apps/core-api/docs/dashboard-read-projections-p0.md) and [layered read-only test/gate matrix](./apps/core-api/docs/dashboard-read-only-test-matrix.md). P1 Project reader, P2 Budget and P3 Tasks require separate implementation reviews; these contracts do not enable endpoints.
+
+### Dashboard read projection P1 — awaiting implementation review
+
+`GET /api/v1/projects/:projectId` and `GET /api/v1/projects` expose minimal Project DTOs in an independent SELECT-only, REPEATABLE READ READ ONLY transaction. Collection scope is the signed project token, explicitly labeled `project-token`; it is not a cross-project directory. Default/max limits are 20/100; invalid limits fail400, and authenticated cursors retain microsecond anchors. No schema/index or legacy budget behavior changes.
+
+See the [approved P0 contract](./apps/core-api/docs/dashboard-read-projections-p0.md), [read-only matrix](./apps/core-api/docs/dashboard-read-only-test-matrix.md) and [P1 implementation/validation report](./apps/core-api/docs/dashboard-project-reader-p1.md). `npm run test:dashboard:projects` runs memory/HTTP and real-PostgreSQL checks; it is included in the required PG16/17 CI test command. Dashboard consumption awaits P1 review ĐẠT; P2 Budget and P3 Tasks remain separate slices.

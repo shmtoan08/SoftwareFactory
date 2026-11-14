@@ -1,3 +1,4 @@
+import type { ProjectReadInput, ProjectReadRows } from "./project-read-projection.ts";
 import type {
   AgentOrgRole,
   AgentOrganizationProfileRecord,
@@ -523,6 +524,7 @@ export interface RecordReleaseAcceptancePackageInput {
  * (real PostgreSQL via `PostgresRuntimePool`).
  */
 export interface ControlPlaneStore {
+  readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows>;
   clockTimestampIso(): string | Promise<string>;
   assertOutsideTransaction(): void;
   withRlsTransaction<T>(

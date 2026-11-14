@@ -1,3 +1,4 @@
+import { ReadProjectionError } from "./project-read-projection.ts";
 import type { AssignExecutionTargetInput } from "./execution-target-broker.ts";
 import type { ApproveReconciliationInput, ExecuteReconciliationInput } from "./deployment-reconciliation.ts";
 import type { ApproveProductionDeploymentInput, ExecuteProductionDeploymentInput } from "./production-deployment.ts";
@@ -296,6 +297,7 @@ export class CoreApiHttpServer {
   }
 
   private sendError(res: ServerResponse, err: unknown): void {
+    if (err instanceof ReadProjectionError) { this.sendJson(res, err.httpStatus, { error_code: err.code }); return; }
     if (err instanceof CodeImportError) {
       this.sendJson(res, err.httpStatus, { error_code: err.code, reason: err.message }); return;
     }
@@ -444,6 +446,15 @@ export class CoreApiHttpServer {
           error_code: "ERR_UNAUTHORIZED",
           reason: `Missing or invalid ${CORE_API_AUTH_HEADER} header`,
         });
+        return;
+      }
+
+      const projectRead = pathname.match(/^\/api\/v1\/projects(?:\/([^/]+))?$/);
+      if (method === "GET" && projectRead) {
+        let projectId: string | undefined;
+        try { projectId = projectRead[1] ? decodeURIComponent(projectRead[1]) : undefined; }
+        catch { throw new ReadProjectionError(400, "ERR_READ_QUERY_INVALID"); }
+        this.sendJson(res, 200, await this.coreApi.readProjectProjection(auth, projectId, url.searchParams));
         return;
       }
 

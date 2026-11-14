@@ -1,3 +1,4 @@
+import { ProjectReadCursorContextError, assertProjectReadRole, type ProjectReadInput, type ProjectReadRows } from "./project-read-projection.ts";
 import { validateTargetAssignment, validateTargetLease } from "./execution-target-validation.ts";
 import { validateReconciliationApproval } from "./reconciliation-validation.ts";
 import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
@@ -680,7 +681,7 @@ class PooledPgConnection {
     return undefined;
   }
 
-  public static async connect(config: PostgresPoolConfig): Promise<PooledPgConnection> {
+  public static async connect(config: PostgresPoolConfig, outerDeadline?: number): Promise<PooledPgConnection> {
     const sslMode = PooledPgConnection.resolveEffectiveSslMode(config);
     if (
       sslMode === "disable" &&
@@ -693,7 +694,7 @@ class PooledPgConnection {
     }
 
     const timeoutMs = Math.max(1, config.connectTimeoutMs ?? 5000);
-    const deadlineAtMs = Date.now() + timeoutMs;
+    const deadlineAtMs = Math.min(Date.now() + timeoutMs, outerDeadline ?? Infinity);
 
     const tcpSocket = await new Promise<net.Socket>((resolve, reject) => {
       const sock = net.createConnection({
@@ -702,7 +703,7 @@ class PooledPgConnection {
       });
       const timer = setTimeout(() => {
         sock.destroy(new Error(`PostgreSQL connect timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
+      }, Math.max(1, deadlineAtMs - Date.now()));
       sock.once("connect", () => {
         clearTimeout(timer);
         sock.setNoDelay(true);
@@ -850,7 +851,7 @@ class PooledPgConnection {
 
     const conn = new PooledPgConnection(activeSocket, config);
     try {
-      await conn.authenticateStartup();
+      await conn.authenticateStartup(outerDeadline);
       return conn;
     } catch (err) {
       await conn.close();
@@ -858,8 +859,8 @@ class PooledPgConnection {
     }
   }
 
-  private async authenticateStartup(): Promise<void> {
-    const deadlineAtMs = Date.now() + this.connectTimeoutMs;
+  private async authenticateStartup(outerDeadline?: number): Promise<void> {
+    const deadlineAtMs = Math.min(Date.now() + this.connectTimeoutMs, outerDeadline ?? Infinity);
     this.socket.write(buildStartupPacket(this.config));
 
     let scramState:
@@ -1185,6 +1186,8 @@ class PooledPgConnection {
     }
   }
 
+  public abortReadOperation(): void { this.failConnection(new Error("Read projection deadline exceeded")); }
+
   public async close(): Promise<void> {
     if (this.closed) {
       return;
@@ -1215,9 +1218,11 @@ interface ActiveTxState {
   readonly conn: PooledPgConnection;
   readonly session: RlsSessionContext;
   readonly afterEnd: (() => Promise<void>)[];
+  readonly readOnly?: boolean;
 }
 
 interface PoolAcquireWaiter {
+  deadline?: number;
   settled: boolean;
   resolve: (conn: PooledPgConnection) => void;
   reject: (err: Error) => void;
@@ -1233,6 +1238,7 @@ export class PostgresRuntimePool {
   private readonly config: PostgresPoolConfig;
   private readonly maxConnections: number;
   private readonly acquireTimeoutMs: number;
+  private connectingCount = 0;
   private readonly allConnections: Set<PooledPgConnection> = new Set();
   private readonly idleConnections: PooledPgConnection[] = [];
   private readonly activeConnections: Set<PooledPgConnection> = new Set();
@@ -1268,6 +1274,7 @@ export class PostgresRuntimePool {
   public afterTransactionEnd(fn: () => Promise<void>): void {
     const active = this.txAsyncStorage.getStore();
     if (!active) throw new Error("afterTransactionEnd requires an active transaction");
+    if (active.readOnly) throw new Error("Read projections cannot register transaction-end work");
     active.afterEnd.push(fn);
   }
 
@@ -1294,7 +1301,7 @@ export class PostgresRuntimePool {
     return undefined;
   }
 
-  private async acquire(): Promise<PooledPgConnection> {
+  private async acquire(readDeadline?: number): Promise<PooledPgConnection> {
     if (this.closed) {
       throw new Error("PostgresRuntimePool is closed");
     }
@@ -1307,8 +1314,11 @@ export class PostgresRuntimePool {
       this.allConnections.delete(idle);
     }
 
-    if (this.allConnections.size < this.maxConnections) {
-      const conn = await PooledPgConnection.connect(this.config);
+    if (this.allConnections.size + this.connectingCount < this.maxConnections) {
+      this.connectingCount++;
+      let conn: PooledPgConnection;
+      try { conn = await PooledPgConnection.connect(this.config, readDeadline); }
+      finally { this.connectingCount--; }
       if (this.closed) {
         await conn.close();
         throw new Error("PostgresRuntimePool is closed");
@@ -1321,8 +1331,9 @@ export class PostgresRuntimePool {
     return new Promise((resolve, reject) => {
       const waiter: PoolAcquireWaiter = {
         settled: false,
+        deadline: readDeadline,
         resolve: (conn) => {
-          if (waiter.settled) return;
+          if (waiter.settled) { void this.release(conn).catch(() => conn.close()); return; }
           waiter.settled = true;
           waiter.cleanup();
           resolve(conn);
@@ -1346,7 +1357,7 @@ export class PostgresRuntimePool {
         waiter.reject(
           new Error(`PostgreSQL pool acquire timeout after ${this.acquireTimeoutMs}ms`)
         );
-      }, this.acquireTimeoutMs);
+      }, Math.max(1, Math.min(this.acquireTimeoutMs, (readDeadline ?? Infinity) - Date.now())));
       this.waiters.push(waiter);
     });
   }
@@ -1359,7 +1370,7 @@ export class PostgresRuntimePool {
       await conn.close();
       const next = this.popActiveWaiter();
       if (next) {
-        this.acquire().then(next.resolve, next.reject);
+        this.acquire(next.deadline).then(next.resolve, next.reject);
       }
     };
 
@@ -1395,6 +1406,7 @@ export class PostgresRuntimePool {
     fn: (conn: PooledPgConnection, effectiveSession: RlsSessionContext) => Promise<T> | T
   ): Promise<T> {
     const active = this.txAsyncStorage.getStore();
+    if (active?.readOnly) throw new Error("Cannot nest legacy transactions in read projection");
     if (active) {
       const desiredProjectId =
         ctx.currentProjectId !== undefined ? ctx.currentProjectId : active.session.currentProjectId;
@@ -1453,6 +1465,30 @@ export class PostgresRuntimePool {
     }
   }
 
+  /** New projection path only. Never borrow a write TX, run callbacks, or mutate business state. */
+  public async withReadOnlyRlsTransaction<T>(ctx: RlsSessionContext, fn: (snapshotAt: string) => Promise<T>, deadlineAt = Date.now() + 5000): Promise<T> {
+    if (this.txAsyncStorage.getStore()) throw new Error("Read projection requires an independent transaction");
+    const started = Date.now();
+    if (deadlineAt <= started) throw new Error("Read deadline exceeded");
+    const conn = await this.acquire(Math.min(deadlineAt, started + 1000));
+    const state: ActiveTxState = { conn, session: { ...ctx }, afterEnd: [], readOnly: true };
+    const timer = setTimeout(() => conn.abortReadOperation(), Math.max(1, deadlineAt - Date.now()));
+    this.transactionsExecuted++;
+    try {
+      await conn.simpleQuery("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL ROLE app_runtime; SET LOCAL statement_timeout = '2000ms'; SET LOCAL lock_timeout = '250ms';");
+      // This first SELECT establishes the repeatable-read snapshot; later reads retain it.
+      const snapshot = await conn.query("SELECT set_config('app.current_project_id',$1::text,true),set_config('app.current_principal_id',$2::text,true),set_config('app.current_role',$3::text,true),to_char(statement_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS snapshot_at;", [ctx.currentProjectId ?? "", ctx.currentPrincipalId ?? "", ctx.currentRole]);
+      const result = await this.txAsyncStorage.run(state, () => fn(String(snapshot.rows[0]!.snapshot_at)));
+      await conn.simpleQuery("COMMIT;");
+      return result;
+    } catch (error) {
+      if (conn.isAlive()) { try { await conn.simpleQuery("ROLLBACK;"); } catch { conn.abortReadOperation(); } }
+      throw error;
+    } finally {
+      try { await this.release(conn); } finally { clearTimeout(timer); }
+    }
+  }
+
   public async queryInActiveTx<TRow extends Record<string, unknown> = Record<string, unknown>>(
     sql: string,
     params: readonly unknown[] = []
@@ -1476,6 +1512,7 @@ export class PostgresRuntimePool {
     ctx: Partial<RlsSessionContext>,
     fn: (conn: PooledPgConnection, effectiveSession: RlsSessionContext) => Promise<T> | T
   ): Promise<T> {
+    if (this.txAsyncStorage.getStore()?.readOnly) throw new Error("Read projections cannot open autonomous transactions");
     if (!this.txAsyncStorage.getStore()) {
       return this.withRlsTransaction(ctx, fn);
     }
@@ -2433,6 +2470,17 @@ function mapBudgetPauseEventRow(row: Record<string, unknown>): BudgetPauseEventR
  */
 export class PostgresControlPlaneRepository implements ControlPlaneStore {
   public readonly pool: PostgresRuntimePool;
+  public async readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows> {
+    return this.pool.withReadOnlyRlsTransaction({ currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service" }, async (snapshotAt) => {
+      const role = await this.pool.queryInActiveTx("SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;", [input.projectId, input.principalId]);
+      assertProjectReadRole(role.rows[0]?.member_role, input.signedRoles);
+      if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+      const exists = await this.pool.queryInActiveTx("SELECT project_id FROM projects WHERE project_id=$1::uuid;", [input.projectId]);
+      if (!exists.rowCount) throw new PostgresRlsError("23503", "Project not found");
+      const rows = await this.pool.queryInActiveTx("SELECT project_id AS id, slug, name, default_branch, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM projects WHERE project_id=$1::uuid AND ($2::timestamptz IS NULL OR (updated_at,project_id)<($2::timestamptz,$3::uuid)) ORDER BY updated_at DESC, project_id DESC LIMIT $4::int;", [input.projectId, input.after?.updatedAt ?? null, input.after?.id ?? null, input.limit + 1]);
+      return { fetchedAt: snapshotAt, projects: rows.rows.map((r) => ({ projectId: String(r.id), slug: String(r.slug), name: String(r.name), defaultBranch: String(r.default_branch), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })) };
+    }, input.deadlineAt);
+  }
   // Local fallback staging refs cache for synthetic (non-filesystem Git) reconciler tests
   private readonly fallbackGitRefsByProject: Map<string, Map<string, string>> = new Map();
   private readonly fallbackGitCommitsByProject: Map<

@@ -1,3 +1,5 @@
+export * from "./project-read-projection.ts";
+import { ProjectReadCursorContextError, assertProjectReadRole, readTimestamp, type ProjectReadInput, type ProjectReadRows } from "./project-read-projection.ts";
 import { validateTargetAssignment, validateTargetLease, validateTargetVerification } from "./execution-target-validation.ts";
 export { executionProfileSnapshot, executionProfileSha } from "./execution-target-validation.ts";
 import { validateReconciliationApproval } from "./reconciliation-validation.ts";
@@ -552,6 +554,23 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
 
   public getProjectMembership(projectId: string, principalId: string): ProjectMembershipRecord | null {
     return this.projectMemberships.get(`${projectId}:${principalId}`) ?? null;
+  }
+
+  /** Independent synchronous snapshot: no transaction context mutation, recovery or live getters. */
+  public async readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows> {
+    this.assertOutsideTransaction();
+    if (this.asyncLocalStorage.getStore()) throw new Error("Nested projection transaction");
+    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+    const membership = this.projectMemberships.get(`${input.projectId}:${input.principalId}`);
+    assertProjectReadRole(membership?.member_role, input.signedRoles);
+    if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+    if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+    const project = this.projects.get(input.projectId);
+    if (!project) throw new PostgresRlsError("23503", "Project not found");
+    const dto = { projectId: project.project_id, slug: project.slug, name: project.name, defaultBranch: project.default_branch,
+      createdAt: readTimestamp(project.created_at), updatedAt: readTimestamp(project.updated_at) };
+    const beforeAnchor = !input.after || dto.updatedAt < input.after.updatedAt || (dto.updatedAt === input.after.updatedAt && dto.projectId < input.after.id);
+    return { fetchedAt, projects: beforeAnchor ? [dto] : [] };
   }
 
   public getProjectById(projectId: string): ProjectRecord | null {

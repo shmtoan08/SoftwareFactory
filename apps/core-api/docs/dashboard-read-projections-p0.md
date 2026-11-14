@@ -1,6 +1,6 @@
 # Dashboard read projections — P0 contract v2 proposal
 
-Status: **PROPOSED; P0 review required before P1 code**. [Plan #22](https://github.com/shmtoan08/SoftwareFactory/issues/22), [owner decision #21](https://github.com/shmtoan08/SoftwareFactory/issues/21#issuecomment-6872474855). Source audit baseline: main `7e50586a82bb9302d0a919409121f75885175c4a`; date 2026-11-14 (Asia/Tokyo). P0 introduces documentation only, not endpoints, schema, indexes, permissions or Dashboard activation.
+Status: **P0 APPROVED**, including D-01/D-02, by [owner/team decision](https://github.com/shmtoan08/SoftwareFactory/issues/22#issuecomment-6874880334). P1–P3 implementations still require separate reviews. [Plan #22](https://github.com/shmtoan08/SoftwareFactory/issues/22), [owner decision #21](https://github.com/shmtoan08/SoftwareFactory/issues/21#issuecomment-6872474855). Source audit baseline: main `7e50586a82bb9302d0a919409121f75885175c4a`; date 2026-11-14 (Asia/Tokyo). P0 introduces documentation only, not endpoints, schema, indexes, permissions or Dashboard activation.
 
 Delivery order is **P0 → P1 Project reader → P2 Budget snapshot → P3 Task projection**. The later owner plan v2 supersedes the earlier suggestion to start Budget first. Each implementation has a separate review gate. Dashboard may consume a projection only after that implementation is reviewed ĐẠT.
 
@@ -28,7 +28,7 @@ The projection need is distinct from the safe readers already present. There is 
 
 READ roles remain AUDITOR / DEVELOPER / PROJECT_APPROVER / ORG_ADMIN. ORG_ADMIN is not a bypass of the signed project/RLS scope. Neither route parameters, cursors, query filters nor a client-supplied principal/tenant field create authorization. Verify the signature before trusting scope, validate IDs/queries, and verify membership before resource lookup. Membership lookup and projection reads share the new read-only RLS transaction.
 
-**P0 decision D-01 (explicit approval requested):** with existing auth, GET `/api/v1/projects` lists only the signed and authorized project scope (normally one row). It is not an all-memberships/all-tenant project picker. A wider project directory needs a separately approved auth/RLS design; it cannot be silently implemented under this slice. Collection metadata must state `scope: {kind:"project-token", projectId}` so the frontend cannot mistake it for a global list.
+**P0 decision D-01 (approved):** with existing auth, GET `/api/v1/projects` lists only the signed and authorized project scope (normally one row). It is not an all-memberships/all-tenant project picker. A wider project directory needs a separately approved auth/RLS design; it cannot be silently implemented under this slice. Collection metadata must state `scope: {kind:"project-token", projectId}` so the frontend cannot mistake it for a global list.
 
 Privacy contract: absent/unparseable auth → 401 as current transport conventions; valid-shaped auth failing signature/lifetime/role/membership or a route project differing from verified scope → 403, independent of whether that foreign project exists. Within an authorized project, missing project/session/task reference → 404. Session lookup includes both session ID and authorized project ID before task/link access; foreign-session and nonexistent-session IDs return the same404. No unscoped existence probes, cross-project redirects, admin exception or resource counts in denied responses.
 
@@ -40,7 +40,7 @@ Required SQL shape: `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY`; trusted `
 
 All projection SELECTs name every field; no SELECT *, JSON row dump, command-handler reuse, provider/Git/model/fs execution or lazy initialization. Fixed built-in aggregation/EXISTS/time functions and reviewed RLS settings only. Schema/RLS/index catalog definitions remain unchanged. DAO implementation may require a new pool/repository method but no migration or permission expansion.
 
-Every response has `schemaVersion:"dashboard-read-v1"` and server `fetchedAt` = UTC snapshot/read timestamp from that transaction. It is not row updatedAt or HTTP receipt time. Frontend `receivedAt` is a separate future field; existing Slice0 frontend-envelope fetchedAt terminology must be updated before consuming these responses. Multiple SELECTs in one response use one snapshot. Each next HTTP request gets a new snapshot; no snapshot token spans pages.
+Every response has `schemaVersion:"dashboard-read-v1"` and server `fetchedAt` = UTC timestamp captured by the first SELECT establishing the REPEATABLE READ transaction snapshot. It is not row updatedAt or HTTP receipt time. Frontend `receivedAt` is a separate future field; existing Slice0 frontend-envelope fetchedAt terminology must be updated before consuming these responses. Multiple SELECTs in one response use one snapshot. Each next HTTP request gets a new snapshot; no snapshot token spans pages.
 
 Money, tokens and millisecond budget totals are **decimal integer strings**, not floating point/unsafe JS numbers. Task attempt counters may be numbers only when validated safe integers. Source timestamps retain UTC microsecond precision for ordering/cursor anchors; do not round through JS Date milliseconds. UUID IDs use schema-valid canonical representation in new-reader fixtures/contracts; legacy non-UUID in-memory fixtures are not a reason to change existing routes or bypass validation.
 
@@ -51,7 +51,7 @@ Errors use `{error_code, requestId?}` with no raw SQL, filesystem paths, signed 
 Routes:
 
 - GET `/api/v1/projects/:projectId`: project detail in the verified project context.
-- GET `/api/v1/projects?limit=20&cursor=...`: bounded collection **within the current signed project context**, pending D-01 approval.
+- GET `/api/v1/projects?limit=20&cursor=...`: bounded collection **within the current signed project context**, per approved D-01.
 
 DTO allowlist, sourced directly from projects: `{projectId:project_id, slug, name, defaultBranch:default_branch, createdAt:created_at, updatedAt:updated_at}`. No repo_bare_path, approval secret/TTL configuration, memberships, session title, raw ProjectRecord or live Git access. `name` is the actual projects.name string.
 
@@ -128,7 +128,7 @@ List envelope: `{schemaVersion,fetchedAt,projectId,sessionId,filters:{sourceStat
 
 Status filter: repeat `status` at most 11 times, each an exact source TaskStatus literal; case-sensitive/no whitespace trimming/CSV aliases, unknown or duplicate values → 400. Canonical filter is the sorted unique set (absence means all source statuses). All 11 literals: Ready, Leased, ExecutingInTarget, BuildingMergeCandidate, VerifyingInDocker, UnderIndependentReview, AwaitingHumanApproval, AtomicCasMerge, MergedAndCompleted, ReworkRequired, ManualIntervention. Filtering is applied in SQL before keyset/limit and on the unchanged source status.
 
-**P0 decision D-02:** no authoritative stage field or per-task stage enum exists in TaskRecord/TaskPlanLink. Existing PipelineStageName is only stages1–4 and cannot truthfully filter Stage8 TaskRecords. Proposal: any `stage` query returns 400 as unsupported in v1; no stage field invented, and the required stage-filter feature remains pending a team-approved authoritative definition. Team must resolve/approve this limitation before P3 implementation/acceptance; this document does not pretend the whole P3 stage requirement is met.
+**P0 decision D-02 (approved):** no authoritative stage field or per-task stage enum exists in TaskRecord/TaskPlanLink. Existing PipelineStageName is only stages1–4 and cannot truthfully filter Stage8 TaskRecords. Approved v1 behavior: any `stage` query returns 400 as unsupported in v1; no stage field invented, and the required stage-filter feature remains pending a team-approved authoritative definition. Owner/team approved this v1 limitation; P3 still requires its own implementation/scale review; this document does not pretend the whole P3 stage requirement is met.
 
 ### Cursor and consistency contract
 
