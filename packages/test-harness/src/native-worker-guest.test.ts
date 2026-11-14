@@ -24,6 +24,7 @@ it("strict measured guest service: signed source/boot identity, host-control mas
   let socketAccepted=false,invocations=0;
   const socket=createServer(s=>{socketAccepted=true;s.destroy();});
   await new Promise<void>(r=>socket.listen(socketPath,r));
+  chmodSync(socketPath,0o777); // Prove the native mask, not an incidental socket ACL, blocks tasks.
   const script=`const fs=require('node:fs'),assert=require('node:assert/strict'),net=require('node:net');
     assert.notEqual(process.getuid(),0);
     assert.throws(()=>fs.readFileSync(${JSON.stringify(join(stateDir,"service-secret"))}));

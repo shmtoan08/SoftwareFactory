@@ -2766,6 +2766,8 @@ jobs:
           trap 'sudo rm -rf -- "$SF_NATIVE_CI_ROOT"' EXIT
           sudo cp -a "$GITHUB_WORKSPACE" "$SF_NATIVE_CI_ROOT/source"
           sudo chown -R root:root "$SF_NATIVE_CI_ROOT"
+          sudo chmod -R go-w "$SF_NATIVE_CI_ROOT"
+          sudo stat -c "%U %a %n" / /opt "$SF_NATIVE_CI_ROOT" "$SF_NATIVE_CI_ROOT/source"
           sudo env PATH="$PATH" SF_NATIVE_SOURCE_ROOT="$SF_NATIVE_CI_ROOT/source" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash "$SF_NATIVE_CI_ROOT/source/scripts/ci/native-worker-guest.sh"
 
       - name: Verify independent worker adversarial and isolation acceptance without skips
