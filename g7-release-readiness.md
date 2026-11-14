@@ -4,7 +4,7 @@ Tracker: [G7 issue #18](https://github.com/shmtoan08/SoftwareFactory/issues/18);
 
 Audit date: **2026-11-14** (Asia/Tokyo). Code baseline: [`78f1b7c190f82ef0aa3088c08b8ede5559aeb838`](https://github.com/shmtoan08/SoftwareFactory/commit/78f1b7c190f82ef0aa3088c08b8ede5559aeb838). **Decision: HOLD — full G7 is not accepted.** This audit starts the release gate; it does not waive unfinished M6C scope or grant deployment approval.
 
-The latest [source review is ĐẠT](https://github.com/shmtoan08/SoftwareFactory/commit/78f1b7c190f82ef0aa3088c08b8ede5559aeb838#commitcomment-209926336), with no requested code fixes remaining in that batch. [Issue #17](https://github.com/shmtoan08/SoftwareFactory/issues/17) remains open for the team's checklist/closure; review acceptance of source is distinct from release acceptance.
+The latest [source review is ĐẠT](https://github.com/shmtoan08/SoftwareFactory/commit/78f1b7c190f82ef0aa3088c08b8ede5559aeb838#commitcomment-209926336), with no requested code fixes remaining in that batch. [Issue #17](https://github.com/shmtoan08/SoftwareFactory/issues/17) was closed by the team after5/5 verification; review acceptance of source is distinct from release acceptance.
 
 ## Gate criteria and evidence
 
@@ -28,7 +28,7 @@ The governing criteria are the [M6C scope](./m6c_parallel_execution_adapters_imp
 - Strict Linux external worker: real smoke, independent isolation acceptance and strict TAP negative probes.
 - Real gVisor verifier: mandatory runtime execution, without fallback.
 
-Local VM adapter suites at the same baseline: Lima54 + WSL256 = **110/110**,19suites,zero skips. These are executable CLI fixtures, not native VM evidence. The source baseline remains explicit if a later documentation commit changes Git HEAD.
+Local VM adapter suites at the same baseline: Lima **54/54** + WSL2 **56/56** = **110/110**, 19 suites, zero skips. These are executable CLI fixtures, not native VM evidence. The source baseline remains explicit if a later documentation commit changes Git HEAD.
 
 ## Scope choices that must not become invented blockers
 
@@ -37,9 +37,9 @@ Local VM adapter suites at the same baseline: Lima54 + WSL256 = **110/110**,19su
 - Owner policy blocks production Codex without trustworthy per-call Cost Guard. Emulator contract tests do not remove this restriction. A restricted release must clearly list disabled features; it must not be labeled full M6C/G7 while required cross-platform worker capabilities remain missing.
 - Native Lima `stop()` is deliberately supported only with lifecycle + dedicated-instance opt-in and pinned identity/state reprobe. Native start/diagnostic remain fail-closed. No new native permission or bypass is introduced.
 
-## Next implementation slice: native VM worker integration and acceptance
+## Deferred native VM worker integration and acceptance
 
-This is remaining M6C work **before full G7**, tracked under issue16. Implement and validate each host separately; preserve the existing worker and verifier protections.
+The owner has [deferred this native slice](https://github.com/shmtoan08/SoftwareFactory/issues/16#issuecomment-6867968014) until dedicated hosts are available, without waiving G7 acceptance. Development continues with remaining Firecracker/cloud-adapter work under the [updated decision](https://github.com/shmtoan08/SoftwareFactory/issues/18#issuecomment-6867968607). This is remaining M6C work **before full G7**, tracked under issue16. Implement and validate each host separately; preserve the existing worker and verifier protections.
 
 1. **Provisioned test environment:** operator-owned dedicated macOS/Lima and Windows/WSL2 hosts, pinned guest identity, private state root and recorded host/guest versions. Do not reuse a user's default VM/distro or treat host OS detection as proof. Current development host is Darwin with no `limactl` in PATH; no native Windows host has been supplied.
 2. **Safe native control path:** resolve Lima existing-only startup and SSH/login/control-socket boundaries before removing its guards. No create/download fallback, inherited host-home mounts, credential/agent forwarding or user-profile execution accepted as isolation. Use supported mechanisms and record their limits; never just flip `testOnlyEmulator`.
@@ -49,3 +49,9 @@ This is remaining M6C work **before full G7**, tracked under issue16. Implement 
 6. **Release package:** rerun required source CI, attach sample pipeline/traceability/release records and enabled/disabled profile matrix, then obtain the team's explicit G7 decision. Team owns issue ticks/closure and gate acceptance.
 
 Native-host access/configuration and target selection are inputs still needed for real execution. This audit neither installs/starts VMs nor calls paid models/cloud services, deploys production, or changes approval/Codex policy.
+
+## Current development after owner adjustment
+
+The [Firecracker management API foundation](./m6c3-firecracker-api-validation.md) is the next delivered slice: operator-pinned Unix socket metadata and scoped pause/resume, with transport tests. KVM guest execution/isolation and cloud-vendor adapters remain separate work. This does not resume or waive Lima/WSL2 native acceptance, and G7 stays HOLD.
+
+CI counters for source baseline78f1b7c were read directly from completed [PG17 job132221360590](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43522908281/job/132221360590) and [PG16 job132221360632](https://github.com/shmtoan08/SoftwareFactory/actions/runs/43522908281/job/132221360632) logs: each tests287, suites47, pass287, fail/cancelled/skipped/todo0. This records developer log verification separately from the reviewer's API-only cross-check (S6-NOTE-DOCS-02).

@@ -259,3 +259,5 @@ The concrete runner uses public registered baselines, a fresh task repository, m
 WSL2 and Lima CLI backend foundations are implemented and exported from WNA; [WSL2 validation](./m6c3-vm-wsl2-validation.md) and [Lima validation](./m6c3-vm-lima-validation.md) distinguish process-fixture tests from native VM evidence. Neither backend is selected by production dispatch. Lima native start and diagnostic execution fail closed until existing-only startup and SSH/login boundaries are enforced. Native VM/kernel acceptance and G7 remain pending.
 
 G7 release readiness is **HOLD**: see the [evidence audit and next native-worker acceptance slice](./g7-release-readiness.md). Passing source CI does not establish native Lima/WSL2 acceptance or authorize production deployment.
+
+The owner has deferred native Lima/WSL2 acceptance without waiving G7. Development continues with the [Firecracker Unix API management foundation](./m6c3-firecracker-api-validation.md); this does not claim a KVM worker/verifier or cloud provisioning implementation.

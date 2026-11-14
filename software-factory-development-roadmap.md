@@ -269,6 +269,8 @@ Bước 6 / issue #16: đã triển khai WSL2 backend foundation (operator-pinne
 
 G7 readiness audit ngày **2026-11-14**: [bảng bằng chứng và phần còn thiếu](./g7-release-readiness.md). Main `78f1b7c` được review **ĐẠT**, CI5/5 xanh, PG16/17 mỗi job287/287 không skip. Tuy nhiên native worker/isolation trong Lima/WSL2 và đường native Lima start/diagnostic vẫn chưa hoàn tất; **G7 = HOLD**, không đồng nhất source review PASS với release acceptance. Firecracker và cloud vendor không tự động trở thành blocker bổ sung nếu là lựa chọn ngoài release profile; scope cần được ghi rõ.
 
+Owner đã [tạm hoãn native Lima/WSL2 acceptance](https://github.com/shmtoan08/SoftwareFactory/issues/16#issuecomment-6867968014), không waive G7, và cho tiếp tục các phần M6C-3 còn lại. Bước 7: [Firecracker management API foundation](./m6c3-firecracker-api-validation.md) triển khai client Unix-socket thật với metadata pinning, scoped pause/resume và bounded uncertain-outcome handling; chưa phải runtime KVM/verifier/worker hoặc cloud provisioning.
+
 Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
 
 - **Triển khai:**

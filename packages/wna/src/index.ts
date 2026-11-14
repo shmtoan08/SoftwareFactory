@@ -1846,3 +1846,6 @@ export {
   type VmProbeResult as LimaVmProbeResult,
   type VmCommandResult as LimaVmCommandResult,
 } from "./vm-lima-backend.ts";
+
+// Operator-only Firecracker API management; transport evidence is not KVM attestation.
+export { FirecrackerApiClient, type FirecrackerApiConfig, type FirecrackerInstanceInfo } from "./firecracker-api-client.ts";
