@@ -35,7 +35,7 @@ import {
 export const MAX_OUTBOX_LINE_BYTES = 262_144; // 256 KB
 export const MAX_OUTBOX_FILE_BYTES = 52_428_800; // 50 MB
 
-export type LinuxNamespaceKind = "user" | "mount" | "pid" | "ipc" | "uts";
+export type LinuxNamespaceKind = "user" | "mount" | "pid" | "ipc" | "uts" | "net";
 
 export interface SandboxResourceMetricsSnapshot {
   readonly taskId: string;
@@ -626,6 +626,8 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     requireKernelCgroup?: boolean;
     requireSubreaper?: boolean;
     requireNamespaceIsolation?: boolean;
+    /** Deny task networking with a separate, unconfigured network namespace. */
+    requireNetworkIsolation?: boolean;
     isolateNamespaces?: boolean;
     maskedPaths?: readonly string[];
     readOnlyPaths?: readonly string[];
@@ -636,6 +638,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
     if (input.externalWorkerGuard && (process.platform !== "linux" || !Number.isSafeInteger(input.externalWorkerGuard.maxRuntimeMs) || input.externalWorkerGuard.maxRuntimeMs < 1 || input.externalWorkerGuard.maxRuntimeMs > 125000 || !input.requireKernelCgroup || !input.requireSubreaper || !input.requireNamespaceIsolation || !input.dropPrivileges)) {
       throw new Error("ERR_EXTERNAL_WORKER_KERNEL_GUARD_REQUIRED");
     }
+    if (input.requireNetworkIsolation!==undefined && typeof input.requireNetworkIsolation!=="boolean" || input.requireNetworkIsolation && (!input.requireNamespaceIsolation || input.isolateNamespaces===false)) throw new Error("ERR_LINUX_NETWORK_ISOLATION_REQUIRED");
     const k = this.key(input.taskId, input.leaseEpoch);
     const cgroupPath = this.getCgroupPath(input.taskId, input.leaseEpoch);
     const taskUid = deriveTaskRunnerUid(input.taskId);
@@ -809,6 +812,7 @@ export class LinuxCgroupV2SandboxBackend implements SandboxBackend {
         ["require_cgroup", input.requireKernelCgroup ? "1" : "0"],
         ["isolate_ns", input.isolateNamespaces === false ? "0" : "1"],
         ["require_ns", input.requireNamespaceIsolation ? "1" : "0"],
+        ["isolate_net", input.requireNetworkIsolation ? "1" : "0"],
         ["enable_subreaper", "1"],
         ["require_subreaper", input.requireSubreaper ? "1" : "0"],
         ["drop_privs", dropPrivsMode],

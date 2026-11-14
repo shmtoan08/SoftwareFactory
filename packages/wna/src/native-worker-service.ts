@@ -44,7 +44,7 @@ export function createNativeWorkerService(config:NativeWorkerServiceConfig,adapt
   const osRelease=readFileSync("/etc/os-release","utf8");
   const osField=(key:string)=>osRelease.split("\n").find(line=>line.startsWith(`${key}=`))?.slice(key.length+1).replace(/^"|"$/g,"")??"unknown";
   const measurements=validateNativeWorkerAttestation({schema_version:"sf-native-worker-v1",instance_id:config.profile.instanceId,source_sha:config.profile.sourceSha,profile_sha256:profileHash,guest_kernel:release(),guest_os:`${osField("ID")}:${osField("VERSION_ID")}`,guest_arch:arch(),guest_boot_id:readFileSync("/proc/sys/kernel/random/boot_id","utf8").trim()});
-  const runner=new LinuxWorkerEndpointRunner({...config,adapter,additionalMaskedPaths:[config.sourceRoot,"/run","/home","/root","/etc/sf-native","/Users","/Volumes"]});
+  const runner=new LinuxWorkerEndpointRunner({...config,adapter,requireNetworkIsolation:true,additionalMaskedPaths:[config.sourceRoot,"/run","/home","/root","/etc/sf-native","/Users","/Volumes"]});
   const server=createWorkerEndpointServer({tenantNamespace:config.tenantNamespace,principalId:config.principalId,workerId:config.workerId,provider:adapter.writerProvider,model:adapter.writerModel,signingSecret:config.signingSecret,stateDir:config.stateDir,runner,port:config.port,runtimeAttestation:measurements});
   return {server,measurements,verifyHealth:(signal:AbortSignal)=>runner.health(signal)};
 }

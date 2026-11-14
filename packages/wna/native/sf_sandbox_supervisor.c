@@ -433,6 +433,7 @@ typedef struct {
   const char *cgroup_path;
   bool require_cgroup;
   bool isolate_ns;
+  bool isolate_net;
   bool require_ns;
   bool enable_subreaper;
   bool require_subreaper;
@@ -482,6 +483,8 @@ static int parse_nul_config(const char *buf, size_t len, SupervisorConfig *cfg) 
       cfg->require_cgroup = strcmp(val, "1") == 0;
     } else if (strcmp(key, "isolate_ns") == 0) {
       cfg->isolate_ns = strcmp(val, "1") == 0;
+    } else if (strcmp(key, "isolate_net") == 0) {
+      cfg->isolate_net = strcmp(val, "1") == 0;
     } else if (strcmp(key, "require_ns") == 0) {
       cfg->require_ns = strcmp(val, "1") == 0;
     } else if (strcmp(key, "enable_subreaper") == 0) {
@@ -542,6 +545,7 @@ static int parse_nul_config(const char *buf, size_t len, SupervisorConfig *cfg) 
       cfg->ro_paths[cfg->ro_path_count++] = val;
     }
   }
+  if (cfg->isolate_net && (!cfg->isolate_ns || !cfg->require_ns)) return -1;
   if (!cfg->cwd || !cfg->ready_file || !cfg->reap_file || !cfg->cmd) {
     return -1;
   }
@@ -963,6 +967,7 @@ int main(int argc, char **argv) {
         }
       } else {
         int ns_flags = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWUTS;
+        if (cfg.isolate_net) ns_flags |= CLONE_NEWNET;
         if (!host_is_root) {
           ns_flags |= CLONE_NEWUSER;
           user_ns_used = true;
@@ -1164,6 +1169,7 @@ int main(int argc, char **argv) {
           fputs("\"mount\",\"pid\",\"ipc\",\"uts\"", jf);
         }
       }
+      if (ns_applied && cfg.isolate_net) fputs(",\"net\"", jf);
       fputs("],\"maskedPathsApplied\":[", jf);
       for (size_t i = 0; i < applied_mask_cnt; i++) {
         if (i > 0) {

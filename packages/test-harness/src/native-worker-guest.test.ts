@@ -4,13 +4,14 @@ import { execFileSync } from "node:child_process";
 import { chmodSync,mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync } from "node:fs";
 import { randomBytes,randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { createServer } from "node:net";
+import { createServer,connect } from "node:net";
+import { createSocket } from "node:dgram";
 import { createNativeWorkerService,nativeVmProfileSha256,WorkerExecutionJournal } from "@software-factory/wna";
 import { UserManagedWorkerHttpConnector,type AgentRuntimeAdapter,type ExternalTargetAction } from "@software-factory/adapter-sdk";
 
 const sourceRoot=process.env.SF_NATIVE_SOURCE_ROOT,cgroupRoot=process.env.SF_WORKER_TEST_CGROUP_ROOT;
 if(process.platform!=="linux" || process.getuid?.()!==0 || !sourceRoot || !cgroupRoot)throw new Error("Native guest bootstrap acceptance requires Linux root, root-owned source and cgroup delegation; no skips");
-it("strict measured guest service: signed source/boot identity, host-control masks, real cleanup and durable replay",async()=>{
+it("strict measured guest service: signed source/boot identity, host-control masks, denied task networking, real cleanup and durable replay",async()=>{
   const root=mkdtempSync("/var/lib/sf-native-guest-test-");chmodSync(root,0o755);
   const stateDir=join(root,"state"),workspaces=join(root,"workspaces"),repo=join(root,"public-repo");
   for(const dir of [stateDir,workspaces,repo,join(repo,"src")])mkdirSync(dir,{mode:dir===stateDir?0o700:0o755});
@@ -25,15 +26,30 @@ it("strict measured guest service: signed source/boot identity, host-control mas
   const socket=createServer(s=>{socketAccepted=true;s.destroy();});
   await new Promise<void>(r=>socket.listen(socketPath,r));
   chmodSync(socketPath,0o777); // Prove the native mask, not an incidental socket ACL, blocks tasks.
-  const script=`const fs=require('node:fs'),assert=require('node:assert/strict'),net=require('node:net');
-    assert.notEqual(process.getuid(),0);
-    assert.throws(()=>fs.readFileSync(${JSON.stringify(join(stateDir,"service-secret"))}));
-    assert.throws(()=>fs.readFileSync(${JSON.stringify(join(sourceRoot!,"package.json"))}));
-    assert.equal(Object.values(process.env).some(v=>v.includes('NATIVE_GUEST_SECRET_CANARY')),false);
-    const s=net.connect(${JSON.stringify(socketPath)});s.once('connect',()=>process.exit(3));s.once('error',()=>{fs.writeFileSync('src/value.txt','native acceptance\\n');});
-    setTimeout(()=>process.exit(4),1500).unref();`;
+  let tcpAccepted=false,udpReceived=false;
+  const tcp=createServer(s=>{tcpAccepted=true;s.destroy();});
+  await new Promise<void>(r=>tcp.listen(0,"127.0.0.1",r));
+  const tcpAddress=tcp.address();assert.ok(tcpAddress && typeof tcpAddress!=="string");
+  const controlConnected=new Promise<void>(r=>tcp.once("connection",()=>r()));
+  const control=connect(tcpAddress.port,"127.0.0.1");control.on("error",()=>{});await controlConnected;control.destroy();tcpAccepted=false;
+  const udp=createSocket("udp4");await new Promise<void>(r=>udp.bind(0,"127.0.0.1",r));
+  const udpAddress=udp.address();udp.on("message",()=>{udpReceived=true;});
+  const parentNetId=execFileSync("readlink",["/proc/self/ns/net"],{encoding:"utf8"}).trim();
+  const script=`const fs=require('node:fs'),assert=require('node:assert/strict'),net=require('node:net'),dgram=require('node:dgram');
+    async function blocked(target){await new Promise((resolve,reject)=>{const s=net.connect(target);let done=false;const finish=(error)=>{if(done)return;done=true;s.destroy();error?reject(error):resolve();};s.once('connect',()=>finish(new Error('Task reached parent network/socket')));s.once('error',()=>finish());s.setTimeout(500,()=>finish(new Error('Network probe timed out')));});}
+    (async()=>{
+      assert.notEqual(process.getuid(),0);
+      assert.notEqual(fs.readlinkSync('/proc/self/ns/net'),${JSON.stringify(parentNetId)});
+      assert.throws(()=>fs.readFileSync(${JSON.stringify(join(stateDir,"service-secret"))}));
+      assert.throws(()=>fs.readFileSync(${JSON.stringify(join(sourceRoot!,"package.json"))}));
+      assert.equal(Object.values(process.env).some(v=>v.includes('NATIVE_GUEST_SECRET_CANARY')),false);
+      await blocked(${JSON.stringify(socketPath)});
+      await blocked({host:'127.0.0.1',port:${tcpAddress.port}});
+      await new Promise((resolve,reject)=>{const s=dgram.createSocket('udp4');let done=false;const finish=(error)=>{if(done)return;done=true;s.close();error?resolve():reject(new Error('Task retained a UDP route'));};s.once('error',finish);s.send('native-network-probe',${udpAddress.port},'127.0.0.1',finish);});
+      fs.writeFileSync('src/value.txt','native acceptance\\n');
+    })().catch(()=>process.exit(5));`;
   const adapter:AgentRuntimeAdapter={runtimeId:"fake-agent-harness",writerProvider:"native-acceptance",writerModel:"provider-free",prepareInvocation:async()=>{invocations++;return{binaryPath:process.execPath,args:["-e",script],sanitizedEnv:{PATH:"/usr/bin:/bin"},timeoutMs:3000};},parseExecutionResult:async()=>{throw new Error("No untrusted Git parser");}};
-  const config={tenantNamespace:"native-guest-acceptance",sourceRoot:sourceRoot!,stateDir,worktreeBaseDir:workspaces,baselineCommitRegistry:{[commit]:repo},cgroupRoot:cgroupRoot!,profile,principalId:"native-guest",workerId:"native-guest",signingSecret:randomBytes(32).toString("hex"),port:24000+process.pid%20000};
+  const config={tenantNamespace:"native-guest-acceptance",sourceRoot:sourceRoot!,stateDir,worktreeBaseDir:workspaces,baselineCommitRegistry:{[commit]:repo},cgroupRoot:cgroupRoot!,requireNetworkIsolation:false,profile,principalId:"native-guest",workerId:"native-guest",signingSecret:randomBytes(32).toString("hex"),port:24000+process.pid%20000};
   let service:ReturnType<typeof createNativeWorkerService>|undefined;let passed=false;
   try{
     assert.throws(()=>createNativeWorkerService({...config,profile:{...profile,sourceSha:"0".repeat(40)}},adapter),/GUEST_SOURCE/);
@@ -51,6 +67,6 @@ it("strict measured guest service: signed source/boot identity, host-control mas
     const record=new WorkerExecutionJournal(stateDir,config.tenantNamespace).read(action)!;
     assert.equal(record.status,"COMPLETED");assert.equal(record.cleanupEvidence?.isSimulated,false);assert.equal(record.cleanupEvidence?.realKernelOperationsExecuted,true);assert.equal(record.cleanupEvidence?.populatedZeroVerified,true);assert.equal(record.cleanupEvidence?.remainingProcsCount,0);assert.equal(record.cleanupEvidence?.cgroupDirRemoved,true);
     await assert.rejects(connector.execute({...action,lease_epoch:2},AbortSignal.timeout(10000)));
-    assert.equal(socketAccepted,false);assert.equal(readFileSync(join(repo,"src/value.txt"),"utf8"),"baseline\n");passed=true;
-  }finally{await service?.server.close();await new Promise<void>(r=>socket.close(()=>r()));if(passed)rmSync(root,{recursive:true,force:true});else process.stderr.write("Failed/uncertain native fixture state retained for inspection\n");}
+    assert.equal(socketAccepted,false);assert.equal(tcpAccepted,false);assert.equal(udpReceived,false);assert.equal(readFileSync(join(repo,"src/value.txt"),"utf8"),"baseline\n");passed=true;
+  }finally{await service?.server.close();await new Promise<void>(r=>socket.close(()=>r()));await new Promise<void>(r=>tcp.close(()=>r()));udp.close();if(passed)rmSync(root,{recursive:true,force:true});else process.stderr.write("Failed/uncertain native fixture state retained for inspection\n");}
 });

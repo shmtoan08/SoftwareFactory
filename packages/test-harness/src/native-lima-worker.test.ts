@@ -5,7 +5,7 @@ import { chmodSync,mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash,randomBytes,randomUUID } from "node:crypto";
-import { NativeLimaWorkerConnector, nativeVmProfileSha256, createNativeWorkerService, type NativeLimaWorkerConfig } from "@software-factory/wna";
+import { LinuxCgroupV2SandboxBackend,NativeLimaWorkerConnector, nativeVmProfileSha256, createNativeWorkerService, type NativeLimaWorkerConfig } from "@software-factory/wna";
 import { signTargetProtocol,validateNativeWorkerAttestation, type ExternalTargetAction, type NativeWorkerAttestation } from "@software-factory/adapter-sdk";
 import { canonicalizeJson,sha256Hex } from "@software-factory/shared-types";
 function fixture() {
@@ -89,6 +89,13 @@ describe("Native Lima worker bridge — transport fixtures, not VM acceptance",(
       assert.throws(()=>execFileSync(process.execPath,["packages/test-harness/src/native-vm-host-acceptance.ts",config,join(fx.root,"guest.json"),join(fx.root,"receipt.json")],{cwd:process.cwd(),encoding:"utf8",stdio:"pipe"}),(error:unknown)=>{const e=error as {status:number;stderr:string};assert.equal(e.status,1);assert.match(e.stderr,/ERR_NATIVE_HOST_ACCEPTANCE/);assert.equal(e.stderr.includes("PRIVATE_CONFIG_CANARY"),false);return true;});
       assert.equal(fx.calls.length,0);
     }finally{if(prior===undefined)delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;else process.env.NODE_TLS_REJECT_UNAUTHORIZED=prior;fx.cleanup();}
+  });
+  it("network isolation cannot silently disable or omit required namespaces",()=>{
+    const backend=new LinuxCgroupV2SandboxBackend();
+    const input={taskId:randomUUID(),leaseEpoch:1,command:"/bin/true",args:[],sanitizedEnv:{PATH:"/usr/bin:/bin"},cwd:"/tmp",requireNetworkIsolation:true};
+    assert.throws(()=>backend.spawnRealProcessInSandbox(input),/ERR_LINUX_NETWORK_ISOLATION_REQUIRED/);
+    assert.throws(()=>backend.spawnRealProcessInSandbox({...input,requireNamespaceIsolation:true,isolateNamespaces:false}),/ERR_LINUX_NETWORK_ISOLATION_REQUIRED/);
+    assert.throws(()=>backend.spawnRealProcessInSandbox({...input,requireNetworkIsolation:"true" as unknown as boolean,requireNamespaceIsolation:true}),/ERR_LINUX_NETWORK_ISOLATION_REQUIRED/);
   });
   it("keeps native startup opt-in strict and refuses plaintext/default homes/loose permissions",()=>{
     const fx=fixture();try{
