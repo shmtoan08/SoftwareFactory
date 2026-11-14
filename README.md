@@ -261,3 +261,5 @@ WSL2 and Lima CLI backend foundations are implemented and exported from WNA; [WS
 G7 release readiness is **HOLD**: see the [evidence audit and next native-worker acceptance slice](./g7-release-readiness.md). Passing source CI does not establish native Lima/WSL2 acceptance or authorize production deployment.
 
 The owner has deferred native Lima/WSL2 acceptance without waiving G7. Development continues with the [Firecracker Unix API management foundation](./m6c3-firecracker-api-validation.md); this does not claim a KVM worker/verifier or cloud provisioning implementation.
+
+Dashboard mode is at Slice 0 (proposal only): [Core API capability/read-only audit](./apps/web/docs/api-capability-matrix.md) and [data mapping specification](./apps/web/docs/data-mapping-spec.md), tracked in [issue #20](https://github.com/shmtoan08/SoftwareFactory/issues/20). UI implementation waits for the required review of both documents and confirmation of unsupported panels.
