@@ -68,3 +68,5 @@ No new schema/migration, Core API method, production config, model invocation, o
 These are gaps, not permission to modify the production API. [Companion mapping proposal](./data-mapping-spec.md) defines display behavior only for verified/approved data. Team must confirm unsupported items and approve both Slice 0 documents before UI implementation, as required by issue #20.
 
 API-gap decisions are tracked in [issue #21](https://github.com/shmtoan08/SoftwareFactory/issues/21); no API change is approved or implemented by opening that issue.
+
+Owner subsequently authorized a separate read-projection program in [plan #22](https://github.com/shmtoan08/SoftwareFactory/issues/22). Its [P0 contract](../../core-api/docs/dashboard-read-projections-p0.md) and [gate test matrix](../../core-api/docs/dashboard-read-only-test-matrix.md) are proposals pending review; no new route is implemented or Dashboard-allowlisted by this authorization alone. The new response fetchedAt is server read/snapshot time; frontend receipt time must be named separately before consuming it.

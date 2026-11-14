@@ -160,3 +160,5 @@ Required Slice 1–3 cases (not claimed executed in this docs-only slice): no se
 Before Slice 1, team must approve the capability matrix and this mapping, confirm all unsupported panels and session-selector scale behavior, and decide any separately requested safe API projections. Issue #20 explicitly requires that review; this proposal is ready for that decision, not a claim that the Dashboard has shipped.
 
 API-gap decisions are tracked in [issue #21](https://github.com/shmtoan08/SoftwareFactory/issues/21); no API change is approved or implemented by opening that issue.
+
+Owner subsequently authorized a separate read-projection program in [plan #22](https://github.com/shmtoan08/SoftwareFactory/issues/22). Its [P0 contract](../../core-api/docs/dashboard-read-projections-p0.md) and [gate test matrix](../../core-api/docs/dashboard-read-only-test-matrix.md) are proposals pending review; no new route is implemented or Dashboard-allowlisted by this authorization alone. The new response fetchedAt is server read/snapshot time; frontend receipt time must be named separately before consuming it.
