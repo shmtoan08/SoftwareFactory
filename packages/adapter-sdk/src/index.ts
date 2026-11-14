@@ -572,3 +572,5 @@ export function applyWorkspaceEditsSync(
 export * from "./runtime-adapters.ts";
 
 export * from "./execution-targets.ts";
+
+export * from "./native-worker-attestation.ts";

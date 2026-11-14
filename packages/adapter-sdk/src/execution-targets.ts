@@ -1,3 +1,4 @@
+import { validateNativeWorkerAttestation, type NativeWorkerAttestation } from "./native-worker-attestation.ts";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { canonicalizeJson, sha256Hex, type ExecutionTargetType } from "@software-factory/shared-types";
 import { validateCodeImportSubmission, type CodeImportSubmission } from "@software-factory/task-contract";
@@ -100,7 +101,7 @@ export class HttpExecutionTargetConnector implements ExecutionTargetConnector {
                 || result.schema_version !== "sf-target-v1" || result.nonce !== nonce || result.target_type !== this.targetType || result.principal_id !== this.principalId || result.worker_id !== this.workerId || result.provider !== this.provider || result.model !== this.model)
                 throw new Error("Invalid target identity/signature");
             const common = ["schema_version", "nonce", "target_type", "principal_id", "worker_id", "provider", "model"];
-            const permitted = [...common, ...(route === "health" ? ["capabilities"] : ["execution_id", "lease_epoch", "submission"])];
+            const permitted = [...common, ...(route === "health" ? ["capabilities", "runtime_attestation"] : ["execution_id", "lease_epoch", "submission"])];
             if (Object.keys(result).some((key) => !permitted.includes(key)))
                 throw new Error("Unknown target response fields");
             return result;
@@ -111,12 +112,13 @@ export class HttpExecutionTargetConnector implements ExecutionTargetConnector {
     }
     public async health(signal: AbortSignal): Promise<{
         health_sha256: string;
+        runtime_attestation?: NativeWorkerAttestation;
     }> {
         const result = await this.call("health", {}, signal);
         const capabilities = result.capabilities;
         if (!Array.isArray(capabilities) || capabilities.length > 16 || capabilities.some((v) => typeof v !== "string" || v.length > 64) || !["code-import-v1", "idempotent-execution", "lease-fenced-results"].every((v) => capabilities.includes(v)))
             throw new Error("ERR_TARGET_CAPABILITIES: controlled-import/idempotency/fencing capability required");
-        return { health_sha256: sha256Hex(canonicalizeJson(result)) };
+        return { health_sha256: sha256Hex(canonicalizeJson(result)), ...(result.runtime_attestation === undefined ? {} : { runtime_attestation: validateNativeWorkerAttestation(result.runtime_attestation) }) };
     }
     public async execute(action: Readonly<ExternalTargetAction>, signal: AbortSignal): Promise<CodeImportSubmission> {
         const result = await this.call("execute", action, signal);

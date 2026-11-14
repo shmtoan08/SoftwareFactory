@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { signTargetProtocol, type ExternalTargetAction } from "@software-factory/adapter-sdk";
+import { validateNativeWorkerAttestation, type NativeWorkerAttestation, signTargetProtocol, type ExternalTargetAction } from "@software-factory/adapter-sdk";
 import { canonicalizeJson } from "@software-factory/shared-types";
 import { isSafeRelativePosixPath, validateCodeImportSubmission, type CodeImportSubmission } from "@software-factory/task-contract";
 import { WorkerExecutionJournal, WorkerJournalConflict } from "./worker-execution-journal.ts";
@@ -21,6 +21,8 @@ export interface WorkerEndpointServerConfig {
   readonly signingSecret: string;
   readonly stateDir: string;
   readonly runner: WorkerEndpointRunner;
+  /** Measured by native guest bootstrap, signed as part of health only. */
+  readonly runtimeAttestation?: NativeWorkerAttestation;
   readonly port?: number;
   /** Loopback listener behind an operator-controlled TLS proxy. No public binding option. */
   readonly host?: "127.0.0.1" | "::1";
@@ -57,7 +59,7 @@ export class WorkerEndpointServer {
     if (config.host !== undefined && !["127.0.0.1", "::1"].includes(config.host) || config.port !== undefined && (!Number.isSafeInteger(config.port) || config.port < 0 || config.port > 65535)) throw new Error("Worker endpoint requires loopback binding");
     if (config.testOnlyHooks && config.testOnlyEmulator !== true) throw new Error("Fault injection requires explicit test-only configuration");
     if (!config.testOnlyEmulator && !(config.runner instanceof LinuxWorkerEndpointRunner)) throw new Error("Production worker endpoint requires the strict Linux runner");
-    this.config = { ...config }; this.journal = new WorkerExecutionJournal(config.stateDir, config.tenantNamespace);
+    this.config = { ...config, ...(config.runtimeAttestation === undefined ? {} : { runtimeAttestation: validateNativeWorkerAttestation(config.runtimeAttestation) }) }; this.journal = new WorkerExecutionJournal(config.stateDir, config.tenantNamespace);
     this.server = createServer((req, res) => {
       res.on("error", () => {});
       const work = this.handle(req, res).catch(() => { if (!res.headersSent) res.writeHead(400, { "content-type": "application/json" }); if (!res.writableEnded) res.end('{"error":"ERR_WORKER_REQUEST"}'); });
@@ -92,7 +94,7 @@ export class WorkerEndpointServer {
     const controller = new AbortController(); this.active.add(controller);
     const disconnected = () => { if (!res.writableEnded) controller.abort(); }; res.once("close", disconnected);
     try {
-      if (req.url === "/health") { strictObject(body.action, []); await this.config.runner.health(AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])); send({ ...identity, capabilities: ["code-import-v1", "idempotent-execution", "lease-fenced-results"] }); return; }
+      if (req.url === "/health") { strictObject(body.action, []); await this.config.runner.health(AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])); send({ ...identity, ...(this.config.runtimeAttestation ? {runtime_attestation:this.config.runtimeAttestation} : {}), capabilities: ["code-import-v1", "idempotent-execution", "lease-fenced-results"] }); return; }
       const action = validateWorkerAction(body.action);
       if (req.headers["idempotency-key"] !== action.execution_id) throw new Error("Idempotency key mismatch");
       const existing = this.journal.read(action);

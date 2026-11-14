@@ -68,6 +68,8 @@ export interface LimaVmBackendConfig {
   readonly binaryPath: string;
   readonly instanceName: string;
   readonly limaHome?: string;
+  /** Explicit private control HOME for the native bridge; never task supplied. */
+  readonly controlHome?: string;
   readonly allowLifecycle?: boolean;
   readonly dedicatedInstance?: boolean;
   readonly commandTimeoutMs?: number;
@@ -119,13 +121,13 @@ export function sanitizeErrorOutput(output: string): string {
  * Strips SSH_AUTH_SOCK and SSH_AGENT_PID from the host env snapshot and purges
  * Factory/Gateway/DB/Git/model credentials. Uses official LIMA_HOME env var.
  */
-export function buildMinimalHostEnv(limaHome?: string): NodeJS.ProcessEnv {
+export function buildMinimalHostEnv(limaHome?: string, controlHome?: string): NodeJS.ProcessEnv {
   const minimal: NodeJS.ProcessEnv = {
     PATH: process.env.PATH || "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
     TMPDIR: process.env.TMPDIR || "/tmp",
     TEMP: process.env.TEMP || "/tmp",
     TMP: process.env.TMP || "/tmp",
-    HOME: process.env.HOME || "/tmp",
+    HOME: controlHome ?? process.env.HOME ?? "/tmp",
     USER: process.env.USER || "lima",
     LOGNAME: process.env.LOGNAME || "lima",
   };
@@ -396,8 +398,10 @@ export class LimaVmBackend {
       }
     }
 
+    if (config.controlHome !== undefined && (typeof config.controlHome !== "string" || !isAbsolute(config.controlHome) || config.controlHome.includes("\0"))) throw new Error("ERR_LIMA_CONTROL_HOME");
+
     // 8. Snapshot minimal host environment once at construction time
-    this.pinnedHostEnv = Object.freeze(buildMinimalHostEnv(config.limaHome));
+    this.pinnedHostEnv = Object.freeze(buildMinimalHostEnv(config.limaHome, config.controlHome));
 
     this.config = Object.freeze({
       binaryPath: config.binaryPath,
@@ -630,6 +634,20 @@ export class LimaVmBackend {
     }
 
     return parseLimaListJsonOutput(result.stdout, this.config.instanceName);
+  }
+
+  /** Read-only native registration inspection. Never starts a VM or opens a guest shell. */
+  async inspectNativeWorker(signal?: AbortSignal): Promise<{ probe: VmProbeResult; entry: Record<string, unknown>; cliVersion: string }> {
+    const version = await this.runHostCli(["--version"], signal);
+    if (version.exitCode !== 0 || version.stdout.trim() !== "limactl version 2.3.0") throw new Error("ERR_LIMA_NATIVE_VERSION");
+    const result = await this.runHostCli(["list", "--json", this.config.instanceName], signal);
+    if (result.exitCode !== 0) throw new Error("ERR_LIMA_NATIVE_PROBE");
+    const probe = parseLimaListJsonOutput(result.stdout, this.config.instanceName);
+    // The parser above already rejects malformed/ambiguous entries and never reflects raw output.
+    const raw = result.stdout.trim();
+    const entries: Record<string, unknown>[] = raw.startsWith("[") ? JSON.parse(raw) : raw.split(/\r?\n/).filter(line=>line.trim()).map(line=>JSON.parse(line));
+    const entry = entries.find(value=>value.name === this.config.instanceName)!;
+    return { probe, entry, cliVersion: "2.3.0" };
   }
 
   /**

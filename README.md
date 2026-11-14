@@ -271,3 +271,7 @@ Dashboard read-projection program ([issue #22](https://github.com/shmtoan08/Soft
 `GET /api/v1/projects/:projectId` and `GET /api/v1/projects` expose minimal Project DTOs in an independent SELECT-only, REPEATABLE READ READ ONLY transaction. Collection scope is the signed project token, explicitly labeled `project-token`; it is not a cross-project directory. Default/max limits are 20/100; invalid limits fail400, and authenticated cursors retain microsecond anchors. No schema/index or legacy budget behavior changes.
 
 See the [approved P0 contract](./apps/core-api/docs/dashboard-read-projections-p0.md), [read-only matrix](./apps/core-api/docs/dashboard-read-only-test-matrix.md) and [P1 implementation/validation report](./apps/core-api/docs/dashboard-project-reader-p1.md). `npm run test:dashboard:projects` runs memory/HTTP and real-PostgreSQL checks; it is included in the required PG16/17 CI test command. Dashboard consumption awaits P1 review ĐẠT; P2 Budget and P3 Tasks remain separate slices.
+
+### Native Lima worker integration — acceptance pending
+
+Owner has dedicated Mac/Windows hosts. The [N1 integration/runbook](./m6c3-native-vm-integration.md) supplies an opt-in connector for a pinned, already-running Lima2.3.0 VZ guest, signed HTTPS worker identity/source/boot checks, root-owned guest bootstrap and strict evidence commands. It does not auto-provision or start a VM; existing native lifecycle guards remain. Ordinary Linux CI validates the guest bootstrap without claiming Lima evidence. Actual Mac/Windows native acceptance and G7 remain pending.

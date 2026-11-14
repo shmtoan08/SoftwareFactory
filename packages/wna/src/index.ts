@@ -1849,3 +1849,6 @@ export {
 
 // Operator-only Firecracker API management; transport evidence is not KVM attestation.
 export { FirecrackerApiClient, type FirecrackerApiConfig, type FirecrackerInstanceInfo } from "./firecracker-api-client.ts";
+
+export * from "./native-lima-worker.ts";
+export * from "./native-worker-service.ts";

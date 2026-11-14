@@ -2701,6 +2701,8 @@ jobs:
       - run: npm ci
       - name: Verify Firecracker Unix API fixtures (no KVM or VM started)
         run: npm run test:m6c3:firecracker-api
+      - name: Verify native Lima bridge transport fixtures (no VM started)
+        run: npm run test:m6c3:native-lima
       - name: Verify Lima CLI fixtures and Darwin guards (no VM started)
         run: npm run test:m6c3:vm-lima
       - run: npm install --global @openai/codex@0.167.2
@@ -2755,6 +2757,16 @@ jobs:
           '
       - name: Verify real worker filesystem, parent-death, deadline and cleanup
         run: sudo env PATH="$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" npm run test:m6c3:worker-linux
+
+      - name: Verify measured native guest bootstrap on real Linux (not VM acceptance)
+        run: |
+          SF_NATIVE_CI_ROOT="/opt/sf-native-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$SF_NATIVE_CI_ROOT"
+          sudo mkdir -m 0755 "$SF_NATIVE_CI_ROOT"
+          trap 'sudo rm -rf -- "$SF_NATIVE_CI_ROOT"' EXIT
+          sudo cp -a "$GITHUB_WORKSPACE" "$SF_NATIVE_CI_ROOT/source"
+          sudo chown -R root:root "$SF_NATIVE_CI_ROOT"
+          sudo env PATH="$PATH" SF_NATIVE_SOURCE_ROOT="$SF_NATIVE_CI_ROOT/source" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash "$SF_NATIVE_CI_ROOT/source/scripts/ci/native-worker-guest.sh"
 
       - name: Verify independent worker adversarial and isolation acceptance without skips
         run: sudo env PATH="$PATH" SF_WORKER_TEST_CGROUP_ROOT="/sys/fs/cgroup/sf-worker-ci-${GITHUB_RUN_ID}" bash scripts/ci/worker-isolation-linux.sh --strict-linux

@@ -15,6 +15,8 @@ export interface LinuxWorkerEndpointRunnerConfig {
   readonly stateDir: string;
   readonly cgroupRoot?: string;
   readonly adapter: AgentRuntimeAdapter;
+  /** Trusted deployment profile only; never accepted from task requests. */
+  readonly additionalMaskedPaths?: readonly string[];
 }
 type FileEntry = { bytes: Buffer; mode: "100644" | "100755" };
 const RESERVED = new Set([".git", ".sf-worker-home"]);
@@ -46,7 +48,8 @@ export class LinuxWorkerEndpointRunner implements WorkerEndpointRunner {
     if (!isAbsolute(config.worktreeBaseDir) || !isAbsolute(config.stateDir) || config.worktreeBaseDir === config.stateDir || !/^[A-Za-z0-9._:-]{1,128}$/.test(config.tenantNamespace)) throw new Error("Invalid Linux worker directories/namespace");
     if (/codex/i.test(`${config.adapter.runtimeId} ${config.adapter.writerProvider} ${config.adapter.writerModel}`)) throw new Error("ERR_UNMETERED_CODEX_DISABLED");
     for (const [commit, repo] of Object.entries(config.baselineCommitRegistry)) if (!/^[a-f0-9]{40}$/.test(commit) || !isAbsolute(repo)) throw new Error("Invalid operator public baseline registry");
-    this.config = { ...config, baselineCommitRegistry: Object.freeze({ ...config.baselineCommitRegistry }) };
+    if (config.additionalMaskedPaths && (!Array.isArray(config.additionalMaskedPaths) || config.additionalMaskedPaths.length>32 || config.additionalMaskedPaths.some(p=>typeof p!=="string" || !isAbsolute(p) || p.includes("\0")))) throw new Error("Invalid worker masks");
+    this.config = { ...config, additionalMaskedPaths:Object.freeze([...(config.additionalMaskedPaths??[])]), baselineCommitRegistry: Object.freeze({ ...config.baselineCommitRegistry }) };
     this.backend = new LinuxCgroupV2SandboxBackend({ cgroupRoot: config.cgroupRoot });
     mkdirSync(config.worktreeBaseDir, { recursive: true, mode: 0o755 });
     if (lstatSync(config.worktreeBaseDir).isSymbolicLink()) throw new Error("Invalid worker worktree root");
@@ -66,7 +69,7 @@ export class LinuxWorkerEndpointRunner implements WorkerEndpointRunner {
     this.ownTree(workspace, deriveTaskRunnerUid(executionId));
     let spawned = false;
     try {
-      const result = this.backend.spawnRealProcessInSandbox({ taskId: executionId, leaseEpoch: 1, command: "/bin/true", args: [], sanitizedEnv: { PATH: "/usr/bin:/bin" }, cwd: workspace, worktreePath: workspace, requireKernelCgroup: true, requireSubreaper: true, requireNamespaceIsolation: true, dropPrivileges: true, maskedPaths: [this.config.stateDir], externalWorkerGuard: { maxRuntimeMs: 3000 } });
+      const result = this.backend.spawnRealProcessInSandbox({ taskId: executionId, leaseEpoch: 1, command: "/bin/true", args: [], sanitizedEnv: { PATH: "/usr/bin:/bin" }, cwd: workspace, worktreePath: workspace, requireKernelCgroup: true, requireSubreaper: true, requireNamespaceIsolation: true, dropPrivileges: true, maskedPaths: [this.config.stateDir,...(this.config.additionalMaskedPaths??[])], externalWorkerGuard: { maxRuntimeMs: 3000 } });
       spawned = true;
       const exit = await result.exitPromise; signal.throwIfAborted(); if (exit.code !== 0) throw new Error("Strict worker probe failed");
     } finally {
@@ -106,7 +109,7 @@ export class LinuxWorkerEndpointRunner implements WorkerEndpointRunner {
       this.ownTree(workspace, deriveTaskRunnerUid(action.execution_id));
       const remaining = Math.min(plan.timeoutMs, Date.parse(action.deadline) - Date.now(), 120000);
       if (remaining <= 0) throw new Error("Worker deadline exceeded before spawn");
-      const result = this.backend.spawnRealProcessInSandbox({ taskId: action.execution_id, leaseEpoch: action.lease_epoch, command: plan.binaryPath, args: plan.args, sanitizedEnv: env, cwd: workspace, worktreePath: workspace, requireKernelCgroup: true, requireSubreaper: true, requireNamespaceIsolation: true, dropPrivileges: true, maskedPaths: [this.config.stateDir, "/var/run/docker.sock"], externalWorkerGuard: { maxRuntimeMs: Math.floor(remaining) } });
+      const result = this.backend.spawnRealProcessInSandbox({ taskId: action.execution_id, leaseEpoch: action.lease_epoch, command: plan.binaryPath, args: plan.args, sanitizedEnv: env, cwd: workspace, worktreePath: workspace, requireKernelCgroup: true, requireSubreaper: true, requireNamespaceIsolation: true, dropPrivileges: true, maskedPaths: [this.config.stateDir, "/var/run/docker.sock",...(this.config.additionalMaskedPaths??[])], externalWorkerGuard: { maxRuntimeMs: Math.floor(remaining) } });
       spawned = true;
       const aborted = new Promise<never>((_, reject) => {
         const abort = () => reject(new Error("Worker invocation aborted"));
