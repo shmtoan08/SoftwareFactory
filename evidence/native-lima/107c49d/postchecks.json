@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "sf-native-postchecks-v1",
+  "sourceSha": "107c49df16b64c19b2f6bafd28a48914d55654e0",
+  "executionId": "4297c453-6cc0-489c-807a-8f7d0252b493",
+  "signedConflictingLeaseHttpStatus": 409,
+  "unsignedHealthHttpStatus": 401,
+  "tlsRejectedWithoutPrivateCa": "UNABLE_TO_VERIFY_LEAF_SIGNATURE"
+}

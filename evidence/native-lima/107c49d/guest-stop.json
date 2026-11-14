@@ -1,0 +1,12 @@
+{
+  "workerStopped": true,
+  "proxyStopped": true,
+  "sourceSha": "107c49df16b64c19b2f6bafd28a48914d55654e0",
+  "sourceCheckoutClean": true,
+  "bootId": "c94693c0-64b0-4270-8647-dbefabb0e86f",
+  "guestOsRelease": "Ubuntu 24.04.5 LTS",
+  "nodeVersion": "v24.16.0",
+  "serviceUnitSha256": "7dcf91e764fb90d44f2e55421ab27b47a221a56400c3708a80e6f5b0b838d8c2",
+  "proxyConfigSha256": "93ab5de49eec28122615753f3036a6b14f75b7d5aa0688e044317219ef76c31d",
+  "baselineCommit": "ab4585579761239de7b98f4b83e2150b5700a4b4"
+}

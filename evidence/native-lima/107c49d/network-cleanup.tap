@@ -1,0 +1,23 @@
+TAP version 13
+# Source 107c49df16b64c19b2f6bafd28a48914d55654e0; boot c94693c0-64b0-4270-8647-dbefabb0e86f
+# Subtest: New network namespace: detached descendant cleanup after coordinator-death
+ok 1 - New network namespace: detached descendant cleanup after coordinator-death
+  ---
+  duration_ms: 292.439923
+  type: 'test'
+  ...
+# Subtest: New network namespace: detached descendant cleanup after native-timeout
+ok 2 - New network namespace: detached descendant cleanup after native-timeout
+  ---
+  duration_ms: 1418.996352
+  type: 'test'
+  ...
+1..2
+# tests 2
+# suites 0
+# pass 2
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1788.375073

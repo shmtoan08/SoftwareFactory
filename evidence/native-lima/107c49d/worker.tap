@@ -1,0 +1,41 @@
+TAP version 13
+# Subtest: M6C-3 strict external Linux worker (no skips)
+    # Subtest: actual runner enforces workspace-only writes, strips secrets and exports artifacts after kernel cleanup
+    ok 1 - actual runner enforces workspace-only writes, strips secrets and exports artifacts after kernel cleanup
+      ---
+      duration_ms: 856.722894
+      type: 'test'
+      ...
+    # Subtest: native supervisor cleans its real cgroup after coordinator-death, including detached descendants
+    ok 2 - native supervisor cleans its real cgroup after coordinator-death, including detached descendants
+      ---
+      duration_ms: 339.711281
+      type: 'test'
+      ...
+    # Subtest: native supervisor cleans its real cgroup after native-timeout, including detached descendants
+    ok 3 - native supervisor cleans its real cgroup after native-timeout, including detached descendants
+      ---
+      duration_ms: 1293.750295
+      type: 'test'
+      ...
+    1..3
+ok 1 - M6C-3 strict external Linux worker (no skips)
+  ---
+  duration_ms: 2492.932027
+  type: 'suite'
+  ...
+# Subtest: strict measured guest service: signed source/boot identity, host-control masks, denied task networking, real cleanup and durable replay
+ok 2 - strict measured guest service: signed source/boot identity, host-control masks, denied task networking, real cleanup and durable replay
+  ---
+  duration_ms: 296.772814
+  type: 'test'
+  ...
+1..2
+# tests 4
+# suites 1
+# pass 4
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 3498.531337

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "sf-native-provisioning-v1",
+  "sourceSha": "107c49df16b64c19b2f6bafd28a48914d55654e0",
+  "recordedAtUtc": "2026-11-14T14:13:27.511542+00:00",
+  "instanceId": "sf-native-acceptance",
+  "limaVersion": "2.3.0",
+  "requestedResources": {
+    "cpus": 2,
+    "memoryGiB": 4,
+    "diskGiB": 16,
+    "sparseDisk": true
+  },
+  "host": {
+    "os": "macOS",
+    "version": "15.7.9",
+    "kernel": "24.6.0",
+    "arch": "x64",
+    "node": "v24.16.0"
+  },
+  "guestOsRelease": "Ubuntu 24.04.5 LTS",
+  "guestNodeVersion": "v24.16.0",
+  "imageSha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
+  "limaConfigSha256": "af0bd158765b92241bc8ba70d16328c9d1ef299f8eaf191e98f3d333b2d6178b",
+  "downloads": {
+    "limaArchive": {
+      "url": "https://github.com/lima-vm/lima/releases/download/v2.3.0/lima-2.3.0-Darwin-x86_64.tar.gz",
+      "sha256": "d58bc7d6b8158d638720d8c8fdb17eb58527dfead6a29a5b60f48a35ee4a65a6"
+    },
+    "ubuntuImage": {
+      "url": "https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-amd64.img",
+      "sha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94"
+    },
+    "nodeArchive": {
+      "url": "https://nodejs.org/dist/v24.16.0/node-v24.16.0-linux-x64.tar.xz",
+      "sha256": "d804845d34eddc21dc1092b519d643ef40b1f58ec5dec5c22b1f4bd8fabde6c9"
+    }
+  },
+  "serviceUnitSha256": "7dcf91e764fb90d44f2e55421ab27b47a221a56400c3708a80e6f5b0b838d8c2",
+  "proxyConfigSha256": "93ab5de49eec28122615753f3036a6b14f75b7d5aa0688e044317219ef76c31d",
+  "cleanup": {
+    "workerStopped": true,
+    "proxyStopped": true,
+    "vmStatus": "Stopped",
+    "hostForwardListenersRemaining": false,
+    "remainingTaskCgroups": 0,
+    "remainingWorkspaceDirectories": 0
+  },
+  "privateKeyMaterialPublished": false
+}

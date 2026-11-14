@@ -271,6 +271,8 @@ G7 readiness audit ngày **2026-11-14**: [bảng bằng chứng và phần còn 
 
 Owner đã [tạm hoãn native Lima/WSL2 acceptance](https://github.com/shmtoan08/SoftwareFactory/issues/16#issuecomment-6867968014), không waive G7, và cho tiếp tục các phần M6C-3 còn lại. Bước 7: [Firecracker management API foundation](./m6c3-firecracker-api-validation.md) triển khai client Unix-socket thật với metadata pinning, scoped pause/resume và bounded uncertain-outcome handling; chưa phải runtime KVM/verifier/worker hoặc cloud provisioning.
 
+**Cập nhật native Mac —2026-11-14:** owner đã cấp quyền chuẩn bị VM riêng. [Bằng chứng Mac/Lima](./m6c3-native-mac-acceptance.md) tại source `107c49d`: Ubuntu24.04.5/VZ, task network namespace bắt buộc,26test guest không skip, HTTPS host receipt và kiểm tra cleanup thực. Source CI5/5 xanh, PG16/17 mỗi job350/350. VM test đã dừng sau kiểm chứng. Windows/WSL2 native và nghiệm thu G7 vẫn pending; team review quyết định checklist/closure, không dùng kết quả Mac thay Windows.
+
 Các trạng thái “Ready for Implementation / M0 Gate Locked” trong core specs ghi nhận thời điểm khóa thiết kế v1.5; không phải bản cập nhật tiến độ triển khai.
 
 - **Triển khai:**

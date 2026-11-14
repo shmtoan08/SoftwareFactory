@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "sf-native-host-acceptance-v1",
+  "status": "HOST_BRIDGE_PASSED",
+  "sourceSha": "107c49df16b64c19b2f6bafd28a48914d55654e0",
+  "host": {
+    "os": "macOS",
+    "version": "15.7.9",
+    "kernel": "24.6.0",
+    "arch": "x64",
+    "node": "v24.16.0"
+  },
+  "limaVersion": "2.3.0",
+  "binarySha256": "127ebfd79ef83ed047a4c5a9982140fcb095b9836b84572d129d77935febc9c7",
+  "profile": {
+    "instanceId": "sf-native-acceptance",
+    "sourceSha": "107c49df16b64c19b2f6bafd28a48914d55654e0",
+    "imageSha256": "04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94",
+    "limaConfigSha256": "af0bd158765b92241bc8ba70d16328c9d1ef299f8eaf191e98f3d333b2d6178b"
+  },
+  "measurements": {
+    "guest_arch": "x64",
+    "guest_boot_id": "c94693c0-64b0-4270-8647-dbefabb0e86f",
+    "guest_kernel": "6.8.0-147-generic",
+    "guest_os": "ubuntu:24.04",
+    "instance_id": "sf-native-acceptance",
+    "profile_sha256": "1dbba5683a35cba3e100e4213c135e8ce6acfe386c0d4b5233d01cc4459675ef",
+    "schema_version": "sf-native-worker-v1",
+    "source_sha": "107c49df16b64c19b2f6bafd28a48914d55654e0"
+  },
+  "guestManifestSha256": "0bc75ed4d7b7f4ed757ccda7233d85a30af5a4a339845a40ad802478be285d7b",
+  "executionId": "4297c453-6cc0-489c-807a-8f7d0252b493",
+  "artifactSha256": "b282ddc1ba66b4866f9b8cc542df1e8a4498004b67a27482559cfa26c426fd6f",
+  "checks": [
+    "guest-suites-zero-skips",
+    "source-profile-boot-binding",
+    "signed-https-worker",
+    "artifact",
+    "durable-replay",
+    "epoch-conflict"
+  ]
+}

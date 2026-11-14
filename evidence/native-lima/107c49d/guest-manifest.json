@@ -1,0 +1,22 @@
+{
+  "schemaVersion": "sf-native-guest-acceptance-v1",
+  "status": "PASSED",
+  "sourceSha": "107c49df16b64c19b2f6bafd28a48914d55654e0",
+  "profileHash": "1dbba5683a35cba3e100e4213c135e8ce6acfe386c0d4b5233d01cc4459675ef",
+  "bootId": "c94693c0-64b0-4270-8647-dbefabb0e86f",
+  "guestKernel": "6.8.0-147-generic",
+  "guestArch": "x64",
+  "nodeVersion": "v24.16.0",
+  "runs": [
+    {
+      "name": "worker",
+      "logFile": "worker.tap",
+      "sha256": "43f0129834d22a88756f1ef48c97984717c39d7d87a5c0929ace1fb787ed3458"
+    },
+    {
+      "name": "isolation",
+      "logFile": "isolation.tap",
+      "sha256": "273f9bbabc669e62f7791a75266257b00c60c45f77da67519e04e8abffe40e1f"
+    }
+  ]
+}
