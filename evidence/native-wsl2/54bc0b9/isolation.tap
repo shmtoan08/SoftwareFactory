@@ -1,0 +1,144 @@
+TAP version 13
+# Subtest: M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contract Suite
+    # Subtest: TC-01: Environment Canaries & Secret Sanitization — zero host credentials leak into child process
+    ok 1 - TC-01: Environment Canaries & Secret Sanitization — zero host credentials leak into child process
+      ---
+      duration_ms: 46.6185
+      type: 'test'
+      ...
+    # Subtest: TC-02: Double-Fork Process Tracking — Darwin fails-closed honestly, Linux reaps orphans via subreaper
+    ok 2 - TC-02: Double-Fork Process Tracking — Darwin fails-closed honestly, Linux reaps orphans via subreaper
+      ---
+      duration_ms: 106.1072
+      type: 'test'
+      ...
+    # Subtest: TC-03: Mount Namespace & Path Traversal Guards — worktree containment, traversal rejection & credential denial
+    ok 3 - TC-03: Mount Namespace & Path Traversal Guards — worktree containment, traversal rejection & credential denial
+      ---
+      duration_ms: 41.8545
+      type: 'test'
+      ...
+    # Subtest: TC-04: Cgroups v2 Hierarchy & Kill-and-Verify Contract — honest reporting, freeze/kill lifecycle
+    ok 4 - TC-04: Cgroups v2 Hierarchy & Kill-and-Verify Contract — honest reporting, freeze/kill lifecycle
+      ---
+      duration_ms: 40.3208
+      type: 'test'
+      ...
+    # Subtest: TC-05: Timeout & Process Termination — killAndVerifyClean reliably terminates long-running tasks
+    ok 5 - TC-05: Timeout & Process Termination — killAndVerifyClean reliably terminates long-running tasks
+      ---
+      duration_ms: 25.8766
+      type: 'test'
+      ...
+    # Subtest: TC-06: Honest Metrics Telemetry — never fabricates cgroup CPU or memory telemetry when unavailable
+    ok 6 - TC-06: Honest Metrics Telemetry — never fabricates cgroup CPU or memory telemetry when unavailable
+      ---
+      duration_ms: 41.365
+      type: 'test'
+      ...
+    # Subtest: TC-07: Task Runner UID Derivation — stable mapping for the fixture task IDs
+    ok 7 - TC-07: Task Runner UID Derivation — stable mapping for the fixture task IDs
+      ---
+      duration_ms: 0.5555
+      type: 'test'
+      ...
+    # Subtest: TC-08: Strict external worker guard rejects missing capabilities and invalid timeouts on every host
+    ok 8 - TC-08: Strict external worker guard rejects missing capabilities and invalid timeouts on every host
+      ---
+      duration_ms: 0.6942
+      type: 'test'
+      ...
+    # Subtest: Worker Endpoint Adversarial Contract Matrix Validation (12 Black-Box Scenarios)
+        # Subtest: TC01: Bad or Missing HMAC Signature Rejection
+        ok 1 - TC01: Bad or Missing HMAC Signature Rejection
+          ---
+          duration_ms: 67.0434
+          type: 'test'
+          ...
+        # Subtest: TC02: Target Identity Mismatch Defense
+        ok 2 - TC02: Target Identity Mismatch Defense
+          ---
+          duration_ms: 43.0261
+          type: 'test'
+          ...
+        # Subtest: TC03: Strict Schema Unknown Fields Rejection
+        ok 3 - TC03: Strict Schema Unknown Fields Rejection
+          ---
+          duration_ms: 13.3658
+          type: 'test'
+          ...
+        # Subtest: TC04: Bounded Request Payload Size Limit
+        ok 4 - TC04: Bounded Request Payload Size Limit
+          ---
+          duration_ms: 14.4753
+          type: 'test'
+          ...
+        # Subtest: TC05: Expired Deadline Rejection Before Spawn
+        ok 5 - TC05: Expired Deadline Rejection Before Spawn
+          ---
+          duration_ms: 11.1552
+          type: 'test'
+          ...
+        # Subtest: TC06: Idempotent Replay with Same Action Payload
+        ok 6 - TC06: Idempotent Replay with Same Action Payload
+          ---
+          duration_ms: 25.2653
+          type: 'test'
+          ...
+        # Subtest: TC07: Conflicting Replay with Altered Payload Rejection
+        ok 7 - TC07: Conflicting Replay with Altered Payload Rejection
+          ---
+          duration_ms: 21.8761
+          type: 'test'
+          ...
+        # Subtest: TC08: Atomic Journal Concurrency & Single Spawn Lock
+        ok 8 - TC08: Atomic Journal Concurrency & Single Spawn Lock
+          ---
+          duration_ms: 26.0147
+          type: 'test'
+          ...
+        # Subtest: TC09: Crash Recovery for Orphaned Pre-Spawn Claim — HOLD state, never auto-respawns
+        ok 9 - TC09: Crash Recovery for Orphaned Pre-Spawn Claim — HOLD state, never auto-respawns
+          ---
+          duration_ms: 17.3483
+          type: 'test'
+          ...
+        # Subtest: TC10: Crash Recovery During Run — Aborted execution leaves claim in durable HOLD
+        ok 10 - TC10: Crash Recovery During Run — Aborted execution leaves claim in durable HOLD
+          ---
+          duration_ms: 16.7737
+          type: 'test'
+          ...
+        # Subtest: TC11: Endpoint action, result and journal exclude service environment canaries
+        ok 11 - TC11: Endpoint action, result and journal exclude service environment canaries
+          ---
+          duration_ms: 19.4049
+          type: 'test'
+          ...
+        # Subtest: TC12: Mount Namespace & Path Traversal Guard — complete coverage
+        ok 12 - TC12: Mount Namespace & Path Traversal Guard — complete coverage
+          ---
+          duration_ms: 10.4002
+          type: 'test'
+          ...
+        1..12
+    ok 9 - Worker Endpoint Adversarial Contract Matrix Validation (12 Black-Box Scenarios)
+      ---
+      duration_ms: 287.4796
+      type: 'suite'
+      ...
+    1..9
+ok 1 - M6C-3 Step 5 — Worker Isolation, Sandbox Cleanup & Adversarial Contract Suite
+  ---
+  duration_ms: 593.2357
+  type: 'suite'
+  ...
+1..1
+# tests 20
+# suites 2
+# pass 20
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 872.8196

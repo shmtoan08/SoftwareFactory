@@ -1,0 +1,74 @@
+{
+  "schemaVersion": "sf-native-wsl2-evidence-files-v1",
+  "runtimeSourceSha": "54bc0b9ff3b87435b2f22c5abcedb06cac5850a0",
+  "files": {
+    "ci-summary.json": {
+      "bytes": 615,
+      "sha256": "325f5b3e7ee1aa8b3ad9ba97c59fdf9c1295d1a5f33fb80a549261f650e3982a"
+    },
+    "final-kernel-run.sh": {
+      "bytes": 4101,
+      "sha256": "0fa0143edce1ee34de4c8ac9e9c044dc4dbc54375d6791d5bc5cb5e9e6839198"
+    },
+    "guest-manifest.json": {
+      "bytes": 2650,
+      "sha256": "60febeae80c7de5f2bbfa1228fb7e2a3e39d57bdf8db78b2c9a9af0931472643"
+    },
+    "host-inventory.json": {
+      "bytes": 1407,
+      "sha256": "bb022adc95b10c98bcbd181aceede70828673198b1490b721b07c4ff4181ff31"
+    },
+    "host-restored.json": {
+      "bytes": 1257,
+      "sha256": "19c1b35db82225396dfbca645e92bee26c81f5001992e337599b50fb937bf0ac"
+    },
+    "isolation.tap": {
+      "bytes": 5723,
+      "sha256": "584abe11d0e4dfd8a9c248ab13af4ecd12fee527f3d0e81bf3601f551e02b094"
+    },
+    "mountinfo.txt": {
+      "bytes": 999,
+      "sha256": "4453e3ce579aed57efe30cdccb3382a604037a208dced45c96ba80b162b10fc2"
+    },
+    "native-bootstrap.tap": {
+      "bytes": 458,
+      "sha256": "32bf55f427ad92ef2ee2e9be96c4c04991455a8ff278caeba6124d475cc19185"
+    },
+    "network-cleanup-probe.mjs": {
+      "bytes": 3640,
+      "sha256": "ecdef559f73253b8cb6b576c69e29ad40847f5cb986208324430ef4d73cbf86f"
+    },
+    "network-cleanup.tap": {
+      "bytes": 643,
+      "sha256": "69fc51d4786bc10e3ca4bc5cc211d951466251931dbb8ceb13cd30cfaff81687"
+    },
+    "operator.wslconfig": {
+      "bytes": 160,
+      "sha256": "d2699af37caf554eaedab6318c93fed561d62471f4adb8d6426529924d070a32"
+    },
+    "provisioning.json": {
+      "bytes": 3349,
+      "sha256": "cff5afb7b6a64314791942057f424637e391b4f94d9ea783f6734b098609f508"
+    },
+    "windows-cli-probe.mjs": {
+      "bytes": 2048,
+      "sha256": "a567a46aa0a33d9d1c4070fd7c82e6020e5aaad8d53eaa97b31041a544b27007"
+    },
+    "windows-cli-probe.ps1": {
+      "bytes": 956,
+      "sha256": "153fb1f58eacbd79950916dee95c6970462de79bf9033bcee2a42509493214de"
+    },
+    "windows-cli-receipt.json": {
+      "bytes": 708,
+      "sha256": "73bd2b1bb116c690f14043733d0bc0ac17cba89533b5d2de781faca39a91f0a5"
+    },
+    "worker-107c49d-compile-failure.tap": {
+      "bytes": 44872,
+      "sha256": "41cfb7d3eb3d517d91dd7838b4ccf1d779c3030a6954b77658e7d8fb3122bac4"
+    },
+    "worker.tap": {
+      "bytes": 1159,
+      "sha256": "d9e9b7c7cdd6f0573dd76238e40380728d782dd04cf270a28c6e925498a2b83f"
+    }
+  }
+}

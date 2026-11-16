@@ -1,0 +1,7 @@
+[wsl2]
+kernel=D:\\sf-native-acceptance\\downloads\\kernel-5.15.167.4
+memory=4GB
+processors=2
+swap=0
+localhostForwarding=true
+kernelCommandLine=cgroup_no_v1=all

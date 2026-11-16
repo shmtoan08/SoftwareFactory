@@ -1,0 +1,26 @@
+{
+  "runtimeSourceSha": "54bc0b9ff3b87435b2f22c5abcedb06cac5850a0",
+  "runId": 43864237238,
+  "url": "https://github.com/shmtoan08/SoftwareFactory/actions/runs/43864237238",
+  "conclusion": "success",
+  "jobsPassed": 5,
+  "pg16": {
+    "tests": 350,
+    "suites": 51,
+    "pass": 350,
+    "fail": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0
+  },
+  "pg17": {
+    "tests": 350,
+    "suites": 51,
+    "pass": 350,
+    "fail": 0,
+    "cancelled": 0,
+    "skipped": 0,
+    "todo": 0
+  },
+  "note": "Exact-source GitHub status and job logs checked by developer; independent of native Windows guest counters"
+}

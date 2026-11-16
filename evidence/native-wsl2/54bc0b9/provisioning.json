@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "sf-wsl2-provisioning-v1",
+  "dateAsiaTokyo": "2026-11-16",
+  "runtimeSourceSha": "54bc0b9ff3b87435b2f22c5abcedb06cac5850a0",
+  "host": "owner Windows10Pro x64 1909 18363.1556",
+  "dedicatedDistro": "sf-native-acceptance",
+  "guest": "Ubuntu22.04.5 x64",
+  "resources": {
+    "cpu": 2,
+    "memory": "4GB",
+    "swap": 0,
+    "disk": "WSL import default sparse VHDX, virtual256GiB; file2182086656bytes at pre-restoration inventory; kept on D, no explicit disk growth cap"
+  },
+  "downloads": {
+    "upstreamImage": {
+      "url": "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-ubuntu22.04lts.rootfs.tar.gz",
+      "sha256": "1483cc5c1dce13064f774834cbffdff226559fd522a67a381a8ea77d63fb4109"
+    },
+    "preparedImage": {
+      "sha256": "2e974464850e7d609720c9df16e19209f974eb78aff639c2fae55882e7ef4657",
+      "change": "Replace only etc/wsl.conf: disable automount/fstab/Windows interop/PATH; remove systemd=true for inbox WSL"
+    },
+    "kernelPackage": {
+      "url": "https://github.com/microsoft/WSL/releases/download/2.3.26/wsl.2.3.26.0.x64.msi",
+      "sha256": "cd3f2a68a1a5836f6a1cc9965a7f5f54db267ca221eaa87df29345ab7957aec4",
+      "authenticode": "Valid Microsoft Corporation on Windows; package NOT installed; embedded kernel extracted on Mac"
+    },
+    "kernel": {
+      "version": "5.15.167.4-microsoft-standard-WSL2",
+      "sha256": "a304abe9c0a0c20ede269a318cd3aff5434a824a752c2f940e6e2cb33dbe2043"
+    },
+    "nodeLinux": {
+      "version": "24.16.0",
+      "sha256": "d804845d34eddc21dc1092b519d643ef40b1f58ec5dec5c22b1f4bd8fabde6c9"
+    },
+    "nodeWindows": {
+      "version": "24.16.0",
+      "sha256": "edaca9bd58ec8e92037dac4e877d52f6b8f430b81c18b57e264b4e2fb111cd56"
+    }
+  },
+  "operatorConfigSha256": "d2699af37caf554eaedab6318c93fed561d62471f4adb8d6426529924d070a32",
+  "sourceBundleSha256": "2b434abdd62c76e982904c111951a41186f2d4bf6bad1908d85e5ddf5a49f07b",
+  "isolationPreparation": [
+    "Separate imported distro; no existing registrations or .wslconfig overwritten",
+    "D root ACL restricted to operator/SYSTEM/Administrators",
+    "Temporary D drive mount used in operator private mount namespace for setup/evidence transfer; unmounted before tests",
+    "Guest test namespace unmounts WSL tools /init9p; automatic Windows drives absent",
+    "Runtime binfmt WSLInterop disabled in same invocation before test; config alone did not disable it",
+    "cgroup_no_v1=all; dedicated delegated subtree /sys/fs/cgroup/unified/sf-native-acceptance"
+  ],
+  "scope": "Developer observed kernel/guest tests and native Windows CLI evidence, not independent hardware attestation or full production Windows worker bridge",
+  "finalHostRestore": "Verified after final reboot: WSL/VMP Disabled, HypervisorPresent false, operator .wslconfig absent, dedicated distro retained on D; personal VMware VM not started/tested",
+  "bootRestoration": {
+    "reason": "Features disabled + first restoration reboot still left bare VBS/hypervisor active",
+    "action": "Export private BCD backup, set current hypervisorlaunchtype Off, reboot without force",
+    "beforeRecoveryBcdLaunchSetting": "Not explicitly set in current boot entry; original pre-test BCD not recorded",
+    "deviceGuardRegistryPolicyChanged": false,
+    "laterWslRunRequiresExplicitHypervisorReenable": true
+  }
+}

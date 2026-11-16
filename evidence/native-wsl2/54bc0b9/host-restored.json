@@ -1,0 +1,35 @@
+{
+    "schemaVersion":  "sf-wsl2-host-restoration-v1",
+    "recordedAtUtc":  "2026-11-16T12:21:58.0585007Z",
+    "restorationVerified":  true,
+    "features":  [
+                     {
+                         "name":  "Microsoft-Windows-Subsystem-Linux",
+                         "state":  "Disabled"
+                     },
+                     {
+                         "name":  "VirtualMachinePlatform",
+                         "state":  "Disabled"
+                     }
+                 ],
+    "hypervisorPresent":  false,
+    "lastBootUtc":  "2026-11-16T12:20:49.5000000Z",
+    "operatorWslconfigPresent":  false,
+    "dedicatedDistroRetained":  true,
+    "vmwareVMStartedByDev":  false,
+    "vmwareGuestWorkloadTested":  false,
+    "sshService":  "Running",
+    "tailscaleService":  "Running",
+    "disks":  [
+                  {
+                      "DeviceID":  "C:",
+                      "FreeSpace":  13889769472
+                  },
+                  {
+                      "DeviceID":  "D:",
+                      "FreeSpace":  175043993600
+                  }
+              ],
+    "hypervisorLaunchType":  "Off (set for VMware restoration after residual VBS persisted)",
+    "cbsRebootPending":  false
+}

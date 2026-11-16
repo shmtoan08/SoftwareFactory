@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import {writeFileSync} from 'node:fs';
+import {Wsl2VmBackend} from '../downloads/vm-wsl2-backend.ts';
+const cfg={binaryPath:'C:\\Windows\\System32\\wsl.exe',distributionName:'sf-native-acceptance',guestUser:'root',dedicatedInstance:true,commandTimeoutMs:15000,maxOutputBytes:1048576};
+assert.equal(process.platform,'win32');
+const backend=new Wsl2VmBackend(cfg);
+const probe=await backend.probe(AbortSignal.timeout(15000));assert.equal(probe.identity,cfg.distributionName);assert.equal(probe.wslVersion,2);
+const kernel=await backend.execOperatorCommand('/bin/uname',['-r']);assert.equal(kernel.exitCode,0);assert.equal(kernel.stdout.trim(),'5.15.167.4-microsoft-standard-WSL2');
+process.env.SF_NATIVE_CANARY='SF_WINDOWS_NATIVE_ENV_CANARY';
+const env=await backend.execOperatorCommand('/usr/bin/env',[]);assert.equal(env.exitCode,0);assert.equal(env.stdout.trim(),'');delete process.env.SF_NATIVE_CANARY;
+await assert.rejects(backend.stop(),/ERR_VM_LIFECYCLE_DISABLED/);
+const wrong=new Wsl2VmBackend({...cfg,distributionName:'sf-native-acceptance-missing'});await assert.rejects(wrong.probe(),/ERR_WSL_DISTRO_NOT_FOUND/);
+const lifecycle=new Wsl2VmBackend({...cfg,allowLifecycle:true});
+await lifecycle.start();assert.equal((await lifecycle.probe()).state.toLowerCase(),'running');
+await lifecycle.stop();assert.equal((await lifecycle.probe()).state.toLowerCase(),'stopped');
+const receipt={schemaVersion:'sf-wsl2-cli-native-v1',runtimeSourceSha:'54bc0b9ff3b87435b2f22c5abcedb06cac5850a0',hostPlatform:process.platform,hostNode:process.version,probe,kernel:kernel.stdout.trim(),checks:{exactIdentityAndWsl2:true,realGuestDiagnostic:true,emptyGuestEnvironment:true,lifecycleDeniedWithoutOptIn:true,missingIdentityRejected:true,scopedStartAndStop:true,dedicatedDistroStopped:true},scope:'native Windows CLI foundation; not production worker HTTPS bridge'};
+writeFileSync(new URL('./windows-cli-receipt.json',import.meta.url),JSON.stringify(receipt,null,2)+'\n');
+console.log(JSON.stringify(receipt,null,2));

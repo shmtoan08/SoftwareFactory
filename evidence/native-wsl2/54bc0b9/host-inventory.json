@@ -1,0 +1,37 @@
+{
+    "schemaVersion":  "sf-wsl2-host-inventory-v1",
+    "sourceSha":  "54bc0b9ff3b87435b2f22c5abcedb06cac5850a0",
+    "recordedAtUtc":  "2026-11-16T12:15:22.0407668Z",
+    "windowsVersion":  "10.0.18363",
+    "windowsBuild":  1556,
+    "lastBootUtc":  "2026-11-16T11:59:15.5000000Z",
+    "hypervisorPresent":  true,
+    "vmwareVMProcessCount":  0,
+    "features":  [
+                     {
+                         "name":  "Microsoft-Windows-Subsystem-Linux",
+                         "state":  "Enabled"
+                     },
+                     {
+                         "name":  "VirtualMachinePlatform",
+                         "state":  "Enabled"
+                     }
+                 ],
+    "wslFileVersion":  "10.0.18362.1049 (WinBuild.160101.0800)",
+    "wslSha256":  "54A248353FC7656A38D70FB4F31D6ABBE572C1C5C7DDA67AD2C34D438C062EFC",
+    "operatorConfigSha256":  "D2699AF37CAF554EAEDAB6318C93FED561D62471F4ADB8D6426529924D070A32",
+    "vhdxFileBytes":  2182086656,
+    "disks":  [
+                  {
+                      "DeviceID":  "C:",
+                      "FreeSpace":  13852229632
+                  },
+                  {
+                      "DeviceID":  "D:",
+                      "FreeSpace":  175043534848
+                  }
+              ],
+    "rebootPerformedForTest":  true,
+    "rebootForced":  false,
+    "distroRetained":  true
+}

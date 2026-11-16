@@ -1,0 +1,464 @@
+TAP version 13
+# Subtest: M6C-3 strict external Linux worker (no skips)
+    # Subtest: actual runner enforces workspace-only writes, strips secrets and exports artifacts after kernel cleanup
+    not ok 1 - actual runner enforces workspace-only writes, strips secrets and exports artifacts after kernel cleanup
+      ---
+      duration_ms: 465.6697
+      type: 'test'
+      location: '/opt/software-factory/packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts:30:3'
+      failureType: 'testCodeFailure'
+      error: 'ERR_TARGET_PROTOCOL: target identity, transport or response validation failed'
+      code: 'ERR_TEST_FAILURE'
+      stack: |-
+        UserManagedWorkerHttpConnector.call (file:///opt/software-factory/packages/adapter-sdk/src/execution-targets.ts:110:19)
+        process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+        async UserManagedWorkerHttpConnector.health (file:///opt/software-factory/packages/adapter-sdk/src/execution-targets.ts:117:24)
+        async TestContext.<anonymous> (file:///opt/software-factory/packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts:45:7)
+        async Test.run (node:internal/test_runner/test:1313:7)
+        async Promise.all (index 0)
+        async Suite.run (node:internal/test_runner/test:1771:7)
+        async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)
+      ...
+    # Subtest: native supervisor cleans its real cgroup after coordinator-death, including detached descendants
+    not ok 2 - native supervisor cleans its real cgroup after coordinator-death, including detached descendants
+      ---
+      duration_ms: 451.2417
+      type: 'test'
+      location: '/opt/software-factory/packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts:58:5'
+      failureType: 'testCodeFailure'
+      error: |-
+        file:///opt/software-factory/packages/wna/src/index.ts:266
+            throw new Error(
+                  ^
+        
+        Error: ERR_SANDBOX_SUPERVISOR_UNAVAILABLE: Failed to compile sf_sandbox_supervisor.c: cc: Command failed: cc -O2 -Wall -Wextra -Werror -o /tmp/sf-wna-native/sf-sandbox-supervisor-792d49a2942f6080.tmp.41.bf84dffb8908b8 /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:9:
+        /usr/include/x86_64-linux-gnu/sys/mount.h:35:3: error: expected identifier before numeric constant
+           35 |   MS_RDONLY = 1,                /* Mount read-only.  */
+              |   ^~~~~~~~~
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:18:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_mount_mask’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                              ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: note: each undeclared identifier is reported only once for each function it appears in
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:58: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:70: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                      ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:81: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                                 ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:376:51: error: ‘MS_BIND’ undeclared (first use in this function)
+          376 |     int rc = mount(empty_file, masked_path, NULL, MS_BIND, NULL);
+              |                                                   ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:379:52: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          379 |       if (mount(NULL, masked_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_readonly_bind_mount’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:45: error: ‘MS_BIND’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                             ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:55: error: ‘MS_REC’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                                       ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:403:51: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          403 |     if (vfs.f_flag & ST_NOSUID) preserve_flags |= MS_NOSUID;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:406:50: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          406 |     if (vfs.f_flag & ST_NODEV) preserve_flags |= MS_NODEV;
+              |                                                  ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:409:51: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          409 |     if (vfs.f_flag & ST_NOEXEC) preserve_flags |= MS_NOEXEC;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:412:52: error: ‘MS_NOATIME’ undeclared (first use in this function); did you mean ‘ST_NOATIME’?
+          412 |     if (vfs.f_flag & ST_NOATIME) preserve_flags |= MS_NOATIME;
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:415:55: error: ‘MS_NODIRATIME’ undeclared (first use in this function); did you mean ‘ST_NODIRATIME’?
+          415 |     if (vfs.f_flag & ST_NODIRATIME) preserve_flags |= MS_NODIRATIME;
+              |                                                       ^~~~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:418:53: error: ‘MS_RELATIME’ undeclared (first use in this function); did you mean ‘ST_RELATIME’?
+          418 |     if (vfs.f_flag & ST_RELATIME) preserve_flags |= MS_RELATIME;
+              |                                                     ^~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:48: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:61: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                             ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘probe_ns_in_fork’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:36: error: ‘MS_REC’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:23: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                       ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:35: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:47: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                               ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:58: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘main’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:36: error: ‘MS_REC’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:1037:48: error: ‘MS_BIND’ undeclared (first use in this function)
+         1037 |       if (boundary_ok && mount("/", "/", NULL, MS_BIND | MS_REC, NULL) != 0) boundary_ok = false;
+              |                                                ^~~~~~~
+        ; gcc: Command failed: gcc -O2 -Wall -Wextra -Werror -o /tmp/sf-wna-native/sf-sandbox-supervisor-792d49a2942f6080.tmp.41.bf84dffb8908b8 /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:9:
+        /usr/include/x86_64-linux-gnu/sys/mount.h:35:3: error: expected identifier before numeric constant
+           35 |   MS_RDONLY = 1,                /* Mount read-only.  */
+              |   ^~~~~~~~~
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:18:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_mount_mask’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                              ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: note: each undeclared identifier is reported only once for each function it appears in
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:58: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:70: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                      ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:81: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                                 ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:376:51: error: ‘MS_BIND’ undeclared (first use in this function)
+          376 |     int rc = mount(empty_file, masked_path, NULL, MS_BIND, NULL);
+              |                                                   ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:379:52: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          379 |       if (mount(NULL, masked_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_readonly_bind_mount’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:45: error: ‘MS_BIND’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                             ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:55: error: ‘MS_REC’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                                       ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:403:51: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          403 |     if (vfs.f_flag & ST_NOSUID) preserve_flags |= MS_NOSUID;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:406:50: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          406 |     if (vfs.f_flag & ST_NODEV) preserve_flags |= MS_NODEV;
+              |                                                  ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:409:51: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          409 |     if (vfs.f_flag & ST_NOEXEC) preserve_flags |= MS_NOEXEC;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:412:52: error: ‘MS_NOATIME’ undeclared (first use in this function); did you mean ‘ST_NOATIME’?
+          412 |     if (vfs.f_flag & ST_NOATIME) preserve_flags |= MS_NOATIME;
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:415:55: error: ‘MS_NODIRATIME’ undeclared (first use in this function); did you mean ‘ST_NODIRATIME’?
+          415 |     if (vfs.f_flag & ST_NODIRATIME) preserve_flags |= MS_NODIRATIME;
+              |                                                       ^~~~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:418:53: error: ‘MS_RELATIME’ undeclared (first use in this function); did you mean ‘ST_RELATIME’?
+          418 |     if (vfs.f_flag & ST_RELATIME) preserve_flags |= MS_RELATIME;
+              |                                                     ^~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:48: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:61: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                             ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘probe_ns_in_fork’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:36: error: ‘MS_REC’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:23: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                       ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:35: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:47: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                               ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:58: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘main’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:36: error: ‘MS_REC’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:1037:48: error: ‘MS_BIND’ undeclared (first use in this function)
+         1037 |       if (boundary_ok && mount("/", "/", NULL, MS_BIND | MS_REC, NULL) != 0) boundary_ok = false;
+              |                                                ^~~~~~~
+        ; clang: spawnSync clang ENOENT
+            at ensureLinuxSupervisorBinary (file:///opt/software-factory/packages/wna/src/index.ts:266:11)
+            at LinuxCgroupV2SandboxBackend.spawnRealProcessInSandbox (file:///opt/software-factory/packages/wna/src/index.ts:797:23)
+            at file:///opt/software-factory/[eval1]:3:30
+            at ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+            at async node:internal/modules/esm/loader:230:26
+            at async ModuleLoader.executeModuleJob (node:internal/modules/esm/loader:227:20)
+            at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+        
+        Node.js v24.16.0
+        
+      code: 'ERR_ASSERTION'
+      name: 'AssertionError'
+      expected: true
+      actual: false
+      operator: '=='
+      stack: |-
+        ensureLinuxSupervisorBinary (file:///opt/software-factory/packages/wna/src/index.ts:266:11)
+        LinuxCgroupV2SandboxBackend.spawnRealProcessInSandbox (file:///opt/software-factory/packages/wna/src/index.ts:797:23)
+        file:///opt/software-factory/[eval1]:3:30
+        ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+        async node:internal/modules/esm/loader:230:26
+        async ModuleLoader.executeModuleJob (node:internal/modules/esm/loader:227:20)
+        async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+        TestContext.<anonymous> (file:///opt/software-factory/packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts:72:90)
+        async Test.run (node:internal/test_runner/test:1313:7)
+        async Suite.processPendingSubtests (node:internal/test_runner/test:897:7)
+      ...
+    # Subtest: native supervisor cleans its real cgroup after native-timeout, including detached descendants
+    not ok 3 - native supervisor cleans its real cgroup after native-timeout, including detached descendants
+      ---
+      duration_ms: 419.8576
+      type: 'test'
+      location: '/opt/software-factory/packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts:58:5'
+      failureType: 'testCodeFailure'
+      error: |-
+        file:///opt/software-factory/packages/wna/src/index.ts:266
+            throw new Error(
+                  ^
+        
+        Error: ERR_SANDBOX_SUPERVISOR_UNAVAILABLE: Failed to compile sf_sandbox_supervisor.c: cc: Command failed: cc -O2 -Wall -Wextra -Werror -o /tmp/sf-wna-native/sf-sandbox-supervisor-792d49a2942f6080.tmp.59.a2e96c5f0f17d8 /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:9:
+        /usr/include/x86_64-linux-gnu/sys/mount.h:35:3: error: expected identifier before numeric constant
+           35 |   MS_RDONLY = 1,                /* Mount read-only.  */
+              |   ^~~~~~~~~
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:18:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_mount_mask’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                              ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: note: each undeclared identifier is reported only once for each function it appears in
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:58: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:70: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                      ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:81: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                                 ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:376:51: error: ‘MS_BIND’ undeclared (first use in this function)
+          376 |     int rc = mount(empty_file, masked_path, NULL, MS_BIND, NULL);
+              |                                                   ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:379:52: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          379 |       if (mount(NULL, masked_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_readonly_bind_mount’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:45: error: ‘MS_BIND’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                             ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:55: error: ‘MS_REC’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                                       ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:403:51: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          403 |     if (vfs.f_flag & ST_NOSUID) preserve_flags |= MS_NOSUID;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:406:50: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          406 |     if (vfs.f_flag & ST_NODEV) preserve_flags |= MS_NODEV;
+              |                                                  ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:409:51: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          409 |     if (vfs.f_flag & ST_NOEXEC) preserve_flags |= MS_NOEXEC;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:412:52: error: ‘MS_NOATIME’ undeclared (first use in this function); did you mean ‘ST_NOATIME’?
+          412 |     if (vfs.f_flag & ST_NOATIME) preserve_flags |= MS_NOATIME;
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:415:55: error: ‘MS_NODIRATIME’ undeclared (first use in this function); did you mean ‘ST_NODIRATIME’?
+          415 |     if (vfs.f_flag & ST_NODIRATIME) preserve_flags |= MS_NODIRATIME;
+              |                                                       ^~~~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:418:53: error: ‘MS_RELATIME’ undeclared (first use in this function); did you mean ‘ST_RELATIME’?
+          418 |     if (vfs.f_flag & ST_RELATIME) preserve_flags |= MS_RELATIME;
+              |                                                     ^~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:48: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:61: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                             ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘probe_ns_in_fork’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:36: error: ‘MS_REC’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:23: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                       ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:35: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:47: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                               ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:58: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘main’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:36: error: ‘MS_REC’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:1037:48: error: ‘MS_BIND’ undeclared (first use in this function)
+         1037 |       if (boundary_ok && mount("/", "/", NULL, MS_BIND | MS_REC, NULL) != 0) boundary_ok = false;
+              |                                                ^~~~~~~
+        ; gcc: Command failed: gcc -O2 -Wall -Wextra -Werror -o /tmp/sf-wna-native/sf-sandbox-supervisor-792d49a2942f6080.tmp.59.a2e96c5f0f17d8 /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:9:
+        /usr/include/x86_64-linux-gnu/sys/mount.h:35:3: error: expected identifier before numeric constant
+           35 |   MS_RDONLY = 1,                /* Mount read-only.  */
+              |   ^~~~~~~~~
+        In file included from /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:18:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_mount_mask’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                              ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:46: note: each undeclared identifier is reported only once for each function it appears in
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:58: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:70: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                      ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:339:81: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          339 |     if (mount("tmpfs", masked_path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              |                                                                                 ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:376:51: error: ‘MS_BIND’ undeclared (first use in this function)
+          376 |     int rc = mount(empty_file, masked_path, NULL, MS_BIND, NULL);
+              |                                                   ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:379:52: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          379 |       if (mount(NULL, masked_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY, NULL) != 0) {
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘apply_readonly_bind_mount’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:45: error: ‘MS_BIND’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                             ^~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:396:55: error: ‘MS_REC’ undeclared (first use in this function)
+          396 |   if (mount(target_path, target_path, NULL, MS_BIND | MS_REC, NULL) != 0) {
+              |                                                       ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:403:51: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          403 |     if (vfs.f_flag & ST_NOSUID) preserve_flags |= MS_NOSUID;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:406:50: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          406 |     if (vfs.f_flag & ST_NODEV) preserve_flags |= MS_NODEV;
+              |                                                  ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:409:51: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          409 |     if (vfs.f_flag & ST_NOEXEC) preserve_flags |= MS_NOEXEC;
+              |                                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:412:52: error: ‘MS_NOATIME’ undeclared (first use in this function); did you mean ‘ST_NOATIME’?
+          412 |     if (vfs.f_flag & ST_NOATIME) preserve_flags |= MS_NOATIME;
+              |                                                    ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:415:55: error: ‘MS_NODIRATIME’ undeclared (first use in this function); did you mean ‘ST_NODIRATIME’?
+          415 |     if (vfs.f_flag & ST_NODIRATIME) preserve_flags |= MS_NODIRATIME;
+              |                                                       ^~~~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:418:53: error: ‘MS_RELATIME’ undeclared (first use in this function); did you mean ‘ST_RELATIME’?
+          418 |     if (vfs.f_flag & ST_RELATIME) preserve_flags |= MS_RELATIME;
+              |                                                     ^~~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:48: error: ‘MS_REMOUNT’ undeclared (first use in this function)
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:421:61: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          421 |   if (mount(NULL, target_path, NULL, MS_BIND | MS_REMOUNT | MS_RDONLY | preserve_flags, NULL) != 0) {
+              |                                                             ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘probe_ns_in_fork’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:36: error: ‘MS_REC’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:723:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          723 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:23: error: ‘MS_RDONLY’ undeclared (first use in this function); did you mean ‘ST_RDONLY’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                       ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:35: error: ‘MS_NOSUID’ undeclared (first use in this function); did you mean ‘ST_NOSUID’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                   ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:47: error: ‘MS_NODEV’ undeclared (first use in this function); did you mean ‘ST_NODEV’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                               ^~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:731:58: error: ‘MS_NOEXEC’ undeclared (first use in this function); did you mean ‘ST_NOEXEC’?
+          731 |                       MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4k,mode=000") == 0) {
+              |                                                          ^~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c: In function ‘main’:
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:36: error: ‘MS_REC’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                    ^~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:996:45: error: ‘MS_PRIVATE’ undeclared (first use in this function)
+          996 |         if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+              |                                             ^~~~~~~~~~
+        /opt/software-factory/packages/wna/native/sf_sandbox_supervisor.c:1037:48: error: ‘MS_BIND’ undeclared (first use in this function)
+         1037 |       if (boundary_ok && mount("/", "/", NULL, MS_BIND | MS_REC, NULL) != 0) boundary_ok = false;
+              |                                                ^~~~~~~
+        ; clang: spawnSync clang ENOENT
+            at ensureLinuxSupervisorBinary (file:///opt/software-factory/packages/wna/src/index.ts:266:11)
+            at LinuxCgroupV2SandboxBackend.spawnRealProcessInSandbox (file:///opt/software-factory/packages/wna/src/index.ts:797:23)
+            at file:///opt/software-factory/[eval1]:3:30
+            at ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+            at async node:internal/modules/esm/loader:230:26
+            at async ModuleLoader.executeModuleJob (node:internal/modules/esm/loader:227:20)
+            at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+        
+        Node.js v24.16.0
+        
+      code: 'ERR_ASSERTION'
+      name: 'AssertionError'
+      expected: true
+      actual: false
+      operator: '=='
+      stack: |-
+        ensureLinuxSupervisorBinary (file:///opt/software-factory/packages/wna/src/index.ts:266:11)
+        LinuxCgroupV2SandboxBackend.spawnRealProcessInSandbox (file:///opt/software-factory/packages/wna/src/index.ts:797:23)
+        file:///opt/software-factory/[eval1]:3:30
+        ModuleJob.run (node:internal/modules/esm/module_job:439:25)
+        async node:internal/modules/esm/loader:230:26
+        async ModuleLoader.executeModuleJob (node:internal/modules/esm/loader:227:20)
+        async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5)
+        TestContext.<anonymous> (file:///opt/software-factory/packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts:72:90)
+        async Test.run (node:internal/test_runner/test:1313:7)
+        async Suite.processPendingSubtests (node:internal/test_runner/test:897:7)
+      ...
+    1..3
+not ok 1 - M6C-3 strict external Linux worker (no skips)
+  ---
+  duration_ms: 1340.1208
+  type: 'suite'
+  location: '/opt/software-factory/packages/test-harness/src/m6c3-worker-endpoint-linux-smoke.ts:29:1'
+  failureType: 'subtestsFailed'
+  error: '3 subtests failed'
+  code: 'ERR_TEST_FAILURE'
+  ...
+1..1
+# tests 3
+# suites 1
+# pass 0
+# fail 3
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1715.3029

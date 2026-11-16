@@ -1,0 +1,75 @@
+{
+  "schemaVersion": "sf-wsl2-guest-kernel-evidence-v1",
+  "status": "GUEST_KERNEL_TESTS_PASSED",
+  "recordedAtUtc": "2026-11-16T12:13:50.305515+00:00",
+  "sourceSha": "54bc0b9ff3b87435b2f22c5abcedb06cac5850a0",
+  "guestBootId": "61b8d50c-69e8-4ca3-bc40-51fa821de12e",
+  "kernel": "5.15.167.4-microsoft-standard-WSL2",
+  "osRelease": "PRETTY_NAME=\"Ubuntu 22.04.5 LTS\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"22.04\"\nVERSION=\"22.04.5 LTS (Jammy Jellyfish)\"\nVERSION_CODENAME=jammy\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.ubuntu.com/\"\nSUPPORT_URL=\"https://help.ubuntu.com/\"\nBUG_REPORT_URL=\"https://bugs.launchpad.net/ubuntu/\"\nPRIVACY_POLICY_URL=\"https://www.ubuntu.com/legal/terms-and-policies/privacy-policy\"\nUBUNTU_CODENAME=jammy\n",
+  "node": "v24.16.0",
+  "cpuCount": 2,
+  "memTotal": "MemTotal:        4015392 kB",
+  "cmdline": "initrd=\\initrd.img panic=-1 pty.legacy_count=0 nr_cpus=2 cgroup_no_v1=all",
+  "supervisorSha256": "a606e482ca08a1d081bda0f521b8d92aa91fd7be5399df134c91cfe0ad9fdc72",
+  "logs": {
+    "worker.tap": {
+      "sha256": "d9e9b7c7cdd6f0573dd76238e40380728d782dd04cf270a28c6e925498a2b83f",
+      "bytes": 1159,
+      "summary": {
+        "tests": 3,
+        "pass": 3,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    },
+    "native-bootstrap.tap": {
+      "sha256": "32bf55f427ad92ef2ee2e9be96c4c04991455a8ff278caeba6124d475cc19185",
+      "bytes": 458,
+      "summary": {
+        "tests": 1,
+        "pass": 1,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    },
+    "isolation.tap": {
+      "sha256": "584abe11d0e4dfd8a9c248ab13af4ecd12fee527f3d0e81bf3601f551e02b094",
+      "bytes": 5723,
+      "summary": {
+        "tests": 20,
+        "pass": 20,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    },
+    "network-cleanup.tap": {
+      "sha256": "69fc51d4786bc10e3ca4bc5cc211d951466251931dbb8ceb13cd30cfaff81687",
+      "bytes": 643,
+      "summary": {
+        "tests": 2,
+        "pass": 2,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0,
+        "todo": 0
+      }
+    }
+  },
+  "totalTests": 26,
+  "postchecks": {
+    "sameBootBeforeAfter": true,
+    "sourceCleanBeforeAfter": true,
+    "taskScopesRemaining": 0,
+    "cgroupPopulatedZero": true,
+    "no9pInTestServiceNamespace": true,
+    "noMountedWindowsDrivePaths": true,
+    "interopDisabledForTestRun": true
+  },
+  "scope": "real Windows WSL2 Linux kernel and local guest worker tests; fixture measured profile in bootstrap; no production Windows HTTPS connector/Core pipeline acceptance"
+}

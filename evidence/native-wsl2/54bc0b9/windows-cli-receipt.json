@@ -1,0 +1,24 @@
+{
+  "schemaVersion": "sf-wsl2-cli-native-v1",
+  "runtimeSourceSha": "54bc0b9ff3b87435b2f22c5abcedb06cac5850a0",
+  "hostPlatform": "win32",
+  "hostNode": "v24.16.0",
+  "probe": {
+    "backend": "wsl2",
+    "identity": "sf-native-acceptance",
+    "present": true,
+    "wslVersion": 2,
+    "state": "Stopped"
+  },
+  "kernel": "5.15.167.4-microsoft-standard-WSL2",
+  "checks": {
+    "exactIdentityAndWsl2": true,
+    "realGuestDiagnostic": true,
+    "emptyGuestEnvironment": true,
+    "lifecycleDeniedWithoutOptIn": true,
+    "missingIdentityRejected": true,
+    "scopedStartAndStop": true,
+    "dedicatedDistroStopped": true
+  },
+  "scope": "native Windows CLI foundation; not production worker HTTPS bridge"
+}
