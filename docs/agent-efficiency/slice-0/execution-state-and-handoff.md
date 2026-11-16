@@ -1,6 +1,6 @@
 # S0-C — Execution state map and checkpoint/handoff proposal
 
-Baseline:1f33a8b. This is a proposed contract for P1 review, not implemented runtime behavior.
+Baseline: 1f33a8b. This is a proposed contract for P1 review, not implemented runtime behavior.
 
 | Existing boundary | Source | Trusted evidence / limitation |
 |---|---|---|
@@ -20,7 +20,7 @@ Candidate checkpoint envelope: version/id/observedAt; execution and lease/genera
 
 Working-tree observations may race active writers. Snapshot from an isolated registered worktree or quiesce the generation, read/recheck stability, and publish only a complete stable capture. A mixed or interrupted capture remains DRAFT/uncertain and cannot carry VERIFIED tests. Do not reuse existing writable worker event payloads as authority by renaming them checkpoint.
 
-Memo has two layers: immutable verified checkpoint reference plus an untrusted scratchpad of at most15lines (decisions, traps, next step, reuse rationale). Proposed versioned states: DRAFT (incomplete/unverified), RECORDED (system durably stored observation; no automatic test claim), VERIFIED (required provenance/code-state checks succeeded), STALE (current SHA/fingerprint/generation mismatch). Missing verification leads recovery/reverification; recording alone does not mean verified. Scratchpad content is never policy, executable instructions or an approval token.
+Memo has two layers: immutable verified checkpoint reference plus an untrusted scratchpad of at most 15 lines (decisions, traps, next step, reuse rationale). Proposed versioned states: DRAFT (incomplete/unverified), RECORDED (system durably stored observation; no automatic test claim), VERIFIED (required provenance/code-state checks succeeded), STALE (current SHA/fingerprint/generation mismatch). Missing verification leads recovery/reverification; recording alone does not mean verified. Scratchpad content is never policy, executable instructions or an approval token.
 
 ## Takeover protocol and fencing
 
