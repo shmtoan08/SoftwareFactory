@@ -6,7 +6,6 @@
 #include <grp.h>
 #include <limits.h>
 #include <linux/capability.h>
-#include <linux/mount.h>
 #include <poll.h>
 #include <sched.h>
 #include <signal.h>
@@ -16,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+/* glibc 2.35 declares MS_* as enums; load them before Linux UAPI macros. */
+#include <linux/mount.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
