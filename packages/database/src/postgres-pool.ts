@@ -1,4 +1,5 @@
 import { ProjectReadCursorContextError, assertProjectReadRole, type ProjectReadInput, type ProjectReadRows } from "./project-read-projection.ts";
+import type { BudgetReadInput, BudgetReadRows } from "./budget-read-projection.ts";
 import { validateTargetAssignment, validateTargetLease } from "./execution-target-validation.ts";
 import { validateReconciliationApproval } from "./reconciliation-validation.ts";
 import { validateProductionApproval, validateDeploymentCompletion } from "./deployment-validation.ts";
@@ -2479,6 +2480,27 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       if (!exists.rowCount) throw new PostgresRlsError("23503", "Project not found");
       const rows = await this.pool.queryInActiveTx("SELECT project_id AS id, slug, name, default_branch, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM projects WHERE project_id=$1::uuid AND ($2::timestamptz IS NULL OR (updated_at,project_id)<($2::timestamptz,$3::uuid)) ORDER BY updated_at DESC, project_id DESC LIMIT $4::int;", [input.projectId, input.after?.updatedAt ?? null, input.after?.id ?? null, input.limit + 1]);
       return { fetchedAt: snapshotAt, projects: rows.rows.map((r) => ({ projectId: String(r.id), slug: String(r.slug), name: String(r.name), defaultBranch: String(r.default_branch), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })) };
+    }, input.deadlineAt);
+  }
+  public async readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows> {
+    return this.pool.withReadOnlyRlsTransaction({ currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service" }, async (snapshotAt) => {
+      const role = await this.pool.queryInActiveTx("SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;", [input.projectId, input.principalId]);
+      assertProjectReadRole(role.rows[0]?.member_role, input.signedRoles);
+      const project = await this.pool.queryInActiveTx("SELECT project_id FROM projects WHERE project_id=$1::uuid;", [input.projectId]);
+      if (!project.rowCount) throw new PostgresRlsError("23503", "Project not found");
+      const policies = await this.pool.queryInActiveTx("SELECT status, max_project_tokens::text AS tokens, max_project_cost_micro_usd::text AS cost, max_project_wall_time_ms::text AS wall, to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM project_budget_policies WHERE project_id=$1::uuid;", [input.projectId]);
+      const totals = await this.pool.queryInActiveTx(`SELECT
+        (SELECT COALESCE(sum(actual_total_tokens),0)::text FROM model_call_ledgers WHERE project_id=$1::uuid) AS tokens,
+        (SELECT COALESCE(sum(actual_cost_micro_usd),0)::text FROM model_call_ledgers WHERE project_id=$1::uuid) AS cost,
+        (SELECT COALESCE(sum(wall_time_ms),0)::text FROM resource_usage_metrics WHERE project_id=$1::uuid) AS wall,
+        EXISTS(SELECT 1 FROM model_call_ledgers WHERE project_id=$1::uuid AND usage_estimated=true) AS estimated,
+        EXISTS(SELECT 1 FROM budget_denial_intents WHERE project_id=$1::uuid AND status='PENDING') AS pending;`, [input.projectId]);
+      const p = policies.rows[0], t = totals.rows[0]!;
+      if (typeof t.estimated !== "boolean" || typeof t.pending !== "boolean") throw new Error("Invalid authoritative budget state");
+      return { projectId: input.projectId, fetchedAt: snapshotAt,
+        policy: p ? { status: String(p.status), updatedAt: String(p.updated_at), tokens: p.tokens === null ? null : String(p.tokens), costMicroUsd: p.cost === null ? null : String(p.cost), wallTimeMs: p.wall === null ? null : String(p.wall) } : null,
+        usage: { tokens: String(t.tokens), costMicroUsd: String(t.cost), wallTimeMs: String(t.wall) },
+        estimatedModelUsageIncluded: t.estimated, recoveryState: t.pending ? "pending" : "clear" };
     }, input.deadlineAt);
   }
   // Local fallback staging refs cache for synthetic (non-filesystem Git) reconciler tests

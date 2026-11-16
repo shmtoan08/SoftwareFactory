@@ -1,4 +1,5 @@
 import { ProjectReadProjectionService, PROJECT_READ_ROLES } from "./project-read-projection.ts";
+import { BudgetReadProjectionService } from "./budget-read-projection.ts";
 export * from "./project-read-projection.ts";
 import { ExecutionTargetBroker, validateTargetId, type ExecutionTargetConfiguration, type AssignExecutionTargetInput } from "./execution-target-broker.ts";
 export * from "./execution-target-broker.ts";
@@ -385,6 +386,7 @@ export class CoreApiService {
   public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
   private readonly projectReads: ProjectReadProjectionService;
+  private readonly budgetReads: BudgetReadProjectionService;
   private readonly executionTargetBroker: ExecutionTargetBroker;
   private readonly productionDeploymentReconciler: ProductionDeploymentReconciler;
   private readonly productionDeploymentGate: ProductionDeploymentGate;
@@ -437,6 +439,7 @@ export class CoreApiService {
           }),
       });
     this.projectReads = new ProjectReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES), (data) => this.authenticator.signProjectReadCursor(data));
+    this.budgetReads = new BudgetReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES));
     this.pipelineService =
       options?.pipelineService ??
       new ProductPipelineService({
@@ -451,6 +454,10 @@ export class CoreApiService {
 
   public readProjectProjection(auth: CoreApiAuthContext, projectId: string | undefined, query = new URLSearchParams()) {
     return this.projectReads.read(auth, projectId, query);
+  }
+
+  public readBudgetProjection(auth: CoreApiAuthContext, projectId: string, query = new URLSearchParams()) {
+    return this.budgetReads.read(auth, projectId, query);
   }
 
   private emitWarning(warning: CoreApiWarning): void {

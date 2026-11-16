@@ -458,6 +458,15 @@ export class CoreApiHttpServer {
         return;
       }
 
+      const budgetRead = pathname.match(/^\/api\/v1\/projects\/([^/]+)\/budget-snapshot$/);
+      if (method === "GET" && budgetRead?.[1]) {
+        let projectId: string;
+        try { projectId = decodeURIComponent(budgetRead[1]); }
+        catch { throw new ReadProjectionError(400, "ERR_READ_QUERY_INVALID"); }
+        this.sendJson(res, 200, await this.coreApi.readBudgetProjection(auth, projectId, url.searchParams));
+        return;
+      }
+
       const budgetRoute = pathname.match(/^\/api\/v1\/projects\/([^/]+)(?:\/tasks\/([^/]+))?\/budget(?:\/(resume))?$/);
       if (budgetRoute?.[1]) {
         const projectId = decodeURIComponent(budgetRoute[1]);

@@ -1,4 +1,5 @@
 import type { ProjectReadInput, ProjectReadRows } from "./project-read-projection.ts";
+import type { BudgetReadInput, BudgetReadRows } from "./budget-read-projection.ts";
 import type {
   AgentOrgRole,
   AgentOrganizationProfileRecord,
@@ -525,6 +526,7 @@ export interface RecordReleaseAcceptancePackageInput {
  */
 export interface ControlPlaneStore {
   readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows>;
+  readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows>;
   clockTimestampIso(): string | Promise<string>;
   assertOutsideTransaction(): void;
   withRlsTransaction<T>(

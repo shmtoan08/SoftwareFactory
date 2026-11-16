@@ -1,4 +1,6 @@
 export * from "./project-read-projection.ts";
+export * from "./budget-read-projection.ts";
+import { storedBudgetInteger, type BudgetReadInput, type BudgetReadRows } from "./budget-read-projection.ts";
 import { ProjectReadCursorContextError, assertProjectReadRole, readTimestamp, type ProjectReadInput, type ProjectReadRows } from "./project-read-projection.ts";
 import { validateTargetAssignment, validateTargetLease, validateTargetVerification } from "./execution-target-validation.ts";
 export { executionProfileSnapshot, executionProfileSha } from "./execution-target-validation.ts";
@@ -571,6 +573,34 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       createdAt: readTimestamp(project.created_at), updatedAt: readTimestamp(project.updated_at) };
     const beforeAnchor = !input.after || dto.updatedAt < input.after.updatedAt || (dto.updatedAt === input.after.updatedAt && dto.projectId < input.after.id);
     return { fetchedAt, projects: beforeAnchor ? [dto] : [] };
+  }
+
+  public async readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows> {
+    this.assertOutsideTransaction();
+    if (this.asyncLocalStorage.getStore()) throw new Error("Nested projection transaction");
+    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+    assertProjectReadRole(this.projectMemberships.get(`${input.projectId}:${input.principalId}`)?.member_role, input.signedRoles);
+    if (!this.projects.has(input.projectId)) throw new PostgresRlsError("23503", "Project not found");
+    const policy = this.projectBudgetPolicies.get(input.projectId);
+    const limit = (n: number | null) => n === null ? null : storedBudgetInteger(n).toString();
+    let tokens = 0n, cost = 0n, wall = 0n, estimated = false;
+    for (const row of this.modelCallLedgers.values()) {
+      if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+      if (row.project_id !== input.projectId) continue;
+      tokens += storedBudgetInteger(row.actual_total_tokens); cost += storedBudgetInteger(row.actual_cost_micro_usd);
+      if (typeof row.usage_estimated !== "boolean") throw new Error("Invalid stored estimation marker");
+      estimated ||= row.usage_estimated;
+    }
+    for (const row of this.resourceUsageMetrics.values()) {
+      if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+      if (row.project_id !== input.projectId) continue;
+      wall += storedBudgetInteger(row.wall_time_ms);
+    }
+    if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+    return { projectId: input.projectId, fetchedAt, policy: policy ? { status: policy.status, updatedAt: readTimestamp(policy.updated_at),
+      tokens: limit(policy.max_project_tokens), costMicroUsd: limit(policy.max_project_cost_micro_usd), wallTimeMs: limit(policy.max_project_wall_time_ms) } : null,
+      usage: { tokens: tokens.toString(), costMicroUsd: cost.toString(), wallTimeMs: wall.toString() },
+      estimatedModelUsageIncluded: estimated, recoveryState: "unknown" };
   }
 
   public getProjectById(projectId: string): ProjectRecord | null {
