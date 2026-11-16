@@ -1,0 +1,26 @@
+{
+  "sourceSha": "1f33a8bb77e80131eeac802d8875ec28e12d5a25",
+  "representativeRealTaskSamples": 0,
+  "measurementStatus": "MISSING_RUNTIME_DATASET_AND_EXECUTION_ATTRIBUTION",
+  "actualTotalTokens": null,
+  "cachedInputTokens": null,
+  "uncachedInputTokens": null,
+  "p50": null,
+  "p75": null,
+  "budgets": {
+    "S": null,
+    "M": null,
+    "L": null
+  },
+  "initialColdStartTargetTokens": 25000,
+  "targetStatus": "owner brief initial target; not measured or enforced",
+  "providerCallsExecutedForAudit": 0,
+  "fixtureUsageIncludedAsReal": false,
+  "gaps": [
+    "No supplied production task usage dataset",
+    "ModelCallLedgerRecord lacks execution/lease generation attribution, layer breakdown and persisted cached/uncached counters",
+    "Anthropic cache counters summed into input; raw provider usage transient in ModelUsageMetrics",
+    "Estimated byte/token fallbacks cannot count as verified telemetry",
+    "No authoritative first meaningful action marker or handoff/rework grouping"
+  ]
+}

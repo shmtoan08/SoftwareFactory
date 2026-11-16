@@ -1,0 +1,158 @@
+[
+  {
+    "workspace": "apps/agent-gateway",
+    "exit": 0,
+    "seconds": 1.359,
+    "counts": {
+      "exports": 0,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "apps/core-api",
+    "exit": 0,
+    "seconds": 0.993,
+    "counts": {
+      "exports": 1,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "apps/web",
+    "exit": 0,
+    "seconds": 1.043,
+    "counts": {
+      "exports": 0,
+      "dependencies": 1,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/adapter-sdk",
+    "exit": 0,
+    "seconds": 0.98,
+    "counts": {
+      "exports": 6,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/database",
+    "exit": 0,
+    "seconds": 1.012,
+    "counts": {
+      "exports": 7,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/observability",
+    "exit": 0,
+    "seconds": 0.901,
+    "counts": {
+      "exports": 3,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/product-pipeline",
+    "exit": 0,
+    "seconds": 0.985,
+    "counts": {
+      "exports": 13,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/reviewer",
+    "exit": 0,
+    "seconds": 0.974,
+    "counts": {
+      "exports": 1,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/shared-types",
+    "exit": 0,
+    "seconds": 1.002,
+    "counts": {
+      "exports": 2,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/task-contract",
+    "exit": 0,
+    "seconds": 1.046,
+    "counts": {
+      "exports": 1,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/test-harness",
+    "exit": 0,
+    "seconds": 1.044,
+    "counts": {
+      "exports": 0,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/verifier",
+    "exit": 0,
+    "seconds": 0.944,
+    "counts": {
+      "exports": 7,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  },
+  {
+    "workspace": "packages/wna",
+    "exit": 0,
+    "seconds": 0.969,
+    "counts": {
+      "exports": 8,
+      "dependencies": 0,
+      "unlisted": 0,
+      "unresolved": 0,
+      "files": 0
+    }
+  }
+]

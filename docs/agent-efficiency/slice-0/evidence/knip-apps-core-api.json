@@ -1,0 +1,21 @@
+{
+  "issues": [
+    {
+      "file": "apps/core-api/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildM5EvidenceBundle",
+          "line": 3027,
+          "col": 17,
+          "pos": 121999
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

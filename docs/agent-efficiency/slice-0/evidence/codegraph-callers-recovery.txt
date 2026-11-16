@@ -1,0 +1,10 @@
+
+Callers of "recoverBudgetDenials" (2):
+
+method PostgresControlPlaneRepository::recoverBudgetDenials (typescript) — packages/database/src/postgres-pool.ts:8139
+method      getProjectBudgetSnapshot
+  packages/database/src/postgres-pool.ts:7910
+
+method      assertBudgetAllowsExecutionSql
+  packages/database/src/postgres-pool.ts:8081
+

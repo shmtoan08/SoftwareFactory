@@ -1,0 +1,21 @@
+{
+  "issues": [
+    {
+      "file": "apps/web/package.json",
+      "dependencies": [
+        {
+          "name": "@software-factory/observability",
+          "line": 11,
+          "col": 6,
+          "pos": 225
+        }
+      ],
+      "devDependencies": [],
+      "exports": [],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

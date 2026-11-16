@@ -1,0 +1,79 @@
+{
+  "issues": [
+    {
+      "file": "packages/database/src/m6a-validation.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "STAGE_TO_ARTIFACT_KIND",
+          "line": 26,
+          "col": 14,
+          "pos": 655
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/database/src/m6b-validation.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "AGENT_ORG_ROLES",
+          "line": 24,
+          "col": 14,
+          "pos": 614
+        },
+        {
+          "name": "EXECUTION_TARGET_TYPES",
+          "line": 31,
+          "col": 14,
+          "pos": 741
+        },
+        {
+          "name": "TARGET_TRUST_TIERS",
+          "line": 38,
+          "col": 14,
+          "pos": 921
+        },
+        {
+          "name": "EXPECTED_TRUST_TIER_BY_TARGET",
+          "line": 45,
+          "col": 14,
+          "pos": 1093
+        },
+        {
+          "name": "validateAllowedFilesAgainstProtectedAndForbidden",
+          "line": 476,
+          "col": 17,
+          "pos": 16529
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/database/src/postgres-pool.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "PostgresQueryError",
+          "line": 202,
+          "col": 14,
+          "pos": 6686
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

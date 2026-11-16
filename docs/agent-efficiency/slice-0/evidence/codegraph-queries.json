@@ -1,0 +1,23 @@
+[
+  {
+    "query": "callers-recovery",
+    "exit": 0,
+    "seconds": 0.557,
+    "stdoutBytes": 336,
+    "stderrBytes": 0
+  },
+  {
+    "query": "explore-project-read",
+    "exit": 0,
+    "seconds": 0.69,
+    "stdoutBytes": 16389,
+    "stderrBytes": 0
+  },
+  {
+    "query": "node-revoke",
+    "exit": 0,
+    "seconds": 0.395,
+    "stdoutBytes": 8399,
+    "stderrBytes": 0
+  }
+]

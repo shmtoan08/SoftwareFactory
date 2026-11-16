@@ -1,0 +1,68 @@
+{
+  "issues": [
+    {
+      "file": "packages/verifier/src/candidate-builder.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "DEFAULT_EPHEMERAL_SNAPSHOT_TTL_MS",
+          "line": 19,
+          "col": 14,
+          "pos": 438
+        },
+        {
+          "name": "sha256File",
+          "line": 97,
+          "col": 17,
+          "pos": 2829
+        },
+        {
+          "name": "assertArchiveContainsNoGitOrTraversal",
+          "line": 152,
+          "col": 17,
+          "pos": 4564
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/verifier/src/docker-verifier.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "FORBIDDEN_VERIFIER_ENV_PATTERNS",
+          "line": 168,
+          "col": 14,
+          "pos": 6182
+        },
+        {
+          "name": "verifyProtectedBaselineIntegrity",
+          "line": 535,
+          "col": 17,
+          "pos": 17214
+        },
+        {
+          "name": "resolveArtifactRelativePath",
+          "line": 1653,
+          "col": 17,
+          "pos": 57372
+        },
+        {
+          "name": "ensureParentDir",
+          "line": 1657,
+          "col": 17,
+          "pos": 57513
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

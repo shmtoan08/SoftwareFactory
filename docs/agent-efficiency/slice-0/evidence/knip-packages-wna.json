@@ -1,0 +1,96 @@
+{
+  "issues": [
+    {
+      "file": "packages/wna/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "MAX_OUTBOX_LINE_BYTES",
+          "line": 35,
+          "col": 14,
+          "pos": 863
+        },
+        {
+          "name": "MAX_OUTBOX_FILE_BYTES",
+          "line": 36,
+          "col": 14,
+          "pos": 919
+        },
+        {
+          "name": "Wsl2VmBackend",
+          "line": 1839,
+          "col": 3,
+          "pos": 61391
+        },
+        {
+          "name": "LimaVmBackend",
+          "line": 1847,
+          "col": 3,
+          "pos": 61645
+        },
+        {
+          "name": "FirecrackerApiClient",
+          "line": 1855,
+          "col": 10,
+          "pos": 61934
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/wna/src/vm-wsl2-backend.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildMinimalHostEnv",
+          "line": 152,
+          "col": 17,
+          "pos": 6556
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/wna/src/vm-lima-backend.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildMinimalHostEnv",
+          "line": 124,
+          "col": 17,
+          "pos": 5608
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/wna/src/worker-endpoint.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "validateWorkerAction",
+          "line": 38,
+          "col": 17,
+          "pos": 2500
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

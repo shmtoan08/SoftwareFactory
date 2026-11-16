@@ -1,0 +1,218 @@
+**4 definitions named "revokeTaskLease"**
+Returning 4 in full — pick the one you need (no Read required).
+
+**revokeTaskLease** (method)
+
+**Location:** apps/core-api/src/index.ts:842
+**Signature:** `(
+    projectId: string,
+    auth: CoreApiAuthContext,
+    input: {
+      task_id: string;
+      lease_id: string;
+      reason: string;
+      requeueTask?: boolean;
+    }
+  ): Promise<TaskLeaseRecord>`
+
+```typescript
+842	  public revokeTaskLease(
+843	    projectId: string,
+844	    auth: CoreApiAuthContext,
+845	    input: {
+846	      task_id: string;
+847	      lease_id: string;
+848	      reason: string;
+849	      requeueTask?: boolean;
+850	    }
+851	  ): Promise<TaskLeaseRecord> {
+852	    return this.withAuthorizedRlsTransaction(auth, projectId, MUTATION_ROLES, () =>
+853	      this.store.revokeTaskLease({
+854	        project_id: projectId,
+855	        ...input,
+856	      })
+857	    );
+858	  }
+```
+**Trail — codegraph_node any of these to follow it (no Read needed)**
+**Calls →** withAuthorizedRlsTransaction (apps/core-api/src/index.ts:546), revokeTaskLease (packages/database/src/types.ts:586), MUTATION_ROLES (apps/core-api/src/index.ts:190), TaskLeaseRecord (packages/shared-types/src/index.ts:211), CoreApiAuthContext (apps/core-api/src/index.ts:173)
+**Called by ←** m1-acceptance.test.ts (packages/test-harness/src/m1-acceptance.test.ts:1), handleRequest (apps/core-api/src/http-server.ts:432)
+
+---
+
+**revokeTaskLease** (method)
+
+**Location:** packages/database/src/index.ts:1168
+**Signature:** `(input: {
+    project_id: string;
+    task_id: string;
+    lease_id: string;
+    reason: string;
+    requeueTask?: boolean;
+  }): Promise<TaskLeaseRecord>`
+
+Atomic Lease Revocation Transaction (MVP-SPEC-02 Section 4 & MVP-SPEC-03 Section 1.2)
+Acquires the exact same canonical lock (`task_leases` -> `tasks`).
+
+```typescript
+1168	  public async revokeTaskLease(input: {
+1169	    project_id: string;
+1170	    task_id: string;
+1171	    lease_id: string;
+1172	    reason: string;
+1173	    requeueTask?: boolean;
+1174	  }): Promise<TaskLeaseRecord> {
+1175	    this.assertWritePermissionForProject(input.project_id);
+1176	
+1177	    return this.withSerializedLock(`task:${input.task_id}`, () => {
+1178	      const nowIso = this.clockTimestampIso();
+1179	      const lease = this.taskLeases.get(input.lease_id);
+1180	      const task = this.tasks.get(input.task_id);
+1181	      if (!lease || !task || lease.project_id !== input.project_id) {
+1182	        throw new Error(`Lease ${input.lease_id} not found`);
+1183	      }
+1184	
+1185	      if (lease.status === "ACTIVE") {
+1186	        lease.status = "REVOKED";
+1187	        lease.revoked_at = nowIso;
+1188	        lease.revoke_reason = input.reason;
+1189	      }
+1190	      if (task.active_lease_id === lease.lease_id) {
+1191	        task.active_lease_id = null;
+1192	        if (task.status === "Leased" || task.status === "ExecutingInTarget") {
+1193	          task.status = input.requeueTask ? "Ready" : "ManualIntervention";
+1194	        }
+1195	        task.updated_at = nowIso;
+1196	      }
+1197	
+1198	      this.insertOutboxEventInternal(
+1199	        input.project_id,
+1200	        "task_lease",
+1201	        lease.lease_id,
+1202	        "lease.revoked",
+1203	        {
+1204	          task_id: task.task_id,
+1205	          lease_id: lease.lease_id,
+1206	          lease_epoch: lease.lease_epoch,
+1207	          reason: input.reason,
+1208	        }
+1209	      );
+1210	
+1211	      return { ...lease };
+1212	    });
+1213	  }
+```
+**Trail — codegraph_node any of these to follow it (no Read needed)**
+**Calls →** clockTimestampIso (packages/database/src/index.ts:263), withSerializedLock (packages/database/src/index.ts:464), insertOutboxEventInternal (packages/database/src/index.ts:7308), assertWritePermissionForProject (packages/database/src/index.ts:427), TaskLeaseRecord (packages/shared-types/src/index.ts:211)
+**Called by ←** m2-acceptance.test.ts (packages/test-harness/src/m2-acceptance.test.ts:1)
+
+---
+
+**revokeTaskLease** (method)
+
+**Location:** packages/database/src/postgres-pool.ts:3381
+**Signature:** `(input: {
+    project_id: string;
+    task_id: string;
+    lease_id: string;
+    reason: string;
+    requeueTask?: boolean;
+  }): Promise<TaskLeaseRecord>`
+
+```typescript
+3381	  public async revokeTaskLease(input: {
+3382	    project_id: string;
+3383	    task_id: string;
+3384	    lease_id: string;
+3385	    reason: string;
+3386	    requeueTask?: boolean;
+3387	  }): Promise<TaskLeaseRecord> {
+3388	    return this.withExistingOrRlsTransaction(
+3389	      {
+3390	        currentProjectId: input.project_id,
+3391	        currentPrincipalId: "core_api_service",
+3392	        currentRole: "core_api_service",
+3393	      },
+3394	      async () => {
+3395	        try {
+3396	          const lockRes = await this.pool.queryInActiveTx(
+3397	            `SELECT l.*, t.active_lease_id, t.status AS task_status
+3398	             FROM task_leases l
+3399	             INNER JOIN tasks t ON t.task_id = l.task_id AND t.project_id = l.project_id
+3400	             WHERE l.lease_id = $1::uuid AND l.task_id = $2::uuid AND l.project_id = $3::uuid
+3401	             FOR UPDATE OF l, t;`,
+3402	            [input.lease_id, input.task_id, input.project_id]
+3403	          );
+3404	          const row = lockRes.rows[0];
+3405	          if (!row) {
+3406	            throw new Error(`Lease ${input.lease_id} not found`);
+3407	          }
+3408	
+3409	          let updatedLease = mapLeaseRow(row);
+3410	          if (updatedLease.status === "ACTIVE") {
+3411	            const res = await this.pool.queryInActiveTx(
+3412	              `UPDATE task_leases SET status = 'REVOKED', revoked_at = clock_timestamp(), revoke_reason = $1::text
+3413	               WHERE lease_id = $2::uuid RETURNING *;`,
+3414	              [input.reason, input.lease_id]
+3415	            );
+3416	            updatedLease = mapLeaseRow(res.rows[0]!);
+3417	          }
+3418	
+3419	          if (String(row.active_lease_id ?? "") === input.lease_id) {
+3420	            const curTaskStatus = String(row.task_status) as TaskStatus;
+3421	            const nextTaskStatus: TaskStatus =
+3422	              curTaskStatus === "Leased" || curTaskStatus === "ExecutingInTarget"
+3423	                ? input.requeueTask
+3424	                  ? "Ready"
+3425	                  : "ManualIntervention"
+3426	                : curTaskStatus;
+3427	            await this.pool.queryInActiveTx(
+3428	              `UPDATE tasks SET active_lease_id = NULL, status = $1::text, updated_at = clock_timestamp()
+3429	               WHERE task_id = $2::uuid;`,
+3430	              [nextTaskStatus, input.task_id]
+3431	            );
+3432	          }
+3433	
+3434	          await this.insertOutboxEventSql(input.project_id, "task_lease", input.lease_id, "lease.revoked", {
+3435	            task_id: input.task_id,
+3436	            lease_id: input.lease_id,
+3437	            lease_epoch: updatedLease.lease_epoch,
+3438	            reason: input.reason,
+3439	          });
+3440	
+3441	          return updatedLease;
+3442	        } catch (error) {
+3443	          mapPgError(error);
+3444	        }
+3445	      }
+3446	    );
+3447	  }
+```
+**Trail — codegraph_node any of these to follow it (no Read needed)**
+**Calls →** mapPgError (packages/database/src/postgres-pool.ts:1574), mapLeaseRow (packages/database/src/postgres-pool.ts:1645), insertOutboxEventSql (packages/database/src/postgres-pool.ts:2519), withExistingOrRlsTransaction (packages/database/src/postgres-pool.ts:2509), queryInActiveTx (packages/database/src/postgres-pool.ts:1492), TaskLeaseRecord (packages/shared-types/src/index.ts:211), TaskStatus (packages/shared-types/src/index.ts:8)
+
+---
+
+**revokeTaskLease** (method)
+
+**Location:** packages/database/src/types.ts:586
+**Signature:** `(input: {
+    project_id: string;
+    task_id: string;
+    lease_id: string;
+    reason: string;
+    requeueTask?: boolean;
+  }): Promise<TaskLeaseRecord>`
+
+```typescript
+586	  revokeTaskLease(input: {
+587	    project_id: string;
+588	    task_id: string;
+589	    lease_id: string;
+590	    reason: string;
+591	    requeueTask?: boolean;
+592	  }): Promise<TaskLeaseRecord>;
+```
+**Trail — codegraph_node any of these to follow it (no Read needed)**
+**Calls →** TaskLeaseRecord (packages/shared-types/src/index.ts:211)
+**Called by ←** failures (packages/test-harness/src/m6c3-targets.test.ts:126), revokeTaskLease (apps/core-api/src/index.ts:842)

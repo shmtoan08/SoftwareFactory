@@ -1,0 +1,535 @@
+{
+  "issues": [
+    {
+      "file": "apps/web/package.json",
+      "dependencies": [
+        {
+          "name": "@software-factory/observability",
+          "line": 11,
+          "col": 6,
+          "pos": 225
+        }
+      ],
+      "devDependencies": [],
+      "exports": [],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/shared-types/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "TERMINAL_WORKER_EVENT_TYPES",
+          "line": 40,
+          "col": 14,
+          "pos": 985
+        },
+        {
+          "name": "isValidTaskStateTransition",
+          "line": 120,
+          "col": 17,
+          "pos": 3371
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/task-contract/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "DEFAULT_MAX_BLOB_BYTES",
+          "line": 36,
+          "col": 14,
+          "pos": 911
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/wna/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "MAX_OUTBOX_LINE_BYTES",
+          "line": 35,
+          "col": 14,
+          "pos": 863
+        },
+        {
+          "name": "MAX_OUTBOX_FILE_BYTES",
+          "line": 36,
+          "col": 14,
+          "pos": 919
+        },
+        {
+          "name": "Wsl2VmBackend",
+          "line": 1839,
+          "col": 3,
+          "pos": 61391
+        },
+        {
+          "name": "LimaVmBackend",
+          "line": 1847,
+          "col": 3,
+          "pos": 61645
+        },
+        {
+          "name": "FirecrackerApiClient",
+          "line": 1855,
+          "col": 10,
+          "pos": 61934
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "apps/core-api/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildM5EvidenceBundle",
+          "line": 3027,
+          "col": 17,
+          "pos": 121999
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/observability/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "generateTraceId",
+          "line": 72,
+          "col": 17,
+          "pos": 2611
+        },
+        {
+          "name": "generateSpanId",
+          "line": 76,
+          "col": 17,
+          "pos": 2700
+        },
+        {
+          "name": "redactTelemetryValue",
+          "line": 135,
+          "col": 17,
+          "pos": 4486
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/wna/src/vm-wsl2-backend.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildMinimalHostEnv",
+          "line": 152,
+          "col": 17,
+          "pos": 6556
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/wna/src/vm-lima-backend.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildMinimalHostEnv",
+          "line": 124,
+          "col": 17,
+          "pos": 5608
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/reviewer/src/independent-reviewer.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "analyzeTier3AgentTests",
+          "line": 578,
+          "col": 17,
+          "pos": 17661
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/verifier/src/candidate-builder.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "DEFAULT_EPHEMERAL_SNAPSHOT_TTL_MS",
+          "line": 19,
+          "col": 14,
+          "pos": 438
+        },
+        {
+          "name": "sha256File",
+          "line": 97,
+          "col": 17,
+          "pos": 2829
+        },
+        {
+          "name": "assertArchiveContainsNoGitOrTraversal",
+          "line": 152,
+          "col": 17,
+          "pos": 4564
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/verifier/src/docker-verifier.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "FORBIDDEN_VERIFIER_ENV_PATTERNS",
+          "line": 168,
+          "col": 14,
+          "pos": 6182
+        },
+        {
+          "name": "verifyProtectedBaselineIntegrity",
+          "line": 535,
+          "col": 17,
+          "pos": 17214
+        },
+        {
+          "name": "resolveArtifactRelativePath",
+          "line": 1653,
+          "col": 17,
+          "pos": 57372
+        },
+        {
+          "name": "ensureParentDir",
+          "line": 1657,
+          "col": 17,
+          "pos": 57513
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/product-pipeline/src/prompts.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "STAGE1_DISCOVERY_PROMPT_VERSION",
+          "line": 8,
+          "col": 14,
+          "pos": 275
+        },
+        {
+          "name": "STAGE2_REQUIREMENTS_PROMPT_VERSION",
+          "line": 11,
+          "col": 14,
+          "pos": 409
+        },
+        {
+          "name": "STAGE3_ARCHITECTURE_PROMPT_VERSION",
+          "line": 14,
+          "col": 14,
+          "pos": 544
+        },
+        {
+          "name": "STAGE7_PLANNING_PROMPT_VERSION",
+          "line": 20,
+          "col": 14,
+          "pos": 817
+        },
+        {
+          "name": "STAGE1_DISCOVERY_OUTPUT_SCHEMA",
+          "line": 22,
+          "col": 14,
+          "pos": 873
+        },
+        {
+          "name": "STAGE2_REQUIREMENTS_OUTPUT_SCHEMA",
+          "line": 111,
+          "col": 14,
+          "pos": 3525
+        },
+        {
+          "name": "STAGE3_ARCHITECTURE_OUTPUT_SCHEMA",
+          "line": 157,
+          "col": 14,
+          "pos": 4758
+        },
+        {
+          "name": "STAGE4_CONSISTENCY_CHECK_OUTPUT_SCHEMA",
+          "line": 316,
+          "col": 14,
+          "pos": 9703
+        },
+        {
+          "name": "STAGE7_PLANNING_OUTPUT_SCHEMA",
+          "line": 357,
+          "col": 14,
+          "pos": 11057
+        },
+        {
+          "name": "STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC",
+          "line": 484,
+          "col": 14,
+          "pos": 14741
+        },
+        {
+          "name": "STAGE7_PLANNING_PROMPT_SPEC",
+          "line": 513,
+          "col": 14,
+          "pos": 15875
+        },
+        {
+          "name": "DEFAULT_PIPELINE_PROMPT_TEMPLATES",
+          "line": 555,
+          "col": 14,
+          "pos": 17884
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/product-pipeline/src/traceability.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildBidirectionalTraceabilityMatrixInTx",
+          "line": 288,
+          "col": 23,
+          "pos": 9722
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/wna/src/worker-endpoint.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "validateWorkerAction",
+          "line": 38,
+          "col": 17,
+          "pos": 2500
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/adapter-sdk/src/structured-output.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "validateAgainstJsonSchema",
+          "line": 119,
+          "col": 17,
+          "pos": 3771
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/adapter-sdk/src/cost-guard.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "evaluatePostcallLimits",
+          "line": 25,
+          "col": 10,
+          "pos": 606
+        },
+        {
+          "name": "evaluatePreflightLimits",
+          "line": 25,
+          "col": 34,
+          "pos": 630
+        },
+        {
+          "name": "DEFAULT_MODEL_PRICING_CATALOG",
+          "line": 62,
+          "col": 14,
+          "pos": 1895
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/adapter-sdk/src/codex-cli.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "CODEX_EMULATOR_CREDENTIAL",
+          "line": 18,
+          "col": 14,
+          "pos": 960
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/adapter-sdk/src/execution-targets.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "HttpExecutionTargetConnector",
+          "line": 40,
+          "col": 14,
+          "pos": 1974
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/database/src/m6a-validation.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "STAGE_TO_ARTIFACT_KIND",
+          "line": 26,
+          "col": 14,
+          "pos": 655
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/database/src/m6b-validation.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "AGENT_ORG_ROLES",
+          "line": 24,
+          "col": 14,
+          "pos": 614
+        },
+        {
+          "name": "EXECUTION_TARGET_TYPES",
+          "line": 31,
+          "col": 14,
+          "pos": 741
+        },
+        {
+          "name": "TARGET_TRUST_TIERS",
+          "line": 38,
+          "col": 14,
+          "pos": 921
+        },
+        {
+          "name": "EXPECTED_TRUST_TIER_BY_TARGET",
+          "line": 45,
+          "col": 14,
+          "pos": 1093
+        },
+        {
+          "name": "validateAllowedFilesAgainstProtectedAndForbidden",
+          "line": 476,
+          "col": 17,
+          "pos": 16529
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/database/src/postgres-pool.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "PostgresQueryError",
+          "line": 202,
+          "col": 14,
+          "pos": 6686
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

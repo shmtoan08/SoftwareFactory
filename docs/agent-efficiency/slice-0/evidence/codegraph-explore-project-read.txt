@@ -1,0 +1,218 @@
+**Exploration: readProjectProjection authorization transaction**
+
+Found 76 symbols across 4 files.
+
+**Blast radius — what depends on these (update/verify before editing)**
+
+- `readProjectProjection` (packages/database/src/index.ts:560) — 1 caller in `packages/database/src/types.ts`; no tests found within 3 caller hops
+- `readProjectProjection` (packages/database/src/postgres-pool.ts:2473) — 1 caller in `packages/database/src/types.ts`; no tests found within 3 caller hops
+- `readProjectProjection` (packages/database/src/types.ts:527) — 1 caller in `apps/core-api/src/project-read-projection.ts`; no tests found within 3 caller hops
+- `readProjectProjection` (apps/core-api/src/index.ts:452) — 1 caller in `apps/core-api/src/http-server.ts`; tested via callers: `packages/test-harness/src/m5-acceptance.test.ts`, `packages/test-harness/src/m6a-acceptance.test.ts` +8
+- `read` (apps/core-api/src/project-read-projection.ts:53) — 1 caller in `apps/core-api/src/index.ts`; no tests found within 3 caller hops
+
+**Source Code**
+
+> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.
+
+**`packages/database/src/index.ts`** — references(references), createTask(method), grantTaskLease(method), instantiates(instantiates), getLeaseSyncStatus(method), +31 more
+
+```typescript
+171	 * Lease/Event Coordinator, 3D Independent Reviewer Guard, 8-Field Approval Binding & TTL,
+172	 * and Idempotent Atomic CAS Merge + Post-Merge Reconciler (MVP-SPEC-02, MVP-SPEC-03, MVP-SPEC-04).
+173	 */
+174	export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
+175	  private clockFn: () => Date;
+176	  private readonly asyncLocalStorage = new AsyncLocalStorage<RlsSessionContext>();
+177	  private readonly txUndoStorage = new AsyncLocalStorage<{
+178	    readonly session: RlsSessionContext;
+
+... (gap: defaultSession (packages/database/src/index.ts:183), lockQueues (packages/database/src/index.ts:190), projects (packages/database/src/index.ts:193), projectMemberships (packages/database/src/index.ts:194), tasks (packages/database/src/index.ts:195), taskLeases (packages/database/src/index.ts:196), +52 more) ...
+
+408	    };
+409	  }
+410	
+411	  public assertOutsideTransaction(): void {
+412	    if (this.txUndoStorage.getStore()) throw new PostgresRlsError("23514", "Production execution requires its own committed transaction");
+413	  }
+414	
+415	  public getCurrentRlsSession(): RlsSessionContext {
+416	    return this.asyncLocalStorage.getStore() ?? { ...this.defaultSession };
+417	  }
+418	
+419	  private requireCurrentProjectId(): string | null {
+420	    const pid = this.getCurrentRlsSession().currentProjectId;
+421	    if (!pid || pid.trim() === "") {
+422	      return null;
+423	    }
+424	    return pid;
+425	  }
+426	
+427	  private assertWritePermissionForProject(targetProjectId: string): void {
+428	    const session = this.getCurrentRlsSession();
+
+... (gap) ...
+
+557	  }
+558	
+559	  /** Independent synchronous snapshot: no transaction context mutation, recovery or live getters. */
+560	  public async readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows> {
+561	    this.assertOutsideTransaction();
+562	    if (this.asyncLocalStorage.getStore()) throw new Error("Nested projection transaction");
+563	    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+564	    const membership = this.projectMemberships.get(`${input.projectId}:${input.principalId}`);
+565	    assertProjectReadRole(membership?.member_role, input.signedRoles);
+566	    if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+567	    if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+568	    const project = this.projects.get(input.projectId);
+569	    if (!project) throw new PostgresRlsError("23503", "Project not found");
+570	    const dto = { projectId: project.project_id, slug: project.slug, name: project.name, defaultBranch: project.default_branch,
+571	      createdAt: readTimestamp(project.created_at), updatedAt: readTimestamp(project.updated_at) };
+572	    const beforeAnchor = !input.after || dto.updatedAt < input.after.updatedAt || (dto.updatedAt === input.after.updatedAt && dto.projectId < input.after.id);
+573	    return { fetchedAt, projects: beforeAnchor ? [dto] : [] };
+574	  }
+575	
+576	  public getProjectById(projectId: string): ProjectRecord | null {
+577	    const project = this.projects.get(projectId);
+
+... (gap) ...
+
+5725	    this.setInMap(this.reconciliationApprovals,id,{...approval,status:"REVOKED"});
+5726	    this.insertOutboxEventInternal(projectId,"production_reconciliation",id,"deployment.reconciliation_revoked",{reconciliation_approval_id:id});
+5727	  }
+5728	  public getProductionReconciliationApproval(id: string): ProductionReconciliationApprovalRecord | null {
+5729	    const record=this.reconciliationApprovals.get(id); return record?.project_id===this.requireCurrentProjectId() ? structuredClone(record) : null;
+5730	  }
+5731	  public getProductionReconciliation(originalApprovalId: string): ProductionReconciliationRecord | null {
+5732	    const record=[...this.reconciliations.values()].find((r)=>r.original_approval_id===originalApprovalId && r.project_id===this.requireCurrentProjectId());
+5733	    return record ? structuredClone(record) : null;
+```
+
+**`packages/database/src/postgres-pool.ts`** — simpleQuery(calls), references(references), calls(calls), RlsSessionContext(references), isAlive(calls), +52 more
+
+```typescript
+1466	  }
+1467	
+1468	  /** New projection path only. Never borrow a write TX, run callbacks, or mutate business state. */
+1469	  public async withReadOnlyRlsTransaction<T>(ctx: RlsSessionContext, fn: (snapshotAt: string) => Promise<T>, deadlineAt = Date.now() + 5000): Promise<T> {
+1470	    if (this.txAsyncStorage.getStore()) throw new Error("Read projection requires an independent transaction");
+1471	    const started = Date.now();
+1472	    if (deadlineAt <= started) throw new Error("Read deadline exceeded");
+1473	    const conn = await this.acquire(Math.min(deadlineAt, started + 1000));
+1474	    const state: ActiveTxState = { conn, session: { ...ctx }, afterEnd: [], readOnly: true };
+1475	    const timer = setTimeout(() => conn.abortReadOperation(), Math.max(1, deadlineAt - Date.now()));
+1476	    this.transactionsExecuted++;
+1477	    try {
+1478	      await conn.simpleQuery("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL ROLE app_runtime; SET LOCAL statement_timeout = '2000ms'; SET LOCAL lock_timeout = '250ms';");
+1479	      // This first SELECT establishes the repeatable-read snapshot; later reads retain it.
+1480	      const snapshot = await conn.query("SELECT set_config('app.current_project_id',$1::text,true),set_config('app.current_principal_id',$2::text,true),set_config('app.current_role',$3::text,true),to_char(statement_timestamp() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS snapshot_at;", [ctx.currentProjectId ?? "", ctx.currentPrincipalId ?? "", ctx.currentRole]);
+
+... (gap) ...
+
+2470	 */
+2471	export class PostgresControlPlaneRepository implements ControlPlaneStore {
+2472	  public readonly pool: PostgresRuntimePool;
+2473	  public async readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows> {
+2474	    return this.pool.withReadOnlyRlsTransaction({ currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service" }, async (snapshotAt) => {
+2475	      const role = await this.pool.queryInActiveTx("SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;", [input.projectId, input.principalId]);
+2476	      assertProjectReadRole(role.rows[0]?.member_role, input.signedRoles);
+2477	      if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+2478	      const exists = await this.pool.queryInActiveTx("SELECT project_id FROM projects WHERE project_id=$1::uuid;", [input.projectId]);
+2479	      if (!exists.rowCount) throw new PostgresRlsError("23503", "Project not found");
+2480	      const rows = await this.pool.queryInActiveTx("SELECT project_id AS id, slug, name, default_branch, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM projects WHERE project_id=$1::uuid AND ($2::timestamptz IS NULL OR (updated_at,project_id)<($2::timestamptz,$3::uuid)) ORDER BY updated_at DESC, project_id DESC LIMIT $4::int;", [input.projectId, input.after?.updatedAt ?? null, input.after?.id ?? null, input.limit + 1]);
+2481	      return { fetchedAt: snapshotAt, projects: rows.rows.map((r) => ({ projectId: String(r.id), slug: String(r.slug), name: String(r.name), defaultBranch: String(r.default_branch), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })) };
+2482	    }, input.deadlineAt);
+2483	  }
+2484	  // Local fallback staging refs cache for synthetic (non-filesystem Git) reconciler tests
+2485	  private readonly fallbackGitRefsByProject: Map<string, Map<string, string>> = new Map();
+2486	  private readonly fallbackGitCommitsByProject: Map<
+```
+
+**`apps/core-api/src/project-read-projection.ts`** — invalid(calls), ReadProjectionError(instantiates), CoreApiAuthContext(references), calls(calls), readTimestamp(calls), +28 more
+
+```typescript
+50	  constructor(store: ControlPlaneStore, verify: (auth: unknown, project: string) => CoreApiAuthContext, mac: (payload: string) => string) {
+51	    this.store = store; this.verify = verify; this.cursor = new ProjectReadCursorCodec(mac);
+52	  }
+53	  async read(auth: CoreApiAuthContext, projectId: string | undefined, query: URLSearchParams) {
+54	    const deadlineAt = Date.now() + 5000;
+55	    const target = projectId ?? (typeof auth?.projectId === "string" ? auth.projectId : "");
+56	    let verified: CoreApiAuthContext;
+57	    try { verified = this.verify(auth, target); }
+58	    catch { throw new ReadProjectionError(403, "ERR_FORBIDDEN_RLS"); }
+59	    if (!uuid.test(verified.projectId)) throw invalid();
+60	    const detail = projectId !== undefined;
+61	    for (const key of query.keys()) if ((detail || !["limit", "cursor"].includes(key)) || query.getAll(key).length !== 1) throw invalid();
+62	    const limitValue = query.get("limit");
+63	    if (limitValue !== null && (!/^[1-9][0-9]{0,2}$/.test(limitValue) || Number(limitValue) > 100)) throw invalid();
+64	    const limit = detail ? 1 : limitValue === null ? 20 : Number(limitValue);
+65	    const cursorValue = query.get("cursor");
+66	    const cursor = cursorValue === null ? null : this.cursor.decode(cursorValue);
+67	    const context = { projectId: verified.projectId, principalId: verified.principalId, limit };
+68	    try {
+69	      const rows = await this.store.readProjectProjection({ ...context, signedRoles: verified.roles, after: cursor?.anchor ?? null, cursorContextMismatch: cursor ? this.cursor.isMismatch(cursor, context) : false, deadlineAt });
+70	      for (const row of rows.projects) {
+71	        if (row.projectId !== verified.projectId || !uuid.test(row.projectId) || Object.keys(row).sort().join() !== "createdAt,defaultBranch,name,projectId,slug,updatedAt") throw new Error("Invalid projection DTO");
+72	        for (const value of Object.values(row)) if (typeof value !== "string" || Buffer.byteLength(value) > 1048576) throw new Error("Invalid projection DTO");
+73	        if (readTimestamp(row.createdAt) !== row.createdAt || readTimestamp(row.updatedAt) !== row.updatedAt) throw new Error("Invalid projection DTO");
+74	      }
+75	      if (readTimestamp(rows.fetchedAt) !== rows.fetchedAt || rows.projects.length > limit + 1) throw new Error("Invalid read result");
+76	      const base = { schemaVersion: "dashboard-read-v1" as const, fetchedAt: rows.fetchedAt };
+77	      const items = rows.projects.slice(0, limit);
+78	      const hasMore = rows.projects.length > limit;
+79	      const result = detail ? { ...base, project: items[0]! } : { ...base, scope: { kind: "project-token" as const, projectId: verified.projectId }, items, page: { limit, hasMore, nextCursor: hasMore ? this.cursor.encode(context, items[items.length - 1]!) : null } };
+80	      if (detail && !items[0]) throw new PostgresRlsError("23503", "Project not found");
+81	      if (Buffer.byteLength(JSON.stringify(result)) > 1048576 || Date.now() >= deadlineAt) throw new Error("Read response bound exceeded");
+82	      return result;
+83	    } catch (err) {
+84	      if (err instanceof ProjectReadCursorContextError) throw new ReadProjectionError(409, "ERR_READ_CURSOR_CONTEXT");
+85	      if (err instanceof PostgresRlsError && err.sqlState === "42501") throw new ReadProjectionError(403, "ERR_FORBIDDEN_RLS");
+86	      if (err instanceof PostgresRlsError && err.sqlState === "23503") throw new ReadProjectionError(404, "ERR_READ_RESOURCE_NOT_FOUND");
+87	      throw new ReadProjectionError(500, "ERR_READ_PROJECTION_FAILED");
+88	    }
+89	  }
+90	}
+91	export { PROJECT_READ_ROLES };
+92	
+```
+
+**`packages/database/src/project-read-projection.ts`** — ProjectReadDto(interface), readTimestamp(function), assertProjectReadRole(function), ProjectReadCursorContextError(class), ProjectReadInput(interface), +2 more
+
+```typescript
+1	import { PostgresRlsError, type ProjectMemberRole } from "./types.ts";
+2	export interface ProjectReadDto {
+3	  projectId: string; slug: string; name: string; defaultBranch: string;
+4	  createdAt: string; updatedAt: string;
+5	}
+6	export interface ProjectReadInput {
+7	  projectId: string; principalId: string; signedRoles: readonly ProjectMemberRole[];
+8	  cursorContextMismatch: boolean; deadlineAt: number;
+9	  limit: number; after: { updatedAt: string; id: string } | null;
+10	}
+11	export interface ProjectReadRows { fetchedAt: string; projects: ProjectReadDto[]; }
+12	export const PROJECT_READ_ROLES: readonly ProjectMemberRole[] = ["AUDITOR", "DEVELOPER", "PROJECT_APPROVER", "ORG_ADMIN"];
+13	export function assertProjectReadRole(role: unknown, roles: readonly ProjectMemberRole[]): void {
+14	  if (!PROJECT_READ_ROLES.includes(role as ProjectMemberRole) || !roles.includes(role as ProjectMemberRole)) throw new PostgresRlsError("42501", "Project read denied");
+15	}
+16	export function readTimestamp(value: string): string {
+17	  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(?:\d{3})?Z$/.test(value) || (!Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value.replace(/(\.\d{3})\d{3}Z$/, "$1Z"))) throw new Error("Invalid projection timestamp");
+18	  return value.replace(/\.(\d{3})Z$/, (_match, ms: string) => `.${ms}000Z`);
+19	}
+20	
+21	export class ProjectReadCursorContextError extends Error {}
+```
+
+**Not shown above — explore these names for their source**
+
+- apps/core-api/src/index.ts: readProjectProjection:452, CoreApiService:379, CoreApiAuthContext:173, runOrphanedPushReconciler:2510, previewProductionReconciliation:792, submitPipelineChangeRequest:2894, +18 more
+- packages/database/src/types.ts: readProjectProjection:527, PostgresRlsError:110, ControlPlaneStore:526, listMergeQueueEntries:1005, listProcessedWorkerEventsForTask:576, listProductPipelineSessions:849, +16 more
+- packages/wna/src/worker-execution-journal.ts: read:41, WorkerExecutionJournal:25, dir:37, claim:55, complete:69, WorkerJournalConflict:16, +3 more
+- packages/shared-types/src/index.ts: canonicalizeJson:589, sha256Hex:623
+- packages/adapter-sdk/src/execution-targets.ts: call:68, ExternalTargetAction:6, signTargetProtocol:37
+- packages/task-contract/src/code-import.ts: runGit:90, validateCodeImportSubmission:42
+- packages/wna/src/worker-endpoint.ts: handle:83, constructor:56
+- apps/core-api/src/http-server.ts: handleRequest:432
+- packages/test-harness/src/dashboard-project-reader.test.ts: catalog:166, contents:152, contract:38, fixture:10, start:23, Fx:22, +1 more
+- packages/wna/src/vm-wsl2-backend.ts: decodeWslOutput:91
+- ... and 11 more files
+
+> Some file sections were trimmed for size. Elided symbols are named inside gap markers as `name (file:line)` and preferred in the file header — run another `codegraph_explore` (or `codegraph_node`) with those exact names for their source.

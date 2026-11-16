@@ -1,0 +1,21 @@
+{
+  "issues": [
+    {
+      "file": "packages/task-contract/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "DEFAULT_MAX_BLOB_BYTES",
+          "line": 36,
+          "col": 14,
+          "pos": 911
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "issues": [
+    {
+      "file": "packages/product-pipeline/src/prompts.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "STAGE1_DISCOVERY_PROMPT_VERSION",
+          "line": 8,
+          "col": 14,
+          "pos": 275
+        },
+        {
+          "name": "STAGE2_REQUIREMENTS_PROMPT_VERSION",
+          "line": 11,
+          "col": 14,
+          "pos": 409
+        },
+        {
+          "name": "STAGE3_ARCHITECTURE_PROMPT_VERSION",
+          "line": 14,
+          "col": 14,
+          "pos": 544
+        },
+        {
+          "name": "STAGE7_PLANNING_PROMPT_VERSION",
+          "line": 20,
+          "col": 14,
+          "pos": 817
+        },
+        {
+          "name": "STAGE1_DISCOVERY_OUTPUT_SCHEMA",
+          "line": 22,
+          "col": 14,
+          "pos": 873
+        },
+        {
+          "name": "STAGE2_REQUIREMENTS_OUTPUT_SCHEMA",
+          "line": 111,
+          "col": 14,
+          "pos": 3525
+        },
+        {
+          "name": "STAGE3_ARCHITECTURE_OUTPUT_SCHEMA",
+          "line": 157,
+          "col": 14,
+          "pos": 4758
+        },
+        {
+          "name": "STAGE4_CONSISTENCY_CHECK_OUTPUT_SCHEMA",
+          "line": 316,
+          "col": 14,
+          "pos": 9703
+        },
+        {
+          "name": "STAGE7_PLANNING_OUTPUT_SCHEMA",
+          "line": 357,
+          "col": 14,
+          "pos": 11057
+        },
+        {
+          "name": "STAGE4_CONSISTENCY_CHECK_PROMPT_SPEC",
+          "line": 484,
+          "col": 14,
+          "pos": 14741
+        },
+        {
+          "name": "STAGE7_PLANNING_PROMPT_SPEC",
+          "line": 513,
+          "col": 14,
+          "pos": 15875
+        },
+        {
+          "name": "DEFAULT_PIPELINE_PROMPT_TEMPLATES",
+          "line": 555,
+          "col": 14,
+          "pos": 17884
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/product-pipeline/src/traceability.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "buildBidirectionalTraceabilityMatrixInTx",
+          "line": 288,
+          "col": 23,
+          "pos": 9722
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

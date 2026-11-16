@@ -1,0 +1,101 @@
+{
+  "sourceSha": "1f33a8bb77e80131eeac802d8875ec28e12d5a25",
+  "files": {
+    "audit-run.json": {
+      "bytes": 2270,
+      "sha256": "baf51f3996e84a52af1f34f8e577d5fa57186d82a4c02cc5d2dd44dd8fbac2b3"
+    },
+    "codegraph-callers-recovery.txt": {
+      "bytes": 336,
+      "sha256": "b42765d335267c01757b5328d7b13593894ade2b011d3049a6c38f4eb06d040c"
+    },
+    "codegraph-explore-project-read.txt": {
+      "bytes": 16389,
+      "sha256": "ba40a6a313864d9f1a2dfc81610f1bfe5c65aaa1aa95dd274552374546db0fc6"
+    },
+    "codegraph-init-meta.json": {
+      "bytes": 89,
+      "sha256": "6b30a503fae15062ce206920882551848b28b509fafc6542c9946423040d2974"
+    },
+    "codegraph-node-revoke.txt": {
+      "bytes": 8399,
+      "sha256": "82bfd44932e57977b9d41d8652b258200e9631998ca0470c5986cbbf524cd0a7"
+    },
+    "codegraph-queries.json": {
+      "bytes": 376,
+      "sha256": "e6eef200d3292b5b4919f89c9af8fb7548feee31f8d59bcb1d4f74df244cda9e"
+    },
+    "entrypoint-inventory.json": {
+      "bytes": 4441,
+      "sha256": "d6600943b20a2a983bc5831153f54447092514cb1858ec85d4f52a75566e47fb"
+    },
+    "knip-apps-agent-gateway.json": {
+      "bytes": 19,
+      "sha256": "8783ac5790c938aa7ea683df5f7b30e6f1faa364fd145dbe8ab26985d07a6bfc"
+    },
+    "knip-apps-core-api.json": {
+      "bytes": 395,
+      "sha256": "de28b5dbf78e16f2ad8561f77b1a305e94a8362f9575487961b9a702416b0428"
+    },
+    "knip-apps-web.json": {
+      "bytes": 394,
+      "sha256": "5cf1f92c3d52d04e90101d70fbc6ee3df9293bf4c4deb789c4909fefd0f1b6a9"
+    },
+    "knip-audit-config.json": {
+      "bytes": 715,
+      "sha256": "7f3fabd47f25b6ef9629a7673a9f575dcdd729c84255359d5bf6a5eeaf4b9af3"
+    },
+    "knip-global.json": {
+      "bytes": 12014,
+      "sha256": "8ff89e147cd7a0618833a540aa3fb3cf03726c754796d317966084e3565171aa"
+    },
+    "knip-packages-adapter-sdk.json": {
+      "bytes": 1844,
+      "sha256": "11f37cc1c18f25647a68e609ae712a2843b007ef3e8ca6c991cbed339c19f1d9"
+    },
+    "knip-packages-database.json": {
+      "bytes": 1709,
+      "sha256": "975e29edbb8019a40bef08ef6d7c274c850cc72aa4b76fb2ed1d0770f8cbb219"
+    },
+    "knip-packages-observability.json": {
+      "bytes": 645,
+      "sha256": "37ca6ce7f2239ce6cd32a4eb1abeb70c9ee678b8a576b4f20fe241122b2f8b0e"
+    },
+    "knip-packages-product-pipeline.json": {
+      "bytes": 2374,
+      "sha256": "0357f512cc494aef1b1b661f1f238cf3b90a95ca0189f47eec0c422da8240e0d"
+    },
+    "knip-packages-reviewer.json": {
+      "bytes": 413,
+      "sha256": "b98eb0fb6efaf0f117a38a9900224e79fe6af3dfe2af1e00e5be636b3f94e0e0"
+    },
+    "knip-packages-shared-types.json": {
+      "bytes": 539,
+      "sha256": "b0948e4a1993894b35c21ab14b5d7583ee122a367ae2ec3036a7571252db5df0"
+    },
+    "knip-packages-task-contract.json": {
+      "bytes": 400,
+      "sha256": "2f32b3920bd116e91e457be0aa8d893fafcbb4eadc675b9851fcf6c5de42daf2"
+    },
+    "knip-packages-test-harness.json": {
+      "bytes": 19,
+      "sha256": "8783ac5790c938aa7ea683df5f7b30e6f1faa364fd145dbe8ab26985d07a6bfc"
+    },
+    "knip-packages-verifier.json": {
+      "bytes": 1483,
+      "sha256": "b83df59a070e80abef420177b811ef470655f4990dea0a551344c671ce9a62ec"
+    },
+    "knip-packages-wna.json": {
+      "bytes": 2028,
+      "sha256": "e00964f1b5eb7b5903975a0b58ede8d7bcdeb06506c3824114ce9b2e2536a791"
+    },
+    "token-measurement.json": {
+      "bytes": 1002,
+      "sha256": "4309a170077d59f339d4b5d6cc6b45454b6ce3b2d2c9d17481899d2d6f739c8e"
+    },
+    "workspace-summary.json": {
+      "bytes": 2771,
+      "sha256": "e31ded4549801a9e5331b5624ca563f3f4e178e4445b4fa14d0f08199413eaa1"
+    }
+  }
+}

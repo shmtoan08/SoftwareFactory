@@ -1,0 +1,33 @@
+{
+  "issues": [
+    {
+      "file": "packages/observability/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "generateTraceId",
+          "line": 72,
+          "col": 17,
+          "pos": 2611
+        },
+        {
+          "name": "generateSpanId",
+          "line": 76,
+          "col": 17,
+          "pos": 2700
+        },
+        {
+          "name": "redactTelemetryValue",
+          "line": 135,
+          "col": 17,
+          "pos": 4486
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

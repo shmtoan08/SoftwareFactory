@@ -1,0 +1,21 @@
+{
+  "issues": [
+    {
+      "file": "packages/reviewer/src/independent-reviewer.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "analyzeTier3AgentTests",
+          "line": 578,
+          "col": 17,
+          "pos": 17661
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

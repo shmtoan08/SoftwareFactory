@@ -1,0 +1,161 @@
+[
+  {
+    "workspace": "apps/agent-gateway",
+    "packageName": "@software-factory/agent-gateway",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "apps/agent-gateway/src/index.ts",
+      "apps/agent-gateway/src/main.ts"
+    ],
+    "role": "HTTP service + public service API",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "apps/core-api",
+    "packageName": "@software-factory/core-api",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "apps/core-api/src/index.ts",
+      "apps/core-api/src/main.ts"
+    ],
+    "role": "HTTP service + public service API",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "apps/web",
+    "packageName": "@software-factory/web",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "apps/web/src/index.ts",
+      "apps/web/src/main.ts"
+    ],
+    "role": "HTTP service + public service API",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/adapter-sdk",
+    "packageName": "@software-factory/adapter-sdk",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/adapter-sdk/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/database",
+    "packageName": "@software-factory/database",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/database/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/observability",
+    "packageName": "@software-factory/observability",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/observability/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/product-pipeline",
+    "packageName": "@software-factory/product-pipeline",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/product-pipeline/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/reviewer",
+    "packageName": "@software-factory/reviewer",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/reviewer/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/shared-types",
+    "packageName": "@software-factory/shared-types",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/shared-types/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/task-contract",
+    "packageName": "@software-factory/task-contract",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/task-contract/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/test-harness",
+    "packageName": "@software-factory/test-harness",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/test-harness/src/index.ts"
+    ],
+    "role": "test/operational harness",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/verifier",
+    "packageName": "@software-factory/verifier",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/verifier/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  },
+  {
+    "workspace": "packages/wna",
+    "packageName": "@software-factory/wna",
+    "declaredExports": {
+      ".": "./src/index.ts"
+    },
+    "entryFiles": [
+      "packages/wna/src/index.ts"
+    ],
+    "role": "architecture library contract; no UI required",
+    "rootPackageScriptsAreAdditionalEntries": true
+  }
+]

@@ -1,0 +1,42 @@
+{
+  "includeEntryExports": true,
+  "workspaces": {
+    ".": {
+      "entry": [
+        "scripts/ci/*.{mjs,ts}",
+        "scripts/git-hooks/*.ts"
+      ],
+      "project": [
+        "scripts/**/*.{ts,mjs}"
+      ]
+    },
+    "apps/*": {
+      "entry": [
+        "src/index.ts",
+        "src/main.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
+    },
+    "packages/*": {
+      "entry": [
+        "src/index.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
+    },
+    "packages/test-harness": {
+      "entry": [
+        "src/*.test.ts",
+        "src/*smoke.ts",
+        "src/native-vm-*.ts",
+        "src/fixtures/*.ts"
+      ],
+      "project": [
+        "src/**/*.ts"
+      ]
+    }
+  }
+}

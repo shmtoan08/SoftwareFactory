@@ -1,0 +1,48 @@
+{
+  "sourceSha": "1f33a8bb77e80131eeac802d8875ec28e12d5a25",
+  "sourceGitTree": "8ea317f494dbb0587a4082e438e584f70a91b196",
+  "dateAsiaTokyo": "2026-11-16",
+  "scope": "Slice0 audit only; no runtime/schema/agent-policy/CI gate changes",
+  "hostNode": "24.16.0",
+  "workspaceCount": 13,
+  "toolPins": {
+    "node_modules/@colbymchenry/codegraph": {
+      "version": "1.6.2",
+      "resolved": "https://registry.npmjs.org/@colbymchenry/codegraph/-/codegraph-1.6.2.tgz",
+      "integrity": "sha512-hODH/mGnCf3IUMs6rzktv/zbecJIKJfdZAYHZ9mqecb0G7ZkHaA8CZafDVnswANFEL1YFcG+lfAwc5SIXzUH6Q=="
+    },
+    "node_modules/@colbymchenry/codegraph-darwin-x64": {
+      "version": "1.6.2",
+      "resolved": "https://registry.npmjs.org/@colbymchenry/codegraph-darwin-x64/-/codegraph-darwin-x64-1.6.2.tgz",
+      "integrity": "sha512-28WglI4BwqxLXNFYlkvZXs5Ye3WYdMLeoFRKFmRA/NwlnH4if8IKGVt6oS7YiQ8qspB9nWo18O+8IDhxkFXXqA=="
+    },
+    "node_modules/knip": {
+      "version": "6.45.1",
+      "resolved": "https://registry.npmjs.org/knip/-/knip-6.45.1.tgz",
+      "integrity": "sha512-zp3zXKy2cZWiIttdlWU5fisKxVQaLSU6471ej0KGz1GdHdaHxpzTAO/LIyFNc3gU3v1W7LJaqvYumoO3l/u+6A=="
+    }
+  },
+  "knipGlobalCounts": {
+    "files": 0,
+    "exports": 49,
+    "dependencies": 1,
+    "unlisted": 0,
+    "unresolved": 0
+  },
+  "knipGlobalWallSeconds": 2.78,
+  "networkControl": "sandbox-exec allow default/deny network* during analysis; empty env except PATH/private HOME/TMPDIR/CI/telemetry flags",
+  "codegraphEnvironment": {
+    "CODEGRAPH_TELEMETRY": "0",
+    "DO_NOT_TRACK": "1",
+    "CODEGRAPH_NO_UPDATE_CHECK": "1"
+  },
+  "codegraphSource": "https://github.com/colbymchenry/codegraph",
+  "codegraphIndexedFiles": 103,
+  "codegraphNodes": 5542,
+  "codegraphEdges": 19001,
+  "codegraphDecision": "Do not adopt by default; structural navigation useful but no measured incremental answer over current Knip+inventory+rg, dynamic dispatch/test coverage incomplete",
+  "toolsInstalledOutsideProductCheckout": true,
+  "agentIntegrationsInstalled": false,
+  "codeDeleted": false,
+  "countersCaveat": "Workspace runs include dependency/dependent scopes and overlap; global counts are unique configured findings, not proven dead code. Explicit test/CLI entries and excluded issue kinds limit coverage."
+}

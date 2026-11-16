@@ -1,0 +1,84 @@
+{
+  "issues": [
+    {
+      "file": "packages/adapter-sdk/src/structured-output.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "validateAgainstJsonSchema",
+          "line": 119,
+          "col": 17,
+          "pos": 3771
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/adapter-sdk/src/cost-guard.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "evaluatePostcallLimits",
+          "line": 25,
+          "col": 10,
+          "pos": 606
+        },
+        {
+          "name": "evaluatePreflightLimits",
+          "line": 25,
+          "col": 34,
+          "pos": 630
+        },
+        {
+          "name": "DEFAULT_MODEL_PRICING_CATALOG",
+          "line": 62,
+          "col": 14,
+          "pos": 1895
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/adapter-sdk/src/codex-cli.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "CODEX_EMULATOR_CREDENTIAL",
+          "line": 18,
+          "col": 14,
+          "pos": 960
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    },
+    {
+      "file": "packages/adapter-sdk/src/execution-targets.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "HttpExecutionTargetConnector",
+          "line": 40,
+          "col": 14,
+          "pos": 1974
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}

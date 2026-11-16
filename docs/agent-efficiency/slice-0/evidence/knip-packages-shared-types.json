@@ -1,0 +1,27 @@
+{
+  "issues": [
+    {
+      "file": "packages/shared-types/src/index.ts",
+      "dependencies": [],
+      "devDependencies": [],
+      "exports": [
+        {
+          "name": "TERMINAL_WORKER_EVENT_TYPES",
+          "line": 40,
+          "col": 14,
+          "pos": 985
+        },
+        {
+          "name": "isValidTaskStateTransition",
+          "line": 120,
+          "col": 17,
+          "pos": 3371
+        }
+      ],
+      "files": [],
+      "optionalPeerDependencies": [],
+      "unlisted": [],
+      "unresolved": []
+    }
+  ]
+}
