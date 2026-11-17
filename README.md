@@ -281,3 +281,5 @@ Native Windows update (2026-11-16): [real Windows1909/WSL2 kernel and CLI eviden
 Agent efficiency issue23: [Slice 0 baseline and architecture audit](./docs/agent-efficiency/slice-0/README.md) covers 13 workspaces, report-only Knip, a bounded offline CodeGraph experiment, explicit token-telemetry gaps and proposed checkpoint/handoff gates. No runtime optimization or deletion is enabled by the audit.
 
 Dashboard API P2: [independent Budget snapshot](./apps/core-api/docs/dashboard-budget-reader-p2.md) adds GET /api/v1/projects/:projectId/budget-snapshot with exact scalar usage and explicit recovery state in a separate read-only snapshot. Legacy /budget recovery is unchanged; implementation review is required before Dashboard consumption/P3.
+
+Dashboard API P3: [session Task read projection](./apps/core-api/docs/dashboard-task-reader-p3.md) implements the authorized session → task chain, bounded keyset pagination and exact source-status filters in an independent read-only snapshot. P2 was accepted in issue #22; P3 and its measured scale envelope await separate review before Task Dashboard consumption. Stage filtering remains unsupported under approved D-02.

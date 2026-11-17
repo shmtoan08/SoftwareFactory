@@ -1,3 +1,4 @@
+import { taskReadDto, type TaskReadInput, type TaskReadRows } from "./task-read-projection.ts";
 import { ProjectReadCursorContextError, assertProjectReadRole, type ProjectReadInput, type ProjectReadRows } from "./project-read-projection.ts";
 import type { BudgetReadInput, BudgetReadRows } from "./budget-read-projection.ts";
 import { validateTargetAssignment, validateTargetLease } from "./execution-target-validation.ts";
@@ -2480,6 +2481,24 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       if (!exists.rowCount) throw new PostgresRlsError("23503", "Project not found");
       const rows = await this.pool.queryInActiveTx("SELECT project_id AS id, slug, name, default_branch, to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS created_at, to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at FROM projects WHERE project_id=$1::uuid AND ($2::timestamptz IS NULL OR (updated_at,project_id)<($2::timestamptz,$3::uuid)) ORDER BY updated_at DESC, project_id DESC LIMIT $4::int;", [input.projectId, input.after?.updatedAt ?? null, input.after?.id ?? null, input.limit + 1]);
       return { fetchedAt: snapshotAt, projects: rows.rows.map((r) => ({ projectId: String(r.id), slug: String(r.slug), name: String(r.name), defaultBranch: String(r.default_branch), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })) };
+    }, input.deadlineAt);
+  }
+  public async readTaskProjection(input: TaskReadInput): Promise<TaskReadRows> {
+    return this.pool.withReadOnlyRlsTransaction({ currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service" }, async (snapshotAt) => {
+      const role = await this.pool.queryInActiveTx("SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;", [input.projectId, input.principalId]);
+      assertProjectReadRole(role.rows[0]?.member_role, input.signedRoles);
+      const project = await this.pool.queryInActiveTx("SELECT project_id FROM projects WHERE project_id=$1::uuid;", [input.projectId]);
+      if (!project.rowCount) throw new PostgresRlsError("23503", "Project not found");
+      const session = await this.pool.queryInActiveTx("SELECT pipeline_session_id FROM product_pipeline_sessions WHERE project_id=$1::uuid AND pipeline_session_id=$2::uuid;", [input.projectId, input.sessionId]);
+      if (!session.rowCount) throw new PostgresRlsError("23503", "Session not found");
+      if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+      const result = await this.pool.queryInActiveTx(TASK_READ_PAGE_SQL, [input.projectId, input.sessionId, JSON.stringify(input.sourceStatuses), input.after?.updatedAt ?? null, input.after?.id ?? null, input.limit + 1]);
+      return { fetchedAt: snapshotAt, tasks: result.rows.map(r => {
+        if (Number(r.assignee_count) > 1 || (r.active_lease_id !== null && r.matched_lease_id === null)) throw new Error("Invalid task association");
+        return taskReadDto({ taskId: String(r.task_id), projectId: String(r.project_id), sessionId: input.sessionId, title: r.title as string, sourceStatus: r.status as TaskReadRows["tasks"][number]["sourceStatus"],
+          currentAttemptNo: Number(r.current_attempt_no), reworkCount: Number(r.rework_count), maxReworkCycles: Number(r.max_rework_cycles), activeLeaseEpoch: String(r.active_lease_epoch),
+          assigneeId: r.assignee_id === null ? null : String(r.assignee_id), leaseOwnerId: r.worker_id === null ? null : String(r.worker_id), leaseExpiresAt: r.expires_at === null ? null : String(r.expires_at), createdAt: String(r.created_at), updatedAt: String(r.updated_at) }, input);
+      }) };
     }, input.deadlineAt);
   }
   public async readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows> {
@@ -8477,3 +8496,19 @@ export function buildCandidateBoundLineage(input: {
     missingLinks,
   };
 }
+
+/** Actual bounded task page query, also exercised by the scale/EXPLAIN acceptance harness. */
+export const TASK_READ_PAGE_SQL = `SELECT t.task_id,t.project_id,t.title,t.status,t.current_attempt_no,t.rework_count,t.max_rework_cycles,t.active_lease_epoch::text,
+  t.active_lease_id,l.lease_id AS matched_lease_id,l.worker_id,
+  to_char(l.expires_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS expires_at,
+  to_char(t.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+  to_char(t.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,a.assignee_id,a.assignee_count
+FROM (SELECT t.task_id,t.project_id,t.title,t.status,t.current_attempt_no,t.rework_count,t.max_rework_cycles,t.active_lease_epoch,t.active_lease_id,t.created_at,t.updated_at
+  FROM tasks t WHERE t.project_id=$1::uuid
+  AND EXISTS(SELECT 1 FROM task_plan_links x WHERE x.project_id=$1::uuid AND x.pipeline_session_id=$2::uuid AND x.task_id=t.task_id)
+  AND ($3::jsonb='[]'::jsonb OR t.status IN (SELECT jsonb_array_elements_text($3::jsonb)))
+  AND ($4::timestamptz IS NULL OR (t.updated_at,t.task_id)<($4::timestamptz,$5::uuid))
+  ORDER BY t.updated_at DESC,t.task_id DESC LIMIT $6::int) t
+LEFT JOIN task_leases l ON l.lease_id=t.active_lease_id AND l.project_id=$1::uuid AND l.task_id=t.task_id AND l.lease_epoch=t.active_lease_epoch
+LEFT JOIN LATERAL (SELECT min(x.assigned_profile_id::text) AS assignee_id,count(DISTINCT x.assigned_profile_id) AS assignee_count FROM task_plan_links x WHERE x.project_id=$1::uuid AND x.pipeline_session_id=$2::uuid AND x.task_id=t.task_id) a ON true
+ORDER BY t.updated_at DESC,t.task_id DESC;`;

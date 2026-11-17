@@ -1,3 +1,5 @@
+export * from "./task-read-projection.ts";
+import { taskReadDto, TASK_READ_UUID, type TaskReadInput, type TaskReadRows, type TaskReadDto } from "./task-read-projection.ts";
 export * from "./project-read-projection.ts";
 export * from "./budget-read-projection.ts";
 import { storedBudgetInteger, type BudgetReadInput, type BudgetReadRows } from "./budget-read-projection.ts";
@@ -573,6 +575,53 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       createdAt: readTimestamp(project.created_at), updatedAt: readTimestamp(project.updated_at) };
     const beforeAnchor = !input.after || dto.updatedAt < input.after.updatedAt || (dto.updatedAt === input.after.updatedAt && dto.projectId < input.after.id);
     return { fetchedAt, projects: beforeAnchor ? [dto] : [] };
+  }
+
+  public async readTaskProjection(input: TaskReadInput): Promise<TaskReadRows> {
+    this.assertOutsideTransaction();
+    if (this.asyncLocalStorage.getStore()) throw new Error("Nested projection transaction");
+    const checkTime = () => { if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded"); };
+    checkTime();
+    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+    assertProjectReadRole(this.projectMemberships.get(`${input.projectId}:${input.principalId}`)?.member_role, input.signedRoles);
+    if (!this.projects.has(input.projectId)) throw new PostgresRlsError("23503", "Project not found");
+    const session = this.pipelineSessions.get(input.sessionId);
+    if (!session || session.project_id !== input.projectId) throw new PostgresRlsError("23503", "Session not found");
+    if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+    const links = new Map<string, Set<string>>();
+    for (const link of this.taskPlanLinks.values()) {
+      checkTime();
+      if (link.project_id !== input.projectId || link.pipeline_session_id !== input.sessionId) continue;
+      const ids = links.get(link.task_id) ?? new Set<string>();
+      if (link.assigned_profile_id !== null) {
+        if (typeof link.assigned_profile_id !== "string" || !TASK_READ_UUID.test(link.assigned_profile_id)) throw new Error("Invalid task assignee reference");
+        ids.add(link.assigned_profile_id);
+      }
+      links.set(link.task_id, ids);
+    }
+    const selected: { task: TaskRecord; updatedAt: string }[] = [];
+    for (const task of this.tasks.values()) {
+      checkTime();
+      if (task.project_id !== input.projectId || !links.has(task.task_id) || (input.sourceStatuses.length && !input.sourceStatuses.includes(task.status))) continue;
+      const updatedAt = readTimestamp(task.updated_at), after = input.after;
+      if (after && !(updatedAt < after.updatedAt || (updatedAt === after.updatedAt && task.task_id < after.id))) continue;
+      selected.push({ task, updatedAt });
+      selected.sort((a,b) => a.updatedAt === b.updatedAt ? (a.task.task_id < b.task.task_id ? 1 : -1) : a.updatedAt < b.updatedAt ? 1 : -1);
+      if (selected.length > input.limit + 1) selected.pop();
+    }
+    const tasks = selected.map(({ task, updatedAt }) => {
+      checkTime();
+      const assignees = links.get(task.task_id)!;
+      if (assignees.size > 1) throw new Error("Ambiguous task assignee");
+      const lease = task.active_lease_id === null ? null : this.taskLeases.get(task.active_lease_id);
+      if (task.active_lease_id !== null && (!lease || lease.project_id !== input.projectId || lease.task_id !== task.task_id || lease.lease_epoch !== task.active_lease_epoch)) throw new Error("Invalid active lease reference");
+      return taskReadDto({ taskId: task.task_id, projectId: task.project_id, sessionId: input.sessionId, title: task.title, sourceStatus: task.status,
+        currentAttemptNo: task.current_attempt_no, reworkCount: task.rework_count, maxReworkCycles: task.max_rework_cycles,
+        activeLeaseEpoch: storedBudgetInteger(task.active_lease_epoch).toString(), assigneeId: [...assignees][0] ?? null,
+        leaseOwnerId: lease ? lease.worker_id : null, leaseExpiresAt: lease ? lease.expires_at : null, createdAt: task.created_at, updatedAt } satisfies TaskReadDto, input);
+    });
+    checkTime();
+    return { fetchedAt, tasks };
   }
 
   public async readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows> {

@@ -1,3 +1,4 @@
+import type { TaskReadInput, TaskReadRows } from "./task-read-projection.ts";
 import type { ProjectReadInput, ProjectReadRows } from "./project-read-projection.ts";
 import type { BudgetReadInput, BudgetReadRows } from "./budget-read-projection.ts";
 import type {
@@ -525,6 +526,7 @@ export interface RecordReleaseAcceptancePackageInput {
  * (real PostgreSQL via `PostgresRuntimePool`).
  */
 export interface ControlPlaneStore {
+  readTaskProjection(input: TaskReadInput): Promise<TaskReadRows>;
   readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows>;
   readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows>;
   clockTimestampIso(): string | Promise<string>;
