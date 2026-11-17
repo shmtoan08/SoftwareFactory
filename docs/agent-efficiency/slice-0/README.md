@@ -18,3 +18,5 @@ Global configured Knip run: **0 file, 49 export, 1 dependency, 0 unlisted, 0 unr
 CodeGraph 1.6.2 produced a graph of 103 files / 5,542 nodes / 19,001 edges and answered 3 bounded navigation queries offline. Decision: **do not adopt as a default dependency/integration yet**. No incremental architectural answer over Knip+inventory+targeted rg was demonstrated, and interface dispatch/test coverage was incomplete. The graph is advisory and cannot establish runtime enforcement.
 
 Next for #23: team reviews the checkpoint boundary/fencing design and telemetry collection gaps before changing gateway/evidence/worker contracts. Independent #22 P2 may proceed under its already-approved P0/P1 gates; it is not blocked by this audit. Subsequent checkpoint work must use service-owned observations and generation-isolated workspaces, not a richer agent-written memo.
+
+S0-B follow-up (2026-11-17): [proposed representative telemetry collection](./telemetry-collection-proposal.md), per owner request. Collection design awaits team review; no instrumentation, paid sampling or numeric budgets are enabled.
