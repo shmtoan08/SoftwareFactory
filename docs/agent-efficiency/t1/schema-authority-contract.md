@@ -6,7 +6,7 @@ Date: 2026-11-17 (Asia/Tokyo). Source baseline: `30a1430bde371a223d047b4908664dc
 
 ## 1. Source findings and implementation boundary
 
-Current `ModelCallLedgerRecord` has task/pipeline/cost-session and normalized totals, but no authoritative execution/generation or cached/thinking split. `ModelCallOrchestrator` in adapter-sdk performs preflight before provider invocation and finalizes a ledger afterward; memory finalization allocates call IDs internally. A ledger call ID therefore cannot simply be assumed durable before dispatch. PromptRegistry currently fingerprints templates with SHA-256; new telemetry must not export that sensitive hash. Existing RLS session variables are useful scope controls but are not proof that an agent has service authority.
+Current `ModelCallLedgerRecord` has task/pipeline/cost-session and normalized totals, but no authoritative execution/generation or cached/thinking split. `ManagedModelProviderExecutor` in adapter-sdk performs preflight before provider invocation and finalizes a ledger afterward; memory finalization allocates call IDs internally. A ledger call ID therefore cannot simply be assumed durable before dispatch. PromptRegistry currently fingerprints templates with SHA-256; new telemetry must not export that sensitive hash. Existing RLS session variables are useful scope controls but are not proof that an agent has service authority.
 
 T1 introduces an independent server invocation ID allocated before the provider call, then an explicit service-owned settlement link to the final ledger call ID. It does not repurpose a ledger ID or infer links by task/time. A crash between dispatch and finalization leaves an unsettled invocation and an incomplete lifecycle. Nothing retries the provider to repair that gap.
 
@@ -118,3 +118,5 @@ Two pilot prompt aliases from T0 remain **disabled/unregistered** unless separat
 Team decisions requested: approve/adjust the proposed tables/indexes and role isolation; the server invocation ID plus explicit settlement link; bounded observer binding protocol with TASK_BOUND disabled where authority cannot be proved; the exact adapter-sdk/service hook scope; numeric/event/queue/report bounds; and the staged provider-free acceptance plan. Acceptance must be recorded on #23 before implementation. Remaining mapping/template/account evidence is an explicit later gate, not a blank permission to implement an execution flow.
 
 After approval, dev writes the scoped implementation task_contract and implements only approved T1 stages. Actual task baseline and S/M/L token budgets remain T3 deliverables.
+
+Implementation authorization (2026-11-18): [owner approved T1](https://github.com/shmtoan08/SoftwareFactory/issues/23#issuecomment-6952955719), including stage A–D within this contract. T2 spending remains separately gated. The proposal-state header above records the original submission, not the current implementation authorization.
