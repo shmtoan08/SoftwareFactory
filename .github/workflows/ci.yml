@@ -2705,6 +2705,9 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0021_t1_ledger_settlements.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-ledger-settlements.sql
           node packages/database/tests/telemetry-observation-concurrency.mjs --settlements
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0022_t1_report_storage_readers.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0022_t1_report_storage_readers.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-report-readers.sql
 
       - name: Execute Full Test Suite
         env:
