@@ -2680,7 +2680,7 @@ jobs:
       - name: Prepare Optional Docker Verifier Base Image
         run: docker pull node:22-alpine || true
 
-      - name: Verify T1 telemetry authority foundation
+      - name: Verify T1 telemetry authority and lifecycle storage
         env:
           PGHOST: 127.0.0.1
           PGPORT: 5432
@@ -2694,6 +2694,9 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0018_t1_telemetry_service_authority.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0018_t1_telemetry_service_authority.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-service-authority.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0019_t1_lifecycle_storage.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0019_t1_lifecycle_storage.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-lifecycle-storage.sql
 
       - name: Execute Full Test Suite
         env:
