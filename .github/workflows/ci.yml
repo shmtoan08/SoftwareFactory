@@ -2701,6 +2701,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0020_t1_unverified_observations.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-unverified-observations.sql
           node packages/database/tests/telemetry-observation-concurrency.mjs
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0021_t1_ledger_settlements.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0021_t1_ledger_settlements.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-ledger-settlements.sql
+          node packages/database/tests/telemetry-observation-concurrency.mjs --settlements
 
       - name: Execute Full Test Suite
         env:
