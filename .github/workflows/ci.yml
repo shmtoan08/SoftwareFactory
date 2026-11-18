@@ -2691,6 +2691,9 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0017_t1_telemetry_authority_foundation.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0017_t1_telemetry_authority_foundation.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-authority.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0018_t1_telemetry_service_authority.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0018_t1_telemetry_service_authority.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-service-authority.sql
 
       - name: Execute Full Test Suite
         env:
