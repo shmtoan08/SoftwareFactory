@@ -1,3 +1,4 @@
+import type { CallObservationHandle, CallTelemetryObserver } from "./call-telemetry.ts";
 import {
   type CostSessionRecord,
   type ModelCallLedgerRecord,
@@ -773,6 +774,8 @@ export function createModelProviderClient(
 }
 
 export interface ManagedModelProviderExecutorOptions {
+  /** Server-only, disabled by absence; never supplied by a worker request. */
+  readonly telemetryObserver?: CallTelemetryObserver;
   readonly client: LiveModelProviderClient;
   readonly promptRegistry: PromptRegistry;
   readonly costGuard: CostGuardRecorder;
@@ -829,6 +832,7 @@ export interface DeferredStructuredExecutionResult<T> {
  * and atomic `CostGuardRecorder` Post-Call Ledger accounting.
  */
 export class ManagedModelProviderExecutor {
+  private readonly telemetryObserver?: CallTelemetryObserver;
   public readonly client: LiveModelProviderClient;
   public readonly promptRegistry: PromptRegistry;
   public readonly costGuard: CostGuardRecorder;
@@ -837,6 +841,7 @@ export class ManagedModelProviderExecutor {
   public readonly defaultTemperature: number;
 
   constructor(options: ManagedModelProviderExecutorOptions) {
+    this.telemetryObserver = options.telemetryObserver;
     this.client = options.client;
     this.promptRegistry = options.promptRegistry;
     this.costGuard = options.costGuard;
@@ -860,6 +865,7 @@ export class ManagedModelProviderExecutor {
       pricingOverrides: this.pricingOverrides,
       defaultMaxTokens: this.defaultMaxTokens,
       defaultTemperature: this.defaultTemperature,
+      telemetryObserver: this.telemetryObserver,
     });
   }
 
@@ -918,7 +924,23 @@ export class ManagedModelProviderExecutor {
       estimated_cost_micro_usd: estimatedCostMicroUsd,
     });
 
+    // Best-effort CALL_ONLY enrollment after unchanged Cost Guard preflight.
+    // No observer I/O is awaited on the execution path.
+    let observation: CallObservationHandle | null = null;
+    try {
+      observation = this.telemetryObserver?.begin({
+        projectId: input.projectId, costSessionId: input.costSessionId,
+        taskId: input.taskId ?? null, pipelineSessionId: input.pipelineSessionId ?? null,
+        provider, model, promptId: renderedPrompt.promptId, promptVersion: renderedPrompt.version,
+        promptSha256: renderedPrompt.promptSha256,
+      }) ?? null;
+    } catch { /* Observation faults never replace execution results. */ }
+    const observeLedger = (ledgerId: string): void => {
+      try { if (observation) this.telemetryObserver?.ledgerCandidate(observation, ledgerId); } catch { /* Best effort. */ }
+    };
+
     if (!preflight.allowed) {
+      observeLedger(preflight.blockedLedger.call_id);
       throw new CostBudgetExceededError({
         limitScope: preflight.limitScope,
         costSessionId: input.costSessionId,
@@ -947,6 +969,7 @@ export class ManagedModelProviderExecutor {
       });
     } catch (providerErr: unknown) {
       const latencyMs = Math.max(0, Date.now() - startMs);
+      try { if (observation) this.telemetryObserver?.failure(observation); } catch { /* Best effort. */ }
       const partialUsage =
         providerErr instanceof ModelProviderHttpError ? providerErr.partialUsage : undefined;
       const actualIn = partialUsage ? partialUsage.inputTokens : 0;
@@ -982,6 +1005,7 @@ export class ManagedModelProviderExecutor {
         error_message: providerErrMsg,
         latency_ms: latencyMs,
       });
+      observeLedger(finalizedProviderErr.ledger.call_id);
       if (!finalizedProviderErr.allowed && partialCostMicroUsd > 0) {
         throw new CostBudgetExceededError({
           limitScope: finalizedProviderErr.limitScope ?? "SESSION_COST_BUDGET",
@@ -1004,6 +1028,7 @@ export class ManagedModelProviderExecutor {
     }
 
     const latencyMs = Math.max(0, Date.now() - startMs);
+    try { if (observation) this.telemetryObserver?.usage(observation, completion.rawUsage); } catch { /* Best effort. */ }
     const usage = completion.usage;
     const actualCostMicroUsd = computeCostMicroUsd(usage.inputTokens, usage.outputTokens, rate);
     const schema = input.outputSchemaOverride ?? renderedPrompt.outputSchema;
@@ -1042,6 +1067,7 @@ export class ManagedModelProviderExecutor {
           outcome: "FAILED_VALIDATION",
           error_message: validationMsg,
         });
+        observeLedger(finalizeFailed.ledger.call_id);
         if (!finalizeFailed.allowed) {
           throw new CostBudgetExceededError({
             limitScope: finalizeFailed.limitScope ?? "SESSION_COST_BUDGET",
@@ -1085,6 +1111,7 @@ export class ManagedModelProviderExecutor {
       pendingAllowedLedgerInput,
       commitAllowedLedger: async () => {
         const finalized = await this.costGuard.finalizeModelCallLedger(pendingAllowedLedgerInput);
+        observeLedger(finalized.ledger.call_id);
         if (!finalized.allowed) {
           throw new CostBudgetExceededError({
             limitScope: finalized.limitScope ?? "SESSION_COST_BUDGET",
@@ -1116,6 +1143,7 @@ export class ManagedModelProviderExecutor {
           outcome,
           error_message: errorMessage,
         });
+        observeLedger(finalizeFailed.ledger.call_id);
         if (!finalizeFailed.allowed) {
           throw new CostBudgetExceededError({
             limitScope: finalizeFailed.limitScope ?? "SESSION_COST_BUDGET",

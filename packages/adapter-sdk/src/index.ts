@@ -574,3 +574,5 @@ export * from "./runtime-adapters.ts";
 export * from "./execution-targets.ts";
 
 export * from "./native-worker-attestation.ts";
+
+export * from "./call-telemetry.ts";
