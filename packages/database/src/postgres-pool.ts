@@ -8512,3 +8512,38 @@ FROM (SELECT t.task_id,t.project_id,t.title,t.status,t.current_attempt_no,t.rewo
 LEFT JOIN task_leases l ON l.lease_id=t.active_lease_id AND l.project_id=$1::uuid AND l.task_id=t.task_id AND l.lease_epoch=t.active_lease_epoch
 LEFT JOIN LATERAL (SELECT min(x.assigned_profile_id::text) AS assignee_id,count(DISTINCT x.assigned_profile_id) AS assignee_count FROM task_plan_links x WHERE x.project_id=$1::uuid AND x.pipeline_session_id=$2::uuid AND x.task_id=t.task_id) a ON true
 ORDER BY t.updated_at DESC,t.task_id DESC;`;
+
+/** Dedicated telemetry service connection. Never joins an app_runtime transaction.
+ * Server-internal primitive; SQL role ACLs remain the authority boundary.
+ */
+export async function withTelemetryServiceTransaction<T>(
+  config: PostgresPoolConfig, projectId: string, signal: AbortSignal,
+  fn: (query: <R extends Record<string, unknown> = Record<string, unknown>>(sql: string, params?: readonly unknown[]) => Promise<PostgresQueryResult<R>>) => Promise<T>
+): Promise<T> {
+  let conn: PooledPgConnection | undefined;
+  const deadline = Date.now() + 2000;
+  const abort = (): void => { conn?.abortReadOperation(); };
+  let expired = false;
+  const timer = setTimeout(() => { expired = true; abort(); }, 2000);
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    if (signal.aborted) throw new Error("aborted");
+    conn = await PooledPgConnection.connect({ ...config, maxRecvBufferBytes: 1024 * 1024,
+      connectTimeoutMs: 500, queryTimeoutMs: 2000, socketTimeoutMs: 2000 }, deadline);
+    if (signal.aborted || expired || Date.now() >= deadline) throw new Error("aborted");
+    await conn.simpleQuery("BEGIN; SET LOCAL ROLE telemetry_ingestor; SET LOCAL statement_timeout='2000ms'; SET LOCAL lock_timeout='50ms';");
+    await conn.query("SELECT telemetry.assert_ingestor($1::uuid);", [projectId]);
+    const result = await fn((sql, params = []) => conn!.query(sql, params));
+    if (signal.aborted || expired || Date.now() >= deadline) throw new Error("aborted");
+    await conn.simpleQuery("COMMIT;");
+    return result;
+  } catch {
+    // Destroy, rather than wait for rollback behind a blocked wire operation.
+    // A COMMIT acknowledgement loss remains uncertain and is safe to replay by ID.
+    abort();
+    throw new Error("Telemetry database operation unavailable");
+  } finally {
+    clearTimeout(timer); signal.removeEventListener("abort", abort);
+    if (conn) { try { await conn.close(); } catch { abort(); } }
+  }
+}
