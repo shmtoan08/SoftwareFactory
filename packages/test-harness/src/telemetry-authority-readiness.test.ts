@@ -36,23 +36,42 @@ function matchingLines(pattern: RegExp): string[] {
   return matches.sort();
 }
 
-function liveModelDispatchLines(): string[] {
+function liveModelDispatchLines(files: readonly string[] = productionSources): string[] {
   const configPath = join(root, "tsconfig.json");
   const config = ts.readConfigFile(configPath, ts.sys.readFile);
   assert.equal(config.error, undefined);
   const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, root, undefined, configPath);
   const program = ts.createProgram(parsed.fileNames, parsed.options);
   const checker = program.getTypeChecker();
-  const production = new Set(productionSources);
+  const inspected = new Set(files);
   const matches: string[] = [];
+  let clientType: ts.Type | undefined;
+
+  const clientSource = program.getSourceFile(join(root, "packages/adapter-sdk/src/model-providers.ts"));
+  assert(clientSource);
+  for (const statement of clientSource.statements) {
+    if (ts.isClassDeclaration(statement) && statement.name?.text === "LiveModelProviderClient") {
+      const symbol = checker.getSymbolAtLocation(statement.name);
+      assert(symbol);
+      clientType = checker.getDeclaredTypeOfSymbol(symbol);
+      break;
+    }
+  }
+  assert(clientType);
+
+  const assignableToClient = (type: ts.Type): boolean => {
+    if (type.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never)) return false;
+    if (type.isUnion()) return type.types.some(assignableToClient);
+    return checker.isTypeAssignableTo(type, clientType!);
+  };
 
   for (const source of program.getSourceFiles()) {
-    if (!production.has(source.fileName)) continue;
+    if (!inspected.has(source.fileName)) continue;
     const visit = (node: ts.Node): void => {
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
         && node.expression.name.text === "complete") {
-        const receiverType = checker.typeToString(checker.getTypeAtLocation(node.expression.expression));
-        if (receiverType.includes("LiveModelProviderClient")) {
+        const receiverType = checker.getTypeAtLocation(node.expression.expression);
+        if (assignableToClient(receiverType)) {
           const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line;
           matches.push(`${relative(root, source.fileName)}|${source.text.split("\n")[line]!.trim()}`);
         }
@@ -69,6 +88,14 @@ test("T1-D inventories every typed LiveModelProviderClient dispatch site regardl
     "packages/adapter-sdk/src/index.ts|const resp = await this.modelClient.complete({",
     "packages/adapter-sdk/src/model-providers.ts|completion = await this.client.complete({",
     "packages/adapter-sdk/src/model-providers.ts|const completion = await client.complete({",
+  ]);
+});
+
+test("T1-D inventory recognizes a structurally declared subtype without matching its rendered type name", () => {
+  assert.deepEqual(liveModelDispatchLines([
+    join(root, "packages/test-harness/src/telemetry-readiness-subtype-fixture.ts"),
+  ]), [
+    "packages/test-harness/src/telemetry-readiness-subtype-fixture.ts|return provider.complete({ systemPrompt: \"fixture\", userPrompt: \"fixture\" });",
   ]);
 });
 

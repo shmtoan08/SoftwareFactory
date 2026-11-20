@@ -19,6 +19,7 @@ BEGIN
   SELECT r.cutoff_at INTO prior_cutoff FROM telemetry.reports r WHERE r.project_id=p_project AND r.report_id=p_supersedes;
   IF NOT FOUND OR prior_cutoff>p_cutoff THEN RAISE EXCEPTION 'Invalid report supersession' USING ERRCODE='23514'; END IF;
  END IF;
+ -- Lock roots in deterministic order using the same key as lifecycle event writers.
  FOR root IN SELECT l.lifecycle_id FROM telemetry.lifecycles l JOIN telemetry.cohort_manifests m
   ON m.project_id=l.project_id AND m.manifest_id=l.manifest_id
   WHERE l.project_id=p_project AND l.created_at<=p_cutoff AND m.manifest_version=p_manifest_version ORDER BY l.lifecycle_id
