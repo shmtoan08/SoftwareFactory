@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import { it } from "node:test";
 import { buildPostgresPoolConfigFromEnv, createControlPlaneStoreFromEnv, PostgresTelemetryDelivery } from "@software-factory/database";
-import { CallTelemetryObserver, LiveModelProviderClient, ManagedModelProviderExecutor, type ModelCompletionResponse } from "@software-factory/adapter-sdk";
+import { CallTelemetryObserver, LiveModelProviderClient, ManagedModelProviderExecutor, verifyProtectedTemplateHmac, type ModelCompletionResponse } from "@software-factory/adapter-sdk";
 import { ProductPipelineService } from "@software-factory/product-pipeline";
 
 it("T1 B3 real pipeline TX2 visibility, rollback compensation and telemetry noninterference", { timeout: 60000 }, async t => {
@@ -46,7 +46,8 @@ it("T1 B3 real pipeline TX2 visibility, rollback compensation and telemetry noni
         const unavailable: PostgresTelemetryDelivery | undefined = mode === "unavailable"
           ? new PostgresTelemetryDelivery({ ...config, database: `missing_${suffix}`, user: role, password }, projectId)
           : undefined;
-        const observer: CallTelemetryObserver | undefined = mode === "off" ? undefined : new CallTelemetryObserver({ projectId, environment: "fixture", keyVersion: "1", hmacKey: Buffer.alloc(32, 9), deliver: mode === "late" ? async (events, signal) => {
+        const hmacKey = Buffer.alloc(32, 9);
+        const observer: CallTelemetryObserver | undefined = mode === "off" ? undefined : new CallTelemetryObserver({ projectId, environment: "fixture", keyVersion: "1", hmacKey, deliver: mode === "late" ? async (events, signal) => {
           for (let n = 0; n < 600 && !entered; n++) await delay(5);
           await transport.deliver(events, signal);
         } : mode === "sql" ? transport.deliver : unavailable!.deliver });
@@ -90,6 +91,14 @@ it("T1 B3 real pipeline TX2 visibility, rollback compensation and telemetry noni
           await transport.reconcile(signal);
           assert.equal(sql(`SELECT count(*) FROM telemetry.settlements s JOIN telemetry.invocations i USING(project_id,invocation_id) WHERE i.cost_session_id='${costId}';`), "1");
           assert.equal(sql(`SELECT s.ledger_call_id FROM telemetry.settlements s JOIN telemetry.invocations i USING(project_id,invocation_id) WHERE i.cost_session_id='${costId}';`), business.ledgers[0]!.call_id);
+          const protectedBinding = sql(`SELECT i.prompt_hmac_ref||'|'||i.key_version||'|'||i.prompt_id||'|'||i.prompt_version||'|'||l.prompt_sha256
+            FROM telemetry.invocations i JOIN telemetry.settlements s USING(project_id,invocation_id)
+            JOIN public.model_call_ledgers l ON l.project_id=s.project_id AND l.call_id=s.ledger_call_id
+            WHERE i.cost_session_id='${costId}';`).split("|");
+          assert.equal(protectedBinding.length, 5);
+          assert.equal(verifyProtectedTemplateHmac({ environment: "fixture", projectId, keyVersion: protectedBinding[1]!,
+            promptId: protectedBinding[2]!, promptVersion: protectedBinding[3]!, promptSha256: protectedBinding[4]! },
+          protectedBinding[0]!, hmacKey), true);
           assert.equal(sql(`SELECT count(*) FROM telemetry.ledger_candidates c JOIN telemetry.invocations i USING(project_id,invocation_id) WHERE i.cost_session_id='${costId}';`), rollback ? "2" : "1");
           const again = await transport.reconcile(signal);
           const ownIds = sql(`SELECT c.candidate_id FROM telemetry.ledger_candidates c JOIN telemetry.invocations i USING(project_id,invocation_id) WHERE i.cost_session_id='${costId}';`).split("\n");

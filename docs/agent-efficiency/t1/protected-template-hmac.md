@@ -1,0 +1,9 @@
+# T1 — protected template HMAC evidence
+
+Date: 2026-11-20. This provider-free slice centralizes the existing `sf-telemetry-template-v1` derivation and adds constant-time verification for trusted service code. The domain binds environment, project, key version, prompt ID/version and the service-internal template SHA-256. Keys must be 32–128 bytes and remain in service secret storage/memory; neither the key nor the plain template fingerprint is copied into telemetry events or diagnostic errors.
+
+`CallTelemetryObserver` now uses the shared derivation without changing the HMAC format. `verifyProtectedTemplateHmac` rejects malformed values, wrong keys and any changed domain field, and uses `timingSafeEqual` for a valid 32-byte digest. This is a cryptographic template-identity check only. It does not authenticate a worker, establish generation/lease authority, prove that a provider call occurred, or prove that every chargeable call was observed.
+
+Provider-free unit evidence checks exact derivation, environment/project/key-version separation, fingerprint mismatch, wrong-key rejection and malformed-reference rejection while retaining the existing no-plain-hash event assertions. The real PostgreSQL pipeline fixture joins the committed invocation settlement to the exact Cost Guard ledger inside an admin-only test, reads the protected ledger fingerprint, and verifies the stored invocation HMAC. Both successful TX2 and compensating failed-validation ledgers are covered. Production roles receive no new ledger hash grant, database function, key, endpoint or runtime wiring.
+
+Stage D remains authoritative: `TASK_BOUND` is disabled, lifecycle close rejects and reports remain incomplete because protected HMAC cannot replace independent dispatch/in-flight inventory. No provider call, prompt registration, mapping promotion, T2 activation, historical backfill or S0-B acceptance is included.

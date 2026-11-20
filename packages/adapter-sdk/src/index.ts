@@ -577,3 +577,5 @@ export * from "./execution-targets.ts";
 export * from "./native-worker-attestation.ts";
 
 export * from "./call-telemetry.ts";
+
+export * from "./protected-template-hmac.ts";

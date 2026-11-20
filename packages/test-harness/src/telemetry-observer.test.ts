@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 import {
   CallTelemetryObserver, sanitizeCandidateUsage, InMemoryCostGuardLedger,
   LiveModelProviderClient, ManagedModelProviderExecutor, PromptRegistry,
+  deriveProtectedTemplateHmac, verifyProtectedTemplateHmac,
   type CallTelemetryEvent, type CallObservationContext, type ModelCompletionResponse,
 } from "@software-factory/adapter-sdk";
 const project = "10000000-0000-0000-0000-000000000071";
@@ -43,6 +44,17 @@ describe("T1 B1 provider-free optional observation", () => {
       assert.equal(JSON.stringify(events).includes(context.promptSha256), false);
     }
     assert.equal(new Set(batches.map(batch => batch[0]?.kind === "register" ? batch[0].promptHmac : "")).size, 4);
+    const register = batches[0]![0]; assert(register?.kind === "register");
+    const binding = { environment: "one", projectId: project, keyVersion: "1", promptId: context.promptId,
+      promptVersion: context.promptVersion, promptSha256: context.promptSha256 };
+    assert.equal(register.promptHmac, deriveProtectedTemplateHmac(binding, Buffer.alloc(32, 7)));
+    assert.equal(verifyProtectedTemplateHmac(binding, register.promptHmac, Buffer.alloc(32, 7)), true);
+    assert.equal(verifyProtectedTemplateHmac({ ...binding, promptSha256: "b".repeat(64) }, register.promptHmac, Buffer.alloc(32, 7)), false);
+    assert.equal(verifyProtectedTemplateHmac({ ...binding, promptId: "other" }, register.promptHmac, Buffer.alloc(32, 7)), false);
+    assert.equal(verifyProtectedTemplateHmac({ ...binding, promptVersion: "2" }, register.promptHmac, Buffer.alloc(32, 7)), false);
+    assert.equal(verifyProtectedTemplateHmac(binding, register.promptHmac, Buffer.alloc(32, 8)), false);
+    assert.equal(verifyProtectedTemplateHmac(binding, "not-a-hmac", Buffer.alloc(32, 7)), false);
+    assert.throws(() => deriveProtectedTemplateHmac(binding, Buffer.alloc(31)), /^Error: Invalid protected template binding$/);
   });
   it("includes in-flight events in capacity; expires hanging transport once and never overlaps delivery", async () => {
     let calls = 0; let signal: AbortSignal | undefined; let release: (() => void) | undefined;

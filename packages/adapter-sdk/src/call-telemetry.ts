@@ -1,5 +1,6 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import { deriveProtectedTemplateHmac } from "./protected-template-hmac.ts";
 
 export interface CallObservationContext {
   readonly projectId: string;
@@ -103,10 +104,10 @@ export class CallTelemetryObserver {
         || !Object.hasOwn(KEYS, context.provider) || ![context.model, context.promptId, context.promptVersion].every(bounded)
         || !/^[a-f0-9]{64}$/.test(context.promptSha256)) { this.#dropped++; return null; }
       const invocationId = randomUUID();
-      const promptHmac = createHmac("sha256", this.#key).update(JSON.stringify([
-        "sf-telemetry-template-v1", this.#environment, context.projectId, this.#keyVersion,
-        context.promptId, context.promptVersion, context.promptSha256,
-      ])).digest("hex");
+      const promptHmac = deriveProtectedTemplateHmac({
+        environment: this.#environment, projectId: context.projectId, keyVersion: this.#keyVersion,
+        promptId: context.promptId, promptVersion: context.promptVersion, promptSha256: context.promptSha256,
+      }, this.#key);
       if (!this.#enqueue(Object.freeze({ kind: "register", invocationId, projectId: context.projectId,
         costSessionId: context.costSessionId, taskId: context.taskId, pipelineSessionId: context.pipelineSessionId,
         provider: context.provider, model: context.model, promptId: context.promptId, promptVersion: context.promptVersion,
