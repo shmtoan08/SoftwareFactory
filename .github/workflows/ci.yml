@@ -2710,6 +2710,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-report-readers.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0023_t1_candidate_delivery.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0023_t1_candidate_delivery.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0024_t1_lifecycle_semantics.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0024_t1_lifecycle_semantics.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-lifecycle-semantics.sql
+          node packages/database/tests/telemetry-lifecycle-concurrency.mjs
 
       - name: Execute Full Test Suite
         env:
