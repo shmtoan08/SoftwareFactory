@@ -4,7 +4,7 @@ Date: 2026-11-20. This is the required provider-free readiness decision under th
 
 ## Executable inventory
 
-`telemetry-authority-readiness.test.ts` scans all production TypeScript under `apps/` and `packages/` and pins every direct `LiveModelProviderClient.complete` site. The measured inventory is three direct HTTP-client dispatch surfaces: managed structured execution, independent live review, and workspace coding. It separately pins two external model CLI surfaces: Claude Code and Codex. A source change that adds or removes a direct client/CLI surface fails the audit until this decision is revisited.
+`telemetry-authority-readiness.test.ts` builds the repository TypeScript program, resolves receiver types, scans all production TypeScript under `apps/` and `packages/`, and pins every call to `complete` whose receiver is a `LiveModelProviderClient`, regardless of the variable or property name. The measured inventory is three direct HTTP-client dispatch surfaces: managed structured execution, independent live review, and workspace coding. It separately pins two external model CLI surfaces: Claude Code and Codex. A source change that adds or removes a direct client/CLI surface fails the audit until this decision is revisited.
 
 Only managed structured execution has the optional observer hook. The other two direct client surfaces bypass it. Claude Code dispatches through the generic agent runtime process boundary without the observer or an authoritative per-call Cost Guard record. Codex production is correctly hard-disabled as unmetered; its emulator is not production coverage evidence. The generic `AgentRuntimeAdapter` injection point also means a source list alone cannot prove that every chargeable command is mediated.
 

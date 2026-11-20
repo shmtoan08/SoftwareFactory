@@ -3,6 +3,11 @@ BEGIN;
 CREATE FUNCTION pg_temp.expect_error(command TEXT, expected TEXT) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE actual TEXT; BEGIN BEGIN EXECUTE command; EXCEPTION WHEN OTHERS THEN GET STACKED DIAGNOSTICS actual=RETURNED_SQLSTATE;
  IF actual=expected THEN RETURN; END IF; RAISE; END; RAISE EXCEPTION 'Expected SQLSTATE %',expected; END $$;
+CREATE FUNCTION pg_temp.expect_error(command TEXT, expected TEXT, expected_message TEXT) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE actual TEXT; actual_message TEXT; BEGIN BEGIN EXECUTE command; EXCEPTION WHEN OTHERS THEN
+ GET STACKED DIAGNOSTICS actual=RETURNED_SQLSTATE,actual_message=MESSAGE_TEXT;
+ IF actual=expected AND actual_message=expected_message THEN RETURN; END IF; RAISE; END;
+ RAISE EXCEPTION 'Expected SQLSTATE % with message %',expected,expected_message; END $$;
 INSERT INTO public.projects(project_id,slug,name,repo_bare_path) VALUES
  ('10000000-0000-0000-0000-000000000261','telemetry-c3-a','A','/unused'),
  ('10000000-0000-0000-0000-000000000262','telemetry-c3-b','B','/unused');
@@ -24,6 +29,9 @@ INSERT INTO telemetry.lifecycle_events(event_id,project_id,lifecycle_id,sequence
  FROM generate_series(261,264) n;
 INSERT INTO telemetry.lifecycle_events(event_id,project_id,lifecycle_id,sequence,kind,service_actor_ref,observed_at,cutoff_at,prior_sequence,prior_event_digest,event_digest)
  VALUES(gen_random_uuid(),'10000000-0000-0000-0000-000000000261','40000000-0000-0000-0000-000000000262',2,'CENSOR','fixture','2026-01-20Z','2026-01-15Z',1,repeat('a',64),repeat('b',64));
+INSERT INTO telemetry.reports(report_id,project_id,cutoff_at,manifest_version,mapping_versions,report_digest,aggregate_json,finalized_at)
+ VALUES('50000000-0000-0000-0000-000000000263','10000000-0000-0000-0000-000000000262','2026-01-10Z','v1',ARRAY['UNVERIFIED'],repeat('c',64),
+ '{"total_roots":"0","complete_roots":"0","incomplete_roots":"0","censored_roots":"0","canonical_total":null}','2026-01-11Z');
 CREATE ROLE sf_telemetry_c3_reporter LOGIN NOINHERIT;
 GRANT telemetry_reporter TO sf_telemetry_c3_reporter;
 INSERT INTO telemetry.service_projects SELECT oid,rolname,'10000000-0000-0000-0000-000000000261','read' FROM pg_roles WHERE rolname='sf_telemetry_c3_reporter';
@@ -32,6 +40,8 @@ SET ROLE telemetry_reporter;
 SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.reports$q$,'42501');
 SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.publish_incomplete_report('10000000-0000-0000-0000-000000000262',gen_random_uuid(),
  '2026-02-01Z','v1',ARRAY['UNVERIFIED'],NULL)$q$,'42501');
+SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.publish_incomplete_report('10000000-0000-0000-0000-000000000261','50000000-0000-0000-0000-000000000263',
+ '2026-02-01Z','v1',ARRAY['UNVERIFIED'],NULL)$q$,'23505','Telemetry report conflict');
 SELECT * FROM telemetry.publish_incomplete_report('10000000-0000-0000-0000-000000000261','50000000-0000-0000-0000-000000000261',
  '2026-02-01Z','v1',ARRAY['UNVERIFIED'],NULL);
 SELECT * FROM telemetry.publish_incomplete_report('10000000-0000-0000-0000-000000000261','50000000-0000-0000-0000-000000000261',

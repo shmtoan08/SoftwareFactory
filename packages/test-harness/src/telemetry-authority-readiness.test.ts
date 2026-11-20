@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../..");
 
@@ -35,8 +36,36 @@ function matchingLines(pattern: RegExp): string[] {
   return matches.sort();
 }
 
-test("T1-D inventories every direct LiveModelProviderClient dispatch site", () => {
-  assert.deepEqual(matchingLines(/(?:\bclient|this\.client|this\.modelClient)\.complete\s*\(/), [
+function liveModelDispatchLines(): string[] {
+  const configPath = join(root, "tsconfig.json");
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  assert.equal(config.error, undefined);
+  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, root, undefined, configPath);
+  const program = ts.createProgram(parsed.fileNames, parsed.options);
+  const checker = program.getTypeChecker();
+  const production = new Set(productionSources);
+  const matches: string[] = [];
+
+  for (const source of program.getSourceFiles()) {
+    if (!production.has(source.fileName)) continue;
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)
+        && node.expression.name.text === "complete") {
+        const receiverType = checker.typeToString(checker.getTypeAtLocation(node.expression.expression));
+        if (receiverType.includes("LiveModelProviderClient")) {
+          const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line;
+          matches.push(`${relative(root, source.fileName)}|${source.text.split("\n")[line]!.trim()}`);
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(source, visit);
+  }
+  return matches.sort();
+}
+
+test("T1-D inventories every typed LiveModelProviderClient dispatch site regardless of receiver name", () => {
+  assert.deepEqual(liveModelDispatchLines(), [
     "packages/adapter-sdk/src/index.ts|const resp = await this.modelClient.complete({",
     "packages/adapter-sdk/src/model-providers.ts|completion = await this.client.complete({",
     "packages/adapter-sdk/src/model-providers.ts|const completion = await client.complete({",

@@ -47,13 +47,18 @@ describe("T1 B1 provider-free optional observation", () => {
     const register = batches[0]![0]; assert(register?.kind === "register");
     const binding = { environment: "one", projectId: project, keyVersion: "1", promptId: context.promptId,
       promptVersion: context.promptVersion, promptSha256: context.promptSha256 };
+    assert.equal(register.promptHmac, "60cf538a65348b25f6727ce56985960a13877126cf638643931428586fe5980a");
     assert.equal(register.promptHmac, deriveProtectedTemplateHmac(binding, Buffer.alloc(32, 7)));
     assert.equal(verifyProtectedTemplateHmac(binding, register.promptHmac, Buffer.alloc(32, 7)), true);
+    assert.equal(verifyProtectedTemplateHmac({ ...binding, environment: "two" }, register.promptHmac, Buffer.alloc(32, 7)), false);
+    assert.equal(verifyProtectedTemplateHmac({ ...binding, projectId: "10000000-0000-0000-0000-000000000072" }, register.promptHmac, Buffer.alloc(32, 7)), false);
+    assert.equal(verifyProtectedTemplateHmac({ ...binding, keyVersion: "2" }, register.promptHmac, Buffer.alloc(32, 7)), false);
     assert.equal(verifyProtectedTemplateHmac({ ...binding, promptSha256: "b".repeat(64) }, register.promptHmac, Buffer.alloc(32, 7)), false);
     assert.equal(verifyProtectedTemplateHmac({ ...binding, promptId: "other" }, register.promptHmac, Buffer.alloc(32, 7)), false);
     assert.equal(verifyProtectedTemplateHmac({ ...binding, promptVersion: "2" }, register.promptHmac, Buffer.alloc(32, 7)), false);
     assert.equal(verifyProtectedTemplateHmac(binding, register.promptHmac, Buffer.alloc(32, 8)), false);
     assert.equal(verifyProtectedTemplateHmac(binding, "not-a-hmac", Buffer.alloc(32, 7)), false);
+    assert.equal(verifyProtectedTemplateHmac({ ...binding, promptSha256: "A".repeat(64) }, register.promptHmac, Buffer.alloc(32, 7)), false);
     assert.throws(() => deriveProtectedTemplateHmac(binding, Buffer.alloc(31)), /^Error: Invalid protected template binding$/);
   });
   it("includes in-flight events in capacity; expires hanging transport once and never overlaps delivery", async () => {
