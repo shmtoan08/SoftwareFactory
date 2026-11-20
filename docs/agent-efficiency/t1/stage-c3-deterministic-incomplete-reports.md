@@ -1,0 +1,9 @@
+# T1 C3 — deterministic incomplete and censored reports
+
+Migration 0026 adds a reporter-only publication function that derives every report field from immutable manifests, lifecycle roots and an event watermark at a past cutoff. The caller supplies identity, cutoff, manifest version, mapping-version inventory and optional superseded report ID; it cannot supply aggregate counts, members, outcomes, reasons or a digest.
+
+Publication serializes per project and takes every included root's existing lifecycle advisory lock in UUID order before computing the inventory. This waits for in-flight event writers and prevents the digest/member queries from observing different event chains. Roots are scoped by project, creation time and exact manifest version. Each member stores the latest event at the cutoff. Unclassified roots remain unclassified; a root with a qualifying CENSOR is censored; every other root is `observer-coverage-unproven`. Complete roots are always zero and canonical total is always null because C2 cannot close or prove coverage.
+
+The report digest binds project/report IDs, cutoff, manifest/mapping versions, supersession, ordered membership watermarks and the derived aggregate. Exact replay returns duplicate; changed reuse conflicts. Supersession must reference an existing same-project report with a cutoff no later than the new cutoff. Append-only tables and immutable FKs preserve old reports.
+
+Real PostgreSQL tests cover direct-table denial, deterministic three-root membership, censor/unclassified/unproved reasons, zero complete and null canonical totals, replay/conflict, monotonic supersession, project authority and app_runtime contamination. No complete/eligible sample, arbitrary report body, public reader, runtime scheduler, TASK_BOUND, provider call, mapping promotion, T2 activation or S0-B acceptance is introduced.

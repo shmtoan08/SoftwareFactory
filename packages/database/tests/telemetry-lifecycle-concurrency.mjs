@@ -29,7 +29,7 @@ try {
     INSERT INTO public.projects(project_id,slug,name,repo_bare_path) VALUES('${project}','c2-concurrent','fixture','/unused');
     INSERT INTO public.tasks(task_id,project_id,title,task_contract_json,status,base_main_commit_hash) VALUES('${task}','${project}','fixture','{}','Ready',repeat('a',40));
     INSERT INTO telemetry.service_projects SELECT oid,rolname,'${project}','operator' FROM pg_roles WHERE rolname='${role}';`);
-  const holder=client(`open_holder_${suffix}`); holder.child.stdin.write(`BEGIN;\n${auth}SELECT pg_advisory_xact_lock(hashtextextended('${project}:${task}',2401));\n\\echo lock_ready\n`);
+  const holder=client(`open_holder_${suffix}`); holder.child.stdin.write(`BEGIN;\n${auth}SELECT pg_advisory_xact_lock(hashtextextended('${project}:report',2601));\nSELECT pg_advisory_xact_lock(hashtextextended('${project}:${task}',2401));\n\\echo lock_ready\n`);
   await until(()=>holder.output().includes('lock_ready'),'Enrollment lock not held');
   const waiter=client(`open_waiter_${suffix}`); waiter.child.stdin.end(`${auth}${open}`);
   await until(()=>sql(`SELECT count(*) FROM pg_stat_activity WHERE datname='${database}' AND application_name='open_waiter_${suffix}' AND wait_event_type='Lock';`).trim()==='1','Concurrent enrollment did not wait');

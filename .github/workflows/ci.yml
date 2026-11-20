@@ -2716,6 +2716,9 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0025_t1_lifecycle_review_fixes.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-lifecycle-semantics.sql
           node packages/database/tests/telemetry-lifecycle-concurrency.mjs
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0026_t1_deterministic_incomplete_reports.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0026_t1_deterministic_incomplete_reports.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-deterministic-reports.sql
 
       - name: Execute Full Test Suite
         env:
