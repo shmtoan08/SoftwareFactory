@@ -43,11 +43,13 @@ it("T1 B3 real pipeline TX2 visibility, rollback compensation and telemetry noni
             return { provider: "anthropic", model: this.config.model, endpoint: "fixture", requestSha256: "b".repeat(64), contentText: JSON.stringify({ summary: "Fixture discovery", facts: [], assumptions: [], recommendations: [] }), rawUsage: { input_tokens: 1, output_tokens: 2 }, usage: { inputTokens: 1, outputTokens: 2, totalTokens: 3 } };
           }
         }
-        const unavailable: PostgresTelemetryDelivery = new PostgresTelemetryDelivery({ ...config, database: `missing_${suffix}`, user: role, password }, projectId);
+        const unavailable: PostgresTelemetryDelivery | undefined = mode === "unavailable"
+          ? new PostgresTelemetryDelivery({ ...config, database: `missing_${suffix}`, user: role, password }, projectId)
+          : undefined;
         const observer: CallTelemetryObserver | undefined = mode === "off" ? undefined : new CallTelemetryObserver({ projectId, environment: "fixture", keyVersion: "1", hmacKey: Buffer.alloc(32, 9), deliver: mode === "late" ? async (events, signal) => {
           for (let n = 0; n < 600 && !entered; n++) await delay(5);
           await transport.deliver(events, signal);
-        } : mode === "sql" ? transport.deliver : unavailable.deliver });
+        } : mode === "sql" ? transport.deliver : unavailable!.deliver });
         if (observer) observers.push(observer);
         const pipeline = new ProductPipelineService({ store });
         const executor = new ManagedModelProviderExecutor({ client: new FixtureClient({ provider: "anthropic", model: "claude-sonnet-4-20250514", apiKey: "fixture" }), promptRegistry: pipeline.promptRegistry, costGuard: store, telemetryObserver: observer });
@@ -104,10 +106,14 @@ it("T1 B3 real pipeline TX2 visibility, rollback compensation and telemetry noni
     }
     assert.equal(sql(`SELECT count(*) FROM telemetry.quality_events WHERE project_id='${projectId}';`), "0");
   } finally {
-    observers.forEach(observer => observer.stop()); await runtime?.close();
-    if (created) {
-      execFileSync("dropdb", ["--maintenance-db", config.database, "--force", database], { env, timeout: 15000 });
-      execFileSync("psql", ["-X", "-v", "ON_ERROR_STOP=1", "-d", config.database], { env, input: `DROP ROLE IF EXISTS ${role};`, stdio: ["pipe", "pipe", "pipe"], timeout: 5000 });
+    observers.forEach(observer => observer.stop());
+    try {
+      await runtime?.close();
+    } finally {
+      if (created) {
+        execFileSync("dropdb", ["--maintenance-db", config.database, "--force", database], { env, timeout: 15000 });
+        execFileSync("psql", ["-X", "-v", "ON_ERROR_STOP=1", "-d", config.database], { env, input: `DROP ROLE IF EXISTS ${role};`, stdio: ["pipe", "pipe", "pipe"], timeout: 5000 });
+      }
     }
   }
 });
