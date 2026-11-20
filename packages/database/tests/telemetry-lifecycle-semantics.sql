@@ -32,6 +32,15 @@ SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.open_lifecycle(
 SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.open_lifecycle(
  '10000000-0000-0000-0000-000000000241','20000000-0000-0000-0000-000000000242',gen_random_uuid(),gen_random_uuid(),
  repeat('a',64),'1','S',1,1,false,false,false,false,false,repeat('b',40),'1')$q$,'23514');
+SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.open_lifecycle(
+ '10000000-0000-0000-0000-000000000241','20000000-0000-0000-0000-000000000241',gen_random_uuid(),gen_random_uuid(),
+ NULL,'1','S',1,1,false,false,false,false,false,repeat('b',40),'1')$q$,'22023');
+SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.open_lifecycle(
+ '10000000-0000-0000-0000-000000000241','20000000-0000-0000-0000-000000000241',gen_random_uuid(),gen_random_uuid(),
+ repeat('a',64),'1',NULL,1,1,false,false,false,false,false,repeat('b',40),'1')$q$,'22023');
+SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.open_lifecycle(
+ '10000000-0000-0000-0000-000000000241','20000000-0000-0000-0000-000000000241',gen_random_uuid(),gen_random_uuid(),
+ repeat('a',64),'1','S',1,1,false,false,false,false,false,NULL,'1')$q$,'22023');
 
 SELECT * FROM telemetry.open_lifecycle(
  '10000000-0000-0000-0000-000000000241','20000000-0000-0000-0000-000000000241',
@@ -64,6 +73,8 @@ SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.append_lifecycle_event('1
 -- Absence of observed calls cannot prove complete coverage, for any outcome.
 SELECT pg_temp.expect_error($q$SELECT telemetry.close_lifecycle('10000000-0000-0000-0000-000000000241',
  '40000000-0000-0000-0000-000000000241','success')$q$,'23514');
+SELECT pg_temp.expect_error($q$SELECT telemetry.close_lifecycle('10000000-0000-0000-0000-000000000241',
+ '40000000-0000-0000-0000-000000000241',NULL)$q$,'22023');
 DO $$ DECLARE outcome TEXT; BEGIN
  FOREACH outcome IN ARRAY ARRAY['failed','abandoned','cancelled'] LOOP
   BEGIN PERFORM telemetry.close_lifecycle('10000000-0000-0000-0000-000000000241',

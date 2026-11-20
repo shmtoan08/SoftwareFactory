@@ -42,6 +42,13 @@ try {
   eventHolder.child.stdin.end(`SELECT sequence FROM telemetry.append_lifecycle_event('${project}','${lifecycle}','50000000-0000-0000-0000-000000000245','AMEND',NULL);\nCOMMIT;\n`);
   assert((await eventHolder.done).split('\n').includes('2')); assert((await eventWaiter.done).split('\n').includes('3'));
   assert.equal(sql(`SELECT count(*) FROM telemetry.lifecycle_events WHERE lifecycle_id='${lifecycle}' AND prior_sequence=sequence-1;`).trim(),'2');
+  const sameEvent='50000000-0000-0000-0000-000000000247';
+  const retryHolder=client(`retry_holder_${suffix}`); retryHolder.child.stdin.write(`BEGIN;\n${auth}SELECT pg_advisory_xact_lock(hashtextextended('${project}:${lifecycle}',2402));\n\\echo lock_ready\n`);
+  await until(()=>retryHolder.output().includes('lock_ready'),'Retry event lock not held');
+  const retryWaiter=client(`retry_waiter_${suffix}`); retryWaiter.child.stdin.end(`${auth}SELECT disposition FROM telemetry.append_lifecycle_event('${project}','${lifecycle}','${sameEvent}','AMEND',NULL);\n`);
+  await until(()=>sql(`SELECT count(*) FROM pg_stat_activity WHERE datname='${database}' AND application_name='retry_waiter_${suffix}' AND wait_event_type='Lock';`).trim()==='1','Identical event retry did not wait');
+  retryHolder.child.stdin.end(`SELECT disposition FROM telemetry.append_lifecycle_event('${project}','${lifecycle}','${sameEvent}','AMEND',NULL);\nCOMMIT;\n`);
+  assert((await retryHolder.done).includes('recorded')); assert((await retryWaiter.done).includes('duplicate'));
   console.log('Concurrent lifecycle enrollment and event sequencing PASS.');
 } finally {
   for(const child of children) child.kill('SIGTERM');
