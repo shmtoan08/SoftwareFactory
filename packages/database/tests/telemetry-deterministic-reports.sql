@@ -30,6 +30,8 @@ INSERT INTO telemetry.service_projects SELECT oid,rolname,'10000000-0000-0000-00
 SET SESSION AUTHORIZATION sf_telemetry_c3_reporter;
 SET ROLE telemetry_reporter;
 SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.reports$q$,'42501');
+SELECT pg_temp.expect_error($q$SELECT * FROM telemetry.publish_incomplete_report('10000000-0000-0000-0000-000000000262',gen_random_uuid(),
+ '2026-02-01Z','v1',ARRAY['UNVERIFIED'],NULL)$q$,'42501');
 SELECT * FROM telemetry.publish_incomplete_report('10000000-0000-0000-0000-000000000261','50000000-0000-0000-0000-000000000261',
  '2026-02-01Z','v1',ARRAY['UNVERIFIED'],NULL);
 SELECT * FROM telemetry.publish_incomplete_report('10000000-0000-0000-0000-000000000261','50000000-0000-0000-0000-000000000261',
