@@ -16,6 +16,7 @@ export * from "./model-providers.ts";
 export * from "./prompt-registry.ts";
 export * from "./structured-output.ts";
 export * from "./cost-guard.ts";
+export * from "./usage-mappings.ts";
 export * from "./codex-cli.ts";
 
 /**

@@ -1,0 +1,11 @@
+# T1 C1 — candidate usage mapping matrix and provider-free fixtures
+
+This slice checks in four exact candidate rows for the repository's configured Anthropic and Google models, endpoints, API versions and non-stream/SSE modes. Every row is `UNVERIFIED`; cache and reasoning relations remain unverified, and no row can produce canonical usage or baseline eligibility.
+
+The source references are the primary Anthropic Messages/streaming documentation and Google GenerateContent API reference, inspected on 2026-11-20. They describe current API shapes, including cumulative Anthropic `message_delta.usage` and Google usage metadata. They do not prove that the repository's candidate model/account returns every counter, that an older pinned API version has identical semantics, or that cache/thinking counters reconcile for billing. Model availability and immutable revision binding remain unproved.
+
+`foldUnverifiedUsageSnapshots` is a provider-free fixture helper, not a runtime collector. It accepts bounded, ordered service receipts, reuses the strict B1 numeric allowlist, ignores identical delivery retries and retains the latest permitted snapshot. It never sums frames because the mapping is unverified. Conflicting receipts, missing/unsafe usage and incomplete streams remain unavailable with a bounded reason; null/missing counters never become zero. Canonical input/output/total are always null.
+
+Executable fixtures cover over-safe-integer rejection and exact decimal strings above JavaScript's safe range, cumulative snapshots without double counting, identical and conflicting duplicate receipts, partial streams, missing totals, cache/thinking candidates, unknown fields/getters, invalid order and multiple non-stream receipts. No HTTP/provider call, database migration, runtime observer wiring, mapping promotion, prompt registration or T2 activation is included.
+
+Before any mapping can move from `UNVERIFIED`, team review still needs exact provider/model revision evidence, endpoint/API response fixtures from the approved nonproduction account, cache subset/additive proof, reasoning inclusion proof, terminal/cumulative or delta semantics, and reconciliation against reported totals. A future promoted mapping must use a new immutable revision; this slice provides no promotion operation.
