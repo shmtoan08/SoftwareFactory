@@ -2724,6 +2724,9 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0028_t1_dispatch_storage.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0028_t1_dispatch_storage.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-dispatch-storage.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0029_t1_dispatch_recovery.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0029_t1_dispatch_recovery.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-dispatch-recovery.sql
 
       - name: Execute Full Test Suite
         env:
