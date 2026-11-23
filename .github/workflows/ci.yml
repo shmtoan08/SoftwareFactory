@@ -2721,6 +2721,9 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0027_t1_review_followups.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0027_t1_review_followups.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-deterministic-reports.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0028_t1_dispatch_storage.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0028_t1_dispatch_storage.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-dispatch-storage.sql
 
       - name: Execute Full Test Suite
         env:
