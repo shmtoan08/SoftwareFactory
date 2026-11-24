@@ -643,7 +643,7 @@ test("Cost session usage follows the Issue #25 envelope, attribution, integer ma
   }
 });
 
-test("Issue #29 approvals use only selected-session R0 readers and preserve exact decision bindings", async (t) => {
+test("Issues #29 and #30 share selected-session R0 readers and preserve exact artifact bindings", async (t) => {
   const id = "10000000-0000-0000-0000-000000000029";
   const selectedId = "20000000-0000-0000-0000-000000000029";
   const foreignSession = "20000000-0000-0000-0000-000000000030";
@@ -654,20 +654,25 @@ test("Issue #29 approvals use only selected-session R0 readers and preserve exac
   const crPath = `${bundlePath}/change-requests`;
   const projectPath = `/projects/${id}`;
   const identity = { project_id: id, pipeline_session_id: selectedId };
+  const oldId = "30000000-0000-0000-0000-000000000029";
+  const exactId = "30000000-0000-0000-0000-000000000030";
+  const artifactMetadata = {
+    ...identity, stage: "STAGE_2_REQUIREMENTS", artifact_kind: "STAGE_2_PRD_SRS",
+  };
   const gate = {
     ...identity, gate_id: "gate-test", gate_stage: "STAGE_2_REQUIREMENTS",
-    target_artifact_id: "artifact-old", target_artifact_sha256: oldHash,
+    target_artifact_id: oldId, target_artifact_sha256: oldHash,
     decision: "APPROVED", rationale: "A note <script>", approver_principal_id: "principal-one", decided_at: stamp,
   };
   const bundle = {
     session: identity,
     artifacts: [
-      { ...identity, artifact_id: "artifact-old", artifact_sha256: latestHash, content_json: { hidden: "Private artifact content" } },
-      { ...identity, artifact_id: "artifact-exact", artifact_sha256: exactHash },
+      { ...artifactMetadata, artifact_id: oldId, artifact_sha256: latestHash, content_json: { hidden: "Private artifact content" } },
+      { ...artifactMetadata, artifact_id: exactId, artifact_sha256: exactHash, content_json: {} },
     ],
     approvalGates: [
       gate,
-      { ...gate, gate_id: "gate-rejected", decision: "REJECTED", target_artifact_id: "artifact-exact", target_artifact_sha256: exactHash },
+      { ...gate, gate_id: "gate-rejected", decision: "REJECTED", target_artifact_id: exactId, target_artifact_sha256: exactHash },
       { ...gate, gate_id: "gate-request-changes", decision: "REQUEST_CHANGES" },
       { ...gate, gate_id: "gate-missing", decision: undefined },
     ],
@@ -748,6 +753,7 @@ test("Issue #29 approvals use only selected-session R0 readers and preserve exac
         });
         holdBundle = undefined;
         assert.equal(independent, true);
+        assert.match(response.body, /id="evidence-loading" data-state="loading"/);
         assert.match(response.body, /id="approval-decisions-loading" data-state="loading"/);
         assert.match(response.body, /id="change-requests-loading" data-state="loading"/);
         const { decisions, changes } = sections(response.body);
@@ -803,6 +809,58 @@ test("Issue #29 approvals use only selected-session R0 readers and preserve exac
         assert.match(result.decisions, /data-state="error"[\s\S]*?Dữ liệu API thiếu trường bắt buộc hoặc không hợp lệ/);
         assert.match(result.changes, /data-state="error"[\s\S]*?Dữ liệu API thiếu trường bắt buộc hoặc không hợp lệ/);
         assert.doesNotMatch(result.changes, /Pending approval/);
+      });
+
+      const evidenceSection = (html: string) => {
+        const section = html.match(/<section id="evidence-result"[\s\S]*?<\/section>/)?.[0];
+        assert.ok(section);
+        assert.doesNotMatch(section, /<(?:a|button|form|script)\b|\b(?:href|src|download)="/i);
+        return section;
+      };
+
+      await t.test("Issue #30 escapes and caps previews and shows only exact non-navigable gate matches", async () => {
+        const from = calls.length;
+        const content = { text: "<script>alert(1)</script>", large: "x".repeat(5000) + "END-OF-PREVIEW" };
+        bundleBody = { ...bundle, approvalGates: [
+          ...bundle.approvalGates, { ...gate, gate_id: "gate-other-id", target_artifact_sha256: exactHash },
+        ], artifacts: [
+          { ...bundle.artifacts[0], content_json: content },
+          bundle.artifacts[1],
+          ...Array.from({ length: 49 }, () => ({ ...bundle.artifacts[1] })),
+        ] };
+        const evidence = evidenceSection((await read()).body);
+        const [old, exact] = evidence.match(/<li>[\s\S]*?<\/li>/g) ?? [];
+        assert.ok(old && exact);
+        assert.match(old, /STAGE_2_PRD_SRS[\s\S]*STAGE_2_REQUIREMENTS/);
+        assert.ok(old.includes(oldId) && old.includes(latestHash));
+        assert.match(old, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+        assert.match(old, /Bản xem trước đã bị cắt/);
+        assert.doesNotMatch(old, /END-OF-PREVIEW|gate-test|gate-rejected/);
+        assert.ok(exact.includes(exactId) && exact.includes(exactHash));
+        assert.match(exact, /gate-rejected/);
+        assert.doesNotMatch(exact, /gate-test|gate-other-id/);
+        assert.match(evidence, /Chỉ hiển thị 50 artifact/);
+        assert.equal(evidence.match(/class="evidence-preview"/g)?.length, 50);
+        assert.deepEqual(calls.slice(from).filter(({ path }) => path === bundlePath), [{ method: "GET", path: bundlePath }]);
+      });
+
+      await t.test("Issue #30 shows empty, inaccessible, malformed and upstream error states", async () => {
+        for (const [status, artifacts, expected] of [
+          [200, [], /data-state="empty".*?Không có artifact/s],
+          [200, undefined, /data-state="unavailable".*?Inaccessible\/unavailable artifact/s],
+          [200, [{ ...bundle.artifacts[0], content_json: undefined }, bundle.artifacts[1]], /data-state="unavailable">Inaccessible\/unavailable artifact/],
+          [200, [{ ...bundle.artifacts[0], project_id: foreignSession }], /data-state="unavailable".*?Inaccessible\/unavailable artifact/s],
+          [403, [], /data-state="access-denied".*?Inaccessible\/unavailable artifact/s],
+          [404, [], /data-state="unavailable".*?Inaccessible\/unavailable artifact/s],
+          [500, [], /data-state="error".*?Không tải được Evidence/s],
+        ] as const) {
+          bundleStatus = status;
+          bundleBody = { ...bundle, artifacts };
+          const evidence = evidenceSection((await read()).body);
+          assert.match(evidence, expected);
+          if (status === 200 && Array.isArray(artifacts) && artifacts.length === 2) assert.match(evidence, /gate-rejected/);
+          assert.doesNotMatch(evidence, /Private artifact content/);
+        }
       });
 
       assert.ok(calls.every(({ method, path }) => method === "GET" && !/approval-center|lineage|production-deployments/.test(path)));

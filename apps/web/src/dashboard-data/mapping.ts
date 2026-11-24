@@ -391,6 +391,54 @@ export function mapApprovalDecisions(value: unknown, projectId: string, sessionI
   }) };
 }
 
+export const ARTIFACT_ROW_LIMIT = 50;
+const ARTIFACT_PREVIEW_LIMIT = 4096;
+
+export function mapApprovalEvidence(value: unknown, projectId: string, sessionId: string) {
+  const bundle = record(value, "pipeline bundle");
+  const session = record(bundle.session, "session");
+  scope(session.project_id, projectId, "session.project_id");
+  scope(session.pipeline_session_id, sessionId, "session.pipeline_session_id");
+
+  let approvals: ReturnType<typeof mapApprovalDecisions> | null;
+  try {
+    approvals = mapApprovalDecisions(bundle, projectId, sessionId);
+  } catch (error) {
+    if (!(error instanceof DashboardDataError)) throw error;
+    approvals = null;
+  }
+
+  const artifacts = Array.isArray(bundle.artifacts) ? bundle.artifacts : null;
+  const evidence = artifacts === null ? null : {
+    limited: artifacts.length > ARTIFACT_ROW_LIMIT,
+    items: artifacts.slice(0, ARTIFACT_ROW_LIMIT).map((value: unknown) => {
+      try {
+        const artifact = record(value, "artifact");
+        scope(artifact.project_id, projectId, "artifact.project_id");
+        scope(artifact.pipeline_session_id, sessionId, "artifact.pipeline_session_id");
+        const id = requireId(artifact.artifact_id, "artifact_id");
+        const hash = artifactHash(artifact.artifact_sha256, "artifact_sha256");
+        const kind = literal(artifact.artifact_kind, "artifact_kind",
+          "STAGE_1_DISCOVERY_BUNDLE", "STAGE_2_PRD_SRS", "STAGE_3_ARCHITECTURE_DESIGN", "STAGE_4_VALIDATION_REPORT");
+        const stage = literal(artifact.stage, "stage",
+          "STAGE_1_IDEA_DISCOVERY", "STAGE_2_REQUIREMENTS", "STAGE_3_ARCHITECTURE", "STAGE_4_SPEC_FREEZE");
+        const content = JSON.stringify(record(artifact.content_json, "content_json"));
+        return {
+          id, hash, kind, stage,
+          preview: content.slice(0, ARTIFACT_PREVIEW_LIMIT),
+          truncated: content.length > ARTIFACT_PREVIEW_LIMIT,
+          gates: approvals?.decisions.filter((gate) => gate.targetArtifactId === id && gate.targetArtifactHash === hash)
+            .map(({ gateId }) => gateId) ?? null,
+        };
+      } catch (error) {
+        if (!(error instanceof DashboardDataError || error instanceof RangeError)) throw error;
+        return null;
+      }
+    }),
+  };
+  return { approvals, evidence };
+}
+
 export function mapApprovalChangeRequests(value: unknown, projectId: string, sessionId: string) {
   const dto = record(value, "change requests");
   return { requests: list(dto.change_requests, "change_requests").map((value) => {

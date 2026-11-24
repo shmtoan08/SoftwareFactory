@@ -39,8 +39,15 @@ function renderResult<T>(
   return panel(resource, "error", `<p role="status">${message}</p>`);
 }
 
-export async function loadApprovalDecisions(client: DashboardClient, sessionId: string): Promise<string> {
-  return renderResult("approval-decisions", await client.listApprovalDecisions(sessionId),
+type ApprovalEvidenceResult = Awaited<ReturnType<DashboardClient["getApprovalEvidence"]>>;
+
+export function renderApprovalDecisions(result: ApprovalEvidenceResult): string {
+  if (result.kind === "error") return renderResult("approval-decisions", result, "", () => "");
+  const data = result.data.approvals;
+  if (data === null) {
+    return panel("approval-decisions", "error", '<p role="status">Dữ liệu API thiếu trường bắt buộc hoặc không hợp lệ.</p>');
+  }
+  return renderResult("approval-decisions", { ...result, kind: data.decisions.length ? "ok" : "empty", data },
     "No recorded decision", ({ decisions }) => `<ul class="approval-records">${decisions.map((gate) => {
       const label = gate.decision === null ? "No recorded decision" : decisionLabels[gate.decision];
       return `<li data-decision="${gate.decision ?? "missing"}"><h3>${label}</h3>${facts([

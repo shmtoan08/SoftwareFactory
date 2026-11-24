@@ -53,9 +53,12 @@ const styles = `
   .profile-table :is(th, td) { padding: .6rem; border-bottom: 1px solid #d8e0ee; vertical-align: top; }
   .project-panels :is(#approval-decisions-loading, #approval-decisions-result) { order: 9; }
   .project-panels :is(#change-requests-loading, #change-requests-result) { order: 10; }
+  .project-panels :is(#evidence-loading, #evidence-result) { order: 11; }
+  .project-panels:has(#evidence-result) #evidence-loading,
   .project-panels:has(#approval-decisions-result) #approval-decisions-loading,
   .project-panels:has(#change-requests-result) #change-requests-loading,
-  .project-panels[data-session-changing] :is(#approval-decisions-result, #change-requests-result) { display: none; }
+  .project-panels[data-session-changing] :is(#approval-decisions-result, #change-requests-result, #evidence-result) { display: none; }
+  .evidence-preview { max-height: 16rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
   .approval-records { display: grid; gap: 1rem; padding-left: 1.25rem; }
   .approval-records h3 { margin: 0 0 .5rem; font-size: 1rem; overflow-wrap: anywhere; }
   .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }

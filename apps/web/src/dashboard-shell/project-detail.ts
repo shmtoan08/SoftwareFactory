@@ -1,8 +1,9 @@
+import { evidencePlaceholder, renderEvidence } from "./evidence.ts";
 import type { ServerResponse } from "node:http";
 import { DashboardClient, type DashboardResult } from "../dashboard-data/client.ts";
 import type { SessionDto, SessionListDto } from "../dashboard-data/mapping.ts";
 import { agentProfilesLoading, agentProfilesPanel, loadAgentProfilesBody } from "./agent-profiles.ts";
-import { approvalsPlaceholder, loadApprovalChangeRequests, loadApprovalDecisions } from "./approvals.ts";
+import { approvalsPlaceholder, loadApprovalChangeRequests, renderApprovalDecisions } from "./approvals.ts";
 import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
 import { costUsagePlaceholder, loadCostUsage } from "./cost-session-usage.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
@@ -95,7 +96,7 @@ export async function sendProjectDetail(
     const state = authToken ? "error" : "access-denied";
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty")
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty")
       + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
@@ -106,7 +107,7 @@ export async function sendProjectDetail(
   } catch {
     res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty")
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty")
       + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
@@ -115,7 +116,7 @@ export async function sendProjectDetail(
   const selectedId = query.get("sessionId");
   const initialState = selectedId ? "loading" : "empty";
   res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
-    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + costUsagePlaceholder(initialState) + approvalsPlaceholder(initialState) + script);
+    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + costUsagePlaceholder(initialState) + approvalsPlaceholder(initialState) + evidencePlaceholder(initialState) + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
   await Promise.all([
     loadAgentProfilesBody(projectId, authToken, baseUrl).then((body) => write(agentProfilesPanel(projectId, body))),
@@ -126,7 +127,7 @@ export async function sendProjectDetail(
         const selected = result.kind === "ok" ? result.data.items.find((item) => item.pipelineSessionId === selectedId) : undefined;
         write(renderSessions(result, projectId, selected, cursor));
         if (!selected) {
-          if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty"));
+          if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty"));
           return;
         }
         if (res.destroyed) return;
@@ -135,12 +136,12 @@ export async function sendProjectDetail(
           readTaskPage(projectId, sessionId, authToken, baseUrl)
             .then((tasks) => write(tasksPanel(projectId, sessionId, renderTasks(tasks)) + workItemsPanel(projectId, sessionId, tasks))),
           loadCostUsage(client, sessionId).then(write),
-          loadApprovalDecisions(client, sessionId).then(write),
+          client.getApprovalEvidence(sessionId).then((result) => write(renderApprovalDecisions(result) + renderEvidence(result))),
           loadApprovalChangeRequests(client, sessionId).then(write),
         ]);
       }, () => {
         write(unavailable("sessions", "error"));
-        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty"));
+        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty"));
       }),
   ]);
   if (!res.destroyed) res.end("</div>" + documentEnd);

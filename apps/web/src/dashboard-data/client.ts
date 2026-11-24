@@ -1,6 +1,6 @@
 import {
   DashboardDataError,
-  mapApprovalDecisions,
+  mapApprovalEvidence,
   mapApprovalChangeRequests,
   mapAgentProfiles,
   type AgentProfileRole,
@@ -162,13 +162,12 @@ export class DashboardClient {
     );
   }
 
-  listApprovalDecisions(pipelineSessionId: string) {
+  getApprovalEvidence(pipelineSessionId: string) {
     const { projectId } = this.options;
     const sessionId = requireId(pipelineSessionId, "pipelineSessionId");
     const endpoint = `${this.projectEndpoint}/pipeline-sessions/${encodeURIComponent(sessionId)}`;
     return this.get({ endpoint, projectId, sessionId },
-      (dto) => mapApprovalDecisions(dto, projectId, sessionId),
-      undefined, (data) => data.decisions.length === 0);
+      (dto) => mapApprovalEvidence(dto, projectId, sessionId));
   }
 
   listApprovalChangeRequests(pipelineSessionId: string) {
