@@ -1,6 +1,6 @@
 import type { DashboardClient, DashboardResult } from "../dashboard-data/client.ts";
 import { recordedTimestamp } from "../dashboard-data/mapping.ts";
-import { escapeHtml, facts } from "./router.ts";
+import { facts } from "./router.ts";
 import type { TasksResult } from "./tasks.ts";
 
 type Budget = Awaited<ReturnType<DashboardClient["getBudgetSnapshot"]>>;
