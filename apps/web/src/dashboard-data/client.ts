@@ -1,5 +1,7 @@
 import {
   DashboardDataError,
+  mapAgentProfiles,
+  type AgentProfileRole,
   mapBudgetSnapshot,
   mapProjectDetail,
   mapProjectList,
@@ -114,6 +116,19 @@ export class DashboardClient {
       (dto) => mapSessions(dto, projectId),
       pageQuery(options),
       (data) => data.items.length === 0,
+    );
+  }
+
+  listAgentProfiles(options: { role?: AgentProfileRole; activeOnly?: boolean } = {}) {
+    const query = new URLSearchParams();
+    if (options.role !== undefined) query.set("role", options.role);
+    if (options.activeOnly !== undefined) query.set("active_only", String(options.activeOnly));
+    const { projectId } = this.options;
+    return this.get(
+      { endpoint: `${this.projectEndpoint}/agent-profiles`, projectId },
+      (dto) => mapAgentProfiles(dto, projectId),
+      query,
+      (data) => data.profiles.length === 0,
     );
   }
 

@@ -41,6 +41,13 @@ const styles = `
   .work-item-status { white-space: pre-wrap; overflow-wrap: anywhere; }
   .dashboard-task-list { display: grid; gap: 1rem; padding-left: 1.25rem; }
   .dashboard-task-list h3 { margin: 0 0 .5rem; overflow-wrap: anywhere; }
+  .project-panels :is(#agent-profiles-loading, #agent-profiles-panel) { order: 7; }
+  .project-panels:has(#agent-profiles-panel) #agent-profiles-loading { display: none; }
+  .profile-filters { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .75rem 0; }
+  .profile-table { max-height: 24rem; overflow: auto; margin-top: 1rem; }
+  .profile-table table { border-collapse: collapse; width: 100%; text-align: left; }
+  .profile-table caption { text-align: left; padding-bottom: .5rem; }
+  .profile-table :is(th, td) { padding: .6rem; border-bottom: 1px solid #d8e0ee; vertical-align: top; }
   .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
   .budget-dimensions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 1rem; margin: 1rem 0; }
   .budget-dimensions h3 { margin: 0 0 .5rem; font-size: 1rem; }

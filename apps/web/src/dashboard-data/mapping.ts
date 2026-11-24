@@ -259,3 +259,29 @@ export function mapSessions(value: unknown, projectId: string): SessionListDto {
     page: page(pageDto),
   };
 }
+
+export const agentProfileRoles = ["PLANNER", "DEVELOPER", "REVIEWER_READONLY", "VERIFIER"] as const;
+export type AgentProfileRole = typeof agentProfileRoles[number];
+
+export interface AgentProfileConfig {
+  principal: string;
+  provider: string;
+  model: string;
+  role: AgentProfileRole;
+  is_active: boolean;
+}
+
+export function mapAgentProfiles(value: unknown, projectId: string): { profiles: AgentProfileConfig[] } {
+  const dto = record(value, "agent profile list");
+  return { profiles: list(dto.profiles, "profiles").map((value) => {
+    const profile = record(value, "profile");
+    scope(profile.project_id, projectId, "profile.project_id");
+    return {
+      principal: string(profile.principal_id, "profile.principal_id"),
+      provider: string(profile.provider, "profile.provider"),
+      model: string(profile.model, "profile.model"),
+      role: literal(profile.role, "profile.role", ...agentProfileRoles),
+      is_active: boolean(profile.is_active, "profile.is_active"),
+    };
+  }) };
+}

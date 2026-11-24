@@ -1,3 +1,4 @@
+import { loadAgentProfilesBody } from "./dashboard-shell/agent-profiles.ts";
 import { loadWorkItemsBody } from "./dashboard-shell/work-items.ts";
 import { loadTasksBody } from "./dashboard-shell/tasks.ts";
 import { loadBudgetBody } from "./dashboard-shell/budget.ts";
@@ -2335,6 +2336,16 @@ export class WebApprovalConsoleHttpServer {
         const header = req.headers[CORE_API_AUTH_HEADER];
         const body = await loadWorkItemsBody(workItemsFragment[1], workItemsFragment[2], url.searchParams,
           Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
+        res.end(body);
+        return;
+      }
+
+      const profilesFragment = method === "GET" ? /^\/projects\/([^/]+)\/dashboard-agent-profiles$/.exec(pathname)?.[1] : undefined;
+      if (profilesFragment !== undefined) {
+        const header = req.headers[CORE_API_AUTH_HEADER];
+        const body = await loadAgentProfilesBody(profilesFragment, Array.isArray(header) ? header[0] : header,
+          this.dashboardCoreApiBaseUrl, url.searchParams);
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
         res.end(body);
         return;

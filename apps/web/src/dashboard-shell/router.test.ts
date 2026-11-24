@@ -357,7 +357,7 @@ test("project detail streams panel states independently and uses only the approv
       for (const call of calls) {
         assert.equal(call.method, "GET");
         const url = new URL(call.url!, endpoint);
-        assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`,
+        assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`, `/api/v1${projectPath}/agent-profiles`,
           `/api/v1${projectPath}/sessions/${chosenId}/tasks`].includes(url.pathname));
         assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
       }
@@ -394,4 +394,120 @@ test("the stack runtime wires project detail to the paired Core API", async () =
   } finally {
     await runtime.close();
   }
+});
+
+test("Agent Profiles render only configured profile fields and handle each panel state", async (t) => {
+  const id = "10000000-0000-0000-0000-000000000031";
+  const profilePath = `/projects/${id}/dashboard-agent-profiles`;
+  const corePath = `/api/v1/projects/${id}/agent-profiles`;
+  const profile = (index: number) => ({
+    project_id: id, principal_id: `profile-${index}`, provider: "<provider&>", model: "approved-model",
+    role: "DEVELOPER", is_active: index % 2 === 0,
+    target_locator: "Private target", public_context: "Private context", profile_snapshot: "Private snapshot",
+    updated_at: "2020-01-01T00:00:00.000000Z",
+  });
+
+  async function scenario(
+    status: number, payload: unknown,
+    verify: (input: { endpoint: string; authHeader: string; calls: string[]; release(): void }) => Promise<void>,
+    hold = false,
+  ) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    if (!hold) release();
+    const calls: string[] = [];
+    let expectedAuth = "";
+    const api = createServer(async (req, res) => {
+      const path = req.url!;
+      if (req.method !== "GET" || req.headers[CORE_API_AUTH_HEADER] !== expectedAuth) {
+        res.writeHead(403).end();
+        return;
+      }
+      calls.push(path);
+      if (new URL(path, "http://127.0.0.1").pathname !== corePath) {
+        res.writeHead(404).end();
+        return;
+      }
+      await gate;
+      res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(payload));
+    });
+    api.listen(0, "127.0.0.1");
+    await once(api, "listening");
+    const address = api.address();
+    assert.ok(address && typeof address !== "string");
+    try {
+      await withConsole(async ({ endpoint, authHeader }) => {
+        expectedAuth = authHeader;
+        await verify({ endpoint, authHeader, calls, release });
+      }, `http://127.0.0.1:${address.port}`);
+    } finally {
+      release();
+      await new Promise<void>((resolve, reject) => api.close((err) => err ? reject(err) : resolve()));
+    }
+  }
+
+  await t.test("loading is visible while other panels finish", async () => {
+    await scenario(200, { profiles: [] }, async ({ endpoint, authHeader, release }) => {
+      let sawLoading = false;
+      const page = await open(endpoint, `/projects/${id}`, {
+        auth: authHeader,
+        onBody(body) {
+          if (body.includes('id="agent-profiles-loading"') && body.includes('id="project-result"')
+            && !body.includes('id="agent-profiles-panel"')) {
+            sawLoading = true;
+            release();
+          }
+        },
+      });
+      assert.equal(sawLoading, true);
+      assert.match(page.body, /id="agent-profiles-loading"[\s\S]*?data-state="loading"/);
+      assert.match(page.body, /id="agent-profiles-panel"[\s\S]*?data-state="empty"/);
+    }, true);
+  });
+
+  for (const [status, expected, payload] of [
+    [200, "empty", { profiles: [] }],
+    [500, "error", { reason: "private backend response" }],
+    [403, "access-denied", { reason: "private backend response" }],
+  ] as const) {
+    await t.test(expected, async () => {
+      await scenario(status, payload, async ({ endpoint, authHeader, calls }) => {
+        const response = await open(endpoint, profilePath, { auth: authHeader });
+        assert.equal(response.status, 200);
+        assert.equal(response.headers["x-dashboard-panel"], "1");
+        assert.match(response.body, new RegExp(`data-state="${expected}"`));
+        assert.doesNotMatch(response.body, /private backend response/);
+        assert.deepEqual(calls, [corePath]);
+        if (expected === "empty") assert.match(response.body, /Không có cấu hình profile/);
+      });
+    });
+  }
+
+  await t.test("read-only filters, exact fields and a bounded configuration table", async () => {
+    await scenario(200, { profiles: Array.from({ length: 101 }, (_, index) => profile(index)) },
+      async ({ endpoint, authHeader, calls }) => {
+        const response = await open(endpoint, profilePath, { auth: authHeader });
+        assert.equal(response.status, 200);
+        assert.deepEqual(calls, [corePath]);
+        assert.match(response.body, /Cấu hình profile/);
+        assert.match(response.body, /Cấu hình bật\/tắt/);
+        assert.match(response.body, /<td>Bật<\/td>/);
+        assert.match(response.body, /<td>Tắt<\/td>/);
+        assert.match(response.body, /&lt;provider&amp;&gt;/);
+        assert.match(response.body, /<dt>Tải lúc \(receivedAt\)<\/dt><dd>[^<]+/);
+        assert.match(response.body, /<dt>fetchedAt<\/dt><dd>API không cung cấp<\/dd>/);
+        assert.match(response.body, /Chỉ hiển thị 100 cấu hình đầu/);
+        assert.equal([...response.body.matchAll(/<th scope="row">profile-/g)].length, 100);
+        assert.doesNotMatch(response.body, /online|running|active worker|Private (?:target|context|snapshot)|2020-01-01/i);
+        const invalid = await open(endpoint, profilePath + "?role=UNKNOWN", { auth: authHeader });
+        assert.match(invalid.body, /data-state="error"/);
+        assert.equal(calls.length, 1);
+      });
+    await scenario(200, { profiles: [profile(0)] }, async ({ endpoint, authHeader, calls }) => {
+      const response = await open(endpoint, profilePath + "?role=DEVELOPER&active_only=true", { auth: authHeader });
+      assert.match(response.body, /<td>Bật<\/td>/);
+      assert.doesNotMatch(response.body, /<td>Tắt<\/td>/);
+      assert.deepEqual(calls, [corePath + "?role=DEVELOPER&active_only=true"]);
+    });
+  });
 });

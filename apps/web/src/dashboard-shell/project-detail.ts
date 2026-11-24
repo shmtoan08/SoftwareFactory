@@ -1,6 +1,7 @@
 import type { ServerResponse } from "node:http";
 import { DashboardClient, type DashboardResult } from "../dashboard-data/client.ts";
 import type { SessionDto, SessionListDto } from "../dashboard-data/mapping.ts";
+import { agentProfilesLoading, agentProfilesPanel, loadAgentProfilesBody } from "./agent-profiles.ts";
 import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
 import { readTaskPage, renderTasks, retireTasksOnSessionChange, tasksPanel, tasksPlaceholder } from "./tasks.ts";
@@ -91,7 +92,8 @@ export async function sendProjectDetail(
     const state = authToken ? "error" : "access-denied";
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + script + end);
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty")
+      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
 
@@ -101,7 +103,8 @@ export async function sendProjectDetail(
   } catch {
     res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + script + end);
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty")
+      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
 
@@ -109,9 +112,10 @@ export async function sendProjectDetail(
   const selectedId = query.get("sessionId");
   const initialState = selectedId ? "loading" : "empty";
   res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
-    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + script);
+    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
   await Promise.all([
+    loadAgentProfilesBody(projectId, authToken, baseUrl).then((body) => write(agentProfilesPanel(projectId, body))),
     loadBudgetBody(projectId, authToken, baseUrl).then((body) => write(budgetPanel(projectId, body))),
     client.getProject().then(renderProject).catch(() => unavailable("project", "error")).then(write),
     client.listSessions(projectId, cursor === null ? {} : { cursor })

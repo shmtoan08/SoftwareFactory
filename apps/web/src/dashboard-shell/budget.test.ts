@@ -83,6 +83,8 @@ test("Budget renders P2 values and refreshes only its body through one GET per c
         defaultBranch: "main", createdAt: firstStamp, updatedAt: firstStamp } }));
     } else if (path === `/api/v1${detailPath}/sessions`) {
       res.end(JSON.stringify({ ...envelope, projectId, items: [], page: { limit: 20, hasMore: false, nextCursor: null } }));
+    } else if (path === `/api/v1${detailPath}/agent-profiles`) {
+      res.end(JSON.stringify({ profiles: [] }));
     } else {
       assert.fail(`Unexpected Core endpoint: ${path}`);
     }
@@ -120,7 +122,7 @@ test("Budget renders P2 values and refreshes only its body through one GET per c
     assert.doesNotMatch(initial, /%|dự báo|<progress|<dd>99<\/dd>|<dd>0<\/dd>/i);
     assert.doesNotMatch(html, new RegExp(auth));
     assert.equal(page.headers.get("cache-control"), "no-store");
-    assert.deepEqual(calls.slice().sort(), [`/api/v1${detailPath}`, `/api/v1${detailPath}/sessions`, budgetPath].sort());
+    assert.deepEqual(calls.slice().sort(), [`/api/v1${detailPath}`, `/api/v1${detailPath}/sessions`, `/api/v1${detailPath}/agent-profiles`, budgetPath].sort());
     const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
     assert.ok(script);
     const sent: string[] = [];
@@ -150,7 +152,7 @@ test("Budget renders P2 values and refreshes only its body through one GET per c
     assert.match(control.body.innerHTML, /<dt>Còn lại<\/dt><dd>-88<\/dd>/);
     assert.doesNotMatch(control.body.innerHTML, /-77/);
     assert.deepEqual(sent, [endpoint]);
-    assert.deepEqual(calls.slice(3), [budgetPath]);
+    assert.deepEqual(calls.slice(4), [budgetPath]);
 
     for (const [httpStatus, state] of [[500, "error"], [403, "access-denied"], [404, "empty"]] as const) {
       status = httpStatus;
@@ -159,11 +161,11 @@ test("Budget renders P2 values and refreshes only its body through one GET per c
       assert.doesNotMatch(control.body.innerHTML, /Tải lúc|-88|Private backend error detail/);
       if (state === "empty") assert.match(control.body.innerHTML, /Không có dữ liệu/);
     }
-    assert.deepEqual(calls.slice(3), Array.from({ length: 4 }, () => budgetPath));
+    assert.deepEqual(calls.slice(4), Array.from({ length: 4 }, () => budgetPath));
     assert.deepEqual(sent, Array.from({ length: 4 }, () => endpoint));
     const unauthorized = await fetch(baseUrl + endpoint);
     assert.match(await unauthorized.text(), /data-state="access-denied"/);
-    assert.equal(calls.length, 7);
+    assert.equal(calls.length, 8);
   } finally {
     initialBudget.resolve();
     await web.stop();
