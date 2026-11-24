@@ -2726,7 +2726,10 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-dispatch-storage.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0029_t1_dispatch_recovery.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0029_t1_dispatch_recovery.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0030_t1_dispatch_fencing.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0030_t1_dispatch_fencing.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-dispatch-recovery.sql
+          node packages/database/tests/telemetry-dispatch-concurrency.mjs
 
       - name: Execute Full Test Suite
         env:
