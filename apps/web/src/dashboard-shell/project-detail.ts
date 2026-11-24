@@ -4,6 +4,7 @@ import type { SessionDto, SessionListDto } from "../dashboard-data/mapping.ts";
 import { agentProfilesLoading, agentProfilesPanel, loadAgentProfilesBody } from "./agent-profiles.ts";
 import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
+import { taskDetailScript } from "./task-detail.ts";
 import { readTaskPage, renderTasks, retireTasksOnSessionChange, tasksPanel, tasksPlaceholder } from "./tasks.ts";
 import { workItemsPanel, workItemsPlaceholder } from "./work-items.ts";
 import { documentEnd, documentStart, escapeHtml, facts } from "./router.ts";
@@ -84,7 +85,7 @@ export async function sendProjectDetail(
 <p><strong>UNSUPPORTED</strong> — Chưa có nguồn tiến độ được duyệt (session DTO không chứa stage/status/tiến độ)</p>
 </section>`;
   const start = documentStart("Project", false, "vi") + '<div class="project-panels">';
-  const script = `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script>`;
+  const script = `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script><script>${taskDetailScript}</script>`;
   const end = "</div>" + documentEnd;
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
 

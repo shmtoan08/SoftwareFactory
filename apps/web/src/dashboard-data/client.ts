@@ -6,6 +6,8 @@ import {
   mapProjectDetail,
   mapProjectList,
   mapSessionTasks,
+  mapTaskAssignment,
+  mapTaskDispatches,
   mapSessions,
   requireId,
 } from "./mapping.ts";
@@ -130,6 +132,19 @@ export class DashboardClient {
       query,
       (data) => data.profiles.length === 0,
     );
+  }
+
+  getTaskAssignment(taskId: string) {
+    const { projectId } = this.options;
+    const endpoint = `${this.projectEndpoint}/tasks/${encodeURIComponent(requireId(taskId, "taskId"))}/execution-target`;
+    return this.get({ endpoint, projectId }, (dto) => mapTaskAssignment(dto, projectId, taskId));
+  }
+
+  listTaskDispatches(taskId: string) {
+    const { projectId } = this.options;
+    const endpoint = `${this.projectEndpoint}/tasks/${encodeURIComponent(requireId(taskId, "taskId"))}/target-dispatches`;
+    return this.get({ endpoint, projectId }, (dto) => mapTaskDispatches(dto, projectId, taskId),
+      undefined, (data) => data.dispatches.length === 0);
   }
 
   private async get<T>(

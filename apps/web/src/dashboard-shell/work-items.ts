@@ -1,5 +1,6 @@
 import { refreshablePanel } from "./panel-refresh.ts";
 import { escapeHtml, facts } from "./router.ts";
+import { loadTaskDetails, taskDetail } from "./task-detail.ts";
 import { readTaskPage, type TasksResult } from "./tasks.ts";
 
 // Data Mapping Spec v2, TaskStatus presentation table.
@@ -52,9 +53,10 @@ function renderWorkItems(result: TasksResult, projectId: string, sessionId: stri
   }
 
   const { data } = result;
-  const rows = data.items.map((item) =>
-    `<tr><th scope="row">${escapeHtml(item.title)}</th><td>${escapeHtml(item.taskId)}</td><td class="work-item-status">${escapeHtml(item.sourceStatus)}</td><td>${statusLabels.get(item.sourceStatus) ?? "Unknown"}</td></tr>`,
-  ).join("");
+  const rows = data.items.map((item) => {
+    const detailUrl = tablePath(projectId, sessionId) + "?" + new URLSearchParams({ taskId: item.taskId }).toString();
+    return `<tr><th scope="row">${escapeHtml(item.title)}${taskDetail(detailUrl, item)}</th><td>${escapeHtml(item.taskId)}</td><td class="work-item-status">${escapeHtml(item.sourceStatus)}</td><td>${statusLabels.get(item.sourceStatus) ?? "Unknown"}</td></tr>`;
+  }).join("");
   const table = result.kind === "empty" ? "<p>Không có work item trong trang này.</p>" : `<div class="work-items-scroll" tabindex="0">
 <table><caption>Work items của session đã chọn</caption><thead><tr><th scope="col">Work item</th><th scope="col">Task ID</th>
 <th scope="col">sourceStatus</th><th scope="col">displayStatus</th></tr></thead><tbody>${rows}</tbody></table></div>`;
@@ -71,6 +73,8 @@ ${table}${paging ? `<p>${paging}</p>` : ""}</div>`;
 export async function loadWorkItemsBody(
   projectId: string, sessionId: string, query: URLSearchParams, authToken: string | undefined, baseUrl: string | undefined,
 ): Promise<string> {
+  const taskId = query.get("taskId");
+  if (taskId !== null && query.size === 1) return loadTaskDetails(projectId, sessionId, taskId, authToken, baseUrl);
   const status = query.get("status") ?? undefined;
   const cursor = query.get("cursor") ?? undefined;
   if ([...query.keys()].some((key) => (key !== "status" && key !== "cursor") || query.getAll(key).length > 1)

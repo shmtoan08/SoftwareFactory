@@ -285,3 +285,30 @@ export function mapAgentProfiles(value: unknown, projectId: string): { profiles:
     };
   }) };
 }
+
+export function mapTaskAssignment(value: unknown, projectId: string, taskId: string) {
+  const dto = record(value, "task assignment");
+  scope(dto.project_id, projectId, "assignment.project_id");
+  scope(dto.task_id, taskId, "assignment.task_id");
+  return {
+    assignmentId: string(dto.assignment_id, "assignment.assignment_id"),
+    profileId: string(dto.profile_id, "assignment.profile_id"),
+    workerId: string(dto.worker_id, "assignment.worker_id"),
+    createdAt: string(dto.created_at, "assignment.created_at"),
+  };
+}
+
+export function mapTaskDispatches(value: unknown, projectId: string, taskId: string) {
+  const dto = record(value, "task dispatches");
+  return { dispatches: list(dto.dispatches, "dispatches").map((value) => {
+    const dispatch = record(value, "dispatch");
+    scope(dispatch.project_id, projectId, "dispatch.project_id");
+    scope(dispatch.task_id, taskId, "dispatch.task_id");
+    return {
+      requestId: string(dispatch.execution_request_id, "dispatch.execution_request_id"),
+      status: literal(dispatch.status, "dispatch.status", "PENDING", "SENDING", "IMPORTED", "UNKNOWN", "REJECTED"),
+      claimedAt: dispatch.claimed_at === null ? null : string(dispatch.claimed_at, "dispatch.claimed_at"),
+      completedAt: dispatch.completed_at === null ? null : string(dispatch.completed_at, "dispatch.completed_at"),
+    };
+  }) };
+}

@@ -7,6 +7,7 @@ import { CORE_API_AUTH_HEADER, CoreApiService, encodeCoreApiAuthHeader } from "@
 import { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
 import { WebApprovalConsoleHttpServer } from "../index.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
+import { taskDetailScript } from "./task-detail.ts";
 import { retireTasksOnSessionChange } from "./tasks.ts";
 
 const projectId = "10000000-0000-0000-0000-000000000007";
@@ -32,7 +33,7 @@ function getTasksPanel(html: string) {
 }
 
 function dashboardScripts(html: string): string[] {
-  const allowed = new Set([panelRefreshScript, retireTasksOnSessionChange]);
+  const allowed = new Set([panelRefreshScript, retireTasksOnSessionChange, taskDetailScript]);
   const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
   for (const [, attributes, script] of scripts) {
     assert.equal(attributes?.trim(), "", "Dashboard scripts must be inline");

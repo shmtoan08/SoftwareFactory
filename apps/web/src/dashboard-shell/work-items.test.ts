@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { test } from "node:test";
 import { runInNewContext } from "node:vm";
 import { CORE_API_AUTH_HEADER, CoreApiService, encodeCoreApiAuthHeader } from "@software-factory/core-api";
@@ -165,5 +167,118 @@ test("Work items use scoped server filtering and paging, with isolated refresh a
   } finally {
     release?.();
     await web.stop();
+  }
+});
+
+test("Work items drill-down uses recorded P3 fields and reads only the opened task's approved detail resources", async () => {
+  const otherTask = "30000000-0000-0000-0000-000000000022";
+  const recordedProfile = "40000000-0000-0000-0000-000000000021";
+  const corePath = `/api/v1${projectPath}`;
+  const p3Path = `${corePath}/sessions/${sessionA}/tasks`;
+  const calls: Array<{ method: string | undefined; path: string }> = [];
+  const core = new CoreApiService(new SoftwareFactoryControlPlaneStore());
+  const auth = encodeCoreApiAuthHeader(core.issueAuthContext({ projectId, principalId: "task-detail-reader", roles: ["AUDITOR"] }));
+  const headers = { [CORE_API_AUTH_HEADER]: auth };
+  const detailPaths = (task: string) => [
+    `${corePath}/tasks/${task}/execution-target`,
+    `${corePath}/tasks/${task}/target-dispatches`,
+  ];
+  const privateFields = { target_locator: "Private locator", public_context: "Private context",
+    profile_snapshot: { example: "Private snapshot" } };
+  const api = createServer((req, res) => {
+    const path = req.url!;
+    calls.push({ method: req.method, path });
+    if (req.method !== "GET" || req.headers[CORE_API_AUTH_HEADER] !== auth) {
+      res.writeHead(403).end();
+      return;
+    }
+    let payload: unknown;
+    let status = 200;
+    if (path === `${corePath}/sessions`) {
+      payload = { ...metadata, projectId, items: [{ pipelineSessionId: sessionA, projectId, title: "Selected session",
+        createdAt: fetchedAt, updatedAt: fetchedAt }], page: { limit: 20, hasMore: false, nextCursor: null } };
+    } else if (path === p3Path) {
+      const data = response(sessionA, ["Ready"]).data;
+      const row = data.items[0]!;
+      payload = { ...data, items: [
+        { ...row, title: "Task with recorded lease", assigneeId: recordedProfile, leaseOwnerId: "recorded-owner", leaseExpiresAt: fetchedAt },
+        { ...row, taskId: otherTask, title: "Task without assignment or lease" },
+      ] };
+    } else if (path === detailPaths(taskId)[0]) {
+      payload = { project_id: projectId, task_id: taskId, assignment_id: "assignment-one", profile_id: "approved-profile",
+        worker_id: "assigned-worker", created_at: fetchedAt, ...privateFields };
+    } else if (path === detailPaths(taskId)[1]) {
+      payload = { dispatches: [{ project_id: projectId, task_id: taskId, execution_request_id: "request-one",
+        status: "UNKNOWN", claimed_at: fetchedAt, completed_at: null, ...privateFields }] };
+    } else if (detailPaths(otherTask).includes(path)) {
+      status = 500;
+      payload = { reason: "Private backend failure", ...privateFields };
+    } else if (path === `${corePath}/agent-profiles`) {
+      payload = { profiles: [] };
+    } else {
+      status = 404;
+      payload = { error_code: "ERR_NOT_FOUND" };
+    }
+    res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(payload));
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const address = api.address();
+  assert.ok(address && typeof address !== "string");
+  const web = new WebApprovalConsoleHttpServer({ coreApi: core, dashboardCoreApiBaseUrl: `http://127.0.0.1:${address.port}` });
+  const { baseUrl } = await web.start();
+  try {
+    const html = await (await fetch(`${baseUrl}${projectPath}?sessionId=${sessionA}`, { headers })).text();
+    assert.equal(calls.filter(({ path }) => path === p3Path).length, 1);
+    const isDetail = ({ path }: { path: string }) => /\/(execution-target|target-dispatches)$/.test(path);
+    assert.equal(calls.filter(isDetail).length, 0);
+    const rows = [...html.matchAll(/<details data-task-detail="([^"]+)">([\s\S]*?)<\/details>/g)];
+    assert.equal(rows.length, 2);
+    const first = rows.find((row) => row[1]?.includes(taskId));
+    const second = rows.find((row) => row[1]?.includes(otherTask));
+    assert.ok(first?.[1] && first[2] && second?.[1] && second[2]);
+    assert.match(first[2], /<dt>Lease owner \(đã ghi\)<\/dt><dd>recorded-owner<\/dd>/);
+    assert.ok(first[2].includes(`<dt>Lease hết hạn lúc</dt><dd>${fetchedAt}</dd>`));
+    assert.ok(first[2].includes(recordedProfile));
+    assert.equal([...second[2].matchAll(/<dd>không có<\/dd>/g)].length, 3);
+
+    type Toggle = (event: { target: unknown }) => Promise<void>;
+    let toggle!: Toggle;
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+    const loader = scripts.find((match) => match[1]?.includes('addEventListener("toggle"'));
+    assert.ok(loader?.[1]);
+    runInNewContext(loader[1], {
+      document: { addEventListener(event: string, handler: Toggle) {
+        assert.equal(event, "toggle");
+        toggle = handler;
+      } },
+      fetch: (path: string, options: RequestInit) => fetch(baseUrl + path, { ...options, headers }),
+      AbortSignal,
+    });
+    const openTask = async (endpoint: string, open: boolean) => {
+      const body = { textContent: "", innerHTML: "" };
+      await toggle({ target: { open, matches: () => true, isConnected: true, dataset: { taskDetail: endpoint },
+        querySelector: () => body } });
+      return body.innerHTML;
+    };
+    const beforeOpen = calls.length;
+    await openTask(first[1], false);
+    assert.equal(calls.length, beforeOpen);
+    const fetched = await openTask(first[1], true);
+    assert.deepEqual(calls.slice(beforeOpen).map(({ path }) => path).sort(), detailPaths(taskId).sort());
+    assert.match(fetched, /<dt>Trạng thái dispatch<\/dt><dd>UNKNOWN<\/dd>/);
+    assert.match(fetched, /assignment-one/);
+    assert.doesNotMatch(fetched, /recorded-owner|Private (?:locator|context|snapshot)|target_locator|public_context|profile_snapshot/i);
+
+    const beforeError = calls.length;
+    const error = await openTask(second[1], true);
+    assert.deepEqual(calls.slice(beforeError).map(({ path }) => path).sort(), detailPaths(otherTask).sort());
+    assert.equal([...error.matchAll(/data-state="error"/g)].length, 2);
+    assert.doesNotMatch(error, /không có|Private|UNKNOWN/);
+    assert.doesNotMatch(first[2] + second[2] + fetched + error, /\b(?:online|running|active worker|active)\b/i);
+    assert.ok(calls.every(({ method }) => method === "GET"));
+  } finally {
+    await web.stop();
+    await new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve()));
   }
 });
