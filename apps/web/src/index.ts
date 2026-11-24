@@ -1,3 +1,4 @@
+import { loadTasksBody } from "./dashboard-shell/tasks.ts";
 import { loadBudgetBody } from "./dashboard-shell/budget.ts";
 import { sendProjectDetail } from "./dashboard-shell/project-detail.ts";
 import { dashboardNotFound, dashboardRoute } from "./dashboard-shell/router.ts";
@@ -2313,6 +2314,16 @@ export class WebApprovalConsoleHttpServer {
         const header = req.headers[CORE_API_AUTH_HEADER];
         const body = await loadBudgetBody(budgetFragment, Array.isArray(header) ? header[0] : header,
           this.dashboardCoreApiBaseUrl);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
+        res.end(body);
+        return;
+      }
+
+      const tasksFragment = method === "GET" ? /^\/projects\/([^/]+)\/dashboard-tasks\/([^/]+)$/.exec(pathname) : null;
+      if (tasksFragment?.[1] && tasksFragment[2]) {
+        const header = req.headers[CORE_API_AUTH_HEADER];
+        const body = await loadTasksBody(tasksFragment[1], tasksFragment[2],
+          Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
         res.end(body);
         return;

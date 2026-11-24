@@ -28,6 +28,11 @@ const styles = `
   .project-panels :is(#sessions-loading, #sessions-result) { order: 2; }
   .project-panels #pipeline-progress { order: 3; }
   .project-panels :is(#budget-loading, #budget-panel) { order: 4; }
+  .project-panels :is(#tasks-loading, #tasks-empty, #tasks-panel) { order: 5; }
+  .project-panels:has(#tasks-empty, #tasks-panel) #tasks-loading,
+  .project-panels[data-session-changing] :is(#tasks-empty, #tasks-panel) { display: none; }
+  .dashboard-task-list { display: grid; gap: 1rem; padding-left: 1.25rem; }
+  .dashboard-task-list h3 { margin: 0 0 .5rem; overflow-wrap: anywhere; }
   .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
   .budget-dimensions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 1rem; margin: 1rem 0; }
   .budget-dimensions h3 { margin: 0 0 .5rem; font-size: 1rem; }

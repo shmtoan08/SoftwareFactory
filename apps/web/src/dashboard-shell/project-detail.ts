@@ -1,8 +1,9 @@
 import type { ServerResponse } from "node:http";
 import { DashboardClient, type DashboardResult } from "../dashboard-data/client.ts";
-import type { SessionListDto } from "../dashboard-data/mapping.ts";
+import type { SessionDto, SessionListDto } from "../dashboard-data/mapping.ts";
 import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
+import { loadTasksBody, retireTasksOnSessionChange, tasksPanel, tasksPlaceholder } from "./tasks.ts";
 import { documentEnd, documentStart, escapeHtml, facts } from "./router.ts";
 
 type ProjectDetail = Extract<Awaited<ReturnType<DashboardClient["getProject"]>>, { data: unknown }>["data"];
@@ -48,15 +49,14 @@ function renderProject(result: DashboardResult<ProjectDetail>): string {
   ]));
 }
 
-function renderSessions(result: DashboardResult<SessionListDto>, projectId: string, selectedId: string | null, cursor: string | null): string {
+function renderSessions(result: DashboardResult<SessionListDto>, projectId: string, selected: SessionDto | undefined, cursor: string | null): string {
   if (result.kind !== "ok") return unavailable("sessions", failureState("sessions", result) ?? "error");
   const { items, page } = result.data;
-  const selected = items.find((item) => item.pipelineSessionId === selectedId);
   const path = `/projects/${encodeURIComponent(projectId)}`;
   const options = items.map((item) =>
     `<option value="${escapeHtml(item.pipelineSessionId)}"${item === selected ? " selected" : ""}>${escapeHtml(item.title)}</option>`,
   ).join("");
-  const selection = `<form method="get" action="${path}">
+  const selection = `<form method="get" action="${path}" data-session-context="${selected?.pipelineSessionId ?? ""}">
 <label for="session-choice">Session</label>
 <select id="session-choice" name="sessionId"><option value=""${selected ? "" : " selected"}>Chưa chọn session</option>${options}</select>
 ${cursor === null ? "" : `<input type="hidden" name="cursor" value="${escapeHtml(cursor)}">`}
@@ -82,14 +82,15 @@ export async function sendProjectDetail(
 <p><strong>UNSUPPORTED</strong> — Chưa có nguồn tiến độ được duyệt (session DTO không chứa stage/status/tiến độ)</p>
 </section>`;
   const start = documentStart("Project", false, "vi") + '<div class="project-panels">';
-  const script = `<script>${panelRefreshScript}</script>`;
+  const script = `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script>`;
   const end = "</div>" + documentEnd;
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
 
   if (!authToken || !baseUrl) {
     const state = authToken ? "error" : "access-denied";
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
-      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl)) + script + end);
+      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
+      + tasksPlaceholder("empty") + script + end);
     return;
   }
 
@@ -98,20 +99,34 @@ export async function sendProjectDetail(
     client = new DashboardClient({ baseUrl, projectId, authToken, timeoutMs: 7000 });
   } catch {
     res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
-      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl)) + script + end);
+      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
+      + tasksPlaceholder("empty") + script + end);
     return;
   }
 
   const cursor = query.get("cursor");
+  const selectedId = query.get("sessionId");
   res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
-    + progress + budgetLoadingPanel() + script);
+    + progress + budgetLoadingPanel() + tasksPlaceholder(selectedId ? "loading" : "empty") + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
   await Promise.all([
     loadBudgetBody(projectId, authToken, baseUrl).then((body) => write(budgetPanel(projectId, body))),
     client.getProject().then(renderProject).catch(() => unavailable("project", "error")).then(write),
     client.listSessions(projectId, cursor === null ? {} : { cursor })
-      .then((result) => renderSessions(result, projectId, query.get("sessionId"), cursor))
-      .catch(() => unavailable("sessions", "error")).then(write),
+      .then(async (result) => {
+        const selected = result.kind === "ok" ? result.data.items.find((item) => item.pipelineSessionId === selectedId) : undefined;
+        write(renderSessions(result, projectId, selected, cursor));
+        if (!selected) {
+          if (selectedId) write(tasksPlaceholder("empty"));
+          return;
+        }
+        if (res.destroyed) return;
+        const body = await loadTasksBody(projectId, selected.pipelineSessionId, authToken, baseUrl);
+        write(tasksPanel(projectId, selected.pipelineSessionId, body));
+      }, () => {
+        write(unavailable("sessions", "error"));
+        if (selectedId) write(tasksPlaceholder("empty"));
+      }),
   ]);
   if (!res.destroyed) res.end("</div>" + documentEnd);
 }

@@ -357,7 +357,8 @@ test("project detail streams panel states independently and uses only the approv
       for (const call of calls) {
         assert.equal(call.method, "GET");
         const url = new URL(call.url!, endpoint);
-        assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`].includes(url.pathname));
+        assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`,
+          `/api/v1${projectPath}/sessions/${chosenId}/tasks`].includes(url.pathname));
         assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
       }
     }, `http://127.0.0.1:${address.port}`);
@@ -388,6 +389,7 @@ test("the stack runtime wires project detail to the paired Core API", async () =
     assertHtml(response, 200, /<dt>Tên<\/dt><dd>Runtime project<\/dd>/);
     assert.ok(response.body.includes(`<dt>Session ID</dt><dd>${session}</dd>`));
     assert.match(response.body, /<dt>Tên<\/dt><dd>Runtime session<\/dd>/);
+    assert.match(response.body, /id="tasks-panel"[\s\S]*?data-state="empty">Session này chưa có task/);
     assert.doesNotMatch(response.body, /Private session source|private\/runtime-project/);
   } finally {
     await runtime.close();
