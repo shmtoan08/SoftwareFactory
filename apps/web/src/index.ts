@@ -1,3 +1,4 @@
+import { dashboardNotFound, dashboardRoute } from "./dashboard-shell/router.ts";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
   CostBudgetExceededError,
@@ -2302,8 +2303,24 @@ export class WebApprovalConsoleHttpServer {
         return;
       }
 
+      const dashboard = method === "GET" ? dashboardRoute(pathname) : undefined;
+      if (dashboard) {
+        this.sendBody(res, dashboard.status, "text/html; charset=utf-8", dashboard.body);
+        return;
+      }
+
+      const isHtmlNavigation = method === "GET"
+        && String(req.headers.accept ?? "").toLowerCase().includes("text/html")
+        && url.searchParams.get("format") !== "json";
+      // Keep the authentication response for the existing console route families.
+      const isConsolePath = /^\/projects\/[^/]+\/(?:pipeline-sessions|agent-profiles|tasks)(?:\/|$)/.test(pathname);
       const auth = decodeCoreApiAuthHeader(req.headers[CORE_API_AUTH_HEADER]);
       if (!auth) {
+        if (isHtmlNavigation && !isConsolePath) {
+          const notFound = dashboardNotFound();
+          this.sendBody(res, notFound.status, "text/html; charset=utf-8", notFound.body);
+          return;
+        }
         this.sendJson(res, 401, {
           error_code: "ERR_UNAUTHORIZED",
           reason: `Missing or invalid ${CORE_API_AUTH_HEADER} header`,
@@ -3644,6 +3661,12 @@ export class WebApprovalConsoleHttpServer {
           return;
         }
         this.sendJson(res, 201, pkg);
+        return;
+      }
+
+      if (isHtmlNavigation) {
+        const notFound = dashboardNotFound();
+        this.sendBody(res, notFound.status, "text/html; charset=utf-8", notFound.body);
         return;
       }
 
