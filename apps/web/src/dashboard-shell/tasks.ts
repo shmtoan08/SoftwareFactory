@@ -2,7 +2,7 @@ import { DashboardClient } from "../dashboard-data/client.ts";
 import { refreshablePanel } from "./panel-refresh.ts";
 import { escapeHtml, facts } from "./router.ts";
 
-type TasksResult = Awaited<ReturnType<DashboardClient["listSessionTasks"]>>;
+export type TasksResult = Awaited<ReturnType<DashboardClient["listSessionTasks"]>>;
 type TaskRow = Extract<TasksResult, { data: unknown }>["data"]["items"][number];
 
 function taskState(state: "loading" | "empty" | "error" | "access-denied", message: string): string {
@@ -34,6 +34,7 @@ document.addEventListener("submit", (event) => {
   const panels = form.closest(".project-panels");
   panels.dataset.sessionChanging = "";
   panels.querySelector("#tasks-panel")?.remove();
+  panels.querySelector("#work-items-panel")?.remove();
 });
 `;
 
@@ -49,7 +50,7 @@ function renderTask(task: TaskRow): string {
   ])}</li>`;
 }
 
-function renderTasks(result: TasksResult): string {
+export function renderTasks(result: TasksResult): string {
   if (result.kind === "empty") return taskState("empty", "Session này chưa có task.");
   if (result.kind === "error") {
     const error = result.error;
@@ -65,13 +66,21 @@ ${data.page.hasMore ? "<p>Đang hiển thị trang đầu của danh sách task.
 <ul class="dashboard-task-list">${data.items.map(renderTask).join("")}</ul></div>`;
 }
 
-export async function loadTasksBody(projectId: string, sessionId: string, authToken: string | undefined, baseUrl: string | undefined): Promise<string> {
-  if (!authToken) return taskState("access-denied", "Bạn không có quyền truy cập dữ liệu này.");
-  if (!baseUrl) return taskState("error", "Không tải được dữ liệu.");
+export async function readTaskPage(
+  projectId: string, sessionId: string, authToken: string | undefined, baseUrl: string | undefined,
+  options?: Parameters<DashboardClient["listSessionTasks"]>[1],
+): Promise<TasksResult> {
+  const source = { endpoint: `/api/v1/projects/${projectId}/sessions/${sessionId}/tasks`, projectId, sessionId };
+  if (!authToken) return { kind: "error", source, receivedAt: null, error: { kind: "access-denied", status: 403 } };
   try {
+    if (!baseUrl) throw new Error("Core API is unavailable");
     const client = new DashboardClient({ baseUrl, projectId, authToken, timeoutMs: 7000 });
-    return renderTasks(await client.listSessionTasks(sessionId));
+    return await client.listSessionTasks(sessionId, options);
   } catch {
-    return taskState("error", "Không tải được dữ liệu.");
+    return { kind: "error", source, receivedAt: null, error: { kind: "data", message: "Task page unavailable" } };
   }
+}
+
+export async function loadTasksBody(projectId: string, sessionId: string, authToken: string | undefined, baseUrl: string | undefined): Promise<string> {
+  return renderTasks(await readTaskPage(projectId, sessionId, authToken, baseUrl));
 }

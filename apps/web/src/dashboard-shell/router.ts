@@ -30,7 +30,15 @@ const styles = `
   .project-panels :is(#budget-loading, #budget-panel) { order: 4; }
   .project-panels :is(#tasks-loading, #tasks-empty, #tasks-panel) { order: 5; }
   .project-panels:has(#tasks-empty, #tasks-panel) #tasks-loading,
-  .project-panels[data-session-changing] :is(#tasks-empty, #tasks-panel) { display: none; }
+  .project-panels[data-session-changing] :is(#tasks-empty, #tasks-panel, #work-items-empty, #work-items-panel),
+  .project-panels:has(#work-items-empty, #work-items-panel) #work-items-loading { display: none; }
+  .project-panels :is(#work-items-loading, #work-items-empty, #work-items-panel) { order: 6; }
+  .work-items-filter { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .75rem 0; }
+  .work-items-scroll { overflow-x: auto; margin-top: 1rem; }
+  .work-items-scroll table { border-collapse: collapse; width: 100%; text-align: left; }
+  .work-items-scroll caption { text-align: left; padding-bottom: .5rem; }
+  .work-items-scroll :is(th, td) { padding: .6rem; border-bottom: 1px solid #d8e0ee; vertical-align: top; }
+  .work-item-status { white-space: pre-wrap; overflow-wrap: anywhere; }
   .dashboard-task-list { display: grid; gap: 1rem; padding-left: 1.25rem; }
   .dashboard-task-list h3 { margin: 0 0 .5rem; overflow-wrap: anywhere; }
   .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }

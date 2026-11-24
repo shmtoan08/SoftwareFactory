@@ -3,7 +3,8 @@ import { DashboardClient, type DashboardResult } from "../dashboard-data/client.
 import type { SessionDto, SessionListDto } from "../dashboard-data/mapping.ts";
 import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
-import { loadTasksBody, retireTasksOnSessionChange, tasksPanel, tasksPlaceholder } from "./tasks.ts";
+import { readTaskPage, renderTasks, retireTasksOnSessionChange, tasksPanel, tasksPlaceholder } from "./tasks.ts";
+import { workItemsPanel, workItemsPlaceholder } from "./work-items.ts";
 import { documentEnd, documentStart, escapeHtml, facts } from "./router.ts";
 
 type ProjectDetail = Extract<Awaited<ReturnType<DashboardClient["getProject"]>>, { data: unknown }>["data"];
@@ -90,7 +91,7 @@ export async function sendProjectDetail(
     const state = authToken ? "error" : "access-denied";
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + script + end);
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + script + end);
     return;
   }
 
@@ -100,14 +101,15 @@ export async function sendProjectDetail(
   } catch {
     res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + script + end);
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + script + end);
     return;
   }
 
   const cursor = query.get("cursor");
   const selectedId = query.get("sessionId");
+  const initialState = selectedId ? "loading" : "empty";
   res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
-    + progress + budgetLoadingPanel() + tasksPlaceholder(selectedId ? "loading" : "empty") + script);
+    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
   await Promise.all([
     loadBudgetBody(projectId, authToken, baseUrl).then((body) => write(budgetPanel(projectId, body))),
@@ -117,15 +119,16 @@ export async function sendProjectDetail(
         const selected = result.kind === "ok" ? result.data.items.find((item) => item.pipelineSessionId === selectedId) : undefined;
         write(renderSessions(result, projectId, selected, cursor));
         if (!selected) {
-          if (selectedId) write(tasksPlaceholder("empty"));
+          if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty"));
           return;
         }
         if (res.destroyed) return;
-        const body = await loadTasksBody(projectId, selected.pipelineSessionId, authToken, baseUrl);
-        write(tasksPanel(projectId, selected.pipelineSessionId, body));
+        const sessionId = selected.pipelineSessionId;
+        const tasks = await readTaskPage(projectId, sessionId, authToken, baseUrl);
+        write(tasksPanel(projectId, sessionId, renderTasks(tasks)) + workItemsPanel(projectId, sessionId, tasks));
       }, () => {
         write(unavailable("sessions", "error"));
-        if (selectedId) write(tasksPlaceholder("empty"));
+        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty"));
       }),
   ]);
   if (!res.destroyed) res.end("</div>" + documentEnd);

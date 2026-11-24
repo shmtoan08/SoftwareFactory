@@ -1,3 +1,4 @@
+import { loadWorkItemsBody } from "./dashboard-shell/work-items.ts";
 import { loadTasksBody } from "./dashboard-shell/tasks.ts";
 import { loadBudgetBody } from "./dashboard-shell/budget.ts";
 import { sendProjectDetail } from "./dashboard-shell/project-detail.ts";
@@ -2323,6 +2324,16 @@ export class WebApprovalConsoleHttpServer {
       if (tasksFragment?.[1] && tasksFragment[2]) {
         const header = req.headers[CORE_API_AUTH_HEADER];
         const body = await loadTasksBody(tasksFragment[1], tasksFragment[2],
+          Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
+        res.end(body);
+        return;
+      }
+
+      const workItemsFragment = method === "GET" ? /^\/projects\/([^/]+)\/dashboard-work-items\/([^/]+)$/.exec(pathname) : null;
+      if (workItemsFragment?.[1] && workItemsFragment[2]) {
+        const header = req.headers[CORE_API_AUTH_HEADER];
+        const body = await loadWorkItemsBody(workItemsFragment[1], workItemsFragment[2], url.searchParams,
           Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
         res.end(body);
