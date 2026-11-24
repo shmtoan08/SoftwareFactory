@@ -27,8 +27,13 @@ const styles = `
   .project-panels :is(#project-loading, #project-result) { order: 1; }
   .project-panels :is(#sessions-loading, #sessions-result) { order: 2; }
   .project-panels #pipeline-progress { order: 3; }
+  .project-panels :is(#budget-loading, #budget-panel) { order: 4; }
+  .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
+  .budget-dimensions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 1rem; margin: 1rem 0; }
+  .budget-dimensions h3 { margin: 0 0 .5rem; font-size: 1rem; }
   .project-panels:has(#project-result) #project-loading,
-  .project-panels:has(#sessions-result) #sessions-loading { display: none; }
+  .project-panels:has(#sessions-result) #sessions-loading,
+  .project-panels:has(#budget-panel) #budget-loading { display: none; }
   @media (max-width: 38rem) {
     body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
     header { padding: 1rem 1.25rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
@@ -90,4 +95,14 @@ export function dashboardRoute(pathname: string): DashboardPage | { projectId: s
 
 export function dashboardNotFound(): DashboardPage {
   return withDashboardRouteBoundary(() => page(404, "Page not found", "Open Projects to return to the dashboard."));
+}
+
+export function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[character]!);
+}
+
+export function facts(entries: [string, string][]): string {
+  return `<dl>${entries.map(([label, value]) => `<dt>${label}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl>`;
 }

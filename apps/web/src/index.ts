@@ -1,3 +1,4 @@
+import { loadBudgetBody } from "./dashboard-shell/budget.ts";
 import { sendProjectDetail } from "./dashboard-shell/project-detail.ts";
 import { dashboardNotFound, dashboardRoute } from "./dashboard-shell/router.ts";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -2304,6 +2305,16 @@ export class WebApprovalConsoleHttpServer {
 
       if (method === "GET" && pathname === "/health") {
         this.sendJson(res, 200, { ok: true, service: "web-approval-console" });
+        return;
+      }
+
+      const budgetFragment = method === "GET" ? /^\/projects\/([^/]+)\/dashboard-budget$/.exec(pathname)?.[1] : undefined;
+      if (budgetFragment !== undefined) {
+        const header = req.headers[CORE_API_AUTH_HEADER];
+        const body = await loadBudgetBody(budgetFragment, Array.isArray(header) ? header[0] : header,
+          this.dashboardCoreApiBaseUrl);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
+        res.end(body);
         return;
       }
 

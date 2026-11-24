@@ -1,19 +1,15 @@
 import type { ServerResponse } from "node:http";
 import { DashboardClient, type DashboardResult } from "../dashboard-data/client.ts";
 import type { SessionListDto } from "../dashboard-data/mapping.ts";
-import { documentEnd, documentStart } from "./router.ts";
+import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
+import { panelRefreshScript } from "./panel-refresh.ts";
+import { documentEnd, documentStart, escapeHtml, facts } from "./router.ts";
 
 type ProjectDetail = Extract<Awaited<ReturnType<DashboardClient["getProject"]>>, { data: unknown }>["data"];
 type Panel = "project" | "sessions";
 type PanelState = "loading" | "empty" | "error" | "access-denied" | "ready";
 
 const headings = { project: "Thông tin project", sessions: "Session context" };
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (character) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  })[character]!);
-}
 
 function panel(id: Panel, state: PanelState, content: string): string {
   const key = `${id}-${state === "loading" ? "loading" : "result"}`;
@@ -40,10 +36,6 @@ function failureState<T>(panel: Panel, result: DashboardResult<T>): "error" | "a
   if (error.kind === "access-denied" || ("status" in error && error.status === 401)) return "access-denied";
   if (panel === "project" && error.kind === "not-found") return "empty";
   return "error";
-}
-
-function facts(entries: [string, string][]): string {
-  return `<dl>${entries.map(([label, value]) => `<dt>${label}</dt><dd>${escapeHtml(value)}</dd>`).join("")}</dl>`;
 }
 
 function renderProject(result: DashboardResult<ProjectDetail>): string {
@@ -90,12 +82,14 @@ export async function sendProjectDetail(
 <p><strong>UNSUPPORTED</strong> — Chưa có nguồn tiến độ được duyệt (session DTO không chứa stage/status/tiến độ)</p>
 </section>`;
   const start = documentStart("Project", false, "vi") + '<div class="project-panels">';
-  const end = progress + "</div>" + documentEnd;
+  const script = `<script>${panelRefreshScript}</script>`;
+  const end = "</div>" + documentEnd;
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
 
   if (!authToken || !baseUrl) {
     const state = authToken ? "error" : "access-denied";
-    res.end(start + unavailable("project", state) + unavailable("sessions", state) + end);
+    res.end(start + unavailable("project", state) + unavailable("sessions", state)
+      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
 
@@ -103,14 +97,17 @@ export async function sendProjectDetail(
   try {
     client = new DashboardClient({ baseUrl, projectId, authToken, timeoutMs: 7000 });
   } catch {
-    res.end(start + unavailable("project", "error") + unavailable("sessions", "error") + end);
+    res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
+      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
 
   const cursor = query.get("cursor");
-  res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading") + progress);
+  res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
+    + progress + budgetLoadingPanel() + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
   await Promise.all([
+    loadBudgetBody(projectId, authToken, baseUrl).then((body) => write(budgetPanel(projectId, body))),
     client.getProject().then(renderProject).catch(() => unavailable("project", "error")).then(write),
     client.listSessions(projectId, cursor === null ? {} : { cursor })
       .then((result) => renderSessions(result, projectId, query.get("sessionId"), cursor))

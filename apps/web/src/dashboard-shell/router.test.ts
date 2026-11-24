@@ -94,7 +94,7 @@ test("Dashboard renders the empty Projects list and protects project data withou
     assertHtml(detail, 200, /<h1>Project<\/h1>/);
     assert.match(detail.body, /id="project-result" data-state="access-denied"/);
     assert.match(detail.body, /id="sessions-result" data-state="access-denied"/);
-    assert.doesNotMatch(detail.body, /<script|\brealtime\b|\blive\b/i);
+    assert.doesNotMatch(detail.body, /\brealtime\b|\blive\b/i);
     const projectsLink = detail.body.match(/<a href="([^"]+)">Projects<\/a>/)?.[1];
     assert.ok(projectsLink);
     assert.equal((await open(endpoint, projectsLink)).body, list.body);
@@ -238,7 +238,7 @@ test("legacy console routes still render and navigate over HTTP", async (t) => {
   });
 });
 
-test("project detail streams panel states independently and uses only the two approved GET endpoints", async () => {
+test("project detail streams panel states independently and uses only the approved GET endpoints", async () => {
   const id = "10000000-0000-0000-0000-000000000001";
   const otherId = "20000000-0000-0000-0000-000000000001";
   const chosenId = "20000000-0000-0000-0000-000000000002";
@@ -357,7 +357,7 @@ test("project detail streams panel states independently and uses only the two ap
       for (const call of calls) {
         assert.equal(call.method, "GET");
         const url = new URL(call.url!, endpoint);
-        assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`].includes(url.pathname));
+        assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`].includes(url.pathname));
         assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
       }
     }, `http://127.0.0.1:${address.port}`);
