@@ -1,3 +1,4 @@
+import { assertSessionReadInput, sessionReadRow, type SessionReadInput, type SessionReadRows } from "./session-read-projection.ts";
 import { taskReadDto, type TaskReadInput, type TaskReadRows } from "./task-read-projection.ts";
 import { ProjectReadCursorContextError, assertProjectReadRole, type ProjectReadInput, type ProjectReadRows } from "./project-read-projection.ts";
 import type { BudgetReadInput, BudgetReadRows } from "./budget-read-projection.ts";
@@ -2483,6 +2484,36 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       return { fetchedAt: snapshotAt, projects: rows.rows.map((r) => ({ projectId: String(r.id), slug: String(r.slug), name: String(r.name), defaultBranch: String(r.default_branch), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })) };
     }, input.deadlineAt);
   }
+  public async readSessionProjection(input: SessionReadInput): Promise<SessionReadRows> {
+    assertSessionReadInput(input);
+    return this.pool.withReadOnlyRlsTransaction({
+      currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service",
+    }, async (fetchedAt) => {
+      const role = await this.pool.queryInActiveTx(
+        "SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;",
+        [input.projectId, input.principalId],
+      );
+      assertProjectReadRole(role.rows[0]?.member_role, input.signedRoles);
+      const project = await this.pool.queryInActiveTx(
+        "SELECT project_id FROM projects WHERE project_id=$1::uuid;", [input.projectId],
+      );
+      if (!project.rowCount) throw new PostgresRlsError("23503", "Project not found");
+
+      const result = await this.pool.queryInActiveTx<Record<keyof SessionReadRows["sessions"][number], unknown>>(
+        `SELECT pipeline_session_id, project_id, title,
+           to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+           to_char(updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at
+         FROM product_pipeline_sessions
+         WHERE project_id=$1::uuid
+           AND ($2::timestamptz IS NULL OR (created_at,pipeline_session_id)<($2::timestamptz,$3::uuid))
+         ORDER BY product_pipeline_sessions.created_at DESC, pipeline_session_id DESC
+         LIMIT $4::int;`,
+        [input.projectId, input.after?.createdAt ?? null, input.after?.pipelineSessionId ?? null, input.limit + 1],
+      );
+      return { fetchedAt, sessions: result.rows.map((row) => sessionReadRow(row, input.projectId)) };
+    }, input.deadlineAt);
+  }
+
   public async readTaskProjection(input: TaskReadInput): Promise<TaskReadRows> {
     return this.pool.withReadOnlyRlsTransaction({ currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service" }, async (snapshotAt) => {
       const role = await this.pool.queryInActiveTx("SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;", [input.projectId, input.principalId]);

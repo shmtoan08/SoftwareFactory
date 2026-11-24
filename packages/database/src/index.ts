@@ -1,3 +1,5 @@
+import { assertSessionReadInput, sessionReadRow, type SessionReadInput, type SessionReadRows } from "./session-read-projection.ts";
+export type { SessionReadInput, SessionReadRow, SessionReadRows } from "./session-read-projection.ts";
 export * from "./task-read-projection.ts";
 import { taskReadDto, TASK_READ_UUID, type TaskReadInput, type TaskReadRows, type TaskReadDto } from "./task-read-projection.ts";
 export * from "./project-read-projection.ts";
@@ -575,6 +577,35 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       createdAt: readTimestamp(project.created_at), updatedAt: readTimestamp(project.updated_at) };
     const beforeAnchor = !input.after || dto.updatedAt < input.after.updatedAt || (dto.updatedAt === input.after.updatedAt && dto.projectId < input.after.id);
     return { fetchedAt, projects: beforeAnchor ? [dto] : [] };
+  }
+
+  public async readSessionProjection(input: SessionReadInput): Promise<SessionReadRows> {
+    this.assertOutsideTransaction();
+    if (this.asyncLocalStorage.getStore()) throw new Error("Nested projection transaction");
+    assertSessionReadInput(input);
+    const checkTime = () => {
+      if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+    };
+    checkTime();
+    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+    assertProjectReadRole(this.projectMemberships.get(`${input.projectId}:${input.principalId}`)?.member_role, input.signedRoles);
+    if (!this.projects.has(input.projectId)) throw new PostgresRlsError("23503", "Project not found");
+
+    const sessions: SessionReadRows["sessions"] = [];
+    const precedes = (createdAt: string, id: string, otherCreatedAt: string, otherId: string) =>
+      createdAt > otherCreatedAt || (createdAt === otherCreatedAt && id > otherId);
+    for (const record of this.pipelineSessions.values()) {
+      checkTime();
+      if (record.project_id !== input.projectId) continue;
+      const row = sessionReadRow(record, input.projectId);
+      if (input.after && !precedes(input.after.createdAt, input.after.pipelineSessionId, row.created_at, row.pipeline_session_id)) continue;
+      const index = sessions.findIndex((other) =>
+        precedes(row.created_at, row.pipeline_session_id, other.created_at, other.pipeline_session_id));
+      if (index !== -1) sessions.splice(index, 0, row);
+      else if (sessions.length <= input.limit) sessions.push(row);
+      if (sessions.length > input.limit + 1) sessions.pop();
+    }
+    return { fetchedAt, sessions };
   }
 
   public async readTaskProjection(input: TaskReadInput): Promise<TaskReadRows> {
