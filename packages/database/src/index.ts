@@ -1,3 +1,5 @@
+import { mapCostSessionProjection, type CostSessionReadInput, type CostSessionReadRows } from "./cost-session-read-projection.ts";
+export { COST_SESSION_READ_UUID } from "./cost-session-read-projection.ts";
 import { assertSessionReadInput, sessionReadRow, type SessionReadInput, type SessionReadRows } from "./session-read-projection.ts";
 export type { SessionReadInput, SessionReadRow, SessionReadRows } from "./session-read-projection.ts";
 export * from "./task-read-projection.ts";
@@ -654,6 +656,25 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     });
     checkTime();
     return { fetchedAt, tasks };
+  }
+
+  public async readCostSessionProjection(input: CostSessionReadInput): Promise<CostSessionReadRows> {
+    this.assertOutsideTransaction();
+    if (this.asyncLocalStorage.getStore()) throw new Error("Nested projection transaction");
+    if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+
+    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+    const membership = this.projectMemberships.get(`${input.projectId}:${input.principalId}`);
+    assertProjectReadRole(membership?.member_role, input.signedRoles);
+    if (!this.projects.has(input.projectId)) throw new PostgresRlsError("23503", "Project not found");
+    const session = this.pipelineSessions.get(input.pipelineSessionId);
+    if (!session || session.project_id !== input.projectId) throw new PostgresRlsError("23503", "Pipeline session not found");
+
+    const cost = session.cost_session_id === null ? undefined : this.costSessions.get(session.cost_session_id);
+    return {
+      fetchedAt,
+      costSession: mapCostSessionProjection(session.cost_session_id, cost?.project_id === input.projectId ? cost : undefined),
+    };
   }
 
   public async readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows> {

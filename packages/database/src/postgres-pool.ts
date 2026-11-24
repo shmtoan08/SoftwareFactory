@@ -1,3 +1,4 @@
+import { mapCostSessionProjection, toSafeInt, type CostSessionReadInput, type CostSessionReadRows } from "./cost-session-read-projection.ts";
 import { assertSessionReadInput, sessionReadRow, type SessionReadInput, type SessionReadRows } from "./session-read-projection.ts";
 import { taskReadDto, type TaskReadInput, type TaskReadRows } from "./task-read-projection.ts";
 import { ProjectReadCursorContextError, assertProjectReadRole, type ProjectReadInput, type ProjectReadRows } from "./project-read-projection.ts";
@@ -1929,31 +1930,6 @@ function mapOutboxRow(row: Record<string, unknown>): OutboxEventRecord {
   };
 }
 
-function toSafeInt(value: unknown, fieldName: string): number {
-  if (typeof value === "bigint") {
-    if (value < BigInt(Number.MIN_SAFE_INTEGER) || value > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new RangeError(`${fieldName} (${value.toString()}) exceeds JavaScript safe integer range`);
-    }
-    return Number(value);
-  }
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!/^-?\d+$/.test(trimmed)) {
-      throw new RangeError(`${fieldName} (${value}) is not a safe integer`);
-    }
-    const parsed = BigInt(trimmed);
-    if (parsed < BigInt(Number.MIN_SAFE_INTEGER) || parsed > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw new RangeError(`${fieldName} (${value}) exceeds JavaScript safe integer range`);
-    }
-    return Number(parsed);
-  }
-  const num = typeof value === "number" ? value : Number(value);
-  if (!Number.isSafeInteger(num)) {
-    throw new RangeError(`${fieldName} (${String(value)}) is not a safe integer`);
-  }
-  return num;
-}
-
 function mapCostSessionRow(row: Record<string, unknown>): CostSessionRecord {
   return {
     cost_session_id: String(row.cost_session_id),
@@ -2533,6 +2509,35 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       }) };
     }, input.deadlineAt);
   }
+  public async readCostSessionProjection(input: CostSessionReadInput): Promise<CostSessionReadRows> {
+    return this.pool.withReadOnlyRlsTransaction({
+      currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service",
+    }, async (fetchedAt) => {
+      const membership = await this.pool.queryInActiveTx(
+        "SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;",
+        [input.projectId, input.principalId],
+      );
+      assertProjectReadRole(membership.rows[0]?.member_role, input.signedRoles);
+      const project = await this.pool.queryInActiveTx(
+        "SELECT project_id FROM projects WHERE project_id=$1::uuid;", [input.projectId],
+      );
+      if (!project.rowCount) throw new PostgresRlsError("23503", "Project not found");
+
+      const result = await this.pool.queryInActiveTx(
+        `SELECT s.cost_session_id AS linked_cost_session_id, c.cost_session_id, c.pipeline_session_id,
+                c.session_cost_budget_micro_usd::text, c.cost_used_micro_usd::text,
+                c.tokens_used_total::text, c.session_token_budget::text, c.status
+         FROM product_pipeline_sessions s
+         LEFT JOIN model_cost_sessions c ON c.project_id=s.project_id AND c.cost_session_id=s.cost_session_id
+         WHERE s.project_id=$1::uuid AND s.pipeline_session_id=$2::uuid;`,
+        [input.projectId, input.pipelineSessionId],
+      );
+      const row = result.rows[0];
+      if (!row) throw new PostgresRlsError("23503", "Pipeline session not found");
+      return { fetchedAt, costSession: mapCostSessionProjection(row.linked_cost_session_id, row) };
+    }, input.deadlineAt);
+  }
+
   public async readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows> {
     return this.pool.withReadOnlyRlsTransaction({ currentProjectId: input.projectId, currentPrincipalId: input.principalId, currentRole: "core_api_service" }, async (snapshotAt) => {
       const role = await this.pool.queryInActiveTx("SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;", [input.projectId, input.principalId]);

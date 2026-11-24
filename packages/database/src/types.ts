@@ -1,3 +1,4 @@
+import type { CostSessionReadInput, CostSessionReadRows } from "./cost-session-read-projection.ts";
 import type { SessionReadInput, SessionReadRows } from "./session-read-projection.ts";
 import type { TaskReadInput, TaskReadRows } from "./task-read-projection.ts";
 import type { ProjectReadInput, ProjectReadRows } from "./project-read-projection.ts";
@@ -530,6 +531,7 @@ export interface ControlPlaneStore {
   readSessionProjection(input: SessionReadInput): Promise<SessionReadRows>;
   readTaskProjection(input: TaskReadInput): Promise<TaskReadRows>;
   readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows>;
+  readCostSessionProjection(input: CostSessionReadInput): Promise<CostSessionReadRows>;
   readBudgetProjection(input: BudgetReadInput): Promise<BudgetReadRows>;
   clockTimestampIso(): string | Promise<string>;
   assertOutsideTransaction(): void;

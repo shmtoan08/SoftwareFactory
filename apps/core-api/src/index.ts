@@ -1,3 +1,4 @@
+import { CostSessionReadProjectionService } from "./cost-session-read-projection.ts";
 import { SessionReadProjectionService } from "./session-read-projection.ts";
 import { TaskReadProjectionService } from "./task-read-projection.ts";
 import { ProjectReadProjectionService, PROJECT_READ_ROLES } from "./project-read-projection.ts";
@@ -395,6 +396,7 @@ export class CoreApiService {
   private readonly projectReads: ProjectReadProjectionService;
   private readonly sessionReads: SessionReadProjectionService;
   private readonly taskReads: TaskReadProjectionService;
+  private readonly costSessionReads: CostSessionReadProjectionService;
   private readonly budgetReads: BudgetReadProjectionService;
   private readonly executionTargetBroker: ExecutionTargetBroker;
   private readonly productionDeploymentReconciler: ProductionDeploymentReconciler;
@@ -453,6 +455,9 @@ export class CoreApiService {
       (data) => this.authenticator.signSessionReadCursor(data),
     );
     this.taskReads = new TaskReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES), (data) => this.authenticator.signProjectReadCursor(data));
+    this.costSessionReads = new CostSessionReadProjectionService(
+      this.store, (auth) => this.authenticator.verifyAuthContext(auth, auth.projectId, PROJECT_READ_ROLES),
+    );
     this.budgetReads = new BudgetReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES));
     this.pipelineService =
       options?.pipelineService ??
@@ -476,6 +481,10 @@ export class CoreApiService {
 
   public readProjectProjection(auth: CoreApiAuthContext, projectId: string | undefined, query = new URLSearchParams()) {
     return this.projectReads.read(auth, projectId, query);
+  }
+
+  public readCostSessionProjection(auth: CoreApiAuthContext, projectId: string, pipelineSessionId: string, query = new URLSearchParams()) {
+    return this.costSessionReads.read(auth, projectId, pipelineSessionId, query);
   }
 
   public readBudgetProjection(auth: CoreApiAuthContext, projectId: string, query = new URLSearchParams()) {

@@ -441,9 +441,11 @@ export class CoreApiHttpServer {
       }
 
       const sessionRead = method === "GET" ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/sessions$/) : null;
+      const costSnapshotRead = method === "GET"
+        ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/cost-session-snapshot$/) : null;
       const auth = this.requireAuth(req);
       if (!auth) {
-        if (sessionRead) throw new ReadProjectionError(401, "ERR_UNAUTHORIZED");
+        if (sessionRead || costSnapshotRead) throw new ReadProjectionError(401, "ERR_UNAUTHORIZED");
         this.sendJson(res, 401, {
           error_code: "ERR_UNAUTHORIZED",
           reason: `Missing or invalid ${CORE_API_AUTH_HEADER} header`,
@@ -465,6 +467,18 @@ export class CoreApiHttpServer {
         try { projectId = decodeURIComponent(sessionRead[1]); }
         catch { throw new ReadProjectionError(400, "ERR_READ_QUERY_INVALID"); }
         this.sendJson(res, 200, await this.coreApi.readSessionProjection(auth, projectId, url.searchParams));
+        return;
+      }
+
+      if (costSnapshotRead?.[1] && costSnapshotRead[2]) {
+        // Keep auth and scope precedence even when a path segment cannot be decoded.
+        const decodeId = (segment: string): string => {
+          try { return decodeURIComponent(segment); }
+          catch { return ""; }
+        };
+        this.sendJson(res, 200, await this.coreApi.readCostSessionProjection(
+          auth, decodeId(costSnapshotRead[1]), decodeId(costSnapshotRead[2]), url.searchParams,
+        ));
         return;
       }
 
