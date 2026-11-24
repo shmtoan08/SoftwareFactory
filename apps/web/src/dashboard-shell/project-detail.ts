@@ -3,6 +3,7 @@ import { DashboardClient, type DashboardResult } from "../dashboard-data/client.
 import type { SessionDto, SessionListDto } from "../dashboard-data/mapping.ts";
 import { agentProfilesLoading, agentProfilesPanel, loadAgentProfilesBody } from "./agent-profiles.ts";
 import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
+import { costUsagePlaceholder, loadCostUsage } from "./cost-session-usage.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
 import { taskDetailScript } from "./task-detail.ts";
 import { readTaskPage, renderTasks, retireTasksOnSessionChange, tasksPanel, tasksPlaceholder } from "./tasks.ts";
@@ -93,7 +94,7 @@ export async function sendProjectDetail(
     const state = authToken ? "error" : "access-denied";
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + workItemsPlaceholder("empty")
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty")
       + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
@@ -104,7 +105,7 @@ export async function sendProjectDetail(
   } catch {
     res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
-      + tasksPlaceholder("empty") + workItemsPlaceholder("empty")
+      + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty")
       + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
     return;
   }
@@ -113,7 +114,7 @@ export async function sendProjectDetail(
   const selectedId = query.get("sessionId");
   const initialState = selectedId ? "loading" : "empty";
   res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
-    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + script);
+    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + costUsagePlaceholder(initialState) + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
   await Promise.all([
     loadAgentProfilesBody(projectId, authToken, baseUrl).then((body) => write(agentProfilesPanel(projectId, body))),
@@ -124,16 +125,19 @@ export async function sendProjectDetail(
         const selected = result.kind === "ok" ? result.data.items.find((item) => item.pipelineSessionId === selectedId) : undefined;
         write(renderSessions(result, projectId, selected, cursor));
         if (!selected) {
-          if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty"));
+          if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty"));
           return;
         }
         if (res.destroyed) return;
         const sessionId = selected.pipelineSessionId;
-        const tasks = await readTaskPage(projectId, sessionId, authToken, baseUrl);
-        write(tasksPanel(projectId, sessionId, renderTasks(tasks)) + workItemsPanel(projectId, sessionId, tasks));
+        await Promise.all([
+          readTaskPage(projectId, sessionId, authToken, baseUrl)
+            .then((tasks) => write(tasksPanel(projectId, sessionId, renderTasks(tasks)) + workItemsPanel(projectId, sessionId, tasks))),
+          loadCostUsage(client, sessionId).then(write),
+        ]);
       }, () => {
         write(unavailable("sessions", "error"));
-        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty"));
+        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty"));
       }),
   ]);
   if (!res.destroyed) res.end("</div>" + documentEnd);

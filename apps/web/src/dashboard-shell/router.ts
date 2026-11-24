@@ -43,6 +43,9 @@ const styles = `
   .dashboard-task-list h3 { margin: 0 0 .5rem; overflow-wrap: anywhere; }
   .project-panels :is(#agent-profiles-loading, #agent-profiles-panel) { order: 7; }
   .project-panels:has(#agent-profiles-panel) #agent-profiles-loading { display: none; }
+  .project-panels :is(#cost-session-loading, #cost-session-result) { order: 8; }
+  .project-panels:has(#cost-session-result) #cost-session-loading,
+  .project-panels[data-session-changing] #cost-session-result { display: none; }
   .profile-filters { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .75rem 0; }
   .profile-table { max-height: 24rem; overflow: auto; margin-top: 1rem; }
   .profile-table table { border-collapse: collapse; width: 100%; text-align: left; }

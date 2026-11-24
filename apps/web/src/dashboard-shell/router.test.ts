@@ -358,7 +358,8 @@ test("project detail streams panel states independently and uses only the approv
         assert.equal(call.method, "GET");
         const url = new URL(call.url!, endpoint);
         assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`, `/api/v1${projectPath}/agent-profiles`,
-          `/api/v1${projectPath}/sessions/${chosenId}/tasks`].includes(url.pathname));
+          `/api/v1${projectPath}/sessions/${chosenId}/tasks`,
+          `/api/v1${projectPath}/pipeline-sessions/${chosenId}/cost-session-snapshot`].includes(url.pathname));
         assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
       }
     }, `http://127.0.0.1:${address.port}`);
@@ -390,6 +391,7 @@ test("the stack runtime wires project detail to the paired Core API", async () =
     assert.ok(response.body.includes(`<dt>Session ID</dt><dd>${session}</dd>`));
     assert.match(response.body, /<dt>Tên<\/dt><dd>Runtime session<\/dd>/);
     assert.match(response.body, /id="tasks-panel"[\s\S]*?data-state="empty">Session này chưa có task/);
+    assert.match(response.body, /id="cost-session-result" data-state="empty"[\s\S]*?Session chưa có cost session/);
     assert.doesNotMatch(response.body, /Private session source|private\/runtime-project/);
   } finally {
     await runtime.close();
@@ -510,4 +512,132 @@ test("Agent Profiles render only configured profile fields and handle each panel
       assert.deepEqual(calls, [corePath + "?role=DEVELOPER&active_only=true"]);
     });
   });
+});
+
+test("Cost session usage follows the Issue #25 envelope, attribution, integer math and error matrix", async (t) => {
+  const id = "10000000-0000-0000-0000-000000000026";
+  const selectedId = "20000000-0000-0000-0000-000000000026";
+  const otherId = "20000000-0000-0000-0000-000000000027";
+  const costId = "30000000-0000-0000-0000-000000000026";
+  const stamp = "2026-11-24T00:00:00.123456Z";
+  const corePath = `/api/v1/projects/${id}`;
+  const readPath = `${corePath}/pipeline-sessions/${selectedId}/cost-session-snapshot`;
+  const projectPath = `/projects/${id}`;
+  const meta = { schemaVersion: "dashboard-read-v1", fetchedAt: stamp, projectId: id };
+  const cost = {
+    cost_session_id: costId, pipeline_session_id: selectedId, session_cost_budget_micro_usd: 20, cost_used_micro_usd: 8,
+    tokens_used_total: 4, session_token_budget: 100, status: "ACTIVE",
+  };
+  let expectedAuth = "";
+  let status = 200;
+  const snapshot = { ...meta, pipelineSessionId: selectedId };
+  let payload: unknown = { ...snapshot, costSession: cost };
+  const calls: Array<{ method: string | undefined; path: string }> = [];
+  const api = createServer((req, res) => {
+    const path = req.url!;
+    if (req.method !== "GET" || req.headers[CORE_API_AUTH_HEADER] !== expectedAuth) {
+      res.writeHead(403).end();
+      return;
+    }
+    if (path === readPath) {
+      calls.push({ method: req.method, path });
+      res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(payload));
+      return;
+    }
+    if (path === `${corePath}/sessions`) {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+        ...meta, items: [{ pipelineSessionId: selectedId, projectId: id, title: "Test pipeline session",
+          createdAt: stamp, updatedAt: stamp }], page: { limit: 20, hasMore: false, nextCursor: null },
+      }));
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "application/json" }).end("{}");
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const address = api.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    await withConsole(async ({ endpoint, authHeader }) => {
+      expectedAuth = authHeader;
+      const costPanel = async (sessionId?: string) => {
+        const url = projectPath + (sessionId === undefined ? "" : `?sessionId=${sessionId}`);
+        const page = await open(endpoint, url, { auth: authHeader });
+        assert.equal(page.status, 200);
+        const panel = page.body.match(/<section id="cost-session-result"[\s\S]*?<\/section>/)?.[0];
+        assert.ok(panel);
+        assert.match(panel, /<h2 id="cost-session-result-heading">Cost session usage<\/h2>/);
+        assert.doesNotMatch(panel, /%|<select|<form|ledger|billing/i);
+        return panel;
+      };
+      await t.test("no confirmed session means no snapshot request", async () => {
+        assert.match(await costPanel(), /data-state="empty"[\s\S]*?Chưa chọn session/);
+        assert.match(await costPanel(otherId), /Chưa chọn session/);
+        assert.equal(calls.length, 0);
+      });
+
+      await t.test("matches attribution and displays a positive remaining balance", async () => {
+        const panel = await costPanel(selectedId);
+        assert.ok(panel.includes(`<dt>Cost session ID</dt><dd>${costId}</dd>`));
+        assert.ok(panel.includes(`<dt>Session ID</dt><dd>${selectedId}</dd>`));
+        assert.match(panel, /<dt>Phạm vi<\/dt><dd>Session đã chọn<\/dd>/);
+        assert.match(panel, /<dt>Đã dùng \(micro-USD\)<\/dt><dd>8<\/dd>/);
+        assert.match(panel, /<dt>Còn lại \(micro-USD\)<\/dt><dd>12<\/dd>/);
+        assert.match(panel, /unsupported — API không cung cấp usage_estimated hoặc nguồn provider\/model/);
+        assert.deepEqual(calls, [{ method: "GET", path: readPath }]);
+      });
+
+      await t.test("preserves cost-session scope on mismatched and null attribution", async () => {
+        for (const attribution of [otherId, null]) {
+          payload = { ...snapshot, costSession: { ...cost, pipeline_session_id: attribution, cost_used_micro_usd: 20 } };
+          const panel = await costPanel(selectedId);
+          assert.match(panel, /<dt>Phạm vi<\/dt><dd>Cost session<\/dd>/);
+          assert.doesNotMatch(panel, /Session đã chọn|<dt>Session ID<\/dt>/);
+          assert.match(panel, /<dt>Đã dùng \(micro-USD\)<\/dt><dd>20<\/dd>/);
+          assert.match(panel, /<dt>Còn lại \(micro-USD\)<\/dt><dd>0<\/dd>/);
+        }
+      });
+
+      await t.test("keeps negative remaining amounts and shows an explicit empty link", async () => {
+        payload = { ...snapshot, costSession: { ...cost, session_cost_budget_micro_usd: 0,
+          cost_used_micro_usd: Number.MAX_SAFE_INTEGER } };
+        assert.match(await costPanel(selectedId), /<dt>Còn lại \(micro-USD\)<\/dt><dd>-9007199254740991 \(overrun\)<\/dd>/);
+        payload = { ...snapshot, costSession: null };
+        const empty = await costPanel(selectedId);
+        assert.match(empty, /data-state="empty"/);
+        assert.match(empty, /Session chưa có cost session/);
+        assert.doesNotMatch(empty, /<dd>0<\/dd>|<dt>Đã dùng/);
+      });
+
+      await t.test("missing, unsafe or string amounts become unsupported before calculation", async () => {
+        const { cost_used_micro_usd: _missing, ...missing } = cost;
+        for (const value of [missing, { ...cost, cost_used_micro_usd: Number.MAX_SAFE_INTEGER + 1 },
+          { ...cost, session_cost_budget_micro_usd: "20" }, { ...cost, cost_used_micro_usd: null }]) {
+          payload = { ...snapshot, costSession: value };
+          const unsupported = await costPanel(selectedId);
+          assert.match(unsupported, /data-state="unsupported"/);
+          assert.doesNotMatch(unsupported, /<dt>Còn lại|<dd>0<\/dd>|overrun/);
+        }
+      });
+
+      await t.test("matches each S0 error and hides backend error details", async () => {
+        for (const [code, error, state, message] of [
+          [400, "ERR_READ_QUERY_INVALID", "error", "Yêu cầu snapshot không hợp lệ"],
+          [401, "ERR_UNAUTHORIZED", "access-denied", "Cần xác thực"],
+          [403, "ERR_FORBIDDEN_RLS", "access-denied", "không có quyền"],
+          [404, "ERR_READ_RESOURCE_NOT_FOUND", "error", "Không tìm thấy snapshot"],
+          [500, "ERR_READ_PROJECTION_FAILED", "error", "Không tải được snapshot"],
+        ] as const) {
+          status = code;
+          payload = { error_code: error, reason: "Private backend detail" };
+          const panel = await costPanel(selectedId);
+          assert.ok(panel.includes(`data-state="${state}"`) && panel.includes(message));
+          assert.doesNotMatch(panel, /<dd>0<\/dd>|Private backend detail|Session chưa có cost session/);
+        }
+        assert.ok(calls.every((call) => call.path === readPath && call.method === "GET"));
+      });
+    }, `http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve()));
+  }
 });

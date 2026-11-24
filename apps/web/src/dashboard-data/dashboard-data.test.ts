@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DashboardClient } from "./client.ts";
-import { mapBudgetSnapshot, mapProjectDetail, mapSessions, mapSessionTasks } from "./mapping.ts";
+import { mapBudgetSnapshot, mapCostSessionSnapshot, mapProjectDetail, mapSessions, mapSessionTasks } from "./mapping.ts";
 
 const projectId = "10000000-0000-0000-0000-000000000001";
 const sessionId = "20000000-0000-0000-0000-000000000001";
@@ -328,5 +328,38 @@ test("session reader fails closed when a response is malformed or contains a bad
     assert.equal(result.error.kind, "data");
     assert.equal(result.receivedAt, receivedAt);
     assert.equal("data" in result, false);
+  }
+});
+
+test("cost snapshot reader uses the exact S0 DTO, guards scope and rejects extra response fields", async () => {
+  const cost = {
+    cost_session_id: "30000000-0000-0000-0000-000000000026",
+    pipeline_session_id: sessionId,
+    session_cost_budget_micro_usd: Number.MAX_SAFE_INTEGER,
+    cost_used_micro_usd: 0,
+    tokens_used_total: 0,
+    session_token_budget: 100,
+    status: "ACTIVE",
+  };
+  const dto = { ...metadata, projectId, pipelineSessionId: sessionId, costSession: cost };
+  const api = client(async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(init?.method, "GET");
+    assert.equal(url.pathname, `/api/v1/projects/${projectId}/pipeline-sessions/${sessionId}/cost-session-snapshot`);
+    assert.equal(url.search, "");
+    return Response.json(dto);
+  });
+  const result = await api.getCostSessionSnapshot(sessionId);
+  assert.equal(result.kind, "ok");
+  assert.deepEqual(result.data, dto);
+  assert.equal(result.receivedAt, receivedAt);
+  for (const invalid of [
+    { ...dto, projectId: sessionId },
+    { ...dto, pipelineSessionId: projectId },
+    { ...dto, modelCallLedgers: [] },
+    { ...dto, costSession: { ...cost, usage_estimated: true } },
+    { ...dto, costSession: { ...cost, cost_session_id: null } },
+  ]) {
+    assert.throws(() => mapCostSessionSnapshot(invalid, projectId, sessionId), /Invalid dashboard response field/);
   }
 });

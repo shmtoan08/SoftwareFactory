@@ -72,6 +72,12 @@ test("Work items use scoped server filtering and paging, with isolated refresh a
   const budgetReader = t.mock.method(DashboardClient.prototype, "getBudgetSnapshot", async () => ({
     kind: "error", receivedAt, source: base, error: { kind: "not-found", status: 404 },
   }));
+  t.mock.method(DashboardClient.prototype, "listAgentProfiles", async () => ({
+    kind: "empty", receivedAt, source: base, data: { profiles: [] },
+  }));
+  t.mock.method(DashboardClient.prototype, "getCostSessionSnapshot", async (pipelineSessionId: string) => ({
+    kind: "empty", receivedAt, source: base, data: { ...metadata, projectId, pipelineSessionId, costSession: null },
+  }));
   t.mock.method(DashboardClient.prototype, "listSessionTasks", async (
     sessionId: string, options?: Parameters<DashboardClient["listSessionTasks"]>[1],
   ) => {

@@ -3,6 +3,7 @@ import {
   mapAgentProfiles,
   type AgentProfileRole,
   mapBudgetSnapshot,
+  mapCostSessionSnapshot,
   mapProjectDetail,
   mapProjectList,
   mapSessionTasks,
@@ -145,6 +146,18 @@ export class DashboardClient {
     const endpoint = `${this.projectEndpoint}/tasks/${encodeURIComponent(requireId(taskId, "taskId"))}/target-dispatches`;
     return this.get({ endpoint, projectId }, (dto) => mapTaskDispatches(dto, projectId, taskId),
       undefined, (data) => data.dispatches.length === 0);
+  }
+
+  getCostSessionSnapshot(pipelineSessionId: string) {
+    const { projectId } = this.options;
+    const sessionId = requireId(pipelineSessionId, "pipelineSessionId");
+    const endpoint = `${this.projectEndpoint}/pipeline-sessions/${encodeURIComponent(sessionId)}/cost-session-snapshot`;
+    return this.get(
+      { endpoint, projectId, sessionId },
+      (dto) => mapCostSessionSnapshot(dto, projectId, sessionId),
+      undefined,
+      (data) => data.costSession === null,
+    );
   }
 
   private async get<T>(

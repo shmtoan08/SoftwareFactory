@@ -312,3 +312,38 @@ export function mapTaskDispatches(value: unknown, projectId: string, taskId: str
     };
   }) };
 }
+
+const costAmountField = "costSession amounts";
+export const costAmountsUnsupportedMessage = new DashboardDataError(costAmountField).message;
+
+function costInteger(value: unknown, minimum = 0): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) {
+    throw new DashboardDataError(costAmountField);
+  }
+  return value;
+}
+
+// Issue #25 S0 specifies the exact snapshot envelope and cost record.
+export function mapCostSessionSnapshot(value: unknown, projectId: string, pipelineSessionId: string) {
+  const dto = record(value, "cost snapshot");
+  exactKeys(dto, "cost snapshot", ["schemaVersion", "fetchedAt", "projectId", "pipelineSessionId", "costSession"]);
+  const envelope = {
+    ...metadata(dto),
+    projectId: scope(dto.projectId, projectId, "projectId"),
+    pipelineSessionId: scope(dto.pipelineSessionId, pipelineSessionId, "pipelineSessionId"),
+  };
+  if (dto.costSession === null) return { ...envelope, costSession: null };
+
+  const cost = record(dto.costSession, "costSession");
+  const costSession = {
+    cost_session_id: requireId(cost.cost_session_id, "cost_session_id"),
+    pipeline_session_id: cost.pipeline_session_id === null ? null : requireId(cost.pipeline_session_id, "pipeline_session_id"),
+    session_cost_budget_micro_usd: costInteger(cost.session_cost_budget_micro_usd),
+    cost_used_micro_usd: costInteger(cost.cost_used_micro_usd),
+    tokens_used_total: costInteger(cost.tokens_used_total),
+    session_token_budget: costInteger(cost.session_token_budget, 1),
+    status: literal(cost.status, "costSession.status", "ACTIVE", "EXHAUSTED", "CLOSED"),
+  };
+  exactKeys(cost, "costSession", Object.keys(costSession));
+  return { ...envelope, costSession };
+}

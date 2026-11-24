@@ -221,7 +221,7 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
     assert.doesNotMatch(content.innerHTML, /Task A/);
     assert.deepEqual(calls.slice(beforeRefresh).sort(), [
       taskPath(sessionA), corePath, `${corePath}/sessions`, `${corePath}/budget-snapshot`,
-      `${corePath}/agent-profiles`, taskPath(sessionB),
+      `${corePath}/agent-profiles`, taskPath(sessionB), `${corePath}/pipeline-sessions/${sessionB}/cost-session-snapshot`,
     ].sort());
   } finally {
     heldA?.resolve();
