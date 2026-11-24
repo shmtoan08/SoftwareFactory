@@ -222,6 +222,7 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
     assert.deepEqual(calls.slice(beforeRefresh).sort(), [
       taskPath(sessionA), corePath, `${corePath}/sessions`, `${corePath}/budget-snapshot`,
       `${corePath}/agent-profiles`, taskPath(sessionB), `${corePath}/pipeline-sessions/${sessionB}/cost-session-snapshot`,
+      `${corePath}/pipeline-sessions/${sessionB}`, `${corePath}/pipeline-sessions/${sessionB}/change-requests`,
     ].sort());
   } finally {
     heldA?.resolve();

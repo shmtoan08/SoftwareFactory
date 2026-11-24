@@ -78,6 +78,12 @@ test("Work items use scoped server filtering and paging, with isolated refresh a
   t.mock.method(DashboardClient.prototype, "getCostSessionSnapshot", async (pipelineSessionId: string) => ({
     kind: "empty", receivedAt, source: base, data: { ...metadata, projectId, pipelineSessionId, costSession: null },
   }));
+  t.mock.method(DashboardClient.prototype, "listApprovalDecisions", async () => ({
+    kind: "empty", receivedAt, source: base, data: { decisions: [] },
+  }));
+  t.mock.method(DashboardClient.prototype, "listApprovalChangeRequests", async () => ({
+    kind: "empty", receivedAt, source: base, data: { requests: [] },
+  }));
   t.mock.method(DashboardClient.prototype, "listSessionTasks", async (
     sessionId: string, options?: Parameters<DashboardClient["listSessionTasks"]>[1],
   ) => {

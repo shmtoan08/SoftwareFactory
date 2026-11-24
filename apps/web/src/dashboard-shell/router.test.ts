@@ -359,7 +359,8 @@ test("project detail streams panel states independently and uses only the approv
         const url = new URL(call.url!, endpoint);
         assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`, `/api/v1${projectPath}/agent-profiles`,
           `/api/v1${projectPath}/sessions/${chosenId}/tasks`,
-          `/api/v1${projectPath}/pipeline-sessions/${chosenId}/cost-session-snapshot`].includes(url.pathname));
+          `/api/v1${projectPath}/pipeline-sessions/${chosenId}/cost-session-snapshot`,
+          `/api/v1${projectPath}/pipeline-sessions/${chosenId}`, `/api/v1${projectPath}/pipeline-sessions/${chosenId}/change-requests`].includes(url.pathname));
         assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
       }
     }, `http://127.0.0.1:${address.port}`);
@@ -636,6 +637,178 @@ test("Cost session usage follows the Issue #25 envelope, attribution, integer ma
         }
         assert.ok(calls.every((call) => call.path === readPath && call.method === "GET"));
       });
+    }, `http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test("Issue #29 approvals use only selected-session R0 readers and preserve exact decision bindings", async (t) => {
+  const id = "10000000-0000-0000-0000-000000000029";
+  const selectedId = "20000000-0000-0000-0000-000000000029";
+  const foreignSession = "20000000-0000-0000-0000-000000000030";
+  const oldHash = "a".repeat(64), latestHash = "b".repeat(64), exactHash = "c".repeat(64);
+  const stamp = "2026-11-24T00:00:00.123456Z";
+  const corePath = `/api/v1/projects/${id}`;
+  const bundlePath = `${corePath}/pipeline-sessions/${selectedId}`;
+  const crPath = `${bundlePath}/change-requests`;
+  const projectPath = `/projects/${id}`;
+  const identity = { project_id: id, pipeline_session_id: selectedId };
+  const gate = {
+    ...identity, gate_id: "gate-test", gate_stage: "STAGE_2_REQUIREMENTS",
+    target_artifact_id: "artifact-old", target_artifact_sha256: oldHash,
+    decision: "APPROVED", rationale: "A note <script>", approver_principal_id: "principal-one", decided_at: stamp,
+  };
+  const bundle = {
+    session: identity,
+    artifacts: [
+      { ...identity, artifact_id: "artifact-old", artifact_sha256: latestHash, content_json: { hidden: "Private artifact content" } },
+      { ...identity, artifact_id: "artifact-exact", artifact_sha256: exactHash },
+    ],
+    approvalGates: [
+      gate,
+      { ...gate, gate_id: "gate-rejected", decision: "REJECTED", target_artifact_id: "artifact-exact", target_artifact_sha256: exactHash },
+      { ...gate, gate_id: "gate-request-changes", decision: "REQUEST_CHANGES" },
+      { ...gate, gate_id: "gate-missing", decision: undefined },
+    ],
+    modelCallLedgers: [{ detail: "Private ledger" }],
+  };
+  const requests = { change_requests: ["PENDING_APPROVAL", "APPROVED", "REJECTED", "APPLIED"].map((status, index) => ({
+    ...identity, cr_id: `change-${index}`, baseline_id: "baseline-one", cr_key: `CR-${index}`,
+    title: `Change ${index}`, status, cr_sha256: String(index).repeat(64), proposed_tasks: ["Private proposed tasks"],
+  })) };
+
+  let auth = "";
+  let bundleStatus = 200, crStatus = 200;
+  let bundleBody: unknown = bundle, crBody: unknown = requests;
+  let holdBundle: Promise<void> | undefined;
+  const calls: Array<{ method: string | undefined; path: string }> = [];
+  const api = createServer(async (req, res) => {
+    const path = req.url!;
+    calls.push({ method: req.method, path });
+    if (req.method !== "GET" || req.headers[CORE_API_AUTH_HEADER] !== auth) {
+      res.writeHead(403).end();
+      return;
+    }
+    if (path === bundlePath) {
+      await holdBundle;
+      res.writeHead(bundleStatus, { "Content-Type": "application/json" }).end(JSON.stringify(bundleBody));
+      return;
+    }
+    if (path === crPath) {
+      res.writeHead(crStatus, { "Content-Type": "application/json" }).end(JSON.stringify(crBody));
+      return;
+    }
+    if (path === `${corePath}/sessions`) {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+        schemaVersion: "dashboard-read-v1", fetchedAt: stamp, projectId: id,
+        items: [{ pipelineSessionId: selectedId, projectId: id, title: "Approval fixture", createdAt: stamp, updatedAt: stamp }],
+        page: { limit: 20, hasMore: false, nextCursor: null },
+      }));
+      return;
+    }
+    res.writeHead(404).end("{}");
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const address = api.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    await withConsole(async ({ endpoint, authHeader }) => {
+      auth = authHeader;
+      const read = (session = selectedId, onBody?: (body: string) => void) =>
+        open(endpoint, projectPath + (session ? `?sessionId=${session}` : ""), { auth, onBody });
+      const sections = (html: string) => {
+        const decisions = html.match(/<section id="approval-decisions-result"[\s\S]*?<\/section>/)?.[0];
+        const changes = html.match(/<section id="change-requests-result"[\s\S]*?<\/section>/)?.[0];
+        assert.ok(decisions && changes);
+        assert.doesNotMatch(decisions + changes, /<form|<button|Private |<script>|Workload|Project Health/);
+        assert.doesNotMatch(decisions, /Pending approval/);
+        return { decisions, changes };
+      };
+      await t.test("no approved reader runs without a selected session", async () => {
+        for (const session of ["", foreignSession]) {
+          const result = sections((await read(session)).body);
+          assert.match(result.decisions, /data-state="empty"[\s\S]*?Chưa chọn session/);
+          assert.match(result.changes, /data-state="empty"[\s\S]*?Chưa chọn session/);
+        }
+        assert.equal(calls.filter(({ path }) => path === bundlePath || path === crPath).length, 0);
+      });
+
+      await t.test("loading is independent and only exact artifact ID and hash can match", async () => {
+        const from = calls.length;
+        let resolve!: () => void;
+        holdBundle = new Promise<void>((done) => { resolve = done; });
+        let independent = false;
+        const response = await read(selectedId, (html) => {
+          if (html.includes('id="change-requests-result"') && !html.includes('id="approval-decisions-result"')) {
+            independent = true;
+            resolve();
+          }
+        });
+        holdBundle = undefined;
+        assert.equal(independent, true);
+        assert.match(response.body, /id="approval-decisions-loading" data-state="loading"/);
+        assert.match(response.body, /id="change-requests-loading" data-state="loading"/);
+        const { decisions, changes } = sections(response.body);
+        const approved = decisions.match(/<li data-decision="APPROVED">[\s\S]*?<\/li>/)?.[0];
+        assert.ok(approved);
+        assert.ok(approved.includes(oldHash));
+        assert.ok(approved.includes(selectedId));
+        assert.doesNotMatch(approved, new RegExp(latestHash));
+        assert.match(approved, /Không có artifact khớp đúng ID và SHA-256/);
+        assert.match(decisions, /data-decision="REJECTED"><h3>Rejected<\/h3>[\s\S]*?Khớp đúng ID và SHA-256 trong bundle/);
+        assert.match(decisions, /data-decision="REQUEST_CHANGES"><h3>Changes requested/);
+        assert.match(decisions, /data-decision="missing"><h3>No recorded decision/);
+        assert.match(decisions, /A note &lt;script&gt;/);
+        assert.match(decisions, /unsupported/);
+        for (const [status, label] of [
+          ["PENDING_APPROVAL", "Pending approval"], ["APPROVED", "Approved"], ["REJECTED", "Rejected"], ["APPLIED", "Applied"],
+        ]) {
+          assert.match(changes, new RegExp(`data-request-status="${status}"[\\s\\S]*?<dt>Trạng thái</dt><dd>${label}</dd>`));
+        }
+        assert.equal([...changes.matchAll(/Pending approval/g)].length, 1);
+        assert.ok(changes.includes(selectedId) && changes.includes("baseline-one") && changes.includes("2".repeat(64)));
+        assert.deepEqual(calls.slice(from).filter(({ path }) => path === bundlePath || path === crPath)
+          .map(({ path }) => path).sort(), [bundlePath, crPath].sort());
+      });
+
+      await t.test("empty responses create no pending record", async () => {
+        bundleBody = { ...bundle, approvalGates: [] };
+        crBody = { change_requests: [] };
+        const { decisions, changes } = sections((await read()).body);
+        assert.match(decisions, /data-state="empty"[\s\S]*?No recorded decision/);
+        assert.match(changes, /data-state="empty"[\s\S]*?Không có change request/);
+        assert.doesNotMatch(changes, /Pending approval|data-request-status/);
+      });
+
+      await t.test("4xx, 5xx and malformed data are explicit and do not affect the other section", async () => {
+        bundleStatus = 403;
+        bundleBody = { reason: "Private gate exception" };
+        crBody = requests;
+        let result = sections((await read()).body);
+        assert.match(result.decisions, /data-state="access-denied"/);
+        assert.match(result.changes, /data-state="ready"/);
+        bundleStatus = 200;
+        bundleBody = bundle;
+        crStatus = 500;
+        crBody = { reason: "Private CR exception" };
+        result = sections((await read()).body);
+        assert.match(result.decisions, /data-state="ready"/);
+        assert.match(result.changes, /data-state="error"/);
+        bundleBody = { ...bundle, approvalGates: [{ ...gate, target_artifact_sha256: undefined }] };
+        crStatus = 200;
+        crBody = { change_requests: [{ ...requests.change_requests[0], pipeline_session_id: foreignSession }] };
+        result = sections((await read()).body);
+        assert.match(result.decisions, /data-state="error"[\s\S]*?Dữ liệu API thiếu trường bắt buộc hoặc không hợp lệ/);
+        assert.match(result.changes, /data-state="error"[\s\S]*?Dữ liệu API thiếu trường bắt buộc hoặc không hợp lệ/);
+        assert.doesNotMatch(result.changes, /Pending approval/);
+      });
+
+      assert.ok(calls.every(({ method, path }) => method === "GET" && !/approval-center|lineage|production-deployments/.test(path)));
+      const allowed = new Set([corePath, `${corePath}/sessions`, `${corePath}/budget-snapshot`, `${corePath}/agent-profiles`,
+        `${corePath}/sessions/${selectedId}/tasks`, `${bundlePath}/cost-session-snapshot`, bundlePath, crPath]);
+      assert.deepEqual(calls.filter(({ path }) => !allowed.has(path)), []);
     }, `http://127.0.0.1:${address.port}`);
   } finally {
     await new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve()));

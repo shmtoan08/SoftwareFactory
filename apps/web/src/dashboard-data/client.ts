@@ -1,5 +1,7 @@
 import {
   DashboardDataError,
+  mapApprovalDecisions,
+  mapApprovalChangeRequests,
   mapAgentProfiles,
   type AgentProfileRole,
   mapBudgetSnapshot,
@@ -158,6 +160,24 @@ export class DashboardClient {
       undefined,
       (data) => data.costSession === null,
     );
+  }
+
+  listApprovalDecisions(pipelineSessionId: string) {
+    const { projectId } = this.options;
+    const sessionId = requireId(pipelineSessionId, "pipelineSessionId");
+    const endpoint = `${this.projectEndpoint}/pipeline-sessions/${encodeURIComponent(sessionId)}`;
+    return this.get({ endpoint, projectId, sessionId },
+      (dto) => mapApprovalDecisions(dto, projectId, sessionId),
+      undefined, (data) => data.decisions.length === 0);
+  }
+
+  listApprovalChangeRequests(pipelineSessionId: string) {
+    const { projectId } = this.options;
+    const sessionId = requireId(pipelineSessionId, "pipelineSessionId");
+    const endpoint = `${this.projectEndpoint}/pipeline-sessions/${encodeURIComponent(sessionId)}/change-requests`;
+    return this.get({ endpoint, projectId, sessionId },
+      (dto) => mapApprovalChangeRequests(dto, projectId, sessionId),
+      undefined, (data) => data.requests.length === 0);
   }
 
   private async get<T>(

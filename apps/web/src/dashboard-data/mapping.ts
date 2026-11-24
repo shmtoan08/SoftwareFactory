@@ -347,3 +347,63 @@ export function mapCostSessionSnapshot(value: unknown, projectId: string, pipeli
   exactKeys(cost, "costSession", Object.keys(costSession));
   return { ...envelope, costSession };
 }
+
+function artifactHash(value: unknown, field: string): string {
+  const hash = string(value, field);
+  if (!/^[a-f0-9]{64}$/.test(hash)) throw new DashboardDataError(field);
+  return hash;
+}
+
+export function mapApprovalDecisions(value: unknown, projectId: string, sessionId: string) {
+  const dto = record(value, "pipeline bundle");
+  const session = record(dto.session, "session");
+  scope(session.project_id, projectId, "session.project_id");
+  scope(session.pipeline_session_id, sessionId, "session.pipeline_session_id");
+
+  // Only artifact identity is needed to verify a gate's exact binding.
+  const bindings = new Set(list(dto.artifacts, "artifacts").map((value) => {
+    const artifact = record(value, "artifact binding");
+    scope(artifact.project_id, projectId, "artifact.project_id");
+    scope(artifact.pipeline_session_id, sessionId, "artifact.pipeline_session_id");
+    return JSON.stringify([
+      string(artifact.artifact_id, "artifact_id"),
+      artifactHash(artifact.artifact_sha256, "artifact_sha256"),
+    ]);
+  }));
+
+  return { decisions: list(dto.approvalGates, "approvalGates").map((value) => {
+    const gate = record(value, "approval gate");
+    scope(gate.project_id, projectId, "gate.project_id");
+    const targetArtifactId = string(gate.target_artifact_id, "target_artifact_id");
+    const targetArtifactHash = artifactHash(gate.target_artifact_sha256, "target_artifact_sha256");
+    return {
+      sessionId: scope(gate.pipeline_session_id, sessionId, "gate.pipeline_session_id"),
+      gateId: string(gate.gate_id, "gate_id"),
+      gate: literal(gate.gate_stage, "gate_stage", "STAGE_1_DISCOVERY", "STAGE_2_REQUIREMENTS", "STAGE_3_ARCHITECTURE", "STAGE_4_SPEC_FREEZE"),
+      targetArtifactId, targetArtifactHash,
+      bindingMatches: bindings.has(JSON.stringify([targetArtifactId, targetArtifactHash])),
+      decision: gate.decision === null || gate.decision === undefined ? null :
+        literal(gate.decision, "decision", "APPROVED", "REJECTED", "REQUEST_CHANGES"),
+      rationale: gate.rationale === null ? null : string(gate.rationale, "rationale"),
+      approver: string(gate.approver_principal_id, "approver_principal_id"),
+      decidedAt: string(gate.decided_at, "decided_at"),
+    };
+  }) };
+}
+
+export function mapApprovalChangeRequests(value: unknown, projectId: string, sessionId: string) {
+  const dto = record(value, "change requests");
+  return { requests: list(dto.change_requests, "change_requests").map((value) => {
+    const cr = record(value, "change request");
+    scope(cr.project_id, projectId, "change_request.project_id");
+    return {
+      sessionId: scope(cr.pipeline_session_id, sessionId, "change_request.pipeline_session_id"),
+      id: string(cr.cr_id, "cr_id"),
+      baselineId: string(cr.baseline_id, "baseline_id"),
+      key: string(cr.cr_key, "cr_key"),
+      hash: artifactHash(cr.cr_sha256, "cr_sha256"),
+      title: string(cr.title, "title"),
+      status: literal(cr.status, "status", "PENDING_APPROVAL", "APPROVED", "REJECTED", "APPLIED"),
+    };
+  }) };
+}

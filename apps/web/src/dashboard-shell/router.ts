@@ -51,6 +51,13 @@ const styles = `
   .profile-table table { border-collapse: collapse; width: 100%; text-align: left; }
   .profile-table caption { text-align: left; padding-bottom: .5rem; }
   .profile-table :is(th, td) { padding: .6rem; border-bottom: 1px solid #d8e0ee; vertical-align: top; }
+  .project-panels :is(#approval-decisions-loading, #approval-decisions-result) { order: 9; }
+  .project-panels :is(#change-requests-loading, #change-requests-result) { order: 10; }
+  .project-panels:has(#approval-decisions-result) #approval-decisions-loading,
+  .project-panels:has(#change-requests-result) #change-requests-loading,
+  .project-panels[data-session-changing] :is(#approval-decisions-result, #change-requests-result) { display: none; }
+  .approval-records { display: grid; gap: 1rem; padding-left: 1.25rem; }
+  .approval-records h3 { margin: 0 0 .5rem; font-size: 1rem; overflow-wrap: anywhere; }
   .panel-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
   .budget-dimensions { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: 1rem; margin: 1rem 0; }
   .budget-dimensions h3 { margin: 0 0 .5rem; font-size: 1rem; }
