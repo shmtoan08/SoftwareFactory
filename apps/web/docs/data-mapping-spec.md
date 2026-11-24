@@ -1,35 +1,105 @@
-# Dashboard Slice 0 — Data Mapping Spec v1 (proposal)
+# Dashboard — Data Mapping Spec v2
 
-Status: **PROPOSED, NOT APPROVED FOR UI IMPLEMENTATION**. [Issue #20](https://github.com/shmtoan08/SoftwareFactory/issues/20), source baseline `305796031ac2f063e20efcb1692f6bd72743c9bf`, 2026-11-14 (Asia/Tokyo). Read together with the [capability/read-only matrix](./api-capability-matrix.md). All display rules below require team approval, including unsupported items. No mappings or UI have been implemented in Slice 0.
+**Status:** Ready for Kit review. Slice 1a implementation starts after Kit accepts this revision.
 
-## 1. Identity, session context and resource state
+**DTO baseline:** `e9a8d56f8b377880f08342ea101dac575262eee6` on `main`. This revision follows the [Slice 1a decision](https://github.com/shmtoan08/SoftwareFactory/issues/20#issuecomment-7121313686) and the [P1–P3 acceptance](https://github.com/shmtoan08/SoftwareFactory/issues/22#issuecomment-6937147418). The [Slice 0 capability matrix](./api-capability-matrix.md) records the earlier audit. The [P0 contract](../../core-api/docs/dashboard-read-projections-p0.md) and the response builders at the stated baseline define the DTOs below.
 
-Authoritative relationships:
+## 1. Client results and API metadata
 
-- `Project.project_id` is the tenant/project scope. There is no approved HTTP project detail/list reader; show verified project ID as context, not a fabricated project name. `ProductPipelineSessionRecord.title` is a session title only.
-- `Project → ProductPipelineSessionRecord[]` is obtained from the sessions reader. A selected pipeline session is identified by `pipeline_session_id`, with original `status` and `current_stage`. It is not an entire project lifecycle.
-- `ProductPipelineBundle.session`, `.artifacts`, `.approvalGates`, `.discoveryItems`, `.baselineFreeze` are session-scoped records. Validate returned project/session IDs against the requested context before presentation; mismatch is data-error, not a fallback to another project/session.
-- Session work hierarchy is `milestones → epics(milestone_id) → stories(epic_id) → TaskPlanLink(story_id,task_id,pipeline_session_id) → TaskRecord`. The authoritative join is a link record, never task title or creation time. This data currently comes only through conditional R1 `m6b-bundle`; its table is unsupported until the read-only and scale decisions are resolved.
-- `AgentOrganizationProfileRecord` belongs to a project, even if bundled with a session. `TaskPlanLink.assigned_profile_id` records planned assignment; `TaskExecutionAssignmentRecord` is the approved external assignment snapshot. `TaskLeaseRecord.worker_id` is a lease owner, not necessarily a profile principal. No Agent Instance entity or live presence endpoint exists.
+Slice 1a uses the four GET endpoints below with the existing signed project context. Preserve the endpoint and requested IDs as client metadata outside the mapped DTO. Check returned project and session IDs against the authorized/requested context. A scope mismatch or missing or malformed required data is an explicit data error. Construct mapped DTOs from the field allowlists below and discard extra keys at each level.
 
-Proposed default selection:
+- Client results are `ok | empty | error`. An accepted collection response with `items: []` is empty. A 403 is access-denied, 404 is not-found, and 500 is a server error. Keep HTTP 400, timeout and network failures distinguishable. Preserve other HTTP errors and their status codes.
+- `receivedAt` belongs to the client result envelope and records when the HTTP response arrives, including HTTP errors. A timeout or network failure without a response has no receipt timestamp. `fetchedAt` belongs to a successful API DTO and records the server transaction snapshot. Copy it verbatim, including on an empty collection. Preserve source timestamps as strings at API precision.
+- Every successful DTO includes `schemaVersion` (`dashboard-read-v1`) and `fetchedAt`. Copy both directly. For both collections, copy `page.limit`, `page.hasMore` and `page.nextCursor` directly. The server supplies an opaque keyset cursor or explicit `null` when no next page exists. Pass the cursor back unchanged with the same scope, limit and filters. Each page has its own snapshot.
+- Limits default to 20 for projects and 25 for tasks. Both accept 1–100. An over-limit request is a 400 error. Preserve this error and avoid clamping the limit.
 
-| Situation | Selection and presentation |
-|---|---|
-| Explicit session ID in dashboard URL | Fetch/validate it within the authorized project. Preserve 403/404/error; never silently choose another session |
-| No explicit ID, exactly one returned ACTIVE session | Select it; show session ID/title/status/current_stage and selection reason |
-| No explicit ID, more than one ACTIVE session | No automatic choice. Show the actual selectable session records and ambiguity message; no merged progress/cost |
-| No ACTIVE sessions, other sessions exist | No automatic “latest”/“most complete” choice. Require explicit selection; list actual FROZEN/CANCELLED statuses |
-| No sessions | Empty session context; do not synthesize a session/stages/tasks |
-| Session list request denied/failed | Access-denied/error state, not “no sessions” and not “no active work” |
+## 2. P1 project list and detail
 
-The session collection has no backend pagination/status filtering. It can support a returned-record selector, not an all-project aggregation or fabricated paged dataset. Large-list support remains unsupported; no hidden full-project scan/join may be added to work around it. Team must approve the selector's deployment/scale limits before Slice 1.
+GET `/api/v1/projects` maps `items[]` to project DTOs and copies `scope.kind` (`project-token`), `scope.projectId` and the page metadata above. Under D-01, the collection is scoped to the signed project token. GET `/api/v1/projects/:projectId` maps the single `project` object. Both use the same field allowlist. [P1 reader](../../core-api/docs/dashboard-project-reader-p1.md)
 
-Changing session cancels/invalidates in-flight reads and cached projections for the old `(projectId,sessionId,authScope)` context. Late old responses must not populate the new session. Project-scoped panels carry a visible Project scope label; they are not silently aggregated into session metrics.
+| DTO field | Mapped field | Meaning |
+|---|---|---|
+| `projectId` | `projectId` | Project ID |
+| `slug` | `slug` | Project slug |
+| `name` | `name` | Project name |
+| `defaultBranch` | `defaultBranch` | Configured default branch |
+| `createdAt` | `createdAt` | Project creation timestamp |
+| `updatedAt` | `updatedAt` | Project update timestamp |
 
-Each frontend resource envelope retains `source.endpoint`, `source.resourceType`, exact IDs and original payload/status, plus `fetchedAt` (client receipt time) separately from backend timestamps. The proposed adapter result states are `loading`, `ready`, `empty`, `error`, `access-denied`; capability `unsupported` is separate and hides the panel. 401 is authentication-required, 403 access-denied, 404 not-found (not an empty list), 409/422 precondition/data errors, 500/timeout error. `200 []` is empty. No auto-retry that could invoke work; refresh is explicit, independent per panel, with stale/error visibly retained if appropriate. No realtime claim.
+## 3. P2 project budget snapshot
 
-## 2. Pipeline Progress — presentation facts, not project percentage
+GET `/api/v1/projects/:projectId/budget-snapshot` takes no query parameters. Map the following fields and the common DTO metadata. [P2 reader](../../core-api/docs/dashboard-budget-reader-p2.md)
+
+| DTO field | Mapped field | Meaning |
+|---|---|---|
+| `projectId` | `projectId` | Project scope |
+| `policy` | `policy` | Preserve `null` for absent policy |
+| `policy.status` | `policy.status` | Literal `ACTIVE` or `AUTO_PAUSED` when policy exists |
+| `policy.updatedAt` | `policy.updatedAt` | Policy update timestamp when policy exists |
+| `dimensions.tokens` | `dimensions.tokens` | Recorded model token usage |
+| `dimensions.costMicroUsd` | `dimensions.costMicroUsd` | Recorded model cost in micro-USD |
+| `dimensions.wallTimeMs` | `dimensions.wallTimeMs` | Recorded phase/attempt wall time in milliseconds |
+| `estimatedModelUsageIncluded` | `estimatedModelUsageIncluded` | Boolean observation from recorded ledgers |
+| `recoveryState` | `recoveryState` | Preserve `clear`, `pending` and `unknown`. Missing or unrecognized values become `unknown`. Use `clear` only when explicitly returned |
+| `recoveryReason` | `recoveryReason` | Server literal `no-visible-pending-intent`, `visible-pending-intent` or `journal-not-modeled` |
+| `recoveryScope` | `recoveryScope` | Server literal `visible-project-budget-denial-intents-at-snapshot` |
+| `usageSemantics` | `usageSemantics` | Server literal `recorded-project-ledgers-and-resource-metrics` |
+
+Each of the three dimension objects has the same field mapping.
+
+| DTO field | Mapped field | Meaning |
+|---|---|---|
+| `unit` | `unit` | `tokens`, `micro_usd` or `milliseconds` as returned for that dimension |
+| `limitKind` | `limitKind` | `configured`, `unbounded` or `policy-absent` |
+| `limit` | `limit` | Exact unsigned decimal string or `null` |
+| `consumed` | `consumed` | Exact unsigned decimal string |
+| `remaining` | `remaining` | Exact signed decimal string or `null` |
+
+Preserve decimal strings, negative remaining amounts and explicit nulls. Use the server's remaining amount directly. Pending and unknown snapshots are provisional. Clear describes the absence of visible committed pending intents at the snapshot.
+
+## 4. P3 session task page
+
+GET `/api/v1/projects/:projectId/sessions/:sessionId/tasks` requires a caller-supplied `sessionId`. Copy the envelope's `projectId`, `sessionId`, `filters.sourceStatuses`, `filters.stage` (literal `null`) and the common DTO and page metadata. The server validates session membership and task links before projecting items. [P3 reader](../../core-api/docs/dashboard-task-reader-p3.md)
+
+| DTO field in `items[]` | Mapped field | Meaning |
+|---|---|---|
+| `taskId` | `taskId` | Task ID |
+| `projectId` | `projectId` | Project ID |
+| `sessionId` | `sessionId` | Validated session association |
+| `title` | `title` | Task title |
+| `sourceStatus` | `sourceStatus` | Exact source string, including unfamiliar literals |
+| `currentAttemptNo` | `currentAttemptNo` | Current attempt counter as a safe integer |
+| `reworkCount` | `reworkCount` | Rework counter as a safe integer |
+| `maxReworkCycles` | `maxReworkCycles` | Rework limit as a safe integer |
+| `activeLeaseEpoch` | `activeLeaseEpoch` | Exact unsigned decimal string |
+| `assigneeId` | `assigneeId` | Planned profile ID or `null` |
+| `leaseOwnerId` | `leaseOwnerId` | Recorded lease worker ID or `null` |
+| `leaseExpiresAt` | `leaseExpiresAt` | Recorded lease expiry or `null`, even when the recorded expiry has elapsed |
+| `createdAt` | `createdAt` | Task creation timestamp |
+| `updatedAt` | `updatedAt` | Task update timestamp |
+
+Keep `sourceStatus` verbatim. Slice 1a assigns no display label, inferred status or previous-attempt outcome. The three counters and lease epoch remain independent fields.
+
+**D-02:** Any `stage` query returns HTTP 400. Stage filtering, grouping and counting are unsupported. `filters.stage: null` is response metadata and confers no task stage.
+
+## 5. Unsupported ở 1a
+
+| Capability | Missing source | Follow-up |
+|---|---|---|
+| Session selection | The P1–P3 DTOs supply no session collection. P3 needs a session ID before the request | Session list read projection in [Issue #24](https://github.com/shmtoan08/SoftwareFactory/issues/24), before Slice 1b |
+| Session-dependent Pipeline Progress | The P1–P3 DTOs supply no session context with artifacts, gate decisions and baseline facts. A task page cannot establish Pipeline Progress | Session context depends on Issue #24. Slice 1b owns Pipeline Progress subject to an authorized source for its evidence |
+| Approval | The P1–P3 DTOs supply no approval or decision records | Slice 3, after an approved reader. Include the rejected-approval case there |
+| Artifact | The P1–P3 DTOs supply no artifact records or access observations | Slice 3, after an approved reader. Include the inaccessible-artifact case there |
+
+## 6. Slice 1a verification after spec review
+
+Use fixtures with the actual P1–P3 wire shapes. Check project list/detail, budget snapshot, task pages with a supplied session ID, counters and unfamiliar `sourceStatus` strings preserved verbatim. Check the allowlists with extra-field fixtures and verify scope and malformed-data failures. Check missing or unfamiliar `recoveryState` separately. Exercise GET-only requests, typed HTTP/timeout/network failures, empty collections, both limit boundaries, opaque cursor forwarding and the D-02 response. Verify that the client sets `receivedAt` at receipt while the DTO's `fetchedAt` passes through unchanged. Run the existing console route regression suite when implementing 1a.
+
+## Appendix. Slice 0 proposals for later slices
+
+The following presentation proposals are retained for later slices. Sections 1–6 govern Slice 1a. Later slices need their own approved data sources and review before implementing these proposals.
+
+### Pipeline Progress — presentation facts, not project percentage
 
 Use the name **Pipeline Progress**. There is no approved formula for total project completion percentage, Project Health or workload. `coverage_percent` is traceability coverage only. The backend `PipelineStageName` has stages 1–4 only; do not extend `current_stage` with invented Stage5–9 states.
 
@@ -49,13 +119,13 @@ R0 v1 can render available stage1–4 artifact/gate facts and approved stage9 re
 
 Retries: `StageArtifactRecord.version` is an artifact version, not a stage execution attempt count. Preserve all returned versions. For a “latest artifact” view, use the greatest version within `(project,session,stage,artifact_kind)` only when unique; conflicting equal versions yield a data-conflict state. Gate records bind `target_artifact_id` and `target_artifact_sha256`; show decisions for that exact version. `current_stage` is a source marker, not proof of a running model call. Actual `ModelCallLedgerRecord` failure statuses may annotate their recorded stage/call, never change the session's source status. The session enum has no FAILED value: an unknown future FAILED state displays Unknown until a mapping is reviewed.
 
-“Blocked” requires a backend-confirmed blocker and a resource ref/reason. No TaskStatus currently equals Blocked. ManualIntervention, ReworkRequired, missing artifacts, dependency edges, timeouts and model failures are not automatically blocked. The mutating scheduler cannot be invoked to discover rejection reasons; budget/pause panels are excluded because their GET may recover/write.
+“Blocked” requires a backend-confirmed blocker and a resource ref/reason. No TaskStatus currently equals Blocked. ManualIntervention, ReworkRequired, missing artifacts, dependency edges, timeouts and model failures are not automatically blocked. The mutating scheduler cannot be invoked to discover rejection reasons; the legacy GET /budget may recover/write. The P2 snapshot supplies project budget observations only.
 
-## 3. Complete source-to-display mappings at this baseline
+### Status presentation (deferred)
 
 Every badge retains `resourceType`, `sourceField`, **sourceStatus** (unaltered), **displayStatus** (presentation only), source IDs and endpoint. Unknown/missing/wrong-type values produce `displayStatus=Unknown`, preserve safe original source data for diagnosis and do not coerce to To Do/Done/Blocked. Plain-text rendering must escape all source content. The tables are presentation proposals, not additions to backend enums or proof that conditional/unsupported endpoints are approved.
 
-### TaskStatus (all 11 values)
+#### TaskStatus (all 11 values)
 
 | sourceStatus | displayStatus |
 |---|---|
@@ -73,7 +143,7 @@ Every badge retains `resourceType`, `sourceField`, **sourceStatus** (unaltered),
 
 Task retry display uses `current_attempt_no`, `active_lease_epoch`, `rework_count` and `max_rework_cycles` as separate exact fields. `Ready` after an expired lease is still Ready; do not collapse it into a hidden previous failed attempt. Candidate/approval records must retain their task/attempt/candidate bindings when such a reader is approved.
 
-### Other status domains (every literal in each relevant source enum)
+#### Other status domains (every literal in each relevant source enum)
 
 | Domain/source field | Exact mapping (source → display) |
 |---|---|
@@ -100,14 +170,14 @@ Task retry display uses `current_attempt_no`, `active_lease_epoch`, `rework_coun
 | Reconciliation approval.status (currently unsupported reader) | ACTIVE → Active; CONSUMED → Consumed; REVOKED → Revoked |
 | Reconciliation record.outcome | SUCCEEDED → Succeeded; NOT_DEPLOYED → Not deployed; never erase the original deployment UNKNOWN/RUNNING history |
 
-### Approval families and deadlines
+#### Approval families and deadlines
 
 - Pipeline gates are immutable decisions with `decided_at`, approver and exact artifact binding. No TTL/pending-request row exists. Missing gate decision means “No recorded decision”, not a fabricated Pending approval card.
 - Human task approval requests and decisions are separate entities. Preserve both decision and lifecycle, all candidate/hash bindings and real `expires_at`. REQUEST_CHANGES is not REJECTED, and ACTIVE is not automatically APPROVED. Existing R1 readers expose only the selected/latest request plus available decisions; do not claim a complete request history.
 - Deployment/reconciliation approvals have real issued/expires timestamps in backend records, but no Dashboard-approved list/detail approval endpoint returns those records. Hide these collections; a known deployment's `approval_id` is not permission to fabricate an approval, owner, status or deadline.
-- A real deadline can be displayed as timestamp. If a local countdown/elapsed hint is later approved, label it as an observation using fetchedAt/client clock; it must not persist expiry or replace PENDING/ACTIVE with an invented backend EXPIRED value. Prefer a server-supplied expiry observation when available through an approved reader. No countdown for records without a source deadline.
+- A real deadline can be displayed as timestamp. If a local countdown/elapsed hint is later approved, label it as an observation using `receivedAt` and the client clock; it must not persist expiry or replace PENDING/ACTIVE with an invented backend EXPIRED value. Prefer a server-supplied expiry observation when available through an approved reader. No countdown for records without a source deadline.
 
-## 4. Agent identity and metrics
+### Agent identity and metrics
 
 | Concept | Source meaning | Permitted interpretation |
 |---|---|---|
@@ -123,9 +193,9 @@ Proposed replacement metrics:
 - **Active executions:** unsupported as a physical process metric; no authoritative collection/heartbeat reader provides it. If a session table is approved later, “Tasks reporting ExecutingInTarget” may be proposed separately as a snapshot count, never relabeled “running workers”. No dispatch SENDING/UNKNOWN inference.
 - **Actual managed-model cost:** use returned `CostSessionRecord.cost_used_micro_usd` with label **Cost session usage**, exact cost_session_id and scope; for selected-session attribution require `costSession.pipeline_session_id === selectedSessionId`. Null/different session scope is shown as cost-session/project scope only or hidden from a session metric, never apportioned. Individual bundle ledgers are pipeline-filtered; do not add their amounts on top of cost-session totals, or equate estimates with invoices. Preserve `usage_estimated` and source provider/model where shown.
 - **Cost-session budget:** supported field `session_cost_budget_micro_usd`; consumed is `cost_used_micro_usd`, proposed remaining is their exact difference in micro-USD, including negative overrun. Formula needs mapping approval; retain integers, reject unsafe numbers instead of rounding silently. No percentage utilization or live provider billing claim.
-- **Project/task budget:** unsupported; GET /budget can replay/write. Do not reuse cost-session limits as project limits. Zero is displayed only when returned; missing/null/error is never zero.
+- **Project budget:** use the P2 projection defined above. Task budget remains unsupported. The legacy GET /budget can replay/write. Cost-session limits apply to their own scope.
 
-## 5. Evidence, activity facts and console navigation
+### Evidence, activity facts and console navigation
 
 Evidence v1 is approved resource metadata (IDs, kind, stage, version, SHA, creator, timestamp), not guessed downloads. Artifact content is escaped and size-controlled; it is not executable markup. There is no artifact download/expiry URL endpoint, so downloads and expired-object UX are unsupported. A 403/404 fetching metadata remains access-denied/not-found; do not mislabel it “expired artifact”. Do not construct URLs from artifact IDs, hashes, task workspace paths or repository locations.
 
@@ -135,30 +205,14 @@ A full audit/pipeline event feed is unsupported. Proposed limited timeline is ex
 {id, type, timestamp, actor: {principalId}|null,
  projectId, sessionId|null, resourceRef: {kind,id},
  source: {endpoint,kind:"resource-fact"|"worker-event",sourceId,sourceField},
- fetchedAt}
+ receivedAt}
 ```
 
 - Resource-fact types are literal descriptions such as artifact recorded (`artifact.created_at`), gate decision recorded (`gate.decided_at`), baseline frozen (`frozen_at`) or release acceptance recorded (`accepted_at`). They are presentation facts, not invented backend audit events. Current status + updated_at does not reconstruct a status-change history.
-- Actor is the exact record creator/approver/worker field when its semantics are known; otherwise null/Unknown, not the current dashboard viewer. Timestamp is the backend event/fact time, never fetchedAt substituted for a missing source time. Missing timestamp means the fact cannot enter chronological activity.
+- Actor is the exact record creator/approver/worker field when its semantics are known; otherwise null/Unknown, not the current dashboard viewer. Timestamp is the backend event/fact time, never `receivedAt` substituted for a missing source time. Missing timestamp means the fact cannot enter chronological activity.
 - Genuine `processedEvents` from a future approved lineage reader use original event_id/event_type/processed_at and a recorded actor only if provided. Do not relabel processing time as original guest wall-clock event time. R1 exclusion means no worker-event fetch in current R0 v1.
 - Presentation `id` is the stable canonical tuple below, not a newly created backend event ID.
-- Dedup resource facts by `(projectId,sessionId,resourceKind,resourceId,factKind)` across overlapping bundles, not by timestamp/title. Worker events dedup by project + original event_id. Distinct records with the same time remain distinct. Conflicting payloads for one identity are a data-conflict, not silent last-response-wins. Order by valid source UTC time then stable identity; preserve partial-data labels and fetchedAt per source.
+- Dedup resource facts by `(projectId,sessionId,resourceKind,resourceId,factKind)` across overlapping bundles, not by timestamp/title. Worker events dedup by project + original event_id. Distinct records with the same time remain distinct. Conflicting payloads for one identity are a data-conflict, not silent last-response-wins. Order by valid source UTC time then stable identity; preserve partial-data labels and `receivedAt` per source.
 - Session facts must match selected session; project-only facts stay in a visibly project-scoped section. No automatic multi-session history join, pagination fiction, realtime or complete audit-trail claim. Large timeline/event history requires an approved paginated backend reader.
 
 Existing GET console deep links may use verified IDs only: `/projects/{p}/pipeline-sessions`, `/projects/{p}/pipeline-sessions/{s}`, `/projects/{p}/agent-profiles`; conditional legacy detail views include `/projects/{p}/pipeline-sessions/{s}/m6b`, `/projects/{p}/pipeline-sessions/{s}/traceability`, `/projects/{p}/tasks/{t}/lineage`, `/projects/{p}/tasks/{t}/approval-center`. These are navigation references, not authorization, dashboard data endpoints or permission to prefetch R1 views. Preserve existing auth requirements; no tokens in URL. No GET web release-package page is advertised (existing web route is POST only). No Dashboard approval/execute/drag-and-drop actions or legacy mutation forms are embedded.
-
-## 6. Future frontend boundaries and verification plan
-
-After approval, implementation stays in apps/web:
-
-1. UI-independent data client: fixed approved R0 Core HTTP readers, existing auth boundary, deadline/cancellation, per-resource errors and source/fetchedAt. Shared with a future 3D mode; no demo entity generator or migration.
-2. Pure mapping layer: scoped identity checks, explicit status tables, session selection, source-bound stage facts and timeline dedup. Mapping rules are unit tested; raw payload is not rewritten.
-3. Components/routes: render mapping output only, with independent loading/empty/error/access-denied behavior, hidden unsupported panels and explicit manual refresh. Existing console routes remain available and unchanged.
-
-Required Slice 1–3 cases (not claimed executed in this docs-only slice): no sessions; multiple ACTIVE sessions; no ACTIVE sessions; explicit missing/forbidden session; unknown session status including FAILED; recorded provider failure without changing session.status; artifact-version retry and gate binding conflicts; task attempt/lease retry preservation; human rejection/request-changes/expiry/stale invalidation; artifact/metadata 403/404 with downloads unsupported; API 401/403/404/422/500/timeout; malformed/unsafe numeric/ID data; late cross-session responses; duplicate and conflicting timeline facts; missing cost scope; cost overruns; R1/unsupported panels causing zero API requests; forbidden GET /budget causing zero requests; no POST/PUT/PATCH/DELETE; no model/lease/reconciliation activity; console route regressions.
-
-Before Slice 1, team must approve the capability matrix and this mapping, confirm all unsupported panels and session-selector scale behavior, and decide any separately requested safe API projections. Issue #20 explicitly requires that review; this proposal is ready for that decision, not a claim that the Dashboard has shipped.
-
-API-gap decisions are tracked in [issue #21](https://github.com/shmtoan08/SoftwareFactory/issues/21); no API change is approved or implemented by opening that issue.
-
-Owner subsequently authorized a separate read-projection program in [plan #22](https://github.com/shmtoan08/SoftwareFactory/issues/22). Its [P0 contract](../../core-api/docs/dashboard-read-projections-p0.md) and [gate test matrix](../../core-api/docs/dashboard-read-only-test-matrix.md) were approved with D-01/D-02 in [the owner/team decision](https://github.com/shmtoan08/SoftwareFactory/issues/22#issuecomment-6874880334). [P1 Project reader](../../core-api/docs/dashboard-project-reader-p1.md) is now implemented and awaits its separate implementation review; it is not yet Dashboard-allowlisted. P2/P3 remain separate slices. The new response fetchedAt is the transaction snapshot time; frontend receipt time must be named separately before consuming it.
