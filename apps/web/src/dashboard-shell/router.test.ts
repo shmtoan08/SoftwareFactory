@@ -643,7 +643,7 @@ test("Cost session usage follows the Issue #25 envelope, attribution, integer ma
   }
 });
 
-test("Issues #29 and #30 share selected-session R0 readers and preserve exact artifact bindings", async (t) => {
+test("Issues #29–31 share selected-session readers, preserve bindings and group recorded facts", async (t) => {
   const id = "10000000-0000-0000-0000-000000000029";
   const selectedId = "20000000-0000-0000-0000-000000000029";
   const foreignSession = "20000000-0000-0000-0000-000000000030";
@@ -652,11 +652,16 @@ test("Issues #29 and #30 share selected-session R0 readers and preserve exact ar
   const corePath = `/api/v1/projects/${id}`;
   const bundlePath = `${corePath}/pipeline-sessions/${selectedId}`;
   const crPath = `${bundlePath}/change-requests`;
+  const budgetPath = `${corePath}/budget-snapshot`;
+  const taskPath = `${corePath}/sessions/${selectedId}/tasks`;
+  const costId = "40000000-0000-0000-0000-000000000031";
+  const taskId = "50000000-0000-0000-0000-000000000031";
   const projectPath = `/projects/${id}`;
   const identity = { project_id: id, pipeline_session_id: selectedId };
   const oldId = "30000000-0000-0000-0000-000000000029";
   const exactId = "30000000-0000-0000-0000-000000000030";
   const artifactMetadata = {
+    created_at: stamp,
     ...identity, stage: "STAGE_2_REQUIREMENTS", artifact_kind: "STAGE_2_PRD_SRS",
   };
   const gate = {
@@ -665,7 +670,8 @@ test("Issues #29 and #30 share selected-session R0 readers and preserve exact ar
     decision: "APPROVED", rationale: "A note <script>", approver_principal_id: "principal-one", decided_at: stamp,
   };
   const bundle = {
-    session: identity,
+    session: { ...identity, created_at: stamp, cost_session_id: costId },
+    costSession: { ...identity, cost_session_id: costId, updated_at: "2026-11-23T00:00:00.000Z" },
     artifacts: [
       { ...artifactMetadata, artifact_id: oldId, artifact_sha256: latestHash, content_json: { hidden: "Private artifact content" } },
       { ...artifactMetadata, artifact_id: exactId, artifact_sha256: exactHash, content_json: {} },
@@ -680,12 +686,27 @@ test("Issues #29 and #30 share selected-session R0 readers and preserve exact ar
   };
   const requests = { change_requests: ["PENDING_APPROVAL", "APPROVED", "REJECTED", "APPLIED"].map((status, index) => ({
     ...identity, cr_id: `change-${index}`, baseline_id: "baseline-one", cr_key: `CR-${index}`,
-    title: `Change ${index}`, status, cr_sha256: String(index).repeat(64), proposed_tasks: ["Private proposed tasks"],
+    title: `Change ${index}`, created_at: stamp, status, cr_sha256: String(index).repeat(64), proposed_tasks: ["Private proposed tasks"],
   })) };
 
   let auth = "";
   let bundleStatus = 200, crStatus = 200;
   let bundleBody: unknown = bundle, crBody: unknown = requests;
+  const snapshot = { schemaVersion: "dashboard-read-v1", fetchedAt: stamp, projectId: id };
+  const dimension = (unit: string) => ({ unit, limitKind: "policy-absent", limit: null, consumed: "0", remaining: null });
+  const budget = {
+    ...snapshot, policy: null, estimatedModelUsageIncluded: false, recoveryState: "clear",
+    recoveryReason: "no-visible-pending-intent", recoveryScope: "visible-project-budget-denial-intents-at-snapshot",
+    usageSemantics: "recorded-project-ledgers-and-resource-metrics",
+    dimensions: { tokens: dimension("tokens"), costMicroUsd: dimension("micro_usd"), wallTimeMs: dimension("milliseconds") },
+  };
+  const tasks = {
+    ...snapshot, sessionId: selectedId, filters: { sourceStatuses: [], stage: null },
+    items: [{ taskId, projectId: id, sessionId: selectedId, title: "Task fixture", sourceStatus: "READY",
+      currentAttemptNo: 0, reworkCount: 0, maxReworkCycles: 1, activeLeaseEpoch: "0", assigneeId: null,
+      leaseOwnerId: null, leaseExpiresAt: null, createdAt: stamp, updatedAt: stamp }],
+    page: { limit: 25, hasMore: false, nextCursor: null },
+  };
   let holdBundle: Promise<void> | undefined;
   const calls: Array<{ method: string | undefined; path: string }> = [];
   const api = createServer(async (req, res) => {
@@ -693,6 +714,10 @@ test("Issues #29 and #30 share selected-session R0 readers and preserve exact ar
     calls.push({ method: req.method, path });
     if (req.method !== "GET" || req.headers[CORE_API_AUTH_HEADER] !== auth) {
       res.writeHead(403).end();
+      return;
+    }
+    if (path === budgetPath || path === taskPath) {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(path === budgetPath ? budget : tasks));
       return;
     }
     if (path === bundlePath) {
@@ -753,6 +778,7 @@ test("Issues #29 and #30 share selected-session R0 readers and preserve exact ar
         });
         holdBundle = undefined;
         assert.equal(independent, true);
+        assert.match(response.body, /id="timeline-loading" data-state="loading"[\s\S]*?Not a complete audit trail/);
         assert.match(response.body, /id="evidence-loading" data-state="loading"/);
         assert.match(response.body, /id="approval-decisions-loading" data-state="loading"/);
         assert.match(response.body, /id="change-requests-loading" data-state="loading"/);
@@ -861,6 +887,54 @@ test("Issues #29 and #30 share selected-session R0 readers and preserve exact ar
           if (status === 200 && Array.isArray(artifacts) && artifacts.length === 2) assert.match(evidence, /gate-rejected/);
           assert.doesNotMatch(evidence, /Private artifact content/);
         }
+      });
+
+      function timeline(html: string) {
+        const body = html.split('<section id="timeline-result"')[1]?.split("</section>").slice(0, 2);
+        assert.ok(body && body.length === 2);
+        const [session, project] = body;
+        assert.match(session!, /Not a complete audit trail; assembled from separate snapshots, no global ordering\./);
+        assert.doesNotMatch(body.join(""), /<form|<button|<a |<script|setInterval|setTimeout|WebSocket|EventSource/i);
+        return { session: session!, project: project! };
+      }
+
+      await t.test("Issue #31 groups named facts and reuses each reader once", async () => {
+        bundleStatus = crStatus = 200;
+        bundleBody = bundle;
+        crBody = requests;
+        const from = calls.length;
+        const first = timeline((await read()).body);
+        assert.match(first.session, /sorted by recorded timestamp, sources independent/);
+        assert.match(first.session, /Session scope[\s\S]*Cost session record updated[\s\S]*Artifact recorded[\s\S]*Gate decision recorded[\s\S]*Session created[\s\S]*P3 task page[\s\S]*Task created[\s\S]*Task record updated[\s\S]*R0 change requests[\s\S]*Change request created/);
+        assert.match(first.session, /<dt>Nguồn<\/dt><dd>P3 task page<\/dd><dt>Tải lúc<\/dt><dd>[^<]+<\/dd>/);
+        assert.doesNotMatch(first.session, /Project budget snapshot|gate-missing|Private ledger/);
+        assert.match(first.project, /Project scope[\s\S]*Project budget snapshot/);
+        assert.ok(first.project.includes(stamp));
+        for (const path of [budgetPath, taskPath, crPath, bundlePath]) {
+          assert.deepEqual(calls.slice(from).filter((call) => call.path === path), [{ method: "GET", path }]);
+        }
+        bundleBody = { ...bundle, costSession: { ...bundle.costSession, pipeline_session_id: foreignSession } };
+        const foreign = timeline((await read()).body);
+        assert.ok(!foreign.session.includes(costId) && !foreign.project.includes(costId));
+        bundleBody = { ...bundle, costSession: { ...bundle.costSession, pipeline_session_id: null } };
+        const unbound = timeline((await read()).body);
+        assert.ok(!unbound.session.includes(costId) && unbound.project.includes(costId));
+      });
+
+      await t.test("Issue #31 keeps scope and banner when sources are empty, incomplete or fail", async () => {
+        const unselected = timeline((await read("")).body);
+        assert.match(unselected.session, /Chưa chọn session/);
+        assert.match(unselected.project, /Project budget snapshot/);
+        bundleBody = { ...bundle, session: identity, costSession: null, approvalGates: [], artifacts: [] };
+        crBody = { change_requests: [] };
+        const missing = timeline((await read()).body);
+        assert.match(missing.session, /Unsupported[\s\S]*Không có activity fact/);
+        assert.doesNotMatch(missing.session, /Session created/);
+        bundleStatus = 403;
+        crStatus = 500;
+        const failed = timeline((await read()).body);
+        assert.match(failed.session, /R0 bundle[\s\S]*Bạn không có quyền truy cập[\s\S]*P3 task page[\s\S]*R0 change requests[\s\S]*Không tải được nguồn này/);
+        assert.match(failed.project, /Project budget snapshot/);
       });
 
       assert.ok(calls.every(({ method, path }) => method === "GET" && !/approval-center|lineage|production-deployments/.test(path)));

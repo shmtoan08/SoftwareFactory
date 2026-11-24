@@ -394,6 +394,36 @@ export function mapApprovalDecisions(value: unknown, projectId: string, sessionI
 export const ARTIFACT_ROW_LIMIT = 50;
 const ARTIFACT_PREVIEW_LIMIT = 4096;
 
+// R0 keeps its original timestamp precision. P2/P3 use the canonical projection format.
+export function recordedTimestamp(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    timestamp(value.replace(/(\.\d{3})Z$/, (_, fraction: string) => fraction + "000Z"), "recorded timestamp");
+    return value;
+  } catch (error) {
+    if (!(error instanceof DashboardDataError)) throw error;
+    return null;
+  }
+}
+
+function mapRecordedCost(value: unknown, projectId: string, sessionId: string, linkedId: unknown) {
+  if (value === null) return null;
+  try {
+    const cost = record(value, "bundle costSession");
+    scope(cost.project_id, projectId, "costSession.project_id");
+    const id = requireId(cost.cost_session_id, "cost_session_id");
+    if (cost.pipeline_session_id !== null && cost.pipeline_session_id !== sessionId) return null;
+    if (id !== linkedId) throw new DashboardDataError("cost_session_id");
+    return {
+      id, sessionId: cost.pipeline_session_id,
+      updatedAt: recordedTimestamp(cost.updated_at),
+    };
+  } catch (error) {
+    if (!(error instanceof DashboardDataError)) throw error;
+    return undefined;
+  }
+}
+
 export function mapApprovalEvidence(value: unknown, projectId: string, sessionId: string) {
   const bundle = record(value, "pipeline bundle");
   const session = record(bundle.session, "session");
@@ -424,7 +454,7 @@ export function mapApprovalEvidence(value: unknown, projectId: string, sessionId
           "STAGE_1_IDEA_DISCOVERY", "STAGE_2_REQUIREMENTS", "STAGE_3_ARCHITECTURE", "STAGE_4_SPEC_FREEZE");
         const content = JSON.stringify(record(artifact.content_json, "content_json"));
         return {
-          id, hash, kind, stage,
+          id, hash, kind, stage, createdAt: recordedTimestamp(artifact.created_at),
           preview: content.slice(0, ARTIFACT_PREVIEW_LIMIT),
           truncated: content.length > ARTIFACT_PREVIEW_LIMIT,
           gates: approvals?.decisions.filter((gate) => gate.targetArtifactId === id && gate.targetArtifactHash === hash)
@@ -436,7 +466,11 @@ export function mapApprovalEvidence(value: unknown, projectId: string, sessionId
       }
     }),
   };
-  return { approvals, evidence };
+  return {
+    approvals, evidence,
+    session: { id: sessionId, createdAt: recordedTimestamp(session.created_at) },
+    cost: mapRecordedCost(bundle.costSession, projectId, sessionId, session.cost_session_id),
+  };
 }
 
 export function mapApprovalChangeRequests(value: unknown, projectId: string, sessionId: string) {
@@ -451,6 +485,7 @@ export function mapApprovalChangeRequests(value: unknown, projectId: string, ses
       key: string(cr.cr_key, "cr_key"),
       hash: artifactHash(cr.cr_sha256, "cr_sha256"),
       title: string(cr.title, "title"),
+      createdAt: recordedTimestamp(cr.created_at),
       status: literal(cr.status, "status", "PENDING_APPROVAL", "APPROVED", "REJECTED", "APPLIED"),
     };
   }) };

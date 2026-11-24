@@ -38,7 +38,7 @@ function dimension(heading: string, data: BudgetSnapshot["dimensions"][keyof Bud
   ])}</div>`;
 }
 
-function renderBudget(result: BudgetResult): string {
+export function renderBudget(result: BudgetResult): string {
   if (result.kind === "empty") return budgetState("empty");
   if (result.kind === "error") {
     if (result.error.kind === "access-denied" || ("status" in result.error && result.error.status === 401)) {

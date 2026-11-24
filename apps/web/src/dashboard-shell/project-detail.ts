@@ -1,10 +1,11 @@
+import { renderTimeline, timelinePlaceholder } from "./timeline.ts";
 import { evidencePlaceholder, renderEvidence } from "./evidence.ts";
 import type { ServerResponse } from "node:http";
 import { DashboardClient, type DashboardResult } from "../dashboard-data/client.ts";
 import type { SessionDto, SessionListDto } from "../dashboard-data/mapping.ts";
 import { agentProfilesLoading, agentProfilesPanel, loadAgentProfilesBody } from "./agent-profiles.ts";
-import { approvalsPlaceholder, loadApprovalChangeRequests, renderApprovalDecisions } from "./approvals.ts";
-import { budgetLoadingPanel, budgetPanel, loadBudgetBody } from "./budget.ts";
+import { approvalsPlaceholder, renderApprovalChangeRequests, renderApprovalDecisions } from "./approvals.ts";
+import { budgetLoadingPanel, budgetPanel, loadBudgetBody, renderBudget } from "./budget.ts";
 import { costUsagePlaceholder, loadCostUsage } from "./cost-session-usage.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
 import { taskDetailScript } from "./task-detail.ts";
@@ -97,7 +98,7 @@ export async function sendProjectDetail(
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
       + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty")
-      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
+      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + timelinePlaceholder(state) + script + end);
     return;
   }
 
@@ -108,7 +109,7 @@ export async function sendProjectDetail(
     res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
       + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty")
-      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + script + end);
+      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + timelinePlaceholder("error") + script + end);
     return;
   }
 
@@ -116,33 +117,47 @@ export async function sendProjectDetail(
   const selectedId = query.get("sessionId");
   const initialState = selectedId ? "loading" : "empty";
   res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
-    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + costUsagePlaceholder(initialState) + approvalsPlaceholder(initialState) + evidencePlaceholder(initialState) + script);
+    + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + costUsagePlaceholder(initialState) + approvalsPlaceholder(initialState) + evidencePlaceholder(initialState) + timelinePlaceholder("loading") + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
+  const budget = client.getBudgetSnapshot().then((result) => {
+    write(budgetPanel(projectId, renderBudget(result)));
+    return result;
+  });
+  const session = client.listSessions(projectId, cursor === null ? {} : { cursor })
+    .then(async (result) => {
+      const selected = result.kind === "ok" ? result.data.items.find((item) => item.pipelineSessionId === selectedId) : undefined;
+      write(renderSessions(result, projectId, selected, cursor));
+      if (!selected) {
+        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty"));
+        return;
+      }
+      if (res.destroyed) return;
+      const sessionId = selected.pipelineSessionId;
+      const [tasks, bundle, changes] = await Promise.all([
+        readTaskPage(projectId, sessionId, authToken, baseUrl).then((result) => {
+          write(tasksPanel(projectId, sessionId, renderTasks(result)) + workItemsPanel(projectId, sessionId, result));
+          return result;
+        }),
+        client.getApprovalEvidence(sessionId).then((result) => {
+          write(renderApprovalDecisions(result) + renderEvidence(result));
+          return result;
+        }),
+        client.listApprovalChangeRequests(sessionId).then((result) => {
+          write(renderApprovalChangeRequests(result));
+          return result;
+        }),
+        loadCostUsage(client, sessionId).then(write),
+      ]);
+      return { id: sessionId, tasks, bundle, changes };
+    }, () => {
+      write(unavailable("sessions", "error"));
+      if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty"));
+      return undefined;
+    });
   await Promise.all([
     loadAgentProfilesBody(projectId, authToken, baseUrl).then((body) => write(agentProfilesPanel(projectId, body))),
-    loadBudgetBody(projectId, authToken, baseUrl).then((body) => write(budgetPanel(projectId, body))),
     client.getProject().then(renderProject).catch(() => unavailable("project", "error")).then(write),
-    client.listSessions(projectId, cursor === null ? {} : { cursor })
-      .then(async (result) => {
-        const selected = result.kind === "ok" ? result.data.items.find((item) => item.pipelineSessionId === selectedId) : undefined;
-        write(renderSessions(result, projectId, selected, cursor));
-        if (!selected) {
-          if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty"));
-          return;
-        }
-        if (res.destroyed) return;
-        const sessionId = selected.pipelineSessionId;
-        await Promise.all([
-          readTaskPage(projectId, sessionId, authToken, baseUrl)
-            .then((tasks) => write(tasksPanel(projectId, sessionId, renderTasks(tasks)) + workItemsPanel(projectId, sessionId, tasks))),
-          loadCostUsage(client, sessionId).then(write),
-          client.getApprovalEvidence(sessionId).then((result) => write(renderApprovalDecisions(result) + renderEvidence(result))),
-          loadApprovalChangeRequests(client, sessionId).then(write),
-        ]);
-      }, () => {
-        write(unavailable("sessions", "error"));
-        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty"));
-      }),
+    Promise.all([budget, session]).then(([budget, session]) => write(renderTimeline(projectId, { budget, session }))),
   ]);
   if (!res.destroyed) res.end("</div>" + documentEnd);
 }

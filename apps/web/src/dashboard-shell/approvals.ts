@@ -59,8 +59,8 @@ export function renderApprovalDecisions(result: ApprovalEvidenceResult): string 
     }).join("")}</ul>`);
 }
 
-export async function loadApprovalChangeRequests(client: DashboardClient, sessionId: string): Promise<string> {
-  return renderResult("change-requests", await client.listApprovalChangeRequests(sessionId),
+export function renderApprovalChangeRequests(result: Awaited<ReturnType<DashboardClient["listApprovalChangeRequests"]>>): string {
+  return renderResult("change-requests", result,
     "Không có change request.", ({ requests }) => `<ul class="approval-records">${requests.map((cr) =>
       `<li data-request-status="${cr.status}"><h3>${escapeHtml(cr.title)}</h3>${facts([
         ["Trạng thái", requestLabels[cr.status]], ["Session nguồn", cr.sessionId], ["Change request ID", cr.id], ["Mã", cr.key],
