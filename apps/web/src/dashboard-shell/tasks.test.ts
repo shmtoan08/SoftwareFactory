@@ -6,6 +6,8 @@ import { runInNewContext } from "node:vm";
 import { CORE_API_AUTH_HEADER, CoreApiService, encodeCoreApiAuthHeader } from "@software-factory/core-api";
 import { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
 import { WebApprovalConsoleHttpServer } from "../index.ts";
+import { panelRefreshScript } from "./panel-refresh.ts";
+import { retireTasksOnSessionChange } from "./tasks.ts";
 
 const projectId = "10000000-0000-0000-0000-000000000007";
 const sessionA = "20000000-0000-0000-0000-000000000007";
@@ -27,6 +29,21 @@ function getTasksPanel(html: string) {
   const panel = html.match(/<section id="tasks-panel" data-panel-url="([^"]+)"[\s\S]*?<div data-panel-body role="status">([\s\S]*?)<\/section>/);
   assert.ok(panel?.[1] && panel[2]);
   return { endpoint: panel[1], body: panel[2] };
+}
+
+function dashboardScripts(html: string): string[] {
+  const allowed = new Set([panelRefreshScript, retireTasksOnSessionChange]);
+  const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
+  for (const [, attributes, script] of scripts) {
+    assert.equal(attributes?.trim(), "", "Dashboard scripts must be inline");
+    assert.ok(script && allowed.delete(script), "Unexpected Dashboard script");
+    assert.doesNotMatch(script, /["'](?:POST|PUT|PATCH|DELETE)["']/i, "Dashboard scripts must be read-only");
+  }
+  assert.equal(allowed.size, 0, "Expected refresh and selection handlers");
+  for (const [form] of html.matchAll(/<form\b[^>]*>/gi)) {
+    assert.match(form, /\bmethod="get"/i, "Dashboard forms must be read-only");
+  }
+  return scripts.map((match) => match[2]!);
 }
 
 test("Tasks requires explicit selection, keeps loading and failures local, and ignores a late refresh after a session change", async () => {
@@ -144,8 +161,9 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
       dataset: { sessionContext: sessionA },
       closest: () => formParent,
     };
-    const scripts = [...htmlA.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((match) => match[1]);
-    assert.equal(scripts.length, 2);
+    assert.throws(() => dashboardScripts(htmlA + "<script>unexpected()</script>"), /Unexpected Dashboard script/);
+    assert.throws(() => dashboardScripts(htmlA + '<form method="post"></form>'), /forms must be read-only/);
+    const scripts = dashboardScripts(htmlA);
     runInNewContext(scripts.join("\n"), {
       document: { addEventListener: (name: string, handler: Handler) => handlers.set(name, handler) },
       fetch: (path: string, options: RequestInit) => fetch(baseUrl + path, { ...options, headers }),
