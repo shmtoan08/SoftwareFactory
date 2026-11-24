@@ -1,6 +1,7 @@
 import { readTimestamp, type ProjectReadInput } from "./project-read-projection.ts";
 
 export interface SessionReadInput extends Omit<ProjectReadInput, "after" | "cursorContextMismatch"> {
+  cursorContextMismatch?: boolean;
   after: { createdAt: string; pipelineSessionId: string } | null;
 }
 

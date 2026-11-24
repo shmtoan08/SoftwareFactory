@@ -440,8 +440,10 @@ export class CoreApiHttpServer {
         return;
       }
 
+      const sessionRead = method === "GET" ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/sessions$/) : null;
       const auth = this.requireAuth(req);
       if (!auth) {
+        if (sessionRead) throw new ReadProjectionError(401, "ERR_UNAUTHORIZED");
         this.sendJson(res, 401, {
           error_code: "ERR_UNAUTHORIZED",
           reason: `Missing or invalid ${CORE_API_AUTH_HEADER} header`,
@@ -455,6 +457,14 @@ export class CoreApiHttpServer {
         try { projectId = projectRead[1] ? decodeURIComponent(projectRead[1]) : undefined; }
         catch { throw new ReadProjectionError(400, "ERR_READ_QUERY_INVALID"); }
         this.sendJson(res, 200, await this.coreApi.readProjectProjection(auth, projectId, url.searchParams));
+        return;
+      }
+
+      if (sessionRead?.[1]) {
+        let projectId: string;
+        try { projectId = decodeURIComponent(sessionRead[1]); }
+        catch { throw new ReadProjectionError(400, "ERR_READ_QUERY_INVALID"); }
+        this.sendJson(res, 200, await this.coreApi.readSessionProjection(auth, projectId, url.searchParams));
         return;
       }
 

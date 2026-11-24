@@ -590,6 +590,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     const fetchedAt = readTimestamp(this.clockFn().toISOString());
     assertProjectReadRole(this.projectMemberships.get(`${input.projectId}:${input.principalId}`)?.member_role, input.signedRoles);
     if (!this.projects.has(input.projectId)) throw new PostgresRlsError("23503", "Project not found");
+    if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
 
     const sessions: SessionReadRows["sessions"] = [];
     const precedes = (createdAt: string, id: string, otherCreatedAt: string, otherId: string) =>

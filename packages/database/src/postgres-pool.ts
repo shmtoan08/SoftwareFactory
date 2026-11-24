@@ -2498,6 +2498,7 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
         "SELECT project_id FROM projects WHERE project_id=$1::uuid;", [input.projectId],
       );
       if (!project.rowCount) throw new PostgresRlsError("23503", "Project not found");
+      if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
 
       const result = await this.pool.queryInActiveTx<Record<keyof SessionReadRows["sessions"][number], unknown>>(
         `SELECT pipeline_session_id, project_id, title,

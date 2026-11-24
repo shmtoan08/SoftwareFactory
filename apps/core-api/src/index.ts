@@ -1,3 +1,4 @@
+import { SessionReadProjectionService } from "./session-read-projection.ts";
 import { TaskReadProjectionService } from "./task-read-projection.ts";
 import { ProjectReadProjectionService, PROJECT_READ_ROLES } from "./project-read-projection.ts";
 import { BudgetReadProjectionService } from "./budget-read-projection.ts";
@@ -235,6 +236,11 @@ export class CoreApiTokenAuthenticator {
     return createHmac("sha256", key).update(data).digest("hex");
   }
 
+  public signSessionReadCursor(data: string): string {
+    const key = createHmac("sha256", this.signingSecret).update("dashboard-session-list-cursor-v1").digest();
+    return createHmac("sha256", key).update(data).digest("hex");
+  }
+
   public issueAuthContext(input: {
     projectId: string;
     principalId: string;
@@ -387,6 +393,7 @@ export class CoreApiService {
   public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
   private readonly projectReads: ProjectReadProjectionService;
+  private readonly sessionReads: SessionReadProjectionService;
   private readonly taskReads: TaskReadProjectionService;
   private readonly budgetReads: BudgetReadProjectionService;
   private readonly executionTargetBroker: ExecutionTargetBroker;
@@ -441,6 +448,10 @@ export class CoreApiService {
           }),
       });
     this.projectReads = new ProjectReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES), (data) => this.authenticator.signProjectReadCursor(data));
+    this.sessionReads = new SessionReadProjectionService(
+      this.store, (auth) => this.authenticator.verifyAuthContext(auth, auth.projectId, PROJECT_READ_ROLES),
+      (data) => this.authenticator.signSessionReadCursor(data),
+    );
     this.taskReads = new TaskReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES), (data) => this.authenticator.signProjectReadCursor(data));
     this.budgetReads = new BudgetReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES));
     this.pipelineService =
@@ -453,6 +464,10 @@ export class CoreApiService {
         pricingOverrides: options?.modelPricingOverrides,
         env: options?.env,
       });
+  }
+
+  public readSessionProjection(auth: CoreApiAuthContext, projectId: string, query = new URLSearchParams()) {
+    return this.sessionReads.read(auth, projectId, query);
   }
 
   public readTaskProjection(auth: CoreApiAuthContext, projectId: string, sessionId: string, query = new URLSearchParams()) {
