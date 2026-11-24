@@ -4,6 +4,7 @@ import {
   mapProjectDetail,
   mapProjectList,
   mapSessionTasks,
+  mapSessions,
   requireId,
 } from "./mapping.ts";
 
@@ -94,6 +95,24 @@ export class DashboardClient {
       source,
       (dto) => mapSessionTasks(dto, projectId, sessionId),
       query,
+      (data) => data.items.length === 0,
+    );
+  }
+
+  async listSessions(projectId: string, options: PageOptions = {}): Promise<DashboardResult<ReturnType<typeof mapSessions>>> {
+    let id: string;
+    try {
+      id = requireId(projectId, "projectId");
+    } catch {
+      return {
+        kind: "error", source: { endpoint: "/api/v1/projects/:projectId/sessions", projectId },
+        receivedAt: null, error: { kind: "data", message: "Invalid projectId" },
+      };
+    }
+    return this.get(
+      { endpoint: `/api/v1/projects/${encodeURIComponent(id)}/sessions`, projectId },
+      (dto) => mapSessions(dto, projectId),
+      pageQuery(options),
       (data) => data.items.length === 0,
     );
   }

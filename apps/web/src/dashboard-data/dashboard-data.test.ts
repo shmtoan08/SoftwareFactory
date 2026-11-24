@@ -2,7 +2,7 @@ import "../dashboard-shell/router.test.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DashboardClient } from "./client.ts";
-import { mapBudgetSnapshot, mapProjectDetail, mapSessionTasks } from "./mapping.ts";
+import { mapBudgetSnapshot, mapProjectDetail, mapSessions, mapSessionTasks } from "./mapping.ts";
 
 const projectId = "10000000-0000-0000-0000-000000000001";
 const sessionId = "20000000-0000-0000-0000-000000000001";
@@ -231,4 +231,103 @@ test("discards keys outside the DTO allowlists at each mapped level", () => {
     ...tasks, ...extra, filters: { ...tasks.filters, ...extra },
     page: { ...tasks.page, ...extra }, items: [{ ...task, ...extra }],
   }, projectId, sessionId), tasks);
+});
+
+const sessionItem = { pipelineSessionId: sessionId, projectId, title: "Session", createdAt: fetchedAt, updatedAt: fetchedAt };
+const sessionPage = {
+  ...metadata, projectId, items: [sessionItem], page: { limit: 20, hasMore: false, nextCursor: null },
+};
+
+test("session reader uses only the scoped GET route and forwards paging options and opaque cursor", async () => {
+  const cursor = "opaque+%&=/?.next";
+  const first = { ...sessionPage, page: { limit: 1, hasMore: true, nextCursor: cursor } };
+  const laterItem = { ...sessionItem, pipelineSessionId: "20000000-0000-0000-0000-000000000002", createdAt: "2026-11-23T23:59:59.999999Z" };
+  const next = { ...sessionPage, items: [laterItem], page: { limit: 1, hasMore: false, nextCursor: null } };
+  const queries: Record<string, string>[] = [];
+  const api = client(async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(init?.method, "GET");
+    assert.equal(url.pathname, `/api/v1/projects/${projectId}/sessions`);
+    queries.push(Object.fromEntries(url.searchParams));
+    return Response.json(queries.length === 1 ? sessionPage : url.searchParams.has("cursor") ? next : first);
+  });
+  const initial = await api.listSessions(projectId);
+  assert.equal(initial.kind, "ok");
+  assert.deepEqual(initial.data, sessionPage);
+  assert.equal(initial.receivedAt, receivedAt);
+  assert.equal(initial.data.fetchedAt, fetchedAt);
+  const paged = await api.listSessions(projectId, { limit: 1 });
+  assert.equal(paged.kind, "ok");
+  assert.ok(paged.data.page.nextCursor);
+  const result = await api.listSessions(projectId, { limit: 1, cursor: paged.data.page.nextCursor });
+  assert.equal(result.kind, "ok");
+  assert.deepEqual(result.data, next);
+  assert.equal(result.receivedAt, receivedAt);
+  assert.deepEqual(queries, [{}, { limit: "1" }, { limit: "1", cursor }]);
+
+  const emptyPage = { ...sessionPage, items: [] };
+  const empty = await client(async () => Response.json(emptyPage)).listSessions(projectId);
+  assert.equal(empty.kind, "empty");
+  assert.deepEqual(empty.data, emptyPage);
+  assert.equal(empty.receivedAt, receivedAt);
+});
+
+test("session reader rejects malformed project path segments before transport", async () => {
+  let requests = 0;
+  const api = client(async () => { requests++; return Response.json(sessionPage); });
+  for (const id of ["..", "x/y", "x?stage=1", "%2f", ""]) {
+    const result = await api.listSessions(id);
+    assert.equal(result.kind, "error");
+    assert.equal(result.error.kind, "data");
+    assert.equal(result.receivedAt, null);
+  }
+  assert.equal(requests, 0);
+});
+
+test("session reader preserves typed HTTP errors and delegates the limit bound to the server", async () => {
+  for (const [status, kind] of [[400, "bad-request"], [403, "access-denied"], [404, "not-found"], [409, "http"], [500, "server-error"]] as const) {
+    const api = client(async (input) => {
+      assert.equal(new URL(String(input)).search, "?limit=101");
+      return Response.json({ error_code: "ERR_TEST" }, { status });
+    });
+    const result = await api.listSessions(projectId, { limit: 101 });
+    assert.equal(result.kind, "error");
+    assert.deepEqual(result.error, { kind, status });
+    assert.equal(result.receivedAt, receivedAt);
+    assert.equal("data" in result, false);
+  }
+});
+
+test("session mapper enforces the exact item and envelope allowlists and project scope", () => {
+  const result = mapSessions(sessionPage, projectId);
+  assert.deepEqual(result, sessionPage);
+  assert.deepEqual(Object.keys(result.items[0]!), ["pipelineSessionId", "projectId", "title", "createdAt", "updatedAt"]);
+  const { title: _missing, ...missingTitle } = sessionItem;
+  for (const malformed of [
+    { ...sessionPage, totalCount: 1 },
+    { ...sessionPage, items: [{ ...sessionItem, stage: "unexpected" }] },
+    { ...sessionPage, items: [{ ...sessionItem, status: "unexpected" }] },
+    { ...sessionPage, items: [missingTitle] },
+    { ...sessionPage, items: [{ ...sessionItem, projectId: sessionId }] },
+    { ...sessionPage, projectId: sessionId },
+    { ...sessionPage, page: { ...sessionPage.page, nextCursor: 1 } },
+    { ...sessionPage, page: { ...sessionPage.page, hasMore: true } },
+  ]) {
+    assert.throws(() => mapSessions(malformed, projectId), /Invalid dashboard response field/);
+  }
+});
+
+test("session reader fails closed when a response is malformed or contains a bad row after a valid row", async () => {
+  const invalidResponses = [
+    new Response("{"),
+    Response.json({ ...sessionPage, items: null }),
+    Response.json({ ...sessionPage, items: [sessionItem, { ...sessionItem, updatedAt: null }] }),
+  ];
+  for (const response of invalidResponses) {
+    const result = await client(async () => response).listSessions(projectId);
+    assert.equal(result.kind, "error");
+    assert.equal(result.error.kind, "data");
+    assert.equal(result.receivedAt, receivedAt);
+    assert.equal("data" in result, false);
+  }
 });

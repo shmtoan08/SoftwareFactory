@@ -213,3 +213,49 @@ export function mapSessionTasks(value: unknown, projectId: string, sessionId: st
     page: page(dto.page),
   };
 }
+
+export interface SessionDto {
+  pipelineSessionId: string;
+  projectId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SessionListDto {
+  schemaVersion: "dashboard-read-v1";
+  fetchedAt: string;
+  projectId: string;
+  items: SessionDto[];
+  page: ReturnType<typeof page>;
+}
+
+function exactKeys(dto: Record<string, unknown>, field: string, keys: readonly string[]): void {
+  if (Object.keys(dto).length !== keys.length || keys.some((key) => !Object.hasOwn(dto, key))) {
+    throw new DashboardDataError(field);
+  }
+}
+
+// Issue #24 S2 defines the session list envelope and its exhaustive field allowlist.
+export function mapSessions(value: unknown, projectId: string): SessionListDto {
+  const dto = record(value, "session list");
+  exactKeys(dto, "session list", ["schemaVersion", "fetchedAt", "projectId", "items", "page"]);
+  const pageDto = record(dto.page, "page");
+  exactKeys(pageDto, "page", ["limit", "hasMore", "nextCursor"]);
+  return {
+    ...metadata(dto),
+    projectId: scope(dto.projectId, projectId, "projectId"),
+    items: list(dto.items, "items").map((value): SessionDto => {
+      const item = record(value, "session");
+      exactKeys(item, "session", ["pipelineSessionId", "projectId", "title", "createdAt", "updatedAt"]);
+      return {
+        pipelineSessionId: requireId(item.pipelineSessionId, "pipelineSessionId"),
+        projectId: scope(item.projectId, projectId, "session.projectId"),
+        title: string(item.title, "title"),
+        createdAt: timestamp(item.createdAt, "createdAt"),
+        updatedAt: timestamp(item.updatedAt, "updatedAt"),
+      };
+    }),
+    page: page(pageDto),
+  };
+}
