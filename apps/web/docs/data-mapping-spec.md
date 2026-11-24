@@ -82,12 +82,29 @@ Keep `sourceStatus` verbatim. Slice 1a assigns no display label, inferred status
 
 **D-02:** Any `stage` query returns HTTP 400. Stage filtering, grouping and counting are unsupported. `filters.stage: null` is response metadata and confers no task stage.
 
+### Session selection for Slice 1b
+
+The official source of selectable sessions is `GET /api/v1/projects/:projectId/sessions` under the signed project scope (D-01). Match the response and each item's `projectId` to the selected project. Use a returned `pipelineSessionId` as the identity for explicit selection and pass it as `sessionId` when requesting the P3 task page. [S0 contract](../../core-api/docs/dashboard-session-list-s0.md) · [S1 projection](../../core-api/src/session-read-projection.ts) · [S1 route](../../core-api/src/http-server.ts)
+
+| DTO field in `items[]` | Use in session selection |
+|---|---|
+| `pipelineSessionId` | Session identity |
+| `projectId` | Authorized project scope |
+| `title` | Stored session title |
+| `createdAt` | Stored creation timestamp |
+| `updatedAt` | Stored update timestamp |
+
+Each page has `schemaVersion`, `fetchedAt`, `projectId`, `items` and `page: {limit, hasMore, nextCursor}`. `fetchedAt` remains the server transaction snapshot timestamp and is copied verbatim. The client records `receivedAt` separately when it receives the response. Keep source timestamps at wire precision.
+
+The reader uses keyset order `(created_at DESC, pipeline_session_id DESC)`. Limit defaults to 20 and accepts at most 100. Pass the opaque `nextCursor` unchanged within the same project, principal and limit until it is null. The cursor uses HMAC-SHA256 with the dedicated purpose `dashboard-session-list-cursor-v1` and expires after 15 minutes. An invalid cursor returns 400, and an expired or context-mismatched session cursor returns 409. The reader supports no filters. A `stage` query returns 400.
+
+Session selection in 1b uses the candidates returned by this reader. A successful empty list supplies no candidates. An access denial or read failure remains an error. The DTO supplies no session status. An ACTIVE-based automatic choice requires an authorized status source. List order and timestamps supply no evidence of an ACTIVE session.
+
 ## 5. Unsupported ở 1a
 
 | Capability | Missing source | Follow-up |
 |---|---|---|
-| Session selection | The P1–P3 DTOs supply no session collection. P3 needs a session ID before the request | Session list read projection in [Issue #24](https://github.com/shmtoan08/SoftwareFactory/issues/24), before Slice 1b |
-| Session-dependent Pipeline Progress | The P1–P3 DTOs supply no session context with artifacts, gate decisions and baseline facts. A task page cannot establish Pipeline Progress | Session context depends on Issue #24. Slice 1b owns Pipeline Progress subject to an authorized source for its evidence |
+| Session-dependent Pipeline Progress | The session reader supplies identity, title and timestamps. It exposes no stage, status, artifacts, gate decisions or baseline evidence. D-02 supplies no authoritative task stage, so a P3 task page cannot fill this gap | Remains unsupported for 1b until a separate authorized progress evidence source is established |
 | Approval | The P1–P3 DTOs supply no approval or decision records | Slice 3, after an approved reader. Include the rejected-approval case there |
 | Artifact | The P1–P3 DTOs supply no artifact records or access observations | Slice 3, after an approved reader. Include the inaccessible-artifact case there |
 
