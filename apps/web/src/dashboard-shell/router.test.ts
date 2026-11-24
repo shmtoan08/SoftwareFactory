@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { request as httpRequest, type IncomingHttpHeaders } from "node:http";
+import { createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
+import { once } from "node:events";
 import { test } from "node:test";
 import { CORE_API_AUTH_HEADER, CoreApiService, encodeCoreApiAuthHeader } from "@software-factory/core-api";
 import { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
-import { WebApprovalConsoleController, WebApprovalConsoleHttpServer } from "../index.ts";
+import { createControlPlaneStackRuntime, WebApprovalConsoleController, WebApprovalConsoleHttpServer } from "../index.ts";
 import { withDashboardRouteBoundary } from "./router.ts";
 
 const projectId = "console-project";
@@ -25,13 +26,13 @@ async function withConsole(run: (context: {
   endpoint: string;
   controller: WebApprovalConsoleController;
   authHeader: string;
-}) => Promise<void>) {
+}) => Promise<void>, dashboardCoreApiBaseUrl?: string) {
   const core = new CoreApiService(new SoftwareFactoryControlPlaneStore());
   const controller = new WebApprovalConsoleController(core);
   const authHeader = encodeCoreApiAuthHeader(core.issueAuthContext({
     projectId, principalId: "console-admin", roles: ["ORG_ADMIN"],
   }));
-  const server = new WebApprovalConsoleHttpServer({ controller });
+  const server = new WebApprovalConsoleHttpServer({ controller, dashboardCoreApiBaseUrl });
   const { baseUrl } = await server.start();
   try {
     await run({ endpoint: baseUrl, controller, authHeader });
@@ -44,6 +45,7 @@ function open(endpoint: string, path: string, options: {
   auth?: string;
   form?: Record<string, string>;
   accept?: string;
+  onBody?: (body: string) => void;
 } = {}): Promise<Response> {
   return new Promise((resolve, reject) => {
     const payload = options.form ? new URLSearchParams(options.form).toString() : undefined;
@@ -58,7 +60,10 @@ function open(endpoint: string, path: string, options: {
     }, (res) => {
       res.setEncoding("utf8");
       let body = "";
-      res.on("data", (chunk: string) => { body += chunk; });
+      res.on("data", (chunk: string) => {
+        body += chunk;
+        options.onBody?.(body);
+      });
       res.on("error", reject);
       res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body }));
     });
@@ -74,7 +79,7 @@ function assertHtml(response: Response, status: number, heading: RegExp) {
   assert.match(response.body, heading);
 }
 
-test("Dashboard renders the empty Projects list and project shell and links back to Projects", async () => {
+test("Dashboard renders the empty Projects list and protects project data without auth", async () => {
   await withConsole(async ({ endpoint, controller }) => {
     const calls: string[] = [];
     controller.listPipelineSessions = async () => { calls.push("listPipelineSessions"); return []; };
@@ -86,8 +91,10 @@ test("Dashboard renders the empty Projects list and project shell and links back
     assert.match(list.body, /<a href="\/projects" aria-current="page">Projects<\/a>/);
 
     const detail = await open(endpoint, project);
-    assertHtml(detail, 200, /<main>\s*<h1>Project<\/h1>\s*<\/main>/);
-    assert.doesNotMatch(detail.body, /<script|<section|\brealtime\b|\blive\b/i);
+    assertHtml(detail, 200, /<h1>Project<\/h1>/);
+    assert.match(detail.body, /id="project-result" data-state="access-denied"/);
+    assert.match(detail.body, /id="sessions-result" data-state="access-denied"/);
+    assert.doesNotMatch(detail.body, /<script|\brealtime\b|\blive\b/i);
     const projectsLink = detail.body.match(/<a href="([^"]+)">Projects<\/a>/)?.[1];
     assert.ok(projectsLink);
     assert.equal((await open(endpoint, projectsLink)).body, list.body);
@@ -105,6 +112,10 @@ test("Dashboard not-found and invalid route pages preserve navigation and the se
     const invalid = await open(endpoint, "/projects/%ZZ");
     assertHtml(invalid, 400, /<h1>Invalid project address<\/h1>/);
     assert.doesNotMatch(invalid.body, /%ZZ|URIError/);
+    const invalidJson = await open(endpoint, "/projects/%ZZ", { accept: "application/json" });
+    assert.equal(invalidJson.status, 400);
+    assert.match(invalidJson.headers["content-type"] ?? "", /^application\/json/);
+    assert.deepEqual(JSON.parse(invalidJson.body), { error_code: "ERR_NOT_FOUND" });
     const json = await open(endpoint, "/unknown", { auth: authHeader, accept: "application/json" });
     assert.equal(json.status, 404);
     assert.equal(JSON.parse(json.body).error_code, "ERR_NOT_FOUND");
@@ -225,4 +236,160 @@ test("legacy console routes still render and navigate over HTTP", async (t) => {
       });
     }
   });
+});
+
+test("project detail streams panel states independently and uses only the two approved GET endpoints", async () => {
+  const id = "10000000-0000-0000-0000-000000000001";
+  const otherId = "20000000-0000-0000-0000-000000000001";
+  const chosenId = "20000000-0000-0000-0000-000000000002";
+  const stamp = "2026-11-24T10:00:00.123456Z";
+  const source = { schemaVersion: "dashboard-read-v1", fetchedAt: stamp };
+  const items = [
+    { pipelineSessionId: otherId, projectId: id, title: "Other", createdAt: stamp, updatedAt: stamp },
+    { pipelineSessionId: chosenId, projectId: id, title: "<Chosen>", createdAt: stamp, updatedAt: stamp },
+  ];
+  const projectPath = `/projects/${id}`;
+  let projectStatus = 200;
+  let sessionsStatus = 200;
+  let sessionItems = items;
+  let receivedAuth: string | undefined;
+  const calls: Array<{ method: string | undefined; url: string | undefined }> = [];
+  const cursor = "opaque+%&";
+  let nextCursor: string | null = null;
+  let releaseProject: (() => void) | undefined;
+  let projectGate: Promise<void> | undefined;
+  const core = createServer(async (req, res) => {
+    calls.push({ method: req.method, url: req.url });
+    if (!receivedAuth || req.headers[CORE_API_AUTH_HEADER] !== receivedAuth) {
+      res.writeHead(403).end();
+      return;
+    }
+    const url = new URL(req.url!, "http://127.0.0.1");
+    if (req.method !== "GET") {
+      res.writeHead(405).end();
+      return;
+    }
+    if (url.pathname === `/api/v1${projectPath}`) {
+      await projectGate;
+      res.writeHead(projectStatus, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ...source, project: { projectId: id, name: "Example project", slug: "example", defaultBranch: "main",
+          createdAt: stamp, updatedAt: stamp },
+      }));
+    } else if (url.pathname === `/api/v1${projectPath}/sessions`) {
+      res.writeHead(sessionsStatus, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...source, projectId: id, items: sessionItems,
+        page: { limit: 20, hasMore: nextCursor !== null, nextCursor } }));
+    } else {
+      res.writeHead(404).end();
+    }
+  });
+  core.listen(0, "127.0.0.1");
+  await once(core, "listening");
+  const address = core.address();
+  assert.ok(address && typeof address !== "string");
+  try {
+    await withConsole(async ({ endpoint, authHeader }) => {
+      receivedAuth = authHeader;
+      projectGate = new Promise<void>((resolve) => { releaseProject = resolve; });
+      let sawIndependentSession = false;
+      const initial = await open(endpoint, projectPath, {
+        auth: authHeader,
+        onBody(body) {
+          if (body.includes('id="sessions-result"') && !body.includes('id="project-result"')) {
+            sawIndependentSession = true;
+            releaseProject?.();
+          }
+        },
+      });
+      projectGate = undefined;
+      assert.equal(sawIndependentSession, true);
+      assertHtml(initial, 200, /id="project-loading" data-state="loading"/);
+      assert.match(initial.body, /id="sessions-loading" data-state="loading"/);
+      assert.match(initial.body, /id="project-result" data-state="ready"/);
+      assert.match(initial.body, /Example project/);
+      assert.ok(initial.body.includes(`<dt>fetchedAt</dt><dd>${stamp}</dd>`));
+      assert.match(initial.body, /<dt>receivedAt<\/dt><dd>[^<]+/);
+      assert.match(initial.body, /id="sessions-result" data-state="empty"/);
+      assert.match(initial.body, /<option value="" selected>Chưa chọn session<\/option>/);
+      assert.doesNotMatch(initial.body, /<option value="[^"]+" selected/);
+      assert.doesNotMatch(initial.body, /name="sessionId"[^>]*value=|<dt>Session ID<\/dt>/);
+      assert.doesNotMatch(initial.body, new RegExp(authHeader));
+
+      nextCursor = cursor;
+      const selected = await open(endpoint, `${projectPath}?sessionId=${chosenId}`, { auth: authHeader });
+      assert.match(selected.body, /id="sessions-result" data-state="ready"/);
+      assert.ok(selected.body.includes(`<dt>Session ID</dt><dd>${chosenId}</dd>`));
+      assert.ok(selected.body.includes(`<option value="${chosenId}" selected>&lt;Chosen&gt;</option>`));
+      assert.doesNotMatch(selected.body, /<Chosen>/);
+      assert.match(selected.body, /<dt>Tạo lúc<\/dt>/);
+      assert.match(selected.body, /<dt>Cập nhật lúc<\/dt>/);
+      assert.match(selected.body, /các panel phụ thuộc session sẽ dùng trong Slice 1c/);
+      const next = selected.body.match(/href="([^"]+)">Trang tiếp/);
+      assert.ok(next?.[1]);
+      nextCursor = null;
+      const nextPage = await open(endpoint, next[1], { auth: authHeader });
+      assert.match(nextPage.body, /<option value="" selected>Chưa chọn session<\/option>/);
+      assert.ok(calls.some(({ url }) => url === `/api/v1${projectPath}/sessions?${new URLSearchParams({ cursor })}`));
+
+      for (const [project, sessions, itemsForPage, expectedProject, expectedSession] of [
+        [500, 200, items, "error", "ready"],
+        [403, 200, items, "access-denied", "ready"],
+        [404, 200, items, "empty", "ready"],
+        [200, 500, items, "ready", "error"],
+        [200, 403, items, "ready", "access-denied"],
+        [200, 200, [], "ready", "empty"],
+      ] as const) {
+        projectStatus = project;
+        sessionsStatus = sessions;
+        sessionItems = [...itemsForPage];
+        const response = await open(endpoint, `${projectPath}?sessionId=${chosenId}`, { auth: authHeader });
+        assert.ok(response.body.includes(`id="project-result" data-state="${expectedProject}"`));
+        assert.ok(response.body.includes(`id="sessions-result" data-state="${expectedSession}"`));
+        const progress = response.body.match(/<section id="pipeline-progress".*?<\/section>/s)?.[0];
+        assert.ok(progress);
+        assert.match(progress, /data-state="unsupported"/);
+        assert.ok(progress.includes("Chưa có nguồn tiến độ được duyệt (session DTO không chứa stage/status/tiến độ)"));
+        assert.doesNotMatch(progress, /<progress|role="progressbar"|%|\d+\s+task|Stage [0-9]/i);
+        if (itemsForPage.length === 0) assert.match(response.body, /Chưa chọn session\. Project chưa có session\./);
+      }
+      assert.ok(calls.length > 0);
+      for (const call of calls) {
+        assert.equal(call.method, "GET");
+        const url = new URL(call.url!, endpoint);
+        assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`].includes(url.pathname));
+        assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
+      }
+    }, `http://127.0.0.1:${address.port}`);
+  } finally {
+    releaseProject?.();
+    await new Promise<void>((resolve, reject) => core.close((err) => err ? reject(err) : resolve()));
+  }
+});
+
+test("the stack runtime wires project detail to the paired Core API", async () => {
+  const store = new SoftwareFactoryControlPlaneStore();
+  const id = "10000000-0000-0000-0000-000000000003";
+  const session = "20000000-0000-0000-0000-000000000003";
+  const principalId = "dashboard-reader";
+  await store.withRlsTransaction({ currentProjectId: id, currentRole: "system_admin_role" }, async () => {
+    await store.createProject({ project_id: id, slug: "runtime-project", name: "Runtime project",
+      repo_bare_path: "/private/runtime-project.git", initial_main_commit_hash: "a".repeat(40) });
+    await store.addProjectMembership({ project_id: id, principal_id: principalId, member_role: "AUDITOR" });
+  });
+  await store.withRlsTransaction({ currentProjectId: id, currentPrincipalId: principalId, currentRole: "core_api_service" }, () =>
+    store.createProductPipelineSession({ pipeline_session_id: session, project_id: id, title: "Runtime session",
+      raw_idea_text: "Private session source", created_by_principal_id: principalId }));
+  const runtime = await createControlPlaneStackRuntime({ env: {}, store, withGatewayHttp: false });
+  try {
+    assert.ok(runtime.webEndpoint && runtime.coreApiRuntime?.coreApiEndpoint);
+    const auth = encodeCoreApiAuthHeader(runtime.coreApi.issueAuthContext({ projectId: id, principalId, roles: ["AUDITOR"] }));
+    const response = await open(runtime.webEndpoint.baseUrl, `/projects/${id}?sessionId=${session}`, { auth });
+    assertHtml(response, 200, /<dt>Tên<\/dt><dd>Runtime project<\/dd>/);
+    assert.ok(response.body.includes(`<dt>Session ID</dt><dd>${session}</dd>`));
+    assert.match(response.body, /<dt>Tên<\/dt><dd>Runtime session<\/dd>/);
+    assert.doesNotMatch(response.body, /Private session source|private\/runtime-project/);
+  } finally {
+    await runtime.close();
+  }
 });

@@ -18,6 +18,7 @@ export interface CreateControlPlaneStackRuntimeOptions
   readonly webHost?: string;
   readonly webPort?: number;
   readonly startCoreApiHttp?: boolean;
+  readonly dashboardCoreApiBaseUrl?: string;
   readonly startServer?: boolean;
 }
 
@@ -91,6 +92,7 @@ export async function createControlPlaneStackRuntime(
     controller,
     host: webHost,
     port: webPort,
+    dashboardCoreApiBaseUrl: options?.dashboardCoreApiBaseUrl ?? coreApiRuntime?.coreApiEndpoint?.baseUrl,
   });
 
   let webEndpoint: { readonly port: number; readonly baseUrl: string } | null = null;

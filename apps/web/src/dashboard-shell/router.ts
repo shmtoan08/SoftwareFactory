@@ -15,6 +15,20 @@ const styles = `
   main { padding: clamp(1.5rem, 6vw, 5rem); }
   h1 { margin: 0 0 1rem; font-size: clamp(1.75rem, 4vw, 2.5rem); letter-spacing: -.035em; }
   main p { color: #48566b; max-width: 44ch; line-height: 1.6; }
+  .project-panels { display: flex; flex-direction: column; gap: 1rem; max-width: 50rem; }
+  .project-panels section { padding: 1.25rem; border: 1px solid #d8e0ee; border-radius: .75rem; background: #fff; }
+  .project-panels h2 { margin: 0 0 .75rem; font-size: 1.125rem; }
+  .project-panels p { margin: .75rem 0 0; max-width: none; }
+  .project-panels dl { margin: 0; display: grid; grid-template-columns: fit-content(12rem) minmax(0, 1fr); gap: .5rem 1rem; }
+  .project-panels dd { margin: 0; overflow-wrap: anywhere; }
+  .project-panels form { margin-top: .75rem; display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+  .project-panels select { min-width: 0; max-width: 100%; }
+  .project-panels button, .project-panels select { font: inherit; padding: .4rem; }
+  .project-panels :is(#project-loading, #project-result) { order: 1; }
+  .project-panels :is(#sessions-loading, #sessions-result) { order: 2; }
+  .project-panels #pipeline-progress { order: 3; }
+  .project-panels:has(#project-result) #project-loading,
+  .project-panels:has(#sessions-result) #sessions-loading { display: none; }
   @media (max-width: 38rem) {
     body { grid-template-columns: 1fr; grid-template-rows: auto 1fr; }
     header { padding: 1rem 1.25rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
@@ -23,10 +37,12 @@ const styles = `
 `;
 
 function page(status: DashboardPage["status"], heading: string, message = "", isProjectList = false): DashboardPage {
-  return {
-    status,
-    body: `<!DOCTYPE html>
-<html lang="en">
+  return { status, body: documentStart(heading, isProjectList) + (message ? `<p>${message}</p>` : "") + documentEnd };
+}
+
+export function documentStart(heading: string, isProjectList = false, language: "en" | "vi" = "en"): string {
+  return `<!DOCTYPE html>
+<html lang="${language}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -42,14 +58,12 @@ function page(status: DashboardPage["status"], heading: string, message = "", is
   </header>
   <main>
     <h1>${heading}</h1>
-    ${message ? `<p>${message}</p>` : ""}
-  </main>
-</body>
-</html>`,
-  };
+`;
 }
 
-export function withDashboardRouteBoundary(render: () => DashboardPage): DashboardPage {
+export const documentEnd = "</main>\n</body>\n</html>";
+
+export function withDashboardRouteBoundary<T>(render: () => T): T | DashboardPage {
   try {
     return render();
   } catch (error) {
@@ -58,7 +72,7 @@ export function withDashboardRouteBoundary(render: () => DashboardPage): Dashboa
   }
 }
 
-export function dashboardRoute(pathname: string): DashboardPage | undefined {
+export function dashboardRoute(pathname: string): DashboardPage | { projectId: string } | undefined {
   if (pathname === "/projects" || pathname === "/projects/") {
     return withDashboardRouteBoundary(() => page(200, "Projects", "Project listings are unavailable here for now.", true));
   }
@@ -68,7 +82,7 @@ export function dashboardRoute(pathname: string): DashboardPage | undefined {
     return withDashboardRouteBoundary(() => {
       const projectId = decodeURIComponent(project);
       if (/[\/\\\u0000-\u001f\u007f]/.test(projectId)) throw new URIError("Invalid project segment");
-      return page(200, "Project");
+      return { projectId };
     });
   }
   return undefined;

@@ -1,3 +1,4 @@
+import { sendProjectDetail } from "./dashboard-shell/project-detail.ts";
 import { dashboardNotFound, dashboardRoute } from "./dashboard-shell/router.ts";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import {
@@ -1698,6 +1699,7 @@ export interface WebApprovalConsoleHttpServerOptions {
   readonly coreApi?: CoreApiService;
   readonly host?: string;
   readonly port?: number;
+  readonly dashboardCoreApiBaseUrl?: string;
 }
 
 function mapErrorToHttpPayload(err: unknown): {
@@ -2033,6 +2035,7 @@ export class WebApprovalConsoleHttpServer {
   private readonly controller: WebApprovalConsoleController;
   private readonly host: string;
   private readonly port: number;
+  private readonly dashboardCoreApiBaseUrl?: string;
   private server: Server | null = null;
 
   constructor(options: WebApprovalConsoleHttpServerOptions) {
@@ -2045,6 +2048,7 @@ export class WebApprovalConsoleHttpServer {
     }
     this.host = options.host ?? "127.0.0.1";
     this.port = options.port ?? 0;
+    this.dashboardCoreApiBaseUrl = options.dashboardCoreApiBaseUrl;
   }
 
   public async start(): Promise<{ port: number; baseUrl: string }> {
@@ -2303,15 +2307,23 @@ export class WebApprovalConsoleHttpServer {
         return;
       }
 
+      const accept = String(req.headers.accept ?? "").toLowerCase();
+      const wantsJson = accept.includes("application/json") || url.searchParams.get("format") === "json";
+      const isHtmlNavigation = method === "GET" && accept.includes("text/html") && !wantsJson;
       const dashboard = method === "GET" ? dashboardRoute(pathname) : undefined;
       if (dashboard) {
-        this.sendBody(res, dashboard.status, "text/html; charset=utf-8", dashboard.body);
+        if ("projectId" in dashboard) {
+          const header = req.headers[CORE_API_AUTH_HEADER];
+          await sendProjectDetail(res, dashboard.projectId, url.searchParams,
+            Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
+        } else if (dashboard.status === 400 && wantsJson) {
+          this.sendJson(res, 400, { error_code: "ERR_NOT_FOUND" });
+        } else {
+          this.sendBody(res, dashboard.status, "text/html; charset=utf-8", dashboard.body);
+        }
         return;
       }
 
-      const isHtmlNavigation = method === "GET"
-        && String(req.headers.accept ?? "").toLowerCase().includes("text/html")
-        && url.searchParams.get("format") !== "json";
       // Keep the authentication response for the existing console route families.
       const isConsolePath = /^\/projects\/[^/]+\/(?:pipeline-sessions|agent-profiles|tasks)(?:\/|$)/.test(pathname);
       const auth = decodeCoreApiAuthHeader(req.headers[CORE_API_AUTH_HEADER]);

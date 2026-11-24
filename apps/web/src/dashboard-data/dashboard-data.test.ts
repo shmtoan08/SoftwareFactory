@@ -1,4 +1,3 @@
-import "../dashboard-shell/router.test.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DashboardClient } from "./client.ts";
