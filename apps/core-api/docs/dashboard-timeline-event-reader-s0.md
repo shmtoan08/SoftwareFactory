@@ -356,3 +356,13 @@ The first fixture has 30,004 artifacts, 30,001 gates and 100,000 decided CRs. Th
 The write probe measures 100 artifact inserts, 100 gate inserts and 100 pending-to-approved CR updates. Both runs roll back. The baseline temporarily drops the three candidate indexes inside its rolled-back transaction. The timings are observations from disposable databases and carry no hard performance threshold.
 
 Actual EXPLAIN JSON is attached for [PostgreSQL 16.16](timeline-index-probe-pg16.json) and [PostgreSQL 17.12](timeline-index-probe-pg17.json). The `plans` array records each case, its boundary, the stage and the unmodified EXPLAIN JSON values. The `writes` section includes the write plans and timings.
+
+## Issue #32 S1-a parity and six-branch plan gate
+
+Before DAO work, M6B-AC4 (memory) and M6B-AC7 (PostgreSQL 17) verified the create → decide → apply flow. Create records a valid `created_at` and a null `decided_at`. Decide records `decided_at` at or after creation and preserves `created_at`. Apply preserves both values. Under app_runtime, a direct `created_at` update was denied (42501) and an attempted APPROVED → APPLIED update that changed `decided_at` was rejected by the transition trigger (23514). Both acceptance tests passed.
+
+The six-branch first-page probe used PostgreSQL 16.16 and 17.12, schema through 0031, the Issue #34 original-size fixture (one project, one session, one baseline, 30,004 artifacts, 30,001 gates, 100,000 decided change requests), and the same app_runtime RLS read-only repeatable-read settings. Each branch used its direct timestamp and UUID, explicit project/session predicates, a nonnull timestamp check, descending ordering, and LIMIT 101. The raw JSON contains the plans and buffer counts. [PG16 plans](timeline-s1a-first-page-pg16.json) · [PG17 plans](timeline-s1a-first-page-pg17.json)
+
+**Stopped before DAO.** Both versions explicitly sort the session and baseline branches even on the one-row fixture. The submitted branch uses `idx_cr_project_session` and an Incremental Sort to complete UUID ordering, reading 102 index rows to return 101 on distinct creation timestamps. The three branches indexed by 0031 use ordered scans and read 101 rows each. The requested no-Sort gate over all six branches therefore fails. No continuation, DAO parity, cursor, or route tests were run. Issue #34's standalone keyset probe for its three indexed branches remains separate evidence.
+
+The S1-a task text groups cursor expiry and owner/session mismatch under 401/403/400, while the contract above assigns 409 to a valid cursor that expired or whose context differs. The distinction is unresolved in this stopped slice.
