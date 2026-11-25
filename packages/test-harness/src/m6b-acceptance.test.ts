@@ -924,6 +924,23 @@ async function runFullStage8ToCasMerge(options: {
   };
 }
 
+function assertChangeRequestTimelineTimes(
+  created: Awaited<ReturnType<HttpCoreApiClient["submitPipelineChangeRequest"]>>,
+  decided: Awaited<ReturnType<HttpCoreApiClient["decidePipelineChangeRequest"]>>,
+  applied: Awaited<ReturnType<HttpCoreApiClient["applyPipelineChangeRequest"]>>["changeRequest"],
+): void {
+  assert.equal(created.status, "PENDING_APPROVAL");
+  assert.equal(created.decided_at, null);
+  assert.ok(Number.isFinite(Date.parse(created.created_at)));
+  assert.equal(decided.status, "APPROVED");
+  assert.ok(decided.decided_at);
+  assert.ok(Date.parse(decided.decided_at) >= Date.parse(created.created_at));
+  assert.equal(decided.created_at, created.created_at);
+  assert.equal(applied.status, "APPLIED");
+  assert.equal(applied.created_at, created.created_at);
+  assert.equal(applied.decided_at, decided.decided_at);
+}
+
 describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, Post-Freeze CR & AC-11b)", () => {
   it("M6B-AC1: Stage 5 Project Bootstrapper & external immutable TrustedAcceptanceTests (fail before impl -> pass after impl -> tamper detection)", async () => {
     const mock = await startMockModelProviderServers();
@@ -2184,7 +2201,7 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         frozen.sessionId,
         cr1.cr_id
       );
-      assert.equal(appliedCr.changeRequest.status, "APPLIED");
+      assertChangeRequestTimelineTimes(cr1, decidedCr, appliedCr.changeRequest);
       assert.equal(appliedCr.tasks.length, 1);
       const taskCr = appliedCr.tasks[0]!;
       assert.equal(taskCr.base_main_commit_hash, commitC1);
@@ -3425,12 +3442,34 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
           ],
         }
       );
-      await coreClient.decidePipelineChangeRequest(
+      const decidedPg = await coreClient.decidePipelineChangeRequest(
         projA.project_id,
         authApproverA,
         frozen.sessionId,
         crPg.cr_id,
         { decision: "APPROVED" }
+      );
+      const crWriteScope = {
+        currentProjectId: projA.project_id,
+        currentPrincipalId: "alice-dev",
+        currentRole: "core_api_service" as const,
+      };
+      await assert.rejects(
+        pool.withRlsTransaction(crWriteScope, (conn) => conn.query(
+          "UPDATE change_requests SET created_at = created_at + interval '1 second' WHERE cr_id = $1::uuid",
+          [crPg.cr_id],
+        )),
+        (error: unknown) => (error as { sqlState?: string }).sqlState === "42501",
+      );
+      await assert.rejects(
+        pool.withRlsTransaction(crWriteScope, (conn) => conn.query(
+          `UPDATE change_requests SET status = 'APPLIED', applied_at = clock_timestamp(),
+             applied_by_principal_id = 'alice-dev', decided_at = decided_at + interval '1 second'
+           WHERE cr_id = $1::uuid`,
+          [crPg.cr_id],
+        )),
+        (error: unknown) => (error as { sqlState?: string }).sqlState === "23514"
+          && /Original approval decision/.test(String(error)),
       );
       const appliedPg = await coreClient.applyPipelineChangeRequest(
         projA.project_id,
@@ -3438,6 +3477,7 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         frozen.sessionId,
         crPg.cr_id
       );
+      assertChangeRequestTimelineTimes(crPg, decidedPg, appliedPg.changeRequest);
       await runFullStage8ToCasMerge({
         store: repo,
         coreClient: gwClient,
