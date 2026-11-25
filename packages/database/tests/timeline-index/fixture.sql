@@ -1,0 +1,20 @@
+INSERT INTO projects(project_id,slug,name,repo_bare_path) VALUES (:p,(:p)::text,'fixture','/fixture');
+INSERT INTO project_memberships(project_id,principal_id,member_role) VALUES (:p,'fixture','AUDITOR');
+INSERT INTO product_pipeline_sessions(pipeline_session_id,project_id,title,raw_idea_text,status,created_by_principal_id)
+VALUES (:s,:p,'fixture','fixture','ACTIVE','fixture');
+INSERT INTO stage_artifacts(artifact_id,project_id,pipeline_session_id,stage,artifact_kind,version,provider,model,prompt_id,prompt_version,prompt_sha256,content_json,artifact_sha256,created_by_principal_id,created_at)
+SELECT md5(:s||'artifact'||g)::uuid,:p,:s,names[g],kinds[g],1,'system','fixture','fixture','1',repeat('a',64),CASE g WHEN 2 THEN '{"srs":{}}'::jsonb WHEN 4 THEN '{"passed":true}'::jsonb ELSE '{}'::jsonb END,CASE g WHEN 2 THEN '6e95cecb9059af2796985d9836b2c490eb8e16e6d05ec7d51549b41d12080ca2' WHEN 4 THEN '11c11db30f4b3f6c758722ba3e27eea08145b7d212f6a157451e364b48475280' ELSE '44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a' END,'fixture','2026-01-01'::timestamptz
+FROM generate_series(1,4) g CROSS JOIN (SELECT ARRAY['STAGE_1_IDEA_DISCOVERY','STAGE_2_REQUIREMENTS','STAGE_3_ARCHITECTURE','STAGE_4_SPEC_FREEZE'] names, ARRAY['STAGE_1_DISCOVERY_BUNDLE','STAGE_2_PRD_SRS','STAGE_3_ARCHITECTURE_DESIGN','STAGE_4_VALIDATION_REPORT'] kinds) a;
+INSERT INTO stage_artifacts(artifact_id,project_id,pipeline_session_id,stage,artifact_kind,version,provider,model,prompt_id,prompt_version,prompt_sha256,content_json,artifact_sha256,created_by_principal_id,created_at)
+SELECT md5(:s||'extra'||g)::uuid,:p,:s,'STAGE_4_SPEC_FREEZE','STAGE_4_VALIDATION_REPORT',g+1,'system','fixture','fixture','1',repeat('a',64),'{"passed":true}','11c11db30f4b3f6c758722ba3e27eea08145b7d212f6a157451e364b48475280','fixture','2026-01-01'::timestamptz+(CASE WHEN g <= :ties THEN 0 ELSE g END)*interval '1 second' FROM generate_series(1,:artifacts) g;
+INSERT INTO stage_approval_gates(gate_id,project_id,pipeline_session_id,gate_stage,target_artifact_id,target_artifact_sha256,approver_principal_id,decision,decided_at)
+SELECT md5(:s||'gate'||version)::uuid,:p,:s,'STAGE_4_SPEC_FREEZE',artifact_id,artifact_sha256,'fixture','APPROVED',created_at FROM stage_artifacts WHERE pipeline_session_id=:s AND stage='STAGE_4_SPEC_FREEZE';
+INSERT INTO baseline_spec_freezes(baseline_id,project_id,pipeline_session_id,stage1_artifact_id,stage1_artifact_sha256,stage2_artifact_id,stage2_artifact_sha256,stage3_artifact_id,stage3_artifact_sha256,validation_report_artifact_id,validation_report_sha256,approval_gate_id,frozen_by_principal_id,freeze_bundle_sha256)
+VALUES (:b,:p,:s,md5(:s||'artifact1')::uuid,'44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',md5(:s||'artifact2')::uuid,'6e95cecb9059af2796985d9836b2c490eb8e16e6d05ec7d51549b41d12080ca2',md5(:s||'artifact3')::uuid,'44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a',md5(:s||'extra'||:artifacts)::uuid,'11c11db30f4b3f6c758722ba3e27eea08145b7d212f6a157451e364b48475280',md5(:s||'gate'||(:artifacts+1))::uuid,'fixture',repeat('c',64));
+UPDATE product_pipeline_sessions SET status='FROZEN', frozen_baseline_id=:b, current_stage='STAGE_4_SPEC_FREEZE' WHERE pipeline_session_id=:s;
+INSERT INTO change_requests(project_id,pipeline_session_id,baseline_id,cr_key,title,rationale,impacted_requirement_ids_json,proposed_tasks_json,status,requested_by_principal_id,decided_by_principal_id,decided_at,cr_sha256,created_at)
+SELECT :p,:s,:b,'fixture-'||g,'fixture','fixture','["req"]','[{}]','APPROVED','fixture','fixture','2026-01-01'::timestamptz+(CASE WHEN g <= :cr_ties THEN 0 ELSE (:requests+1)-g END)*interval '1 second',repeat('c',64),'2026-01-01'::timestamptz+(g-(:requests+1))*interval '1 microsecond' FROM generate_series(1,:requests) g;
+INSERT INTO change_requests(project_id,pipeline_session_id,baseline_id,cr_key,title,rationale,impacted_requirement_ids_json,proposed_tasks_json,requested_by_principal_id,cr_sha256)
+SELECT :p,:s,:b,'pending-'||g,'fixture','fixture','["req"]','[{}]','fixture',repeat('c',64)
+FROM generate_series(1,:pending) g;
+ANALYZE;
