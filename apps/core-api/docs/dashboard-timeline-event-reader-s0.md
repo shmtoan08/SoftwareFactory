@@ -90,3 +90,248 @@ Each branch was a separate prepared SELECT with explicit project and session UUI
 **Stop.** The artifact, gate and change-request decision plans scan every candidate before returning the page. Top-N sorting bounds sort memory and returned rows. Read work still grows with session history. The observed times are under the statement timeout on this fixture, but the measured plans do not establish the required work bound. The existing artifact/gate indexes are stage-oriented, and the CR index orders by creation time instead of decision time. These branches require an index decision before implementation. The submitted branch result is for distinct timestamps and does not establish a bound for large groups of ties. Finite-cursor plans and multi-project scale remain unverified.
 
 The CR source audit found three repository write sites per backend. Create sets the creation time and leaves decision/application timestamps unset, decide requires pending and sets the decision time, and apply preserves creation and decision times. PostgreSQL enforces retention of the creation and decision timestamps through the transition trigger. The memory clock/PG application timestamp difference remains deferred above. This static audit is separate from the required executable parity proof, which was not reached after the scale stop. No DAO, cursor, route, schema or index is included in this retry. [Memory create](../../../packages/database/src/index.ts#L5500-L5524) · [Memory decide](../../../packages/database/src/index.ts#L5607-L5623) · [Memory apply](../../../packages/database/src/index.ts#L5772-L5779) · [PostgreSQL trigger](../../../packages/database/migrations/0008_m6b_stages_5_9_and_traceability.sql#L364-L422)
+
+## Issue #34 index probe and stop
+
+Replayed all schema migrations through 0030 from empty PostgreSQL 16.16 and 17.12 databases, excluding 0002 (the separate RLS verification script). Tested the following candidate definitions in disposable databases only. CI invokes migration files with `psql -v ON_ERROR_STOP=1 -f`; migration 0030 uses explicit `BEGIN`/`COMMIT`. The candidate used the same transaction framing and ordinary `CREATE INDEX IF NOT EXISTS`. Both versions accepted a second execution and listed all three definitions in `pg_indexes`.
+
+```sql
+BEGIN;
+CREATE INDEX IF NOT EXISTS idx_stage_artifacts_timeline
+  ON stage_artifacts USING btree (project_id, pipeline_session_id, created_at DESC, artifact_id DESC);
+CREATE INDEX IF NOT EXISTS idx_stage_approval_gates_timeline
+  ON stage_approval_gates USING btree (project_id, pipeline_session_id, decided_at DESC, gate_id DESC);
+CREATE INDEX IF NOT EXISTS idx_change_requests_decided_timeline
+  ON change_requests USING btree (project_id, pipeline_session_id, decided_at DESC, cr_id DESC)
+  WHERE decided_at IS NOT NULL;
+COMMIT;
+```
+
+Reused the prior 30,004 artifact / 30,001 gate / 100,000 decided CR fixture sizes and branch queries. Fixture artifact hashes were computed from their JSON to satisfy the canonical hash trigger in migration 0011. The tied fixture kept those cardinalities and assigned at least 3,000 rows per branch the same timestamp. Both fixtures queried under `app_runtime`, `row_security=on`, read-only repeatable read, with limit 101. The first-page probe used the prior internal infinity boundary. The tied probe used `2026-01-01T00:00:00Z`, the queried branch's rank and UUID `01000000-0000-0000-0000-000000000000`.
+
+**Stopped.** At the tied boundary, the prior predicate compares `(timestamp, type_rank, UUID)`. The actual index conditions only bound the timestamp. Both versions filtered several thousand candidates afterward. Artifact and gate branches still sorted on both versions, and the decision branch still sorted on PostgreSQL 16. An ordered scan on PostgreSQL 17 still filtered 2,992 decision rows. The first-page results do not establish bounded work for continuation. A future review must decide whether to authorize a rank-aware branch predicate and re-run the probes. No migration was added to the repository. Second-scale, NULL-majority, multi-project, write overhead and CI verification were not reached after this stop.
+
+### Actual EXPLAIN output
+
+Below are the measured plans, with psql formatting and planning-only buffer output omitted.
+
+#### PostgreSQL 16 · Original size, first page
+
+**artifact.recorded**
+
+```text
+ Limit  (cost=0.41..16.90 rows=101 width=93) (actual time=0.061..0.102 rows=101 loops=1)
+   Buffers: shared hit=5 read=3
+         One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+         Buffers: shared hit=5 read=3
+               Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (created_at IS NOT NULL) AND (created_at <= 'infinity'::timestamp with time zone))
+               Filter: (ROW(created_at, 2, artifact_id) < ROW('infinity'::timestamp with time zone, 6, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+               Buffers: shared hit=5 read=3
+Execution Time: 0.145 ms
+```
+
+**gate.decided**
+
+```text
+ Limit  (cost=0.41..13.70 rows=101 width=118) (actual time=0.057..0.092 rows=101 loops=1)
+   Buffers: shared hit=4 read=3
+         One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+         Buffers: shared hit=4 read=3
+               Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at IS NOT NULL) AND (decided_at <= 'infinity'::timestamp with time zone))
+               Filter: (ROW(decided_at, 3, gate_id) < ROW('infinity'::timestamp with time zone, 6, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+               Buffers: shared hit=4 read=3
+Execution Time: 0.118 ms
+```
+
+**change-request.decided**
+
+```text
+ Limit  (cost=0.42..7.27 rows=101 width=28) (actual time=0.069..0.090 rows=101 loops=1)
+   Buffers: shared hit=1 read=3
+         One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+         Buffers: shared hit=1 read=3
+               Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at <= 'infinity'::timestamp with time zone))
+               Filter: (ROW(decided_at, 6, cr_id) < ROW('infinity'::timestamp with time zone, 6, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+               Heap Fetches: 0
+               Buffers: shared hit=1 read=3
+Execution Time: 0.114 ms
+```
+
+#### PostgreSQL 16 · Tied continuation
+
+**artifact.recorded**
+
+```text
+ Limit  (cost=1430.41..1430.42 rows=3 width=93) (actual time=1.981..1.985 rows=13 loops=1)
+   Buffers: shared hit=122 read=30
+         Sort Key: created_at DESC, artifact_id DESC
+         Sort Method: quicksort  Memory: 26kB
+         Buffers: shared hit=122 read=30
+               One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+               Buffers: shared hit=122 read=30
+                     Recheck Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (created_at IS NOT NULL))
+                     Filter: (ROW(created_at, 2, artifact_id) < ROW('2026-01-01 00:00:00+00'::timestamp with time zone, 2, '01000000-0000-0000-0000-000000000000'::uuid))
+                     Rows Removed by Filter: 2991
+                     Heap Blocks: exact=121
+                     Buffers: shared hit=122 read=30
+                           Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (created_at IS NOT NULL) AND (created_at <= '2026-01-01 00:00:00+00'::timestamp with time zone))
+                           Buffers: shared hit=1 read=30
+ Planning Time: 0.241 ms
+ Execution Time: 2.053 ms
+(20 rows)
+Execution Time: 2.053 ms
+```
+
+**gate.decided**
+
+```text
+ Limit  (cost=1019.34..1019.35 rows=3 width=118) (actual time=1.477..1.480 rows=13 loops=1)
+   Buffers: shared hit=80 read=30
+         Sort Key: decided_at DESC, gate_id DESC
+         Sort Method: quicksort  Memory: 28kB
+         Buffers: shared hit=80 read=30
+               One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+               Buffers: shared hit=80 read=30
+                     Recheck Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at IS NOT NULL))
+                     Filter: (ROW(decided_at, 3, gate_id) < ROW('2026-01-01 00:00:00+00'::timestamp with time zone, 3, '01000000-0000-0000-0000-000000000000'::uuid))
+                     Rows Removed by Filter: 2988
+                     Heap Blocks: exact=79
+                     Buffers: shared hit=80 read=30
+                           Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at IS NOT NULL) AND (decided_at <= '2026-01-01 00:00:00+00'::timestamp with time zone))
+                           Buffers: shared hit=1 read=30
+ Planning Time: 0.163 ms
+ Execution Time: 1.545 ms
+(20 rows)
+Execution Time: 1.545 ms
+```
+
+**change-request.decided**
+
+```text
+ Limit  (cost=3815.12..3815.14 rows=10 width=28) (actual time=2.122..2.125 rows=7 loops=1)
+   Buffers: shared hit=109 read=30
+         Sort Key: decided_at DESC, cr_id DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=109 read=30
+               One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+               Buffers: shared hit=109 read=30
+                     Recheck Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at IS NOT NULL))
+                     Filter: (ROW(decided_at, 6, cr_id) < ROW('2026-01-01 00:00:00+00'::timestamp with time zone, 6, '01000000-0000-0000-0000-000000000000'::uuid))
+                     Rows Removed by Filter: 2993
+                     Heap Blocks: exact=108
+                     Buffers: shared hit=109 read=30
+                           Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at <= '2026-01-01 00:00:00+00'::timestamp with time zone))
+                           Buffers: shared hit=1 read=30
+ Planning Time: 0.153 ms
+ Execution Time: 2.231 ms
+(20 rows)
+Execution Time: 2.231 ms
+```
+
+#### PostgreSQL 17 · Original size, first page
+
+**artifact.recorded**
+
+```text
+ Limit  (cost=0.41..16.65 rows=101 width=93) (actual time=0.153..0.208 rows=101 loops=1)
+   Buffers: shared hit=5 read=3
+         One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+         Buffers: shared hit=5 read=3
+               Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (created_at <= 'infinity'::timestamp with time zone))
+               Filter: (ROW(created_at, 2, artifact_id) < ROW('infinity'::timestamp with time zone, 6, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+               Buffers: shared hit=5 read=3
+Execution Time: 0.263 ms
+```
+
+**gate.decided**
+
+```text
+ Limit  (cost=0.41..13.45 rows=101 width=118) (actual time=0.089..0.148 rows=101 loops=1)
+   Buffers: shared hit=4 read=3
+         One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+         Buffers: shared hit=4 read=3
+               Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at <= 'infinity'::timestamp with time zone))
+               Filter: (ROW(decided_at, 3, gate_id) < ROW('infinity'::timestamp with time zone, 6, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+               Buffers: shared hit=4 read=3
+Execution Time: 0.184 ms
+```
+
+**change-request.decided**
+
+```text
+ Limit  (cost=0.42..15.62 rows=101 width=28) (actual time=0.084..0.132 rows=101 loops=1)
+   Buffers: shared hit=4 read=3
+         One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+         Buffers: shared hit=4 read=3
+               Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at <= 'infinity'::timestamp with time zone))
+               Filter: (ROW(decided_at, 6, cr_id) < ROW('infinity'::timestamp with time zone, 6, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid))
+               Heap Fetches: 101
+               Buffers: shared hit=4 read=3
+Execution Time: 0.162 ms
+```
+
+#### PostgreSQL 17 · Tied continuation
+
+**artifact.recorded**
+
+```text
+ Limit  (cost=1422.86..1422.87 rows=3 width=93) (actual time=1.054..1.057 rows=13 loops=1)
+   Buffers: shared hit=122 read=30
+         Sort Key: created_at DESC, artifact_id DESC
+         Sort Method: quicksort  Memory: 26kB
+         Buffers: shared hit=122 read=30
+               One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+               Buffers: shared hit=122 read=30
+                     Recheck Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid))
+                     Filter: (ROW(created_at, 2, artifact_id) < ROW('2026-01-01 00:00:00+00'::timestamp with time zone, 2, '01000000-0000-0000-0000-000000000000'::uuid))
+                     Rows Removed by Filter: 2991
+                     Heap Blocks: exact=121
+                     Buffers: shared hit=122 read=30
+                           Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (created_at <= '2026-01-01 00:00:00+00'::timestamp with time zone))
+                           Buffers: shared hit=1 read=30
+ Planning Time: 0.318 ms
+ Execution Time: 1.117 ms
+(20 rows)
+Execution Time: 1.117 ms
+```
+
+**gate.decided**
+
+```text
+ Limit  (cost=1011.83..1011.84 rows=3 width=118) (actual time=0.930..0.932 rows=13 loops=1)
+   Buffers: shared hit=80 read=30
+         Sort Key: decided_at DESC, gate_id DESC
+         Sort Method: quicksort  Memory: 28kB
+         Buffers: shared hit=80 read=30
+               One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+               Buffers: shared hit=80 read=30
+                     Recheck Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid))
+                     Filter: (ROW(decided_at, 3, gate_id) < ROW('2026-01-01 00:00:00+00'::timestamp with time zone, 3, '01000000-0000-0000-0000-000000000000'::uuid))
+                     Rows Removed by Filter: 2988
+                     Heap Blocks: exact=79
+                     Buffers: shared hit=80 read=30
+                           Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at <= '2026-01-01 00:00:00+00'::timestamp with time zone))
+                           Buffers: shared hit=1 read=30
+ Planning Time: 0.182 ms
+ Execution Time: 1.001 ms
+(20 rows)
+Execution Time: 1.001 ms
+```
+
+**change-request.decided**
+
+```text
+ Limit  (cost=0.42..200.50 rows=10 width=28) (actual time=0.573..0.578 rows=8 loops=1)
+   Buffers: shared hit=2 read=30
+         One-Time Filter: (current_app_project_id() = '10000000-0000-0000-0000-000000000001'::uuid)
+         Buffers: shared hit=2 read=30
+               Index Cond: ((project_id = '10000000-0000-0000-0000-000000000001'::uuid) AND (pipeline_session_id = '20000000-0000-0000-0000-000000000001'::uuid) AND (decided_at <= '2026-01-01 00:00:00+00'::timestamp with time zone))
+               Filter: (ROW(decided_at, 6, cr_id) < ROW('2026-01-01 00:00:00+00'::timestamp with time zone, 6, '01000000-0000-0000-0000-000000000000'::uuid))
+               Rows Removed by Filter: 2992
+               Heap Fetches: 0
+               Buffers: shared hit=2 read=30
+ Planning Time: 0.133 ms
+ Execution Time: 0.609 ms
+(13 rows)
+Execution Time: 0.609 ms
+```
