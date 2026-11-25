@@ -366,3 +366,20 @@ The six-branch first-page probe used PostgreSQL 16.16 and 17.12, schema through 
 **Stopped before DAO.** Both versions explicitly sort the session and baseline branches even on the one-row fixture. The submitted branch uses `idx_cr_project_session` and an Incremental Sort to complete UUID ordering, reading 102 index rows to return 101 on distinct creation timestamps. The three branches indexed by 0031 use ordered scans and read 101 rows each. The requested no-Sort gate over all six branches therefore fails. No continuation, DAO parity, cursor, or route tests were run. Issue #34's standalone keyset probe for its three indexed branches remains separate evidence.
 
 The S1-a task text groups cursor expiry and owner/session mismatch under 401/403/400, while the contract above assigns 409 to a valid cursor that expired or whose context differs. The distinction is unresolved in this stopped slice.
+
+## Issue #32 S1-a retry with a work bound
+
+[Decision](https://github.com/shmtoan08/SoftwareFactory/issues/32#issuecomment-7165362909). The acceptance gate is scan work, including rows filtered or removed by index recheck, summed across executed scan nodes and accounting for loops. A Sort or Incremental Sort is acceptable only within the same input limit. The probe sets the bound to 102 rows per SELECT stage (limit 100, one lookahead row, one sort lookahead row). The database catalog checks confirm `product_pipeline_sessions.pipeline_session_id` is the primary key and `baseline_spec_freezes.uq_one_frozen_baseline_per_session` is a unique constraint on `pipeline_session_id`. Both constraints originate in migration 0006.
+
+Reproduce from the repository root using Docker and Python 3. The probe exits 1 on either version for the recorded work-bound violations.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/work_bound.py 16 /tmp/timeline-work-bound-pg16.json
+PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/work_bound.py 17 /tmp/timeline-work-bound-pg17.json
+```
+
+The mixed fixture has 30,004 artifacts, 30,001 gates and 100,000 decided CRs, including 3,000 CRs sharing a submission timestamp. A second session has 3,000 CRs all sharing one submission timestamp. The first, second and last page probes use the locked two-stage queries under app_runtime RLS in a read-only repeatable-read transaction. The second and last boundary keys come from a reference ORDER BY in that snapshot. The reference query uses a separate 30-second test-oracle budget, and each measured stage uses the regular P0 2-second statement timeout.
+
+**Stopped before DAO.** Both versions passed 23 of 30 stages. The first and second global pages scanned 3,001 submitted rows for an Incremental Sort. In the submitted-only page walk, the second page's equality stage scanned 3,232 rows on PG16 and 3,321 on PG17 despite having no Sort. The all-tied fixture scanned 3,000 submitted rows per measured nonempty page, including the last page where the Sort input itself was only 100. Other branches stayed within 102. No index, schema, trigger, write-path, DAO or cursor changes are included. [Raw PG16 plans](timeline-s1a-work-bound-pg16.json) · [Raw PG17 plans](timeline-s1a-work-bound-pg17.json)
+
+Parity evidence remains [b311d65](https://github.com/shmtoan08/SoftwareFactory/commit/b311d65). The decision also resolves the prior cursor question. Use 409 ERR_READ_CURSOR_CONTEXT for a valid expired or context-mismatched cursor, 400 for invalid signature or format, and 401/403 for auth failures.

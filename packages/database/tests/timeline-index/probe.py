@@ -57,12 +57,12 @@ def scope(number):
     return tuple(f'{part}0000000-0000-0000-0000-{number:012d}' for part in (1, 2, 3))
 
 
-def seed(db, number, artifacts, requests, ties, pending=0, cr_ties=None):
+def seed(db, number, artifacts, requests, ties, pending=0, cr_ties=None, submitted_ties=0):
     project, session, baseline = map(quoting, scope(number))
     fixture = (HERE / 'fixture.sql').read_text()
     values = dict(p=project, s=session, b=baseline, artifacts=artifacts, requests=requests,
-                  ties=ties, pending=pending, cr_ties=cr_ties or ties)
-    db.query(re.sub(r'(?<!:):(p|s|b|artifacts|requests|ties|pending|cr_ties)\b', lambda match: str(values[match[1]]), fixture))
+                  ties=ties, pending=pending, cr_ties=cr_ties or ties, submitted_ties=submitted_ties)
+    db.query(re.sub(r'(?<!:):(p|s|b|artifacts|requests|ties|pending|cr_ties|submitted_ties)\b', lambda match: str(values[match[1]]), fixture))
 
 
 def read_scope(db, number):
