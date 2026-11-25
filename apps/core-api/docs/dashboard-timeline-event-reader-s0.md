@@ -46,7 +46,7 @@ Success is exactly `{schemaVersion:"timeline-v1", fetchedAt, scope:{kind:"projec
 
 Return finite UTC timestamps at six fractional digits and preserve database microseconds through the cursor. Validate all projected values and reject invalid source data. Payloads do not include actor identifiers, free text, rationale, raw content/JSON, workspaces, tokens, provider metadata, task IDs, or ledger data.
 
-Use descending tuple `(recorded_at, type_rank, resource_id)` using PostgreSQL timestamptz, integer, and native UUID order. Rank separates distinct milestones with the same row ID and timestamp. Within rank, the source PK resolves ties. Use a strict tuple-less-than continuation from the last returned item, with `limit + 1` lookahead. Return a nonnull cursor only when another row was seen. This yields gap-free, duplicate-free traversal of a fixed dataset. Each request sees a fresh snapshot, so commits between requests may add rows behind the boundary or leave newer rows for a fresh first page. There is no cross-request snapshot guarantee or total count.
+Use descending tuple `(recorded_at, type_rank, resource_id)` using PostgreSQL timestamptz, integer, and native UUID order. Rank separates distinct milestones with the same row ID and timestamp. Within rank, the source PK resolves ties. Use the last returned item as the global boundary `(ts_b, rank_b, id_b)`. Each branch constrains project and session and orders by its timestamp and UUID descending. For a branch below the boundary rank use `ts <= ts_b`, and for a branch above it use `ts < ts_b`. At equal rank issue two separately bounded SELECTs in order, first `ts = ts_b AND id < id_b`, then `ts < ts_b`. Each SELECT uses `limit + 1`. The two phases are disjoint and at most 202 rows enter a branch merge at the maximum limit. Merge the branch results in the original global order and apply `limit + 1` lookahead. Row comparison in SQL is excluded from the boundary predicate. Return a nonnull cursor only when another row was seen. This yields gap-free, duplicate-free traversal of a fixed dataset. Each request sees a fresh snapshot, so commits between requests may add rows behind the boundary or leave newer rows for a fresh first page. There is no cross-request snapshot guarantee or total count.
 
 Use a versioned HMAC-SHA256 cursor with an independent timeline-purpose signing context, a 15-minute expiry, and bindings to project, session, principal and effective limit. Include the exact boundary tuple. Reject oversized cursor strings (over 2,048 ASCII characters) and invalid transport or signatures. Reject cross-reader tokens, and use constant-time signature comparison. Check current membership on every page. Never emit a partial success body when its serialized UTF-8 JSON exceeds 1 MiB.
 
@@ -94,6 +94,8 @@ The CR source audit found three repository write sites per backend. Create sets 
 ## Issue #34 index probe and stop
 
 Replayed all schema migrations through 0030 from empty PostgreSQL 16.16 and 17.12 databases, excluding 0002 (the separate RLS verification script). Tested the following candidate definitions in disposable databases only. CI invokes migration files with `psql -v ON_ERROR_STOP=1 -f`; migration 0030 uses explicit `BEGIN`/`COMMIT`. The candidate used the same transaction framing and ordinary `CREATE INDEX IF NOT EXISTS`. Both versions accepted a second execution and listed all three definitions in `pg_indexes`.
+
+### Candidate DDL retained from the original probe
 
 ```sql
 BEGIN;
@@ -335,3 +337,22 @@ Execution Time: 1.001 ms
 (13 rows)
 Execution Time: 0.609 ms
 ```
+
+## Issue #34 retry with a two-stage boundary
+
+The retry uses the unchanged candidate DDL above. The historical Sort failures used the three-column row comparison. The standard for S1-a is the rank-aware, two-stage boundary in the HTTP contract above.
+
+Run the [self-checking probe](../../../packages/database/tests/timeline-index/probe.py) from the repository root with Python 3 and Docker. The local PostgreSQL images must report 16.16 and 17.12 respectively.
+
+```sh
+python3 packages/database/tests/timeline-index/probe.py 16 /tmp/timeline-pg16.json --writes
+python3 packages/database/tests/timeline-index/probe.py 17 /tmp/timeline-pg17.json --writes
+```
+
+The probe starts disposable databases, replays the schema migrations, applies the candidate twice and checks the three catalog entries. It runs each EXPLAIN as `app_runtime` under read-only repeatable read with RLS enabled. Every stage must use exactly one of its expected ordered index scans, with `Actual Rows <= 101`, one loop at most, zero removed rows, no residual filter and no Sort. Combining stages may use up to 202 rows per branch. It exits nonzero if a checked plan or page deviates.
+
+The first fixture has 30,004 artifacts, 30,001 gates and 100,000 decided CRs. The second has 60,004 artifacts, 60,001 gates and 200,000 decided CRs, plus 210,000 pending CRs. Both projects and both sessions remain in the second database's tables during measurements. The probe checks that the other project's rows are invisible under RLS. Groups of at least 3,000 ties are present for all three branches. The second fixture has a 100,000-row CR tie. Positions are the first, middle and last UUID within a tie and a real key at the neighboring group boundary. Each is probed at equal, lower and higher relative rank. The rank comparison tests include synthetic ranks to exercise every branch rule. The full keyset walk checks the larger fixture against an unrestricted reference ORDER BY on the same snapshot.
+
+The write probe measures 100 artifact inserts, 100 gate inserts and 100 pending-to-approved CR updates. Both runs roll back. The baseline temporarily drops the three candidate indexes inside its rolled-back transaction. The timings are observations from disposable databases and carry no hard performance threshold.
+
+Actual EXPLAIN JSON is attached for [PostgreSQL 16.16](timeline-index-probe-pg16.json) and [PostgreSQL 17.12](timeline-index-probe-pg17.json). The `plans` array records each case, its boundary, the stage and the unmodified EXPLAIN JSON values. The `writes` section includes the write plans and timings.
