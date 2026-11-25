@@ -12,6 +12,10 @@ export class CostSessionReadProjectionService {
   }
 
   async read(auth: CoreApiAuthContext, projectId: string, pipelineSessionId: string, query: URLSearchParams) {
+    return (await this.readEncoded(auth, projectId, pipelineSessionId, query)).result;
+  }
+
+  async readEncoded(auth: CoreApiAuthContext, projectId: string, pipelineSessionId: string, query: URLSearchParams) {
     const deadlineAt = Date.now() + 5000;
     let verified: CoreApiAuthContext;
     try {
@@ -31,8 +35,10 @@ export class CostSessionReadProjectionService {
         projectId, pipelineSessionId, principalId: verified.principalId, signedRoles: verified.roles, deadlineAt,
       });
       const result = { schemaVersion: "dashboard-read-v1" as const, fetchedAt: readTimestamp(fetchedAt), projectId, pipelineSessionId, costSession };
-      if (Date.now() >= deadlineAt || Buffer.byteLength(JSON.stringify(result)) > 1048576) throw new Error("Read response bound exceeded");
-      return result;
+      if (Date.now() >= deadlineAt) throw new Error("Read response bound exceeded");
+      const payload = Buffer.from(JSON.stringify(result), "utf8");
+      if (payload.length > 1048576) throw new Error("Read response bound exceeded");
+      return { result, payload };
     } catch (error) {
       if (error instanceof PostgresRlsError && error.sqlState === "42501") throw new ReadProjectionError(403, "ERR_FORBIDDEN_RLS");
       if (error instanceof PostgresRlsError && error.sqlState === "23503") throw new ReadProjectionError(404, "ERR_READ_RESOURCE_NOT_FOUND");

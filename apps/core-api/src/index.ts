@@ -487,6 +487,10 @@ export class CoreApiService {
     return this.costSessionReads.read(auth, projectId, pipelineSessionId, query);
   }
 
+  public async readCostSessionProjectionBody(auth: CoreApiAuthContext, projectId: string, pipelineSessionId: string, query: URLSearchParams): Promise<Buffer> {
+    return (await this.costSessionReads.readEncoded(auth, projectId, pipelineSessionId, query)).payload;
+  }
+
   public readBudgetProjection(auth: CoreApiAuthContext, projectId: string, query = new URLSearchParams()) {
     return this.budgetReads.read(auth, projectId, query);
   }

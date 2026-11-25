@@ -65,7 +65,10 @@ async function prepare(store: ControlPlaneStore) {
     const headers: Record<string, string> = token === null ? {} : { [CORE_API_AUTH_HEADER]: token };
     const response = await fetch(baseUrl + "/api/v1/projects" + path, { headers });
     const text = await response.text();
-    return { status: response.status, body: JSON.parse(text), bytes: Buffer.byteLength(text) };
+    return {
+      status: response.status, body: JSON.parse(text), bytes: Buffer.byteLength(text),
+      text, contentLength: response.headers.get("content-length"),
+    };
   };
   const sessionPath = (projectId: string, sessionId: string) => `/${projectId}/pipeline-sessions/${sessionId}`;
   const get = (projectId: string = a, sessionId: string = linked, token: string | null = auth(), query = "") =>
@@ -161,13 +164,27 @@ test("bounded cost-session snapshot in memory", async () => {
     maps.costSessions.set(f.cost, cost);
     assert.equal((await f.get()).body.fetchedAt, stamp);
 
+    const cap = 1024 * 1024;
+    const baseline = (await f.get()).body;
+    const expected = { ...baseline, costSession: { ...baseline.costSession, payload: "é" } };
+    expected.costSession.payload += "x".repeat(cap - Buffer.byteLength(JSON.stringify(expected)));
+    let payload = expected.costSession.payload;
     const read = store.readCostSessionProjection.bind(store);
     store.readCostSessionProjection = async (input) => {
       const result = await read(input);
       assert.ok(result.costSession);
-      const costSession = { ...result.costSession, payload: "x".repeat(1048576) };
+      const costSession = { ...result.costSession, payload };
       return { ...result, costSession };
     };
+    const exact = await f.get();
+    assert.equal(exact.status, 200);
+    assert.equal(exact.text, JSON.stringify(expected));
+    assert.equal(exact.bytes, cap);
+    assert.equal(exact.contentLength, String(cap));
+
+    payload += "x";
+    expected.costSession.payload = payload;
+    assert.equal(Buffer.byteLength(JSON.stringify(expected)), cap + 1);
     checkError(await f.get(), failed);
   } finally {
     await f.stop();

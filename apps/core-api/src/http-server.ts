@@ -261,7 +261,10 @@ export class CoreApiHttpServer {
   }
 
   private sendJson(res: ServerResponse, statusCode: number, body: unknown): void {
-    const payload = JSON.stringify(body);
+    this.sendJsonPayload(res, statusCode, JSON.stringify(body));
+  }
+
+  private sendJsonPayload(res: ServerResponse, statusCode: number, payload: string | Buffer): void {
     res.writeHead(statusCode, {
       "Content-Type": "application/json",
       "Content-Length": Buffer.byteLength(payload),
@@ -476,7 +479,7 @@ export class CoreApiHttpServer {
           try { return decodeURIComponent(segment); }
           catch { return ""; }
         };
-        this.sendJson(res, 200, await this.coreApi.readCostSessionProjection(
+        this.sendJsonPayload(res, 200, await this.coreApi.readCostSessionProjectionBody(
           auth, decodeId(costSnapshotRead[1]), decodeId(costSnapshotRead[2]), url.searchParams,
         ));
         return;
