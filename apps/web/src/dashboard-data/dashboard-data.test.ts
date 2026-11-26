@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { CoreApiHttpServer, CoreApiService, encodeCoreApiAuthHeader } from "@software-factory/core-api";
 import { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
 import { DashboardClient } from "./client.ts";
-import { mapBudgetSnapshot, mapCostSessionSnapshot, mapProjectDetail, mapSessions, mapSessionTasks, mapTimeline } from "./mapping.ts";
+import { assertUniquePendingApprovalPage, DashboardDataError, mapBudgetSnapshot, mapCostSessionSnapshot, mapPendingApprovals, mapProjectDetail, mapSessions, mapSessionTasks, mapTimeline } from "./mapping.ts";
 
 const projectId = "10000000-0000-0000-0000-000000000001";
 const sessionId = "20000000-0000-0000-0000-000000000001";
@@ -470,4 +470,152 @@ test("timeline client and live Core API enforce signed project scope", async () 
   } finally {
     await server.stop();
   }
+});
+
+const pendingChangeRequest = {
+  kind: "CHANGE_REQUEST", cr_id: task.taskId, pipeline_session_id: sessionId, baseline_id: sessionId,
+  cr_key: "CR-1", hash: "a".repeat(64), title: "Update requirements", status: "PENDING_APPROVAL", created_at: fetchedAt,
+};
+const pendingMergeApproval = {
+  kind: "MERGE_APPROVAL", approval_request_id: task.taskId, task_id: task.taskId, merge_candidate_id: sessionId,
+  status: "PENDING", created_at: fetchedAt, expires_at: "2026-11-25T00:00:00.123456Z",
+};
+const pendingApprovals = {
+  schemaVersion: "pending-approvals-v1", fetchedAt, scope: { kind: "project-token", projectId },
+  items: [pendingChangeRequest, pendingMergeApproval],
+  page: { limit: 20, hasMore: false, nextCursor: null },
+};
+
+test("Pending approvals sends the project-scoped GET with only limit and an untouched opaque cursor", async () => {
+  const seen: { url: URL; init?: RequestInit }[] = [];
+  const serverOrder = { ...pendingApprovals, items: [pendingMergeApproval, pendingChangeRequest] };
+  const api = client(async (input, init) => {
+    seen.push({ url: new URL(String(input)), ...(init ? { init } : {}) });
+    return Response.json(serverOrder);
+  });
+  const cursor = "Opaque+/=?% &カ";
+  for (const result of [await api.listPendingApprovals(), await api.listPendingApprovals({ cursor })]) {
+    assert.deepEqual(result, {
+      kind: "ok", source: { endpoint: `/api/v1/projects/${projectId}/pending-approvals`, projectId },
+      receivedAt, data: serverOrder,
+    });
+  }
+  assert.equal(seen.length, 2);
+  for (const [index, { url, init }] of seen.entries()) {
+    assert.equal(url.origin, "http://core.test");
+    assert.equal(url.pathname, `/api/v1/projects/${projectId}/pending-approvals`);
+    assert.deepEqual([...url.searchParams], index ? [["limit", "20"], ["cursor", cursor]] : [["limit", "20"]]);
+    assert.deepEqual(Object.keys(init!).sort(), ["headers", "method", "redirect", "signal"]);
+    assert.equal(init?.method, "GET");
+    assert.equal(init?.redirect, "error");
+    assert.deepEqual([...new Headers(init?.headers)], [["x-sf-auth-token", "test-token"]]);
+  }
+});
+
+const { hash: _hash, ...missingCrHash } = pendingChangeRequest;
+const { expires_at: _expiry, ...missingMergeExpiry } = pendingMergeApproval;
+const invalidPendingApprovals: [string, object][] = [
+  ["schema version", { schemaVersion: "dashboard-read-v1" }],
+  ["unknown envelope field", { totalCount: 2 }],
+  ["missing envelope field", { fetchedAt: undefined }],
+  ["scope kind", { scope: { ...pendingApprovals.scope, kind: "tenant" } }],
+  ["scope project", { scope: { ...pendingApprovals.scope, projectId: sessionId } }],
+  ["unknown scope field", { scope: { ...pendingApprovals.scope, pipelineSessionId: sessionId } }],
+  ["unknown item kind", { items: [{ ...pendingChangeRequest, kind: "GATE" }] }],
+  ["missing CR field", { items: [missingCrHash] }],
+  ["extra CR field", { items: [{ ...pendingChangeRequest, rationale: "excluded" }] }],
+  ["missing merge field", { items: [missingMergeExpiry] }],
+  ["extra merge field", { items: [{ ...pendingMergeApproval, stage: "excluded" }] }],
+  ["invalid CR status", { items: [{ ...pendingChangeRequest, status: "APPROVED" }] }],
+  ["invalid merge status", { items: [{ ...pendingMergeApproval, status: "INVALIDATED_EXPIRED" }] }],
+  ["invalid hash", { items: [{ ...pendingChangeRequest, hash: "A".repeat(64) }] }],
+  ["invalid item UUID", { items: [{ ...pendingMergeApproval, task_id: "not-a-uuid" }] }],
+  ["invalid creation timestamp", { items: [{ ...pendingChangeRequest, created_at: "2026-02-30T00:00:00.000000Z" }] }],
+  ["invalid expiry timestamp", { items: [{ ...pendingMergeApproval, expires_at: "tomorrow" }] }],
+  ["invalid snapshot timestamp", { fetchedAt: "2026-11-24" }],
+  ["nonboolean hasMore", { page: { ...pendingApprovals.page, hasMore: "false" } }],
+  ["empty continuation cursor", { page: { ...pendingApprovals.page, hasMore: true, nextCursor: "" } }],
+  ["missing continuation cursor", { page: { limit: 20, hasMore: true } }],
+  ["null continuation cursor", { page: { ...pendingApprovals.page, hasMore: true } }],
+  ["cursor on terminal page", { page: { ...pendingApprovals.page, nextCursor: "unexpected" } }],
+  ["oversized cursor", { page: { limit: 2, hasMore: true, nextCursor: "é".repeat(1025) } }],
+  ["short page with continuation", { page: { ...pendingApprovals.page, hasMore: true, nextCursor: "opaque" } }],
+  ["items longer than limit", { page: { ...pendingApprovals.page, limit: 1 } }],
+  ["response limit differs from request", { page: { ...pendingApprovals.page, limit: 3 } }],
+  ["unknown page field", { page: { ...pendingApprovals.page, offset: 1 } }],
+];
+
+for (const [name, replacement] of invalidPendingApprovals) {
+  test(`Pending approvals rejects ${name} without exposing items`, async () => {
+    const result = await client(async () => Response.json({ ...pendingApprovals, ...replacement })).listPendingApprovals();
+    assert.equal(result.kind, "error");
+    assert.equal(result.error.kind, "data");
+    assert.equal("data" in result, false);
+  });
+}
+
+test("Pending approvals validates kind and ID across pages atomically", () => {
+  const first = mapPendingApprovals({ ...pendingApprovals, items: [pendingChangeRequest],
+    page: { limit: 1, hasMore: true, nextCursor: "opaque" } }, projectId);
+  const next = mapPendingApprovals({ ...pendingApprovals, items: [pendingMergeApproval] }, projectId);
+  assert.doesNotThrow(() => assertUniquePendingApprovalPage(next.items, first.items));
+  const duplicate = mapPendingApprovals({ ...pendingApprovals, items: [
+    pendingMergeApproval, { ...pendingChangeRequest, created_at: "2026-11-23T00:00:00.123456Z" },
+  ] }, projectId);
+  assert.throws(() => assertUniquePendingApprovalPage(duplicate.items, first.items),
+    (error) => error instanceof DashboardDataError && /duplicate pending approval identity/.test(error.message));
+  assert.deepEqual(first.items, [pendingChangeRequest]);
+  assert.throws(() => mapPendingApprovals({ ...pendingApprovals, items: [pendingMergeApproval, pendingMergeApproval] }, projectId),
+    /duplicate pending approval identity/);
+});
+
+test("Pending approvals keeps 401 and 409 distinct without changing other reader classifications", async () => {
+  for (const [status, kind] of [
+    [401, "unauthorized"], [403, "access-denied"], [400, "bad-request"], [409, "cursor-context"], [500, "server-error"],
+  ] as const) {
+    const api = client(async () => new Response("private error details", { status }));
+    const result = await api.listPendingApprovals();
+    assert.equal(result.kind, "error");
+    assert.deepEqual(result.error, { kind, status });
+    if (status === 401 || status === 409) {
+      const unchanged = await api.listTimeline(sessionId);
+      assert.equal(unchanged.kind, "error");
+      assert.deepEqual(unchanged.error, { kind: "http", status });
+    }
+  }
+});
+
+test("Pending approvals distinguishes network, timeout and malformed response JSON", async () => {
+  const offline = await client(async () => { throw new TypeError("network down"); }).listPendingApprovals();
+  assert.equal(offline.kind, "error");
+  assert.deepEqual(offline.error, { kind: "network" });
+  const timeout = await client(async (_input, init) => {
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    init?.signal?.throwIfAborted();
+    throw new Error("Expected aborted signal");
+  }, 1).listPendingApprovals();
+  assert.equal(timeout.kind, "error");
+  assert.deepEqual(timeout.error, { kind: "timeout" });
+  const malformed = await client(async () => new Response("{")).listPendingApprovals();
+  assert.equal(malformed.kind, "error");
+  assert.equal(malformed.error.kind, "data");
+});
+
+test("Pending approvals maps the actual S2 empty response over HTTP", async (t) => {
+  const store = new SoftwareFactoryControlPlaneStore();
+  const core = new CoreApiService(store);
+  const principalId = "pending-reader";
+  await store.withRlsTransaction({ currentRole: "system_admin_role", currentProjectId: projectId }, async () => {
+    await store.createProject({ project_id: projectId, slug: "pending-approvals", name: "Fixture",
+      repo_bare_path: "/fixture", initial_main_commit_hash: "a".repeat(40) });
+    await store.addProjectMembership({ project_id: projectId, principal_id: principalId, member_role: "AUDITOR" });
+  });
+  const server = new CoreApiHttpServer({ coreApi: core });
+  const { baseUrl } = await server.start();
+  t.after(() => server.stop());
+  const api = new DashboardClient({ baseUrl, projectId, timeoutMs: 1000,
+    authToken: encodeCoreApiAuthHeader(core.issueAuthContext({ projectId, principalId, roles: ["AUDITOR"] })) });
+  const result = await api.listPendingApprovals();
+  assert.equal(result.kind, "empty");
+  assert.deepEqual(result.data, { ...pendingApprovals, fetchedAt: result.data.fetchedAt, items: [] });
 });

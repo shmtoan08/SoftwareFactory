@@ -529,3 +529,83 @@ export function mapTimeline(value: unknown, projectId: string, pipelineSessionId
     page: pagination,
   };
 }
+
+// Exact allowlist from the project pending approvals S0 contract.
+function pendingApprovalItem(value: unknown) {
+  const dto = record(value, "pending approval");
+  const kind = literal(dto.kind, "pending approval.kind", "CHANGE_REQUEST", "MERGE_APPROVAL");
+  if (kind === "CHANGE_REQUEST") {
+    exactKeys(dto, "pending change request", [
+      "kind", "cr_id", "pipeline_session_id", "baseline_id", "cr_key", "hash", "title", "status", "created_at",
+    ]);
+    return {
+      kind,
+      cr_id: requireId(dto.cr_id, "cr_id"),
+      pipeline_session_id: requireId(dto.pipeline_session_id, "pipeline_session_id"),
+      baseline_id: requireId(dto.baseline_id, "baseline_id"),
+      cr_key: string(dto.cr_key, "cr_key"),
+      hash: artifactHash(dto.hash, "hash"),
+      title: string(dto.title, "title"),
+      status: literal(dto.status, "status", "PENDING_APPROVAL"),
+      created_at: timestamp(dto.created_at, "created_at"),
+    };
+  }
+  exactKeys(dto, "pending merge approval", [
+    "kind", "approval_request_id", "task_id", "merge_candidate_id", "status", "created_at", "expires_at",
+  ]);
+  return {
+    kind,
+    approval_request_id: requireId(dto.approval_request_id, "approval_request_id"),
+    task_id: requireId(dto.task_id, "task_id"),
+    merge_candidate_id: requireId(dto.merge_candidate_id, "merge_candidate_id"),
+    status: literal(dto.status, "status", "PENDING"),
+    created_at: timestamp(dto.created_at, "created_at"),
+    expires_at: timestamp(dto.expires_at, "expires_at"),
+  };
+}
+
+export type PendingApprovalItemDto = ReturnType<typeof pendingApprovalItem>;
+
+export function pendingApprovalKey(item: PendingApprovalItemDto): string {
+  return `${item.kind}:${item.kind === "CHANGE_REQUEST" ? item.cr_id : item.approval_request_id}`;
+}
+
+export function assertUniquePendingApprovalPage(
+  incoming: readonly PendingApprovalItemDto[],
+  previous: readonly PendingApprovalItemDto[] = [],
+): void {
+  const keys = new Set(previous.map(pendingApprovalKey));
+  for (const item of incoming) {
+    const key = pendingApprovalKey(item);
+    if (keys.has(key)) throw new DashboardDataError("duplicate pending approval identity");
+    keys.add(key);
+  }
+}
+
+export function mapPendingApprovals(value: unknown, projectId: string) {
+  const dto = record(value, "pending approvals");
+  exactKeys(dto, "pending approvals", ["schemaVersion", "fetchedAt", "scope", "items", "page"]);
+  const source = record(dto.scope, "scope");
+  exactKeys(source, "scope", ["kind", "projectId"]);
+  const paging = record(dto.page, "page");
+  exactKeys(paging, "page", ["limit", "hasMore", "nextCursor"]);
+  const pagination = page(paging);
+  const items = list(dto.items, "items").map(pendingApprovalItem);
+  if (items.length > pagination.limit || (pagination.hasMore && items.length !== pagination.limit)
+    || (pagination.nextCursor !== null && Buffer.byteLength(pagination.nextCursor) > 2048)) {
+    throw new DashboardDataError("pending approvals page");
+  }
+  assertUniquePendingApprovalPage(items);
+  return {
+    schemaVersion: literal(dto.schemaVersion, "schemaVersion", "pending-approvals-v1"),
+    fetchedAt: timestamp(dto.fetchedAt, "fetchedAt"),
+    scope: {
+      kind: literal(source.kind, "scope.kind", "project-token"),
+      projectId: scope(source.projectId, projectId, "scope.projectId"),
+    },
+    items,
+    page: pagination,
+  };
+}
+
+export type PendingApprovalsDto = ReturnType<typeof mapPendingApprovals>;

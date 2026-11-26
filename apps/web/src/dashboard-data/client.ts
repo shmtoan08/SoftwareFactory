@@ -13,11 +13,12 @@ import {
   mapTaskDispatches,
   mapSessions,
   mapTimeline,
+  mapPendingApprovals,
   requireId,
 } from "./mapping.ts";
 
 type Source = { endpoint: string; projectId: string; sessionId?: string };
-type HttpError = { kind: "bad-request" | "access-denied" | "not-found" | "server-error" | "http"; status: number };
+type HttpError = { kind: "bad-request" | "access-denied" | "not-found" | "server-error" | "http" | "unauthorized" | "cursor-context"; status: number };
 type RequestError = HttpError | { kind: "timeout" | "network" } | { kind: "data"; message: string };
 
 export type DashboardResult<T> =
@@ -172,6 +173,26 @@ export class DashboardClient {
       pageQuery(options), (data) => data.items.length === 0);
   }
 
+  listPendingApprovals(options: { cursor?: string } = {}) {
+    const { projectId } = this.options;
+    const limit = 20;
+    return this.get(
+      { endpoint: `${this.projectEndpoint}/pending-approvals`, projectId },
+      (dto) => {
+        const data = mapPendingApprovals(dto, projectId);
+        if (data.page.limit !== limit) throw new DashboardDataError("page.limit");
+        return data;
+      },
+      pageQuery({ limit, cursor: options.cursor }),
+      (data) => data.items.length === 0,
+      (status) => {
+        if (status === 401) return { kind: "unauthorized", status };
+        if (status === 409) return { kind: "cursor-context", status };
+        return httpError(status);
+      },
+    );
+  }
+
   getApprovalEvidence(pipelineSessionId: string) {
     const { projectId } = this.options;
     const sessionId = requireId(pipelineSessionId, "pipelineSessionId");
@@ -194,6 +215,7 @@ export class DashboardClient {
     map: (value: unknown) => T,
     query?: URLSearchParams,
     isEmpty?: (data: T) => boolean,
+    classifyHttpError = httpError,
   ): Promise<DashboardResult<T>> {
     const url = new URL(source.endpoint, this.options.baseUrl);
     if (query) url.search = query.toString();
@@ -208,7 +230,7 @@ export class DashboardClient {
       });
       receivedAt = this.now().toISOString();
       if (!response.ok) {
-        return { kind: "error", source, receivedAt, error: httpError(response.status) };
+        return { kind: "error", source, receivedAt, error: classifyHttpError(response.status) };
       }
       const body = await response.text();
       const data = map(JSON.parse(body) as unknown);
