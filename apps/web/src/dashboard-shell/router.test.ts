@@ -1,3 +1,6 @@
+import { runInNewContext } from "node:vm";
+import { panelRefreshScript } from "./panel-refresh.ts";
+import { sessionNavigationScript, sessionPanelsContentType } from "./session-navigation.ts";
 import assert from "node:assert/strict";
 import { createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { once } from "node:events";
@@ -360,11 +363,12 @@ test("project detail streams panel states independently and uses only the approv
         assert.equal(call.method, "GET");
         const url = new URL(call.url!, endpoint);
         assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`, `/api/v1${projectPath}/agent-profiles`,
-          `/api/v1${projectPath}/sessions/${chosenId}/tasks`,
+          `/api/v1${projectPath}/pending-approvals`, `/api/v1${projectPath}/sessions/${chosenId}/tasks`,
           `/api/v1${projectPath}/pipeline-sessions/${chosenId}/cost-session-snapshot`,
           `/api/v1${projectPath}/pipeline-sessions/${chosenId}`, `/api/v1${projectPath}/pipeline-sessions/${chosenId}/change-requests`,
           `/api/v1${projectPath}/pipeline-sessions/${chosenId}/timeline`].includes(url.pathname));
-        assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
+        if (url.pathname.endsWith("/pending-approvals")) assert.equal(url.search, "?limit=20");
+        else assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
       }
     }, `http://127.0.0.1:${address.port}`);
   } finally {
@@ -891,7 +895,7 @@ test("Issues #29–30 share selected-session readers and preserve bindings", asy
 
       assert.ok(calls.every(({ method, path }) => method === "GET" && !/approval-center|lineage|production-deployments/.test(path)));
       const allowed = new Set([corePath, `${corePath}/sessions`, `${corePath}/budget-snapshot`, `${corePath}/agent-profiles`,
-        `${corePath}/sessions/${selectedId}/tasks`, `${bundlePath}/cost-session-snapshot`, bundlePath, crPath, `${bundlePath}/timeline`]);
+        `${corePath}/pending-approvals?limit=20`, `${corePath}/sessions/${selectedId}/tasks`, `${bundlePath}/cost-session-snapshot`, bundlePath, crPath, `${bundlePath}/timeline`]);
       assert.deepEqual(calls.filter(({ path }) => !allowed.has(path)), []);
     }, `http://127.0.0.1:${address.port}`);
   } finally {
@@ -1023,4 +1027,134 @@ test("Issue #37 Project detail streams the first Timeline page in server order w
   } finally {
     await new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+test("Pending approvals keeps the project snapshot through session navigation and refreshes only on demand", async (t) => {
+  const id = (n: number) => `30000000-0000-0000-0000-${String(n).padStart(12, "0")}`;
+  const projectId = id(1);
+  const firstSession = id(2);
+  const secondSession = id(3);
+  const path = `/projects/${projectId}`;
+  const upstream = `/api/v1${path}`;
+  const readPath = `${upstream}/pending-approvals?limit=20`;
+  const fetchedAt = "2026-11-26T10:00:00.123456Z";
+  const refreshedAt = "2026-11-26T10:01:00.123456Z";
+  const expiresAt = "2026-11-26T11:00:00.123456Z";
+  const hash = "123456789abc" + "d".repeat(52);
+  const changes = Array.from({ length: 19 }, (_, i) => ({
+    kind: "CHANGE_REQUEST", cr_id: id(20 + i), pipeline_session_id: firstSession, baseline_id: id(4),
+    cr_key: `CR-${i}`, title: "Change <requirements>", hash, status: "PENDING_APPROVAL", created_at: fetchedAt,
+  }));
+  const merge = {
+    kind: "MERGE_APPROVAL", approval_request_id: id(6), task_id: id(7), merge_candidate_id: id(8),
+    status: "PENDING", created_at: fetchedAt, expires_at: expiresAt,
+  };
+  const calls: { method?: string; path: string }[] = [];
+  let auth = "";
+  let refresh = false;
+  const api = createServer((req, res) => {
+    calls.push({ method: req.method, path: req.url! });
+    assert.equal(req.headers[CORE_API_AUTH_HEADER], auth);
+    if (req.url === readPath) {
+      res.end(JSON.stringify({
+        schemaVersion: "pending-approvals-v1", scope: { kind: "project-token", projectId },
+        fetchedAt: refresh ? refreshedAt : fetchedAt, items: refresh ? [] : [...changes, merge],
+        page: { limit: 20, hasMore: !refresh, nextCursor: refresh ? null : "never-embed-this-cursor" },
+      }));
+    } else if (req.url === `${upstream}/sessions`) {
+      res.end(JSON.stringify({ schemaVersion: "dashboard-read-v1", projectId, fetchedAt,
+        items: [firstSession, secondSession].map((pipelineSessionId) => ({
+          projectId, pipelineSessionId, title: pipelineSessionId, createdAt: fetchedAt, updatedAt: fetchedAt,
+        })), page: { limit: 20, hasMore: false, nextCursor: null },
+      }));
+    } else res.writeHead(404).end();
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const address = api.address();
+  assert.ok(address && typeof address !== "string");
+  t.after(() => new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve())));
+
+  await withConsole(async ({ endpoint, authHeader }) => {
+    auth = authHeader;
+    const base = endpoint;
+    const initial = await open(endpoint, `${path}?sessionId=${firstSession}`, { auth });
+    const section = initial.body.match(/<section id="pending-approvals-panel"[\s\S]*?<\/section>/)?.[0];
+    assert.ok(section);
+    const pending = {
+      markup: section,
+      dataset: { panelUrl: `${path}/dashboard-pending-approvals` },
+      querySelector: () => body,
+      isConnected: true,
+      remove: () => assert.fail("Pending approvals panel must keep its identity"),
+    };
+    const body = { innerHTML: section, setAttribute() {} };
+    assert.match(section, /<h2[^>]*>Pending approvals<\/h2>/);
+    assert.match(section, /<button type="button" data-panel-refresh>Refresh<\/button>/);
+    assert.match(section, /Change request<\/p><h3>Change &lt;requirements&gt;<\/h3>/);
+    assert.match(section, /<dt>Hash<\/dt><dd><code title="123456789abc[d]{52}">123456789abc<\/code><\/dd>/);
+    assert.match(section, /<dt>Expires at<\/dt><dd><time datetime="2026-11-26T11:00:00.123456Z">2026-11-26T11:00:00.123456Z<\/time>/);
+    for (const [label, value] of [["Session", firstSession], ["Baseline", id(4)], ["Request", id(6)], ["Task", id(7)], ["Merge candidate", id(8)]]) {
+      assert.ok(section.includes(`<dt>${label}</dt><dd><code>${value}</code></dd>`));
+    }
+    assert.doesNotMatch(section, /never-embed-this-cursor|Load more|expires in|expired|<form|<a |\bonclick|rationale/i);
+    assert.match(section, /More items available/);
+    assert.match(section, /PENDING_APPROVAL/);
+    assert.match(section, />PENDING</);
+    assert.ok(section.includes(`As of <time datetime="${fetchedAt}">${fetchedAt}</time>`));
+    assert.equal((section.match(/<button/g) ?? []).length, 1);
+    assert.equal(calls.filter((call) => call.path === readPath).length, 1);
+
+    const handlers = new Map<string, (event: unknown) => unknown>();
+    const old = { remove() { panels.children.splice(panels.children.indexOf(old), 1); } };
+    const panels = {
+      children: [pending, old], dataset: {} as Record<string, string>, querySelector: () => pending,
+      append() {},
+    };
+    const chosen = new URL(`${base}${path}?sessionId=${secondSession}`);
+    let complete!: () => void;
+    const navigation = new Promise<void>((resolve) => { complete = resolve; });
+    const fetchWeb = (input: URL | string, init: RequestInit) =>
+      fetch(new URL(input, base), { ...init, headers: { ...init.headers, [CORE_API_AUTH_HEADER]: auth } });
+    runInNewContext(sessionNavigationScript + panelRefreshScript, {
+      document: { readyState: "complete", addEventListener: (name: string, handler: (event: unknown) => unknown) => handlers.set(name, handler) },
+      window: { addEventListener() {} }, URL, URLSearchParams, AbortController, AbortSignal, fetch: fetchWeb,
+      Date: class extends Date { static override now() { return Date.parse(expiresAt) + 1000000; } },
+      FormData: class { *[Symbol.iterator]() { yield ["sessionId", secondSession]; } },
+      DOMParser: class {
+        parseFromString(html: string) {
+          assert.match(html, new RegExp(`data-session-context="${secondSession}"`));
+          assert.doesNotMatch(html, /<section id="pending-approvals-(?:panel|loading)"/);
+          return { querySelector: () => ({ children: [] }) };
+        }
+      },
+      history: { pushState: (_state: unknown, _title: string, url: URL) => { assert.equal(url.href, chosen.href); complete(); } },
+      location: { assign: (url: URL) => assert.fail(`Unexpected full navigation to ${url}`) },
+    });
+    let prevented = false;
+    handlers.get("submit")!({
+      target: { matches: () => true, closest: () => panels, action: base + path },
+      preventDefault: () => { prevented = true; },
+    });
+    await navigation;
+    assert.equal(prevented, true);
+    assert.deepEqual(panels.children, [pending]);
+    assert.equal(body.innerHTML, section);
+    assert.equal(calls.filter((call) => call.path === readPath).length, 1);
+
+    refresh = true;
+    const button = { disabled: false, closest: () => pending };
+    await handlers.get("click")!({ target: { closest: () => button } });
+    assert.equal(calls.filter((call) => call.path === readPath).length, 2);
+    assert.ok(calls.every((call) => call.method === "GET"));
+    assert.match(body.innerHTML, /No pending change requests or merge approvals as of 2026-11-26T10:01:00.123456Z\./);
+    assert.match(body.innerHTML, /Stage gates are not listed here\./);
+    assert.doesNotMatch(body.innerHTML, /PENDING|More items available|Change &lt;requirements&gt;/);
+
+    const noAuth = await open(endpoint, path);
+    assert.match(noAuth.body, /id="pending-approvals-panel"[\s\S]*?data-state="access-denied"/);
+    assert.equal(calls.filter((call) => call.path === readPath).length, 2);
+    assert.doesNotMatch(sessionNavigationScript + panelRefreshScript, /setInterval|setTimeout|WebSocket|EventSource/);
+    assert.ok(initial.body.includes(sessionPanelsContentType));
+  }, `http://127.0.0.1:${address.port}`);
 });

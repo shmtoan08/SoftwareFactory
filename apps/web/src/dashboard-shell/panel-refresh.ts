@@ -45,9 +45,9 @@ document.addEventListener("click", async (event) => {
 });
 `;
 
-export function refreshablePanel(id: string, heading: string, endpoint: string, body: string, controls = ""): string {
+export function refreshablePanel(id: string, heading: string, endpoint: string, body: string, controls = "", refreshLabel = "Làm mới"): string {
   return `<section id="${id}" data-panel-url="${endpoint}" aria-labelledby="${id}-heading">
-<div class="panel-heading"><h2 id="${id}-heading">${heading}</h2><button type="button" data-panel-refresh>Làm mới</button></div>
+<div class="panel-heading"><h2 id="${id}-heading">${heading}</h2><button type="button" data-panel-refresh>${refreshLabel}</button></div>
 ${controls}<div data-panel-body role="status">${body}</div>
 </section>`;
 }

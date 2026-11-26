@@ -1,3 +1,5 @@
+import { loadPendingApprovalsBody } from "./dashboard-shell/pending-approvals.ts";
+import { sessionPanelsContentType } from "./dashboard-shell/session-navigation.ts";
 import { loadTimelinePage, timelinePageContentType } from "./dashboard-shell/timeline.ts";
 import { loadAgentProfilesBody } from "./dashboard-shell/agent-profiles.ts";
 import { loadWorkItemsBody } from "./dashboard-shell/work-items.ts";
@@ -2312,6 +2314,16 @@ export class WebApprovalConsoleHttpServer {
         return;
       }
 
+      const pendingApprovalsFragment = method === "GET" ? /^\/projects\/([^/]+)\/dashboard-pending-approvals$/.exec(pathname)?.[1] : undefined;
+      if (pendingApprovalsFragment !== undefined) {
+        const header = req.headers[CORE_API_AUTH_HEADER];
+        const body = await loadPendingApprovalsBody(pendingApprovalsFragment, Array.isArray(header) ? header[0] : header,
+          this.dashboardCoreApiBaseUrl);
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Dashboard-Panel": "1" });
+        res.end(body);
+        return;
+      }
+
       const budgetFragment = method === "GET" ? /^\/projects\/([^/]+)\/dashboard-budget$/.exec(pathname)?.[1] : undefined;
       if (budgetFragment !== undefined) {
         const header = req.headers[CORE_API_AUTH_HEADER];
@@ -2368,7 +2380,7 @@ export class WebApprovalConsoleHttpServer {
             return;
           }
           await sendProjectDetail(res, dashboard.projectId, url.searchParams,
-            Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
+            Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl, accept === sessionPanelsContentType);
         } else if (dashboard.status === 400 && wantsJson) {
           this.sendJson(res, 400, { error_code: "ERR_NOT_FOUND" });
         } else {

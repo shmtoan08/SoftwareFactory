@@ -54,6 +54,8 @@ const styles = `
   .project-panels :is(#approval-decisions-loading, #approval-decisions-result) { order: 9; }
   .project-panels :is(#change-requests-loading, #change-requests-result) { order: 10; }
   .project-panels :is(#evidence-loading, #evidence-result) { order: 11; }
+  .project-panels :is(#pending-approvals-loading, #pending-approvals-panel) { order: 13; }
+  .project-panels:has(#pending-approvals-panel) #pending-approvals-loading { display: none; }
   .project-panels :is(#timeline-loading, #timeline-panel) { order: 12; }
   .project-panels:has(#timeline-panel) #timeline-loading,
   .project-panels:has(#evidence-result) #evidence-loading,

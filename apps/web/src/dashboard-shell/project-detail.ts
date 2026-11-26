@@ -1,3 +1,5 @@
+import { pendingApprovalsPanel, pendingApprovalsPlaceholder, renderPendingApprovals } from "./pending-approvals.ts";
+import { sessionNavigationScript, sessionPanelsContentType } from "./session-navigation.ts";
 import { evidencePlaceholder, renderEvidence } from "./evidence.ts";
 import type { ServerResponse } from "node:http";
 import { DashboardClient, type DashboardResult } from "../dashboard-data/client.ts";
@@ -70,8 +72,8 @@ ${cursor === null ? "" : `<input type="hidden" name="cursor" value="${escapeHtml
 <button type="submit">Chọn session</button>
 </form>`;
   const pagination = [
-    cursor === null ? "" : `<a href="${path}">Trang đầu</a>`,
-    page.nextCursor === null ? "" : `<a href="${path}?${escapeHtml(new URLSearchParams({ cursor: page.nextCursor }).toString())}">Trang tiếp</a>`,
+    cursor === null ? "" : `<a data-session-page href="${path}">Trang đầu</a>`,
+    page.nextCursor === null ? "" : `<a data-session-page href="${path}?${escapeHtml(new URLSearchParams({ cursor: page.nextCursor }).toString())}">Trang tiếp</a>`,
   ].filter(Boolean).join(" · ");
   const details = selected ? facts([
     ["Session ID", selected.pipelineSessionId], ["Tên", selected.title],
@@ -82,21 +84,22 @@ ${cursor === null ? "" : `<input type="hidden" name="cursor" value="${escapeHtml
 }
 
 export async function sendProjectDetail(
-  res: ServerResponse, projectId: string, query: URLSearchParams, authToken: string | undefined, baseUrl: string | undefined,
+  res: ServerResponse, projectId: string, query: URLSearchParams, authToken: string | undefined, baseUrl: string | undefined, sessionPanelsOnly = false,
 ): Promise<void> {
   const progress = `<section id="pipeline-progress" data-state="unsupported" aria-labelledby="pipeline-progress-heading">
 <h2 id="pipeline-progress-heading">Pipeline Progress</h2>
 <p><strong>UNSUPPORTED</strong> — Chưa có nguồn tiến độ được duyệt (session DTO không chứa stage/status/tiến độ)</p>
 </section>`;
-  const start = documentStart("Project", false, "vi") + '<div class="project-panels">';
-  const script = `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script><script>${taskDetailScript}</script><script>${timelinePaginationScript}</script>`;
-  const end = "</div>" + documentEnd;
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  const start = (sessionPanelsOnly ? "" : documentStart("Project", false, "vi")) + '<div class="project-panels">';
+  const pending = (body: string) => sessionPanelsOnly ? "" : pendingApprovalsPanel(projectId, body);
+  const script = sessionPanelsOnly ? "" : `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script><script>${taskDetailScript}</script><script>${timelinePaginationScript}</script><script>${sessionNavigationScript}</script>`;
+  const end = "</div>" + (sessionPanelsOnly ? "" : documentEnd);
+  res.writeHead(200, { "Content-Type": `${sessionPanelsOnly ? sessionPanelsContentType : "text/html"}; charset=utf-8`, "Cache-Control": "no-store" });
 
   if (!authToken || !baseUrl) {
     const state = authToken ? "error" : "access-denied";
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
-      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
+      + pending(pendingApprovalsPlaceholder(state)) + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
       + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty")
       + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + timelineFailure(authToken ? undefined : 401) + script + end);
     return;
@@ -107,7 +110,7 @@ export async function sendProjectDetail(
     client = new DashboardClient({ baseUrl, projectId, authToken, timeoutMs: 7000 });
   } catch {
     res.end(start + unavailable("project", "error") + unavailable("sessions", "error")
-      + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
+      + pending(pendingApprovalsPlaceholder("error")) + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
       + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty")
       + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + timelinePlaceholder("error") + script + end);
     return;
@@ -117,8 +120,11 @@ export async function sendProjectDetail(
   const selectedId = query.get("sessionId");
   const initialState = selectedId ? "loading" : "empty";
   res.write(start + unavailable("project", "loading") + unavailable("sessions", "loading")
+    + (sessionPanelsOnly ? "" : '<section id="pending-approvals-loading"><h2>Pending approvals</h2><p>Đang tải…</p></section>')
     + progress + budgetLoadingPanel() + tasksPlaceholder(initialState) + workItemsPlaceholder(initialState) + agentProfilesLoading() + costUsagePlaceholder(initialState) + approvalsPlaceholder(initialState) + evidencePlaceholder(initialState) + timelinePlaceholder(initialState) + script);
   const write = (html: string) => { if (!res.destroyed) res.write(html); };
+  const pendingApprovals = sessionPanelsOnly ? undefined
+    : client.listPendingApprovals().then((result) => write(pending(renderPendingApprovals(result))));
   const budget = client.getBudgetSnapshot().then((result) => write(budgetPanel(projectId, renderBudget(result))));
   const session = client.listSessions(projectId, cursor === null ? {} : { cursor })
     .then(async (result) => {
@@ -156,7 +162,8 @@ export async function sendProjectDetail(
     loadAgentProfilesBody(projectId, authToken, baseUrl).then((body) => write(agentProfilesPanel(projectId, body))),
     client.getProject().then(renderProject).catch(() => unavailable("project", "error")).then(write),
     budget,
+    pendingApprovals,
     session,
   ]);
-  if (!res.destroyed) res.end("</div>" + documentEnd);
+  if (!res.destroyed) res.end(end);
 }
