@@ -10,6 +10,7 @@ import { panelRefreshScript } from "./panel-refresh.ts";
 import { taskDetailScript } from "./task-detail.ts";
 import { retireTasksOnSessionChange } from "./tasks.ts";
 
+import { pendingApprovalsPaginationScript } from "./pending-approvals.ts";
 import { sessionNavigationScript } from "./session-navigation.ts";
 import { timelinePaginationScript } from "./timeline.ts";
 
@@ -36,7 +37,7 @@ function getTasksPanel(html: string) {
 }
 
 function dashboardScripts(html: string): string[] {
-  const allowed = new Set([panelRefreshScript, retireTasksOnSessionChange, taskDetailScript, timelinePaginationScript, sessionNavigationScript]);
+  const allowed = new Set([panelRefreshScript, retireTasksOnSessionChange, taskDetailScript, timelinePaginationScript, sessionNavigationScript, pendingApprovalsPaginationScript]);
   const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
   for (const [, attributes, script] of scripts) {
     assert.equal(attributes?.trim(), "", "Dashboard scripts must be inline");
@@ -169,7 +170,7 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
     assert.throws(() => dashboardScripts(htmlA + "<script>unexpected()</script>"), /Unexpected Dashboard script/);
     assert.throws(() => dashboardScripts(htmlA + '<form method="post"></form>'), /forms must be read-only/);
     const scripts = dashboardScripts(htmlA);
-    runInNewContext(scripts.filter((script) => script !== sessionNavigationScript).join("\n"), {
+    runInNewContext(scripts.filter((script) => script !== sessionNavigationScript && script !== pendingApprovalsPaginationScript).join("\n"), {
       document: { addEventListener: (name: string, handler: Handler) => handlers.set(name, [...handlers.get(name) ?? [], handler]) },
       fetch: (path: string, options: RequestInit) => fetch(baseUrl + path, { ...options, headers }),
       AbortSignal,

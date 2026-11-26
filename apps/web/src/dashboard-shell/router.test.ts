@@ -1059,7 +1059,7 @@ test("Pending approvals keeps the project snapshot through session navigation an
       res.end(JSON.stringify({
         schemaVersion: "pending-approvals-v1", scope: { kind: "project-token", projectId },
         fetchedAt: refresh ? refreshedAt : fetchedAt, items: refresh ? [] : [...changes, merge],
-        page: { limit: 20, hasMore: !refresh, nextCursor: refresh ? null : "never-embed-this-cursor" },
+        page: { limit: 20, hasMore: !refresh, nextCursor: refresh ? null : "first-opaque-cursor" },
       }));
     } else if (req.url === `${upstream}/sessions`) {
       res.end(JSON.stringify({ schemaVersion: "dashboard-read-v1", projectId, fetchedAt,
@@ -1097,12 +1097,12 @@ test("Pending approvals keeps the project snapshot through session navigation an
     for (const [label, value] of [["Session", firstSession], ["Baseline", id(4)], ["Request", id(6)], ["Task", id(7)], ["Merge candidate", id(8)]]) {
       assert.ok(section.includes(`<dt>${label}</dt><dd><code>${value}</code></dd>`));
     }
-    assert.doesNotMatch(section, /never-embed-this-cursor|Load more|expires in|expired|<form|<a |\bonclick|rationale/i);
-    assert.match(section, /More items available/);
+    assert.doesNotMatch(section, /expires in|expired|<form|<a |\bonclick|rationale/i);
+    assert.match(section, /data-pending-cursor="first-opaque-cursor">Load more/);
     assert.match(section, /PENDING_APPROVAL/);
     assert.match(section, />PENDING</);
     assert.ok(section.includes(`As of <time datetime="${fetchedAt}">${fetchedAt}</time>`));
-    assert.equal((section.match(/<button/g) ?? []).length, 1);
+    assert.equal((section.match(/<button/g) ?? []).length, 2);
     assert.equal(calls.filter((call) => call.path === readPath).length, 1);
 
     const handlers = new Map<string, (event: unknown) => unknown>();

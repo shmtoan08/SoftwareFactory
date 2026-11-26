@@ -1,4 +1,4 @@
-import { loadPendingApprovalsBody } from "./dashboard-shell/pending-approvals.ts";
+import { loadPendingApprovalsBody, loadPendingApprovalsPage, pendingApprovalsPageContentType } from "./dashboard-shell/pending-approvals.ts";
 import { sessionPanelsContentType } from "./dashboard-shell/session-navigation.ts";
 import { loadTimelinePage, timelinePageContentType } from "./dashboard-shell/timeline.ts";
 import { loadAgentProfilesBody } from "./dashboard-shell/agent-profiles.ts";
@@ -2311,6 +2311,16 @@ export class WebApprovalConsoleHttpServer {
 
       if (method === "GET" && pathname === "/health") {
         this.sendJson(res, 200, { ok: true, service: "web-approval-console" });
+        return;
+      }
+
+      const pendingApprovalsPage = method === "GET" ? /^\/projects\/([^/]+)\/dashboard-pending-approvals\/page$/.exec(pathname)?.[1] : undefined;
+      if (pendingApprovalsPage !== undefined) {
+        const header = req.headers[CORE_API_AUTH_HEADER];
+        const page = await loadPendingApprovalsPage(pendingApprovalsPage, url.searchParams,
+          Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
+        res.writeHead(page.status, { "Content-Type": pendingApprovalsPageContentType, "Cache-Control": "no-store" });
+        res.end(JSON.stringify(page.body));
         return;
       }
 

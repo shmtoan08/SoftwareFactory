@@ -1,4 +1,4 @@
-import { pendingApprovalsPanel, pendingApprovalsPlaceholder, renderPendingApprovals } from "./pending-approvals.ts";
+import { pendingApprovalsPaginationScript, pendingApprovalsPanel, pendingApprovalsPlaceholder, renderPendingApprovals } from "./pending-approvals.ts";
 import { sessionNavigationScript, sessionPanelsContentType } from "./session-navigation.ts";
 import { evidencePlaceholder, renderEvidence } from "./evidence.ts";
 import type { ServerResponse } from "node:http";
@@ -92,7 +92,7 @@ export async function sendProjectDetail(
 </section>`;
   const start = (sessionPanelsOnly ? "" : documentStart("Project", false, "vi")) + '<div class="project-panels">';
   const pending = (body: string) => sessionPanelsOnly ? "" : pendingApprovalsPanel(projectId, body);
-  const script = sessionPanelsOnly ? "" : `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script><script>${taskDetailScript}</script><script>${timelinePaginationScript}</script><script>${sessionNavigationScript}</script>`;
+  const script = sessionPanelsOnly ? "" : `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script><script>${taskDetailScript}</script><script>${timelinePaginationScript}</script><script>${sessionNavigationScript}</script><script>${pendingApprovalsPaginationScript}</script>`;
   const end = "</div>" + (sessionPanelsOnly ? "" : documentEnd);
   res.writeHead(200, { "Content-Type": `${sessionPanelsOnly ? sessionPanelsContentType : "text/html"}; charset=utf-8`, "Cache-Control": "no-store" });
 

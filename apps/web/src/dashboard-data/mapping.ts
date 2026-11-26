@@ -571,12 +571,13 @@ export function pendingApprovalKey(item: PendingApprovalItemDto): string {
 }
 
 export function assertUniquePendingApprovalPage(
-  incoming: readonly PendingApprovalItemDto[],
-  previous: readonly PendingApprovalItemDto[] = [],
+  incoming: readonly (PendingApprovalItemDto | string)[],
+  previous: readonly (PendingApprovalItemDto | string)[] = [],
 ): void {
-  const keys = new Set(previous.map(pendingApprovalKey));
+  const identity = (item: PendingApprovalItemDto | string) => typeof item === "string" ? item : pendingApprovalKey(item);
+  const keys = new Set(previous.map(identity));
   for (const item of incoming) {
-    const key = pendingApprovalKey(item);
+    const key = identity(item);
     if (keys.has(key)) throw new DashboardDataError("duplicate pending approval identity");
     keys.add(key);
   }
