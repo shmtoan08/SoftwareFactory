@@ -402,3 +402,29 @@ The complete submitted walks matched the reference `ORDER BY created_at DESC, cr
 The new index occupies 7,749,632 bytes at 100,000 CRs on each version. One rollback-only batch of 1,000 pending CR inserts measured 40.055 ms before and 56.811 ms after on PG16, and 68.580 ms before and 76.769 ms after on PG17. These are single EXPLAIN execution times from disposable databases, with no latency acceptance threshold.
 
 [Actual PG16 EXPLAIN JSON](timeline-s1-idx2-pg16.json) · [Actual PG17 EXPLAIN JSON](timeline-s1-idx2-pg17.json)
+
+## Issue #32 S1-a implementation evidence
+
+The DAO issues a separate parameterized SELECT for each milestone and each required boundary stage. Timestamp projection preserves PostgreSQL microseconds. It reads through the existing app_runtime read-only repeatable-read unit and merges the bounded results in the contract's global order. The internal core service checks signed project, live membership, session visibility, cursor purpose and context. S1-b will own the HTTP route.
+
+The actual SQL and bound parameters exported by the DAO were run with `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` under app_runtime RLS on PostgreSQL 16.16 and 17.12. Each version passed 68 stages across first, second, last and submitted-specific continuation pages. The mixed fixture has 30,004 artifacts, 30,001 gates and 100,000 decided CRs with 3,000 tied creation timestamps. The second fixture has 5 artifacts, 2 gates and 3,000 CRs with all creation timestamps tied. Each fixture has one project, session and baseline. Both coexist for the second fixture's queries.
+
+| Branch | Max scan rows on PG16 / PG17 | Observed access path |
+| --- | ---: | --- |
+| session.created | 2 / 2 | Seq Scan, max Sort input 1 |
+| artifact.recorded | 101 / 101 | Index Scan, idx_stage_artifacts_timeline |
+| gate.decided | 101 / 101 | Index Scan, idx_stage_approval_gates_timeline |
+| baseline.frozen | 2 / 2 | Seq Scan, max Sort input 1 |
+| change-request.submitted | 101 / 101 | Index Only Scan, idx_change_requests_submitted_timeline |
+| change-request.decided | 101 / 101 | Index Only Scan, idx_change_requests_decided_timeline |
+
+Counts include rows filtered by the scans. The threshold remains 102. The SQL plans are fixture evidence. The signed cursor integration test walks 6,009 milestones in 61 pages on each version and compares with a single reference ORDER BY. Unit coverage checks auth, query validation, purpose separation and expired or mismatched cursor contexts. The existing parity and work-bound probes were not run separately.
+
+Reproduce from the repository root with Node, Python 3, Docker and local PG16.16/PG17.12 Alpine images.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/dao_explain.py 16 /tmp/timeline-dao-pg16.json
+PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/dao_explain.py 17 /tmp/timeline-dao-pg17.json
+```
+
+[Actual DAO plans PG16](timeline-s1a-dao-pg16.json) · [Actual DAO plans PG17](timeline-s1a-dao-pg17.json)
