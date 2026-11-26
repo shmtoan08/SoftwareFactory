@@ -383,3 +383,22 @@ The mixed fixture has 30,004 artifacts, 30,001 gates and 100,000 decided CRs, in
 **Stopped before DAO.** Both versions passed 23 of 30 stages. The first and second global pages scanned 3,001 submitted rows for an Incremental Sort. In the submitted-only page walk, the second page's equality stage scanned 3,232 rows on PG16 and 3,321 on PG17 despite having no Sort. The all-tied fixture scanned 3,000 submitted rows per measured nonempty page, including the last page where the Sort input itself was only 100. Other branches stayed within 102. No index, schema, trigger, write-path, DAO or cursor changes are included. [Raw PG16 plans](timeline-s1a-work-bound-pg16.json) · [Raw PG17 plans](timeline-s1a-work-bound-pg17.json)
 
 Parity evidence remains [b311d65](https://github.com/shmtoan08/SoftwareFactory/commit/b311d65). The decision also resolves the prior cursor question. Use 409 ERR_READ_CURSOR_CONTEXT for a valid expired or context-mismatched cursor, 400 for invalid signature or format, and 401/403 for auth failures.
+
+## Issue #35 submitted index and work-bound verification
+
+Migration `0032_change_request_submitted_timeline_index.sql` creates `idx_change_requests_submitted_timeline`, a nonpartial B-tree on `change_requests (project_id, pipeline_session_id, created_at DESC, cr_id DESC)`. The migration uses the same explicit transaction and idempotent index creation as 0031. The repository has no down migration runner. The probe verified manual rollback with `BEGIN; DROP INDEX public.idx_change_requests_submitted_timeline; COMMIT;` on disposable databases. It verified the catalog definition on a clean replay and again upgrading a populated 0031 database, including reapplying 0032.
+
+The work-bound reproduction commands above now exit 0 on PG16.16 and PG17.12. Both versions pass all 30 stages across all six branches, under app_runtime with RLS enabled. Each submitted stage uses the new ordered index with no Sort, including stages that return zero rows. The unchanged bound is 102. The work bound is an observation for these fixtures and plans. Production data distributions and planner choices can differ.
+
+| Fixture and branch | First page | Page 2 (equality + older where applicable) | Last page |
+| --- | ---: | ---: | ---: |
+| Mixed, global submitted | 101 | 101 | 0 + 7 |
+| Mixed, submitted only | 101 | 101 + 101 | 0 + 100 |
+| All-tied, submitted only | 101 | 101 + 0 | 100 + 0 |
+| Mixed, global decided | 101 | 0 + 101 | 0 |
+
+The complete submitted walks matched the reference `ORDER BY created_at DESC, cr_id DESC` on the same snapshot. Both versions returned 100,000 rows on the mixed fixture and 3,000 on the all-tied fixture without duplicates or omissions. The decided regression retains `idx_change_requests_decided_timeline` from 0031 on every stage. Parity evidence remains b311d65.
+
+The new index occupies 7,749,632 bytes at 100,000 CRs on each version. One rollback-only batch of 1,000 pending CR inserts measured 40.055 ms before and 56.811 ms after on PG16, and 68.580 ms before and 76.769 ms after on PG17. These are single EXPLAIN execution times from disposable databases, with no latency acceptance threshold.
+
+[Actual PG16 EXPLAIN JSON](timeline-s1-idx2-pg16.json) · [Actual PG17 EXPLAIN JSON](timeline-s1-idx2-pg17.json)
