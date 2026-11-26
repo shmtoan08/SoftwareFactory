@@ -1,3 +1,4 @@
+import { encodePendingApprovalsPage, PendingApprovalsCursorCodec } from "./pending-approvals-read-projection.ts";
 import type { PendingApprovalBoundary } from "@software-factory/database";
 import { TimelineReadProjectionService } from "./timeline-read-projection.ts";
 import { CostSessionReadProjectionService } from "./cost-session-read-projection.ts";
@@ -249,6 +250,11 @@ export class CoreApiTokenAuthenticator {
     return createHmac("sha256", key).update(data).digest("hex");
   }
 
+  public signPendingApprovalsCursor(data: string): string {
+    const key = createHmac("sha256", this.signingSecret).update("dashboard-pending-approvals-cursor-v1").digest();
+    return createHmac("sha256", key).update(data).digest("hex");
+  }
+
   public issueAuthContext(input: {
     projectId: string;
     principalId: string;
@@ -490,6 +496,23 @@ export class CoreApiService {
     return this.store.readPendingApprovalsProjection({
       projectId, principalId: verified.principalId, signedRoles: verified.roles, deadlineAt,
       limit: options.limit ?? 20, after: options.after ?? null,
+    });
+  }
+
+  public readPendingApprovalsProjectionBody(auth: CoreApiAuthContext | null, projectId: string, query: URLSearchParams): Promise<Buffer> {
+    return encodePendingApprovalsPage({
+      auth, projectId, query,
+      verify: (token) => this.authenticator.verifyAuthContext(token, token.projectId, READ_ROLES),
+      cursor: new PendingApprovalsCursorCodec((data) => this.authenticator.signPendingApprovalsCursor(data)),
+      // The project projection's context guard checks live membership in a read-only transaction
+      // and exits before any resource lookup. Invalid continuations never enter the S1 reader.
+      rejectContext: async (verified, deadlineAt) => {
+        await this.store.readProjectProjection({
+          projectId, principalId: verified.principalId, signedRoles: verified.roles,
+          cursorContextMismatch: true, deadlineAt, limit: 1, after: null,
+        });
+      },
+      read: (verified, limit, after) => this.readPendingApprovalsProjection(verified, projectId, { limit, ...(after ? { after } : {}) }),
     });
   }
 

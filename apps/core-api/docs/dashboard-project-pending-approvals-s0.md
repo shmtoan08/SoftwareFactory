@@ -44,11 +44,12 @@ Measure the final serialized UTF-8 success body before sending headers. Exactly 
 | Condition | HTTP and code |
 | --- | --- |
 | Missing or malformed authentication transport | 401 `ERR_UNAUTHORIZED` |
-| Unverified or expired claims, role/membership denied, or signed project mismatch | 403 `ERR_FORBIDDEN_RLS` |
+| Unverified or expired claims, role/membership denied, missing project, or signed project mismatch | 403 `ERR_FORBIDDEN_RLS` |
 | Invalid route UUID, invalid limit, unsupported or duplicate query key, or invalid cursor format/size/purpose/signature | 400 `ERR_READ_QUERY_INVALID` |
-| Authorized scope with no visible project | 404 `ERR_READ_RESOURCE_NOT_FOUND` |
 | Valid cursor expired or bound to a different project, principal, or effective limit | 409 `ERR_READ_CURSOR_CONTEXT` |
 | Read, timeout, data validation, or response cap failure | 500 `ERR_READ_PROJECTION_FAILED` |
+
+A same-project token for a nonexistent project fails the membership check and receives the same 403 as a token without membership in an existing project. This route has no child resource, so there is no resource-visibility 404. [Issue #38 decision](https://github.com/shmtoan08/SoftwareFactory/issues/38#issuecomment-7184225121)
 
 ## Response examples
 

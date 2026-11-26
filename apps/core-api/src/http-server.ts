@@ -447,6 +447,16 @@ export class CoreApiHttpServer {
       const costSnapshotRead = method === "GET"
         ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/cost-session-snapshot$/) : null;
       const auth = this.requireAuth(req);
+      const pendingApprovalsRead = method === "GET"
+        ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/pending-approvals$/) : null;
+      if (pendingApprovalsRead?.[1]) {
+        let projectId = "";
+        try { projectId = decodeURIComponent(pendingApprovalsRead[1]); }
+        catch { /* The projection validates the pathname after checking auth transport. */ }
+        this.sendJsonPayload(res, 200, await this.coreApi.readPendingApprovalsProjectionBody(auth, projectId, url.searchParams));
+        return;
+      }
+
       const timelineRead = method === "GET"
         ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/timeline$/) : null;
       if (timelineRead?.[1] && timelineRead[2]) {
