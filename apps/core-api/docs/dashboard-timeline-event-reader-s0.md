@@ -428,3 +428,33 @@ PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/dao_exp
 ```
 
 [Actual DAO plans PG16](timeline-s1a-dao-pg16.json) · [Actual DAO plans PG17](timeline-s1a-dao-pg17.json)
+
+## Issue #32 S1-b applied work-bound gate
+
+Issue #33 aligned the memory `applied_at` with the end of materialization in commit `7d420c9`. Before adding the candidate rank-7 `change-request.applied` milestone, the probe measured `applied_at` and `cr_id` with the existing two-stage boundary and a 101-row SQL limit. The bound stays at 102 scanned rows per stage.
+
+The probe created disposable databases with schema through 0032. The mixed fixture has 100,000 applied CRs, including 3,000 with the same `applied_at`. The all-tied fixture has 3,000 applied CRs at one timestamp. The script creates those values using fixture transitions through the existing triggers. The measured reads use `app_runtime`, RLS, and a read-only repeatable-read transaction. Cursor anchors are drawn from the reference order at the first, second and last pages.
+
+| Fixture | Page | Stage | Rows read PG16.16 / PG17.12 | Sort input PG16.16 / PG17.12 |
+| --- | --- | --- | ---: | ---: |
+| Mixed | First | Initial | 100,000 / 100,000 | 100,000 / 100,000 |
+| Mixed | Second | Equal timestamp | 3,772 / 3,547 | none / none |
+| Mixed | Second | Older | 100,000 / 100,000 | 97,000 / 97,000 |
+| Mixed | Last | Equal timestamp | 58,074 / 100,000 | 0 / 0 |
+| Mixed | Last | Older | 100,000 / 100,000 | 100 / 100 |
+| All tied | First | Initial | 3,000 / 3,000 | 3,000 / 3,000 |
+| All tied | Second | Equal timestamp | 2,900 / 2,900 | 2,900 / 2,900 |
+| All tied | Second | Older | 3,000 / 3,000 | 0 / 0 |
+| All tied | Last | Equal timestamp | 100 / 100 | 100 / 100 |
+| All tied | Last | Older | 3,000 / 3,000 | 0 / 0 |
+
+**Stopped.** One of ten stages passed on each version, and each run exited 1. Existing CR indexes order by submission or decision time. The measured plans could not bound reads in applied time under the locked query shape. The rank-7 milestone and S1-b route remain deferred. No index, schema, apply write-path, or DAO changes are included in this slice.
+
+Reproduce from the repository root using the same Docker versions as the S1-a probe.
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/applied_bound.py 16 /tmp/timeline-applied-pg16.json
+PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/applied_bound.py 17 /tmp/timeline-applied-pg17.json
+```
+
+[Actual PG16 EXPLAIN JSON](timeline-s1b-applied-pg16.json) · [Actual PG17 EXPLAIN JSON](timeline-s1b-applied-pg17.json)
