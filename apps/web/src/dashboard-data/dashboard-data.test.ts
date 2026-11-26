@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { CoreApiHttpServer, CoreApiService, encodeCoreApiAuthHeader } from "@software-factory/core-api";
+import { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
 import { DashboardClient } from "./client.ts";
-import { mapBudgetSnapshot, mapCostSessionSnapshot, mapProjectDetail, mapSessions, mapSessionTasks } from "./mapping.ts";
+import { mapBudgetSnapshot, mapCostSessionSnapshot, mapProjectDetail, mapSessions, mapSessionTasks, mapTimeline } from "./mapping.ts";
 
 const projectId = "10000000-0000-0000-0000-000000000001";
 const sessionId = "20000000-0000-0000-0000-000000000001";
@@ -361,5 +363,111 @@ test("cost snapshot reader uses the exact S0 DTO, guards scope and rejects extra
     { ...dto, costSession: { ...cost, cost_session_id: null } },
   ]) {
     assert.throws(() => mapCostSessionSnapshot(invalid, projectId, sessionId), /Invalid dashboard response field/);
+  }
+});
+
+const timelineItems = [
+  { type: "change-request.applied", details: {} },
+  { type: "change-request.decided", details: {} },
+  { type: "change-request.submitted", details: {} },
+  { type: "baseline.frozen", details: {} },
+  { type: "gate.decided", details: { decision: "REJECTED", targetArtifactId: sessionId, targetArtifactSha256: "b".repeat(64) } },
+  { type: "artifact.recorded", details: { artifactSha256: "b".repeat(64) } },
+  { type: "session.created", details: {} },
+].map((item) => ({ ...item, recordedAt: fetchedAt, resourceId: sessionId }));
+
+const timelineDto = {
+  schemaVersion: "timeline-v1", fetchedAt,
+  scope: { kind: "project-token", projectId, pipelineSessionId: sessionId },
+  items: timelineItems, page: { limit: 20, hasMore: false, nextCursor: null },
+};
+
+test("timeline maps all seven S0 milestones and preserves server order and microseconds", () => {
+  assert.deepEqual(mapTimeline(timelineDto, projectId, sessionId), timelineDto);
+  assert.deepEqual(mapTimeline({ ...timelineDto, items: [] }, projectId, sessionId).items, []);
+});
+
+test("timeline request is scoped to the configured project and serializes only limit and opaque cursor", async () => {
+  const foreignProject = "10000000-0000-0000-0000-000000000002";
+  const opaque = "part-one._-+part-two=";
+  const path = `/api/v1/projects/${projectId}/pipeline-sessions/${sessionId}/timeline`;
+  const seen: string[][][] = [];
+  const api = new DashboardClient({
+    baseUrl: "https://core.example",
+    projectId, authToken: "signed-token", timeoutMs: 1000,
+    fetch: async (input, init) => {
+      const url = new URL(String(input));
+      assert.equal(url.pathname, path);
+      assert.equal(init?.method, "GET");
+      assert.equal(new Headers(init?.headers).get("x-sf-auth-token"), "signed-token");
+      seen.push([...url.searchParams]);
+      return Response.json(timelineDto);
+    },
+  });
+  const extra = { projectId: foreignProject, stage: "READY", limit: 20, cursor: opaque };
+  const withCursor = await api.listTimeline(sessionId, extra);
+  assert.equal(withCursor.kind, "ok");
+  assert.equal((await api.listTimeline(sessionId)).kind, "ok");
+  assert.deepEqual(seen, [[["limit", "20"], ["cursor", opaque]], []]);
+});
+
+test("timeline contract errors reject the entire page, including preceding valid items", async () => {
+  const invalidItems = [
+    { ...timelineItems[0], type: "task.created" },
+    { ...timelineItems[0], recordedAt: undefined },
+    { ...timelineItems[0], actorId: "forbidden" },
+    { ...timelineItems[0], details: { rationale: "forbidden" } },
+    { ...timelineItems[4], details: { ...timelineItems[4]!.details, targetArtifactId: undefined } },
+    { ...timelineItems[4], details: { ...timelineItems[4]!.details, taskId: "forbidden" } },
+    { ...timelineItems[5], details: { artifactSha256: "not-a-sha" } },
+  ];
+  const invalidPages = [
+    ...invalidItems.map((item) => ({ ...timelineDto, items: [timelineItems[0], item] })),
+    { ...timelineDto, injected: true },
+    { ...timelineDto, scope: { ...timelineDto.scope, pipelineSessionId: undefined } },
+    { ...timelineDto, scope: { ...timelineDto.scope, projectId: sessionId } },
+    { ...timelineDto, page: { ...timelineDto.page, totalCount: 7 } },
+  ];
+  for (const badPage of invalidPages) {
+    const result = await client(async () => Response.json(badPage)).listTimeline(sessionId);
+    assert.equal(result.kind, "error");
+    assert.ok(!("data" in result));
+    if (result.kind === "error") assert.equal(result.error.kind, "data");
+  }
+});
+
+test("timeline client and live Core API enforce signed project scope", async () => {
+  const otherProject = "10000000-0000-0000-0000-000000000002";
+  const otherSession = "20000000-0000-0000-0000-000000000002";
+  const store = new SoftwareFactoryControlPlaneStore();
+  for (const [project, session] of [[projectId, sessionId], [otherProject, otherSession]] as const) {
+    await store.withRlsTransaction({ currentRole: "system_admin_role", currentProjectId: project }, async () => {
+      await store.createProject({ project_id: project, slug: project, name: "Fixture",
+        repo_bare_path: "/fixture", initial_main_commit_hash: "a".repeat(40) });
+      await store.addProjectMembership({ project_id: project, principal_id: "auditor", member_role: "AUDITOR" });
+    });
+    await store.withRlsTransaction({ currentRole: "core_api_service", currentProjectId: project }, async () => {
+      await store.createProductPipelineSession({ pipeline_session_id: session, project_id: project,
+        title: "Fixture", raw_idea_text: "excluded", created_by_principal_id: "auditor" });
+    });
+  }
+  const core = new CoreApiService(store);
+  const authToken = encodeCoreApiAuthHeader(core.issueAuthContext({ projectId, principalId: "auditor", roles: ["AUDITOR"] }));
+  const server = new CoreApiHttpServer({ coreApi: core });
+  const { baseUrl } = await server.start();
+  try {
+    const api = new DashboardClient({ baseUrl, projectId, authToken, timeoutMs: 1000 });
+    const valid = await api.listTimeline(sessionId);
+    assert.equal(valid.kind, "ok");
+    if (valid.kind === "ok") assert.deepEqual(valid.data.items.map((item) => item.type), ["session.created"]);
+    const foreignSession = await api.listTimeline(otherSession);
+    assert.equal(foreignSession.kind, "error");
+    if (foreignSession.kind === "error") assert.deepEqual(foreignSession.error, { kind: "not-found", status: 404 });
+    const mismatched = await new DashboardClient({ baseUrl, projectId: otherProject, authToken, timeoutMs: 1000 })
+      .listTimeline(otherSession);
+    assert.equal(mismatched.kind, "error");
+    if (mismatched.kind === "error") assert.deepEqual(mismatched.error, { kind: "access-denied", status: 403 });
+  } finally {
+    await server.stop();
   }
 });

@@ -643,7 +643,7 @@ test("Cost session usage follows the Issue #25 envelope, attribution, integer ma
   }
 });
 
-test("Issues #29–31 share selected-session readers, preserve bindings and group recorded facts", async (t) => {
+test("Issues #29–30 share selected-session readers and preserve bindings", async (t) => {
   const id = "10000000-0000-0000-0000-000000000029";
   const selectedId = "20000000-0000-0000-0000-000000000029";
   const foreignSession = "20000000-0000-0000-0000-000000000030";
@@ -654,7 +654,6 @@ test("Issues #29–31 share selected-session readers, preserve bindings and grou
   const crPath = `${bundlePath}/change-requests`;
   const budgetPath = `${corePath}/budget-snapshot`;
   const taskPath = `${corePath}/sessions/${selectedId}/tasks`;
-  const costId = "40000000-0000-0000-0000-000000000031";
   const taskId = "50000000-0000-0000-0000-000000000031";
   const projectPath = `/projects/${id}`;
   const identity = { project_id: id, pipeline_session_id: selectedId };
@@ -670,8 +669,7 @@ test("Issues #29–31 share selected-session readers, preserve bindings and grou
     decision: "APPROVED", rationale: "A note <script>", approver_principal_id: "principal-one", decided_at: stamp,
   };
   const bundle = {
-    session: { ...identity, created_at: stamp, cost_session_id: costId },
-    costSession: { ...identity, cost_session_id: costId, updated_at: "2026-11-23T00:00:00.000Z" },
+    session: identity,
     artifacts: [
       { ...artifactMetadata, artifact_id: oldId, artifact_sha256: latestHash, content_json: { hidden: "Private artifact content" } },
       { ...artifactMetadata, artifact_id: exactId, artifact_sha256: exactHash, content_json: {} },
@@ -778,7 +776,6 @@ test("Issues #29–31 share selected-session readers, preserve bindings and grou
         });
         holdBundle = undefined;
         assert.equal(independent, true);
-        assert.match(response.body, /id="timeline-loading" data-state="loading"[\s\S]*?Not a complete audit trail/);
         assert.match(response.body, /id="evidence-loading" data-state="loading"/);
         assert.match(response.body, /id="approval-decisions-loading" data-state="loading"/);
         assert.match(response.body, /id="change-requests-loading" data-state="loading"/);
@@ -887,54 +884,6 @@ test("Issues #29–31 share selected-session readers, preserve bindings and grou
           if (status === 200 && Array.isArray(artifacts) && artifacts.length === 2) assert.match(evidence, /gate-rejected/);
           assert.doesNotMatch(evidence, /Private artifact content/);
         }
-      });
-
-      function timeline(html: string) {
-        const body = html.split('<section id="timeline-result"')[1]?.split("</section>").slice(0, 2);
-        assert.ok(body && body.length === 2);
-        const [session, project] = body;
-        assert.match(session!, /Not a complete audit trail; assembled from separate snapshots, no global ordering\./);
-        assert.doesNotMatch(body.join(""), /<form|<button|<a |<script|setInterval|setTimeout|WebSocket|EventSource/i);
-        return { session: session!, project: project! };
-      }
-
-      await t.test("Issue #31 groups named facts and reuses each reader once", async () => {
-        bundleStatus = crStatus = 200;
-        bundleBody = bundle;
-        crBody = requests;
-        const from = calls.length;
-        const first = timeline((await read()).body);
-        assert.match(first.session, /sorted by recorded timestamp, sources independent/);
-        assert.match(first.session, /Session scope[\s\S]*Cost session record updated[\s\S]*Artifact recorded[\s\S]*Gate decision recorded[\s\S]*Session created[\s\S]*P3 task page[\s\S]*Task created[\s\S]*Task record updated[\s\S]*R0 change requests[\s\S]*Change request created/);
-        assert.match(first.session, /<dt>Nguồn<\/dt><dd>P3 task page<\/dd><dt>Tải lúc<\/dt><dd>[^<]+<\/dd>/);
-        assert.doesNotMatch(first.session, /Project budget snapshot|gate-missing|Private ledger/);
-        assert.match(first.project, /Project scope[\s\S]*Project budget snapshot/);
-        assert.ok(first.project.includes(stamp));
-        for (const path of [budgetPath, taskPath, crPath, bundlePath]) {
-          assert.deepEqual(calls.slice(from).filter((call) => call.path === path), [{ method: "GET", path }]);
-        }
-        bundleBody = { ...bundle, costSession: { ...bundle.costSession, pipeline_session_id: foreignSession } };
-        const foreign = timeline((await read()).body);
-        assert.ok(!foreign.session.includes(costId) && !foreign.project.includes(costId));
-        bundleBody = { ...bundle, costSession: { ...bundle.costSession, pipeline_session_id: null } };
-        const unbound = timeline((await read()).body);
-        assert.ok(!unbound.session.includes(costId) && unbound.project.includes(costId));
-      });
-
-      await t.test("Issue #31 keeps scope and banner when sources are empty, incomplete or fail", async () => {
-        const unselected = timeline((await read("")).body);
-        assert.match(unselected.session, /Chưa chọn session/);
-        assert.match(unselected.project, /Project budget snapshot/);
-        bundleBody = { ...bundle, session: identity, costSession: null, approvalGates: [], artifacts: [] };
-        crBody = { change_requests: [] };
-        const missing = timeline((await read()).body);
-        assert.match(missing.session, /Unsupported[\s\S]*Không có activity fact/);
-        assert.doesNotMatch(missing.session, /Session created/);
-        bundleStatus = 403;
-        crStatus = 500;
-        const failed = timeline((await read()).body);
-        assert.match(failed.session, /R0 bundle[\s\S]*Bạn không có quyền truy cập[\s\S]*P3 task page[\s\S]*R0 change requests[\s\S]*Không tải được nguồn này/);
-        assert.match(failed.project, /Project budget snapshot/);
       });
 
       assert.ok(calls.every(({ method, path }) => method === "GET" && !/approval-center|lineage|production-deployments/.test(path)));

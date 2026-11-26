@@ -394,36 +394,6 @@ export function mapApprovalDecisions(value: unknown, projectId: string, sessionI
 export const ARTIFACT_ROW_LIMIT = 50;
 const ARTIFACT_PREVIEW_LIMIT = 4096;
 
-// R0 keeps its original timestamp precision. P2/P3 use the canonical projection format.
-export function recordedTimestamp(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  try {
-    timestamp(value.replace(/(\.\d{3})Z$/, (_, fraction: string) => fraction + "000Z"), "recorded timestamp");
-    return value;
-  } catch (error) {
-    if (!(error instanceof DashboardDataError)) throw error;
-    return null;
-  }
-}
-
-function mapRecordedCost(value: unknown, projectId: string, sessionId: string, linkedId: unknown) {
-  if (value === null) return null;
-  try {
-    const cost = record(value, "bundle costSession");
-    scope(cost.project_id, projectId, "costSession.project_id");
-    const id = requireId(cost.cost_session_id, "cost_session_id");
-    if (cost.pipeline_session_id !== null && cost.pipeline_session_id !== sessionId) return null;
-    if (id !== linkedId) throw new DashboardDataError("cost_session_id");
-    return {
-      id, sessionId: cost.pipeline_session_id,
-      updatedAt: recordedTimestamp(cost.updated_at),
-    };
-  } catch (error) {
-    if (!(error instanceof DashboardDataError)) throw error;
-    return undefined;
-  }
-}
-
 export function mapApprovalEvidence(value: unknown, projectId: string, sessionId: string) {
   const bundle = record(value, "pipeline bundle");
   const session = record(bundle.session, "session");
@@ -454,7 +424,7 @@ export function mapApprovalEvidence(value: unknown, projectId: string, sessionId
           "STAGE_1_IDEA_DISCOVERY", "STAGE_2_REQUIREMENTS", "STAGE_3_ARCHITECTURE", "STAGE_4_SPEC_FREEZE");
         const content = JSON.stringify(record(artifact.content_json, "content_json"));
         return {
-          id, hash, kind, stage, createdAt: recordedTimestamp(artifact.created_at),
+          id, hash, kind, stage,
           preview: content.slice(0, ARTIFACT_PREVIEW_LIMIT),
           truncated: content.length > ARTIFACT_PREVIEW_LIMIT,
           gates: approvals?.decisions.filter((gate) => gate.targetArtifactId === id && gate.targetArtifactHash === hash)
@@ -466,11 +436,7 @@ export function mapApprovalEvidence(value: unknown, projectId: string, sessionId
       }
     }),
   };
-  return {
-    approvals, evidence,
-    session: { id: sessionId, createdAt: recordedTimestamp(session.created_at) },
-    cost: mapRecordedCost(bundle.costSession, projectId, sessionId, session.cost_session_id),
-  };
+  return { approvals, evidence };
 }
 
 export function mapApprovalChangeRequests(value: unknown, projectId: string, sessionId: string) {
@@ -485,8 +451,81 @@ export function mapApprovalChangeRequests(value: unknown, projectId: string, ses
       key: string(cr.cr_key, "cr_key"),
       hash: artifactHash(cr.cr_sha256, "cr_sha256"),
       title: string(cr.title, "title"),
-      createdAt: recordedTimestamp(cr.created_at),
       status: literal(cr.status, "status", "PENDING_APPROVAL", "APPROVED", "REJECTED", "APPLIED"),
     };
   }) };
+}
+
+// Timeline-v1 allowlist comes from the Timeline reader S0 contract.
+const timelineTypes = [
+  "session.created", "artifact.recorded", "gate.decided", "baseline.frozen",
+  "change-request.submitted", "change-request.decided", "change-request.applied",
+] as const;
+type TimelineType = typeof timelineTypes[number];
+type TimelineDecision = "APPROVED" | "REJECTED" | "REQUEST_CHANGES";
+
+export type TimelineItemDto = { recordedAt: string; resourceId: string } & (
+  | { type: "artifact.recorded"; details: { artifactSha256: string } }
+  | { type: "gate.decided"; details: { decision: TimelineDecision; targetArtifactId: string; targetArtifactSha256: string } }
+  | { type: Exclude<TimelineType, "artifact.recorded" | "gate.decided">; details: Record<string, never> }
+);
+
+export interface TimelineDto {
+  schemaVersion: "timeline-v1";
+  fetchedAt: string;
+  scope: { kind: "project-token"; projectId: string; pipelineSessionId: string };
+  items: TimelineItemDto[];
+  page: ReturnType<typeof page>;
+}
+
+function timelineItem(value: unknown): TimelineItemDto {
+  const dto = record(value, "timeline item");
+  exactKeys(dto, "timeline item", ["type", "recordedAt", "resourceId", "details"]);
+  const type = literal(dto.type, "timeline item.type", ...timelineTypes);
+  const identity = {
+    recordedAt: timestamp(dto.recordedAt, "timeline item.recordedAt"),
+    resourceId: requireId(dto.resourceId, "timeline item.resourceId"),
+  };
+  const details = record(dto.details, "timeline item.details");
+  switch (type) {
+    case "artifact.recorded":
+      exactKeys(details, "artifact details", ["artifactSha256"]);
+      return { ...identity, type, details: { artifactSha256: artifactHash(details.artifactSha256, "artifactSha256") } };
+    case "gate.decided":
+      exactKeys(details, "gate details", ["decision", "targetArtifactId", "targetArtifactSha256"]);
+      return { ...identity, type, details: {
+        decision: literal(details.decision, "decision", "APPROVED", "REJECTED", "REQUEST_CHANGES"),
+        targetArtifactId: requireId(details.targetArtifactId, "targetArtifactId"),
+        targetArtifactSha256: artifactHash(details.targetArtifactSha256, "targetArtifactSha256"),
+      } };
+    default:
+      exactKeys(details, "timeline item.details", []);
+      return { ...identity, type, details: {} };
+  }
+}
+
+export function mapTimeline(value: unknown, projectId: string, pipelineSessionId: string): TimelineDto {
+  const dto = record(value, "timeline");
+  exactKeys(dto, "timeline", ["schemaVersion", "fetchedAt", "scope", "items", "page"]);
+  const source = record(dto.scope, "scope");
+  exactKeys(source, "scope", ["kind", "projectId", "pipelineSessionId"]);
+  const paging = record(dto.page, "page");
+  exactKeys(paging, "page", ["limit", "hasMore", "nextCursor"]);
+  const pagination = page(paging);
+  const items = list(dto.items, "items").map(timelineItem);
+  if (items.length > pagination.limit || (pagination.hasMore && items.length !== pagination.limit)
+    || (pagination.nextCursor !== null && Buffer.byteLength(pagination.nextCursor) > 2048)) {
+    throw new DashboardDataError("timeline page");
+  }
+  return {
+    schemaVersion: literal(dto.schemaVersion, "schemaVersion", "timeline-v1"),
+    fetchedAt: timestamp(dto.fetchedAt, "fetchedAt"),
+    scope: {
+      kind: literal(source.kind, "scope.kind", "project-token"),
+      projectId: scope(source.projectId, projectId, "scope.projectId"),
+      pipelineSessionId: scope(source.pipelineSessionId, pipelineSessionId, "scope.pipelineSessionId"),
+    },
+    items,
+    page: pagination,
+  };
 }

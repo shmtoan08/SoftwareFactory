@@ -12,6 +12,7 @@ import {
   mapTaskAssignment,
   mapTaskDispatches,
   mapSessions,
+  mapTimeline,
   requireId,
 } from "./mapping.ts";
 
@@ -160,6 +161,15 @@ export class DashboardClient {
       undefined,
       (data) => data.costSession === null,
     );
+  }
+
+  listTimeline(pipelineSessionId: string, options: PageOptions = {}) {
+    const { projectId } = this.options;
+    const sessionId = requireId(pipelineSessionId, "pipelineSessionId");
+    const endpoint = `${this.projectEndpoint}/pipeline-sessions/${encodeURIComponent(sessionId)}/timeline`;
+    return this.get({ endpoint, projectId, sessionId },
+      (dto) => mapTimeline(dto, projectId, sessionId),
+      pageQuery(options), (data) => data.items.length === 0);
   }
 
   getApprovalEvidence(pipelineSessionId: string) {
