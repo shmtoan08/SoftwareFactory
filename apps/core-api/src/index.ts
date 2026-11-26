@@ -486,6 +486,10 @@ export class CoreApiService {
     return this.timelineReads.read(auth, projectId, pipelineSessionId, query);
   }
 
+  public async readTimelineProjectionBody(auth: CoreApiAuthContext | null, projectId: string, pipelineSessionId: string, query: URLSearchParams): Promise<Buffer> {
+    return (await this.timelineReads.readEncoded(auth, projectId, pipelineSessionId, query)).payload;
+  }
+
   public readSessionProjection(auth: CoreApiAuthContext, projectId: string, query = new URLSearchParams()) {
     return this.sessionReads.read(auth, projectId, query);
   }

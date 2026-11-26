@@ -447,6 +447,19 @@ export class CoreApiHttpServer {
       const costSnapshotRead = method === "GET"
         ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/cost-session-snapshot$/) : null;
       const auth = this.requireAuth(req);
+      const timelineRead = method === "GET"
+        ? pathname.match(/^\/api\/v1\/projects\/([^/]+)\/pipeline-sessions\/([^/]+)\/timeline$/) : null;
+      if (timelineRead?.[1] && timelineRead[2]) {
+        const decodeId = (segment: string): string => {
+          try { return decodeURIComponent(segment); }
+          catch { return ""; }
+        };
+        this.sendJsonPayload(res, 200, await this.coreApi.readTimelineProjectionBody(
+          auth, decodeId(timelineRead[1]), decodeId(timelineRead[2]), url.searchParams,
+        ));
+        return;
+      }
+
       if (!auth) {
         if (sessionRead || costSnapshotRead) throw new ReadProjectionError(401, "ERR_UNAUTHORIZED");
         this.sendJson(res, 401, {

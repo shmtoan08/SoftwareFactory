@@ -84,6 +84,10 @@ export class TimelineReadProjectionService {
   }
 
   async read(auth: CoreApiAuthContext | null, projectId: string, pipelineSessionId: string, query: URLSearchParams) {
+    return (await this.readEncoded(auth, projectId, pipelineSessionId, query)).result;
+  }
+
+  async readEncoded(auth: CoreApiAuthContext | null, projectId: string, pipelineSessionId: string, query: URLSearchParams) {
     const deadlineAt = Date.now() + 5000;
     if (!auth) throw new ReadProjectionError(401, "ERR_UNAUTHORIZED");
     let verified: CoreApiAuthContext;
@@ -127,8 +131,9 @@ export class TimelineReadProjectionService {
         items,
         page: { limit, hasMore, nextCursor: hasMore ? this.cursor.encode(context, timelineAnchor(items[items.length - 1]!)) : null },
       };
-      if (Date.now() >= deadlineAt || Buffer.byteLength(JSON.stringify(result)) > 1048576) throw new Error("Read response bound exceeded");
-      return result;
+      const payload = Buffer.from(JSON.stringify(result), "utf8");
+      if (Date.now() >= deadlineAt || payload.length > 1048576) throw new Error("Read response bound exceeded");
+      return { result, payload };
     } catch (error) {
       if (error instanceof ProjectReadCursorContextError) throw new ReadProjectionError(409, "ERR_READ_CURSOR_CONTEXT");
       if (error instanceof PostgresRlsError && error.sqlState === "42501") throw forbidden();

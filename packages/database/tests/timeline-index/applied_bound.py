@@ -25,7 +25,7 @@ def assert_index(db):
     return definition
 
 
-def measure_applied(db, report, label, scope, requests, pending=0):
+def mark_applied(db, scope):
     project, session, _ = map(probe.quoting, probe.scope(scope))
     db.query(f"""UPDATE change_requests
         SET status='APPLIED', applied_by_principal_id='fixture',
@@ -33,6 +33,11 @@ def measure_applied(db, report, label, scope, requests, pending=0):
                 THEN '{TIE_TIME}'::timestamptz ELSE decided_at + interval '1 second' END
         WHERE project_id={project} AND pipeline_session_id={session} AND status='APPROVED';
         ANALYZE change_requests""")
+
+
+def measure_applied(db, report, label, scope, requests, pending=0):
+    mark_applied(db, scope)
+    project, session, _ = map(probe.quoting, probe.scope(scope))
     probe.read_scope(db, scope)
     source = probe.base(APPLIED, scope)
     total, tied = map(int, db.query(f"""SELECT count(*),

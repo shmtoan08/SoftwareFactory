@@ -8,6 +8,7 @@ import subprocess
 import time
 
 import probe
+from applied_bound import APPLIED, mark_applied
 import work_bound as work
 
 DAO_QUERIES = """import fs from 'node:fs';
@@ -19,8 +20,9 @@ console.log(JSON.stringify(inputs.map(timelineQueries)));
 
 def explain_fixture(db, report, label, scope, artifacts, requests):
     probe.seed(db, scope, artifacts, requests, 3000, submitted_ties=3000)
+    mark_applied(db, scope)
     probe.read_scope(db, scope)
-    sources = ' UNION ALL '.join(probe.base(branch, scope) for branch in work.BRANCHES)
+    sources = ' UNION ALL '.join(probe.base(branch, scope) for branch in (*work.BRANCHES, APPLIED))
     cases = work.cursor_cases(db, sources)
     cases.extend(
         (f'submitted-{name}', boundary)

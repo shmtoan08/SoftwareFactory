@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CoreApiService, CoreApiTokenAuthenticator } from "@software-factory/core-api";
+import {
+  CORE_API_AUTH_HEADER, CoreApiHttpServer, CoreApiService, CoreApiTokenAuthenticator,
+  encodeCoreApiAuthHeader, type CoreApiAuthContext,
+} from "@software-factory/core-api";
 import {
   buildPostgresPoolConfigFromEnv, PostgresControlPlaneRepository, PostgresRuntimePool,
   SoftwareFactoryControlPlaneStore, timelineAnchor, type TimelineItem,
@@ -63,13 +66,68 @@ test("timeline service enforces authentication, query and cursor context before 
   await assert.rejects(read(`cursor=${wrongPurpose}`), { httpStatus: 400 });
 });
 
+type TimelinePage = Awaited<ReturnType<CoreApiService["readTimelineProjection"]>>;
+
+function timelinePath(project: string, session: string): string {
+  return `/api/v1/projects/${project}/pipeline-sessions/${session}/timeline`;
+}
+
+function request(baseUrl: string, project: string, session: string, auth?: CoreApiAuthContext | string, query = "") {
+  const headers: Record<string, string> = auth === undefined ? {} : {
+    [CORE_API_AUTH_HEADER]: typeof auth === "string" ? auth : encodeCoreApiAuthHeader(auth),
+  };
+  return fetch(baseUrl + timelinePath(project, session) + query, { headers });
+}
+
+async function assertHttpError(response: Response, status: number, code: string) {
+  assert.equal(response.status, status);
+  assert.deepEqual(await response.json(), { error_code: code });
+}
+
+test("timeline HTTP response cap accepts exactly 1 MiB and rejects one extra UTF-8 byte", async (t) => {
+  const store = new SoftwareFactoryControlPlaneStore();
+  const core = new CoreApiService(store);
+  const auth = core.issueAuthContext({ projectId, principalId, roles: ["AUDITOR"] });
+  const stamp = "2026-11-26T00:00:00.123456Z";
+  const details = { artifactSha256: "é" };
+  const item: TimelineItem = { type: "artifact.recorded", recordedAt: stamp, resourceId: scopeId(3, 1), details };
+  // Production details are fixed-size. Inject a larger DAO row to exercise the transport safety cap.
+  const expected = {
+    schemaVersion: "timeline-v1", fetchedAt: stamp,
+    scope: { kind: "project-token", projectId, pipelineSessionId },
+    items: [item], page: { limit: 20, hasMore: false, nextCursor: null },
+  };
+  const cap = 1024 * 1024;
+  details.artifactSha256 += "x".repeat(cap - Buffer.byteLength(JSON.stringify(expected)));
+  t.mock.method(store, "readTimelineProjection", async () => ({ fetchedAt: stamp, items: [item] }));
+  const server = new CoreApiHttpServer({ coreApi: core });
+  const { baseUrl } = await server.start();
+  try {
+    const exact = await request(baseUrl, projectId, pipelineSessionId, auth);
+    assert.equal(exact.status, 200);
+    assert.equal(exact.headers.get("content-length"), String(cap));
+    assert.equal(await exact.text(), JSON.stringify(expected));
+    details.artifactSha256 += "x";
+    assert.equal(Buffer.byteLength(JSON.stringify(expected)), cap + 1);
+    await assertHttpError(await request(baseUrl, projectId, pipelineSessionId, auth), 500, "ERR_READ_PROJECTION_FAILED");
+  } finally {
+    await server.stop();
+  }
+});
+
 const fixture = process.env.TIMELINE_DAO_FIXTURES === "1" ? buildPostgresPoolConfigFromEnv() : null;
 
-test("PostgreSQL timeline DAO walks the complete 3,000-tie fixture with signed page cursors", { skip: !fixture }, async () => {
+test("PostgreSQL timeline HTTP route walks seven milestones and enforces the full error table", { skip: !fixture }, async (t) => {
   const pool = new PostgresRuntimePool(fixture!);
+  const repo = new PostgresControlPlaneRepository(pool);
+  const authenticator = new CoreApiTokenAuthenticator();
+  const core = new CoreApiService(repo, { authenticator });
+  const server = new CoreApiHttpServer({ coreApi: core });
   try {
+    const { baseUrl } = await server.start();
     const project = scopeId(1, 2), session = scopeId(2, 2);
-    const core = new CoreApiService(new PostgresControlPlaneRepository(pool));
+    const read = (query = "", token: CoreApiAuthContext | string = auth, projectPath = project, sessionPath = session) =>
+      request(baseUrl, projectPath, sessionPath, token, query);
     const auth = core.issueAuthContext({ projectId: project, principalId, roles: ["AUDITOR"] });
     const reference = await pool.withReadOnlyRlsTransaction(
       { currentProjectId: project, currentPrincipalId: principalId, currentRole: "core_api_service" },
@@ -84,16 +142,20 @@ test("PostgreSQL timeline DAO walks the complete 3,000-tie fixture with signed p
            UNION ALL SELECT 5,'change-request.submitted',created_at,cr_id FROM change_requests WHERE project_id=$1 AND pipeline_session_id=$2
            UNION ALL SELECT 6,'change-request.decided',decided_at,cr_id FROM change_requests
              WHERE project_id=$1 AND pipeline_session_id=$2 AND decided_at IS NOT NULL
+           UNION ALL SELECT 7,'change-request.applied',applied_at,cr_id FROM change_requests
+             WHERE project_id=$1 AND pipeline_session_id=$2 AND applied_at IS NOT NULL
          ) AS expected ORDER BY ts DESC, rank DESC, id DESC`, [project, session])).rows,
     );
-    assert.equal(reference.length, 6009);
+    assert.equal(reference.length, 9009);
     let cursor: string | null = null;
     let pages = 0;
     const seen = [];
     do {
       const query = new URLSearchParams({ limit: "100" });
       if (cursor) query.set("cursor", cursor);
-      const result = await core.readTimelineProjection(auth, project, session, query);
+      const response = await read(`?${query}`);
+      assert.equal(response.status, 200);
+      const result = await response.json() as TimelinePage;
       assert.deepEqual(result.scope, { kind: "project-token", projectId: project, pipelineSessionId: session });
       for (const item of result.items) {
         assert.deepEqual(Object.keys(item).sort(), ["details", "recordedAt", "resourceId", "type"]);
@@ -104,12 +166,63 @@ test("PostgreSQL timeline DAO walks the complete 3,000-tie fixture with signed p
       }
       cursor = result.page.nextCursor;
       assert.equal(result.page.hasMore, cursor !== null);
-      assert.ok(++pages <= 61);
+      assert.ok(++pages <= 91);
     } while (cursor);
     assert.deepEqual(seen, reference);
-    assert.equal(pages, 61);
-    await assert.rejects(core.readTimelineProjection(auth, project, pipelineSessionId), { httpStatus: 404 });
+    assert.equal(pages, 91);
+    assert.equal(new Set(seen.map((row) => row.type)).size, 7);
+    assert.equal(seen.filter((row) => row.type === "change-request.applied").length, 3000);
+
+    await assertHttpError(await request(baseUrl, project, session), 401, "ERR_UNAUTHORIZED");
+    await assertHttpError(await read("", "malformed-transport"), 401, "ERR_UNAUTHORIZED");
+    const forged = { ...auth, signatureHex: "0".repeat(64) };
+    await assertHttpError(await read("", forged), 403, "ERR_FORBIDDEN_RLS");
+    const unlisted = core.issueAuthContext({ projectId: project, principalId: "unlisted", roles: ["AUDITOR"] });
+    await assertHttpError(await read("", unlisted), 403, "ERR_FORBIDDEN_RLS");
+    await assertHttpError(await read("", auth, projectId, pipelineSessionId), 403, "ERR_FORBIDDEN_RLS");
+    for (const id of [pipelineSessionId, scopeId(2, 99)]) {
+      await assertHttpError(await read("", auth, project, id), 404, "ERR_READ_RESOURCE_NOT_FOUND");
+    }
+    for (const query of ["?limit=0", "?limit=101", "?stage=READY", "?unsupported=1", "?limit=1&limit=2",
+      "?cursor=malformed", "?cursor=a&cursor=b", `?cursor=${"a".repeat(2049)}`]) {
+      await assertHttpError(await read(query), 400, "ERR_READ_QUERY_INVALID");
+    }
+    await assertHttpError(await read("", auth, project, "%ZZ"), 400, "ERR_READ_QUERY_INVALID");
+    const first = await read("?limit=1");
+    assert.equal(first.status, 200);
+    const page = await first.json() as TimelinePage;
+    assert.equal(page.items.length, 1);
+    assert.ok(page.page.nextCursor);
+    const issued = page.page.nextCursor;
+    await assertHttpError(await read(`?limit=2&cursor=${issued}`), 409, "ERR_READ_CURSOR_CONTEXT");
+    await assertHttpError(await read(`?limit=1&cursor=${issued.slice(0, -1)}${issued.endsWith("0") ? "1" : "0"}`),
+      400, "ERR_READ_QUERY_INVALID");
+    const mac = (data: string) => authenticator.signTimelineReadCursor(data);
+    const context = { projectId: project, pipelineSessionId: session, principalId, limit: 1 };
+    const anchor = timelineAnchor(page.items[0]!);
+    const expired = new TimelineReadCursorCodec(mac, () => Date.now() - 900_001).encode(context, anchor);
+    const otherSession = new TimelineReadCursorCodec(mac).encode({ ...context, pipelineSessionId }, anchor);
+    for (const token of [expired, otherSession]) {
+      await assertHttpError(await read(`?limit=1&cursor=${token}`), 409, "ERR_READ_CURSOR_CONTEXT");
+    }
+    const defaultPage = await read();
+    assert.equal(defaultPage.status, 200);
+    assert.equal((await defaultPage.json() as TimelinePage).page.limit, 20);
+
+    const boundary = reference.at(-1)!;
+    const end = new TimelineReadCursorCodec(mac).encode(context, timelineAnchor({
+      type: boundary.type, recordedAt: boundary.recorded_at, resourceId: boundary.resource_id, details: {},
+    }));
+    const exhausted = await read(`?limit=1&cursor=${end}`);
+    assert.equal(exhausted.status, 200);
+    const exhaustedBody = await exhausted.json() as TimelinePage;
+    assert.deepEqual(exhaustedBody.items, []);
+    assert.deepEqual(exhaustedBody.page, { limit: 1, hasMore: false, nextCursor: null });
+
+    t.mock.method(repo, "readTimelineProjection", async () => { throw new Error("private database failure"); });
+    await assertHttpError(await read(), 500, "ERR_READ_PROJECTION_FAILED");
   } finally {
+    await server.stop();
     await pool.close();
   }
 });
