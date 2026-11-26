@@ -1,3 +1,6 @@
+import { assertTimelineReadInput, compareTimeline, timelineAnchor, timelineItem,
+  type TimelineReadInput, type TimelineReadRows, type TimelineItem } from "./timeline-read-projection.ts";
+export * from "./timeline-read-projection.ts";
 import { mapCostSessionProjection, type CostSessionReadInput, type CostSessionReadRows } from "./cost-session-read-projection.ts";
 export { COST_SESSION_READ_UUID } from "./cost-session-read-projection.ts";
 import { assertSessionReadInput, sessionReadRow, type SessionReadInput, type SessionReadRows } from "./session-read-projection.ts";
@@ -579,6 +582,52 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       createdAt: readTimestamp(project.created_at), updatedAt: readTimestamp(project.updated_at) };
     const beforeAnchor = !input.after || dto.updatedAt < input.after.updatedAt || (dto.updatedAt === input.after.updatedAt && dto.projectId < input.after.id);
     return { fetchedAt, projects: beforeAnchor ? [dto] : [] };
+  }
+
+  public async readTimelineProjection(input: TimelineReadInput): Promise<TimelineReadRows> {
+    this.assertOutsideTransaction();
+    if (this.asyncLocalStorage.getStore()) throw new Error("Nested projection transaction");
+    assertTimelineReadInput(input);
+    const checkTime = () => {
+      if (Date.now() >= input.deadlineAt) throw new Error("Read deadline exceeded");
+    };
+    checkTime();
+    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+    const { projectId, principalId, pipelineSessionId, after, limit } = input;
+    assertProjectReadRole(this.projectMemberships.get(`${projectId}:${principalId}`)?.member_role, input.signedRoles);
+    const session = this.pipelineSessions.get(pipelineSessionId);
+    if (!this.projects.has(projectId) || session?.project_id !== projectId) throw new PostgresRlsError("23503", "Pipeline session not found");
+    if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+
+    const items: TimelineItem[] = [];
+    const add = (item: TimelineItem) => {
+      const anchor = timelineAnchor(item);
+      if (after && compareTimeline(after, anchor) >= 0) return;
+      const index = items.findIndex((other) => compareTimeline(anchor, timelineAnchor(other)) < 0);
+      if (index !== -1) items.splice(index, 0, item);
+      else if (items.length <= limit) items.push(item);
+      if (items.length > limit + 1) items.pop();
+    };
+    const inScope = (row: { project_id: string; pipeline_session_id: string }) => {
+      checkTime();
+      return row.project_id === projectId && row.pipeline_session_id === pipelineSessionId;
+    };
+    add(timelineItem("session.created", session.created_at, session.pipeline_session_id));
+    for (const row of this.stageArtifacts.values()) {
+      if (inScope(row)) add(timelineItem("artifact.recorded", row.created_at, row.artifact_id, row));
+    }
+    for (const row of this.stageApprovalGates.values()) {
+      if (inScope(row)) add(timelineItem("gate.decided", row.decided_at, row.gate_id, row));
+    }
+    for (const row of this.baselineSpecFreezes.values()) {
+      if (inScope(row)) add(timelineItem("baseline.frozen", row.frozen_at, row.baseline_id));
+    }
+    for (const row of this.changeRequests.values()) {
+      if (!inScope(row)) continue;
+      add(timelineItem("change-request.submitted", row.created_at, row.cr_id));
+      if (row.decided_at !== null) add(timelineItem("change-request.decided", row.decided_at, row.cr_id));
+    }
+    return { fetchedAt, items };
   }
 
   public async readSessionProjection(input: SessionReadInput): Promise<SessionReadRows> {

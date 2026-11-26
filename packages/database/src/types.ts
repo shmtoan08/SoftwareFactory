@@ -1,3 +1,4 @@
+import type { TimelineReadInput, TimelineReadRows } from "./timeline-read-projection.ts";
 import type { CostSessionReadInput, CostSessionReadRows } from "./cost-session-read-projection.ts";
 import type { SessionReadInput, SessionReadRows } from "./session-read-projection.ts";
 import type { TaskReadInput, TaskReadRows } from "./task-read-projection.ts";
@@ -528,6 +529,7 @@ export interface RecordReleaseAcceptancePackageInput {
  * (real PostgreSQL via `PostgresRuntimePool`).
  */
 export interface ControlPlaneStore {
+  readTimelineProjection(input: TimelineReadInput): Promise<TimelineReadRows>;
   readSessionProjection(input: SessionReadInput): Promise<SessionReadRows>;
   readTaskProjection(input: TaskReadInput): Promise<TaskReadRows>;
   readProjectProjection(input: ProjectReadInput): Promise<ProjectReadRows>;

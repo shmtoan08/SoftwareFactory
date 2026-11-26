@@ -1,3 +1,5 @@
+import { assertTimelineReadInput, compareTimeline, timelineAnchor, timelineItem, timelineQueries,
+  type TimelineReadInput, type TimelineReadRows } from "./timeline-read-projection.ts";
 import { mapCostSessionProjection, toSafeInt, type CostSessionReadInput, type CostSessionReadRows } from "./cost-session-read-projection.ts";
 import { assertSessionReadInput, sessionReadRow, type SessionReadInput, type SessionReadRows } from "./session-read-projection.ts";
 import { taskReadDto, type TaskReadInput, type TaskReadRows } from "./task-read-projection.ts";
@@ -2460,6 +2462,42 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       return { fetchedAt: snapshotAt, projects: rows.rows.map((r) => ({ projectId: String(r.id), slug: String(r.slug), name: String(r.name), defaultBranch: String(r.default_branch), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })) };
     }, input.deadlineAt);
   }
+  public async readTimelineProjection(input: TimelineReadInput): Promise<TimelineReadRows> {
+    assertTimelineReadInput(input);
+    const { projectId, pipelineSessionId, principalId } = input;
+    return this.pool.withReadOnlyRlsTransaction({
+      currentProjectId: projectId, currentPrincipalId: principalId, currentRole: "core_api_service",
+    }, async (fetchedAt) => {
+      const role = await this.pool.queryInActiveTx(
+        "SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;",
+        [projectId, principalId],
+      );
+      assertProjectReadRole(role.rows[0]?.member_role, input.signedRoles);
+      const session = await this.pool.queryInActiveTx(
+        "SELECT pipeline_session_id FROM product_pipeline_sessions WHERE project_id=$1::uuid AND pipeline_session_id=$2::uuid;",
+        [projectId, pipelineSessionId],
+      );
+      if (!session.rowCount) throw new PostgresRlsError("23503", "Pipeline session not found");
+      if (input.cursorContextMismatch) throw new ProjectReadCursorContextError();
+
+      const items: TimelineReadRows["items"] = [];
+      for (const query of timelineQueries(input)) {
+        const result = await this.pool.queryInActiveTx(query.sql, query.params);
+        if (result.rows.length > input.limit + 1) throw new Error("Invalid timeline row bound");
+        let previous = input.after;
+        for (const row of result.rows) {
+          const item = timelineItem(query.type, row.recorded_at, row.resource_id, row);
+          const anchor = timelineAnchor(item);
+          if (previous && compareTimeline(previous, anchor) >= 0) throw new Error("Invalid timeline row order");
+          previous = anchor;
+          items.push(item);
+        }
+      }
+      items.sort((left, right) => compareTimeline(timelineAnchor(left), timelineAnchor(right)));
+      return { fetchedAt, items: items.slice(0, input.limit + 1) };
+    }, input.deadlineAt);
+  }
+
   public async readSessionProjection(input: SessionReadInput): Promise<SessionReadRows> {
     assertSessionReadInput(input);
     return this.pool.withReadOnlyRlsTransaction({

@@ -1,3 +1,4 @@
+import { TimelineReadProjectionService } from "./timeline-read-projection.ts";
 import { CostSessionReadProjectionService } from "./cost-session-read-projection.ts";
 import { SessionReadProjectionService } from "./session-read-projection.ts";
 import { TaskReadProjectionService } from "./task-read-projection.ts";
@@ -242,6 +243,11 @@ export class CoreApiTokenAuthenticator {
     return createHmac("sha256", key).update(data).digest("hex");
   }
 
+  public signTimelineReadCursor(data: string): string {
+    const key = createHmac("sha256", this.signingSecret).update("dashboard-timeline-cursor-v1").digest();
+    return createHmac("sha256", key).update(data).digest("hex");
+  }
+
   public issueAuthContext(input: {
     projectId: string;
     principalId: string;
@@ -394,6 +400,7 @@ export class CoreApiService {
   public readonly pipelineService: ProductPipelineService;
   public readonly warnings: CoreApiWarning[] = [];
   private readonly projectReads: ProjectReadProjectionService;
+  private readonly timelineReads: TimelineReadProjectionService;
   private readonly sessionReads: SessionReadProjectionService;
   private readonly taskReads: TaskReadProjectionService;
   private readonly costSessionReads: CostSessionReadProjectionService;
@@ -450,6 +457,10 @@ export class CoreApiService {
           }),
       });
     this.projectReads = new ProjectReadProjectionService(this.store, (auth, project) => this.authenticator.verifyAuthContext(auth, project, PROJECT_READ_ROLES), (data) => this.authenticator.signProjectReadCursor(data));
+    this.timelineReads = new TimelineReadProjectionService(
+      this.store, (auth) => this.authenticator.verifyAuthContext(auth, auth.projectId, PROJECT_READ_ROLES),
+      (data) => this.authenticator.signTimelineReadCursor(data),
+    );
     this.sessionReads = new SessionReadProjectionService(
       this.store, (auth) => this.authenticator.verifyAuthContext(auth, auth.projectId, PROJECT_READ_ROLES),
       (data) => this.authenticator.signSessionReadCursor(data),
@@ -469,6 +480,10 @@ export class CoreApiService {
         pricingOverrides: options?.modelPricingOverrides,
         env: options?.env,
       });
+  }
+
+  public readTimelineProjection(auth: CoreApiAuthContext | null, projectId: string, pipelineSessionId: string, query = new URLSearchParams()) {
+    return this.timelineReads.read(auth, projectId, pipelineSessionId, query);
   }
 
   public readSessionProjection(auth: CoreApiAuthContext, projectId: string, query = new URLSearchParams()) {
