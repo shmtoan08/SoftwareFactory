@@ -458,3 +458,24 @@ PYTHONDONTWRITEBYTECODE=1 python3 packages/database/tests/timeline-index/applied
 ```
 
 [Actual PG16 EXPLAIN JSON](timeline-s1b-applied-pg16.json) · [Actual PG17 EXPLAIN JSON](timeline-s1b-applied-pg17.json)
+
+## Issue #36 partial index and applied work-bound verification
+
+Migration 0033 adds `idx_change_requests_applied_timeline`, a B-tree on `change_requests (project_id, pipeline_session_id, applied_at DESC, cr_id DESC) WHERE applied_at IS NOT NULL`. The probe checks the catalog after replay from empty, verifies removal with transactional `DROP INDEX` in the disposable database, upgrades the populated 0032 database, and reapplies 0033. The migration follows the existing forward-only file convention with explicit BEGIN/COMMIT.
+
+The reproduction commands above now exit 0 on PG16.16 and PG17.12, under app_runtime with RLS and read-only repeatable read. Each applied stage uses the partial index with an ordered scan. The proven query includes the literal `applied_at IS NOT NULL` on every stage. No fallback to a full index was needed. No applied plan uses a Sort or a sequential scan. The 102-row bound is unchanged.
+
+| Fixture and page | Rows read before PG16 / PG17 | Rows read after on both versions |
+| --- | ---: | ---: |
+| Mixed 100,000 CR, first | 100,000 / 100,000 | 101 |
+| Mixed, second (equal then older) | 3,772 + 100,000 / 3,547 + 100,000 | 101 + 101 |
+| Mixed, last (equal then older) | 58,074 + 100,000 / 100,000 + 100,000 | 0 + 100 |
+| All tied 3,000 CR, first | 3,000 / 3,000 | 101 |
+| All tied, second | 2,900 + 3,000 / 2,900 + 3,000 | 101 + 0 |
+| All tied, last | 100 + 3,000 / 100 + 3,000 | 100 + 0 |
+
+The additional NULL-majority fixture has 3,000 applied and 6,000 pending CRs. Its five stages match the all-tied counts. All 3,000 tied applied rows matched the reference `ORDER BY applied_at DESC, cr_id DESC` in a full keyset walk on both versions with no duplication or omission.
+
+Each version passed all 33 measured stages. The 18 same-table regression stages used indexes 0032 for submitted and 0031 for decided and read at most 101 rows per stage. The eight global CR stages and five submitted-only stages matched Issue #35's recorded counts. The five additional decided-only stages measured 101, 0 + 101 and 100 + 0 rows. These results describe the measured fixtures. S1-b still owns the DAO milestone, route and E2E tests.
+
+[Actual PG16 EXPLAIN JSON](timeline-s1-idx3-pg16.json) · [Actual PG17 EXPLAIN JSON](timeline-s1-idx3-pg17.json)
