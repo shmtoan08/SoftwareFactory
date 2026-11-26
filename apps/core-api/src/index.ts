@@ -1,3 +1,4 @@
+import type { PendingApprovalBoundary } from "@software-factory/database";
 import { TimelineReadProjectionService } from "./timeline-read-projection.ts";
 import { CostSessionReadProjectionService } from "./cost-session-read-projection.ts";
 import { SessionReadProjectionService } from "./session-read-projection.ts";
@@ -480,6 +481,16 @@ export class CoreApiService {
         pricingOverrides: options?.modelPricingOverrides,
         env: options?.env,
       });
+  }
+
+  public readPendingApprovalsProjection(auth: CoreApiAuthContext, projectId: string,
+    options: { limit?: number; after?: PendingApprovalBoundary } = {}) {
+    const deadlineAt = Date.now() + 5000;
+    const verified = this.authenticator.verifyAuthContext(auth, projectId, READ_ROLES);
+    return this.store.readPendingApprovalsProjection({
+      projectId, principalId: verified.principalId, signedRoles: verified.roles, deadlineAt,
+      limit: options.limit ?? 20, after: options.after ?? null,
+    });
   }
 
   public readTimelineProjection(auth: CoreApiAuthContext | null, projectId: string, pipelineSessionId: string, query = new URLSearchParams()) {

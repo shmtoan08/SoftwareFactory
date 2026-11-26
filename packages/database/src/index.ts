@@ -1,3 +1,6 @@
+import { assertPendingApprovalsInput, comparePendingApprovals, pendingApprovalBoundary, pendingApprovalItem,
+  type PendingApprovalItem, type PendingApprovalsReadInput, type PendingApprovalsReadRows } from "./pending-approvals-read-projection.ts";
+export * from "./pending-approvals-read-projection.ts";
 import { assertTimelineReadInput, compareTimeline, timelineAnchor, timelineItem,
   type TimelineReadInput, type TimelineReadRows, type TimelineItem } from "./timeline-read-projection.ts";
 export * from "./timeline-read-projection.ts";
@@ -582,6 +585,35 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       createdAt: readTimestamp(project.created_at), updatedAt: readTimestamp(project.updated_at) };
     const beforeAnchor = !input.after || dto.updatedAt < input.after.updatedAt || (dto.updatedAt === input.after.updatedAt && dto.projectId < input.after.id);
     return { fetchedAt, projects: beforeAnchor ? [dto] : [] };
+  }
+
+  public async readPendingApprovalsProjection(input: PendingApprovalsReadInput): Promise<PendingApprovalsReadRows> {
+    this.assertOutsideTransaction();
+    assertPendingApprovalsInput(input);
+    const { projectId, principalId, limit, after } = input;
+    assertProjectReadRole(this.projectMemberships.get(`${projectId}:${principalId}`)?.member_role, input.signedRoles);
+    if (!this.projects.has(projectId)) throw new PostgresRlsError("23503", "Project not found");
+    const fetchedAt = readTimestamp(this.clockFn().toISOString());
+    const items: PendingApprovalItem[] = [];
+    const add = (item: PendingApprovalItem) => {
+      const boundary = pendingApprovalBoundary(item);
+      if (after && comparePendingApprovals(after, boundary) >= 0) return;
+      const index = items.findIndex((existing) => comparePendingApprovals(boundary, pendingApprovalBoundary(existing)) < 0);
+      if (index >= 0) items.splice(index, 0, item);
+      else if (items.length <= limit) items.push(item);
+      if (items.length > limit + 1) items.pop();
+    };
+    for (const row of this.changeRequests.values()) {
+      if (Date.now() >= input.deadlineAt) throw new Error("Pending approvals read deadline exceeded");
+      if (row.project_id === projectId && row.status === "PENDING_APPROVAL") add(pendingApprovalItem(0, { ...row }));
+    }
+    for (const row of this.approvalRequests.values()) {
+      if (Date.now() >= input.deadlineAt) throw new Error("Pending approvals read deadline exceeded");
+      if (row.project_id !== projectId || row.status !== "PENDING") continue;
+      const item = pendingApprovalItem(1, { ...row });
+      if (item.kind === "MERGE_APPROVAL" && item.expires_at > fetchedAt) add(item);
+    }
+    return { fetchedAt, items };
   }
 
   public async readTimelineProjection(input: TimelineReadInput): Promise<TimelineReadRows> {

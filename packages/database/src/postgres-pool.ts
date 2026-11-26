@@ -1,3 +1,5 @@
+import { assertPendingApprovalsInput, readPendingApprovalCandidates,
+  type PendingApprovalsReadInput, type PendingApprovalsReadRows } from "./pending-approvals-read-projection.ts";
 import { assertTimelineReadInput, compareTimeline, timelineAnchor, timelineItem, timelineQueries,
   type TimelineReadInput, type TimelineReadRows } from "./timeline-read-projection.ts";
 import { mapCostSessionProjection, toSafeInt, type CostSessionReadInput, type CostSessionReadRows } from "./cost-session-read-projection.ts";
@@ -2462,6 +2464,29 @@ export class PostgresControlPlaneRepository implements ControlPlaneStore {
       return { fetchedAt: snapshotAt, projects: rows.rows.map((r) => ({ projectId: String(r.id), slug: String(r.slug), name: String(r.name), defaultBranch: String(r.default_branch), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })) };
     }, input.deadlineAt);
   }
+  public async readPendingApprovalsProjection(input: PendingApprovalsReadInput): Promise<PendingApprovalsReadRows> {
+    assertPendingApprovalsInput(input);
+    const { projectId, principalId } = input;
+    return this.pool.withReadOnlyRlsTransaction({
+      currentProjectId: projectId, currentPrincipalId: principalId, currentRole: "core_api_service",
+    }, async () => {
+      const role = await this.pool.queryInActiveTx(
+        "SELECT member_role FROM project_memberships WHERE project_id=$1::uuid AND principal_id=$2::text;",
+        [projectId, principalId],
+      );
+      assertProjectReadRole(role.rows[0]?.member_role, input.signedRoles);
+      const project = await this.pool.queryInActiveTx(
+        "SELECT project_id FROM projects WHERE project_id=$1::uuid;", [projectId],
+      );
+      if (!project.rowCount) throw new PostgresRlsError("23503", "Project not found");
+      const snapshot = await this.pool.queryInActiveTx<{ fetched_at: string }>(
+        `SELECT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS fetched_at;`,
+      );
+      return readPendingApprovalCandidates(input, snapshot.rows[0]!.fetched_at,
+        async (sql, params) => (await this.pool.queryInActiveTx(sql, params)).rows);
+    }, input.deadlineAt);
+  }
+
   public async readTimelineProjection(input: TimelineReadInput): Promise<TimelineReadRows> {
     assertTimelineReadInput(input);
     const { projectId, pipelineSessionId, principalId } = input;

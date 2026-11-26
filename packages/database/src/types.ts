@@ -1,3 +1,4 @@
+import type { PendingApprovalsReadInput, PendingApprovalsReadRows } from "./pending-approvals-read-projection.ts";
 import type { TimelineReadInput, TimelineReadRows } from "./timeline-read-projection.ts";
 import type { CostSessionReadInput, CostSessionReadRows } from "./cost-session-read-projection.ts";
 import type { SessionReadInput, SessionReadRows } from "./session-read-projection.ts";
@@ -529,6 +530,7 @@ export interface RecordReleaseAcceptancePackageInput {
  * (real PostgreSQL via `PostgresRuntimePool`).
  */
 export interface ControlPlaneStore {
+  readPendingApprovalsProjection(input: PendingApprovalsReadInput): Promise<PendingApprovalsReadRows>;
   readTimelineProjection(input: TimelineReadInput): Promise<TimelineReadRows>;
   readSessionProjection(input: SessionReadInput): Promise<SessionReadRows>;
   readTaskProjection(input: TaskReadInput): Promise<TaskReadRows>;
