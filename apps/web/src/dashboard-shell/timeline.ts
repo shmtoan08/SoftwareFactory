@@ -1,6 +1,8 @@
-import type { DashboardResult } from "../dashboard-data/client.ts";
+import { DashboardClient, type DashboardResult } from "../dashboard-data/client.ts";
 import type { TimelineDto, TimelineItemDto } from "../dashboard-data/mapping.ts";
 import { escapeHtml, facts } from "./router.ts";
+
+export const timelinePageContentType = "application/vnd.sf.timeline-page+json";
 
 const partial = "Partial activity feed — ordered by recorded time. Not a complete or causal audit trail.";
 
@@ -41,8 +43,93 @@ export function renderTimelineItem(item: TimelineItemDto): string {
   }
 }
 
-export function renderTimeline(result: DashboardResult<TimelineDto>): string {
-  if (result.kind === "error") return timelinePlaceholder("error");
-  if (result.kind === "empty") return panel("empty", '<p role="status">Không có mốc đã ghi.</p>');
-  return panel("ready", `<ul class="approval-records">${result.data.items.map(renderTimelineItem).join("")}</ul>`);
+function timelineError(status?: number): string {
+  switch (status) {
+    case 401:
+    case 403: return "Bạn không có quyền truy cập Timeline.";
+    case 404: return "Không tìm thấy session trong phạm vi project.";
+    case 409: return "Timeline đã thay đổi, tải lại từ đầu";
+    default: return "Không tải được Timeline.";
+  }
 }
+
+export function timelineFailure(status?: number): string {
+  return panel("error", `<p role="status">${timelineError(status)}</p>`);
+}
+
+function timelineRows(data: TimelineDto): string {
+  return data.items.map(renderTimelineItem).join("");
+}
+
+export function renderTimeline(result: DashboardResult<TimelineDto>, sessionId: string): string {
+  if (result.kind === "error") return timelineFailure("status" in result.error ? result.error.status : undefined);
+  if (result.kind === "empty") return panel("empty", '<p role="status">No recorded events</p>');
+  const cursor = result.data.page.nextCursor;
+  const pagination = cursor === null ? "" : `<button type="button" data-timeline-cursor="${escapeHtml(cursor)}">Load more</button><p data-timeline-status role="status"></p>`;
+  return panel("ready", `<div data-timeline-session="${escapeHtml(sessionId)}"><ul class="approval-records">${timelineRows(result.data)}</ul>${pagination}</div>`);
+}
+
+export async function loadTimelinePage(
+  projectId: string, query: URLSearchParams, authToken: string | undefined, baseUrl: string | undefined,
+) {
+  const error = (status: number) => ({ status, body: { message: timelineError(status) } });
+  if (!authToken) return error(401);
+  if (!baseUrl) return error(500);
+  const session = query.get("sessionId");
+  const cursor = query.get("cursor");
+  if (!session || !cursor || [...query.keys()].length !== 2) return error(400);
+  try {
+    const client = new DashboardClient({ baseUrl, projectId, authToken, timeoutMs: 7000 });
+    const result = await client.listTimeline(session, { cursor });
+    if (result.kind === "error") {
+      return error("status" in result.error ? result.error.status : 500);
+    }
+    return { status: 200, body: { rows: timelineRows(result.data), nextCursor: result.data.page.nextCursor } };
+  } catch {
+    return error(400);
+  }
+}
+
+export const timelinePaginationScript = `(() => {
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest?.("button[data-timeline-cursor]");
+    if (!button || button.disabled || button.hidden || button.closest("[data-session-changing]")) return;
+    const content = button.closest("[data-timeline-session]");
+    const status = content.querySelector("[data-timeline-status]");
+    button.disabled = true;
+    status.textContent = "Đang tải…";
+    try {
+      const query = new URLSearchParams({ sessionId: content.dataset.timelineSession, cursor: button.dataset.timelineCursor });
+      const response = await fetch(location.pathname + "?" + query, {
+        headers: { Accept: "${timelinePageContentType}" },
+        cache: "no-store",
+      });
+      if (response.headers.get("Content-Type") !== "${timelinePageContentType}") throw new Error();
+      const page = await response.json();
+      if (!button.isConnected || button.closest("[data-session-changing]")) return;
+      if (!response.ok) {
+        status.textContent = typeof page.message === "string" ? page.message : "Không tải được Timeline.";
+        if ([401, 403, 404, 409].includes(response.status)) {
+          delete button.dataset.timelineCursor;
+          button.hidden = true;
+        }
+        if ([401, 403, 404].includes(response.status)) content.querySelector("ul").replaceChildren();
+        return;
+      }
+      if (typeof page.rows !== "string" || (page.nextCursor !== null &&
+          (typeof page.nextCursor !== "string" || !page.nextCursor || page.nextCursor === button.dataset.timelineCursor))) throw new Error();
+      content.querySelector("ul").insertAdjacentHTML("beforeend", page.rows);
+      if (page.nextCursor === null) {
+        delete button.dataset.timelineCursor;
+        button.hidden = true;
+      } else {
+        button.dataset.timelineCursor = page.nextCursor;
+      }
+      status.textContent = "";
+    } catch {
+      status.textContent = "Không tải được Timeline.";
+    } finally {
+      button.disabled = false;
+    }
+  });
+})();`;

@@ -82,7 +82,8 @@ def main():
                    for p in report['plans']), 'DAO plan exceeded bound'
         port = probe.command('docker', 'port', container, '5432/tcp').strip().rsplit(':', 1)[1]
         subprocess.run(
-            ['node', '--test', 'packages/test-harness/src/dashboard-timeline-reader.test.ts'],
+            ['node', '--test', 'packages/test-harness/src/dashboard-timeline-reader.test.ts',
+             'apps/web/src/dashboard-shell/timeline.test.ts'],
             check=True, env={**os.environ, 'TIMELINE_DAO_FIXTURES': '1', 'PGHOST': '127.0.0.1',
                              'PGPORT': port, 'PGUSER': 'postgres', 'PGDATABASE': 'postgres',
                              'PGPASSWORD': 'timeline_probe_fixture'},

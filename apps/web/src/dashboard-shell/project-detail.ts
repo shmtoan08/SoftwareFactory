@@ -7,7 +7,7 @@ import { approvalsPlaceholder, renderApprovalChangeRequests, renderApprovalDecis
 import { budgetLoadingPanel, budgetPanel, loadBudgetBody, renderBudget } from "./budget.ts";
 import { costUsagePlaceholder, loadCostUsage } from "./cost-session-usage.ts";
 import { panelRefreshScript } from "./panel-refresh.ts";
-import { renderTimeline, timelinePlaceholder } from "./timeline.ts";
+import { renderTimeline, timelineFailure, timelinePaginationScript, timelinePlaceholder } from "./timeline.ts";
 import { taskDetailScript } from "./task-detail.ts";
 import { readTaskPage, renderTasks, retireTasksOnSessionChange, tasksPanel, tasksPlaceholder } from "./tasks.ts";
 import { workItemsPanel, workItemsPlaceholder } from "./work-items.ts";
@@ -89,7 +89,7 @@ export async function sendProjectDetail(
 <p><strong>UNSUPPORTED</strong> — Chưa có nguồn tiến độ được duyệt (session DTO không chứa stage/status/tiến độ)</p>
 </section>`;
   const start = documentStart("Project", false, "vi") + '<div class="project-panels">';
-  const script = `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script><script>${taskDetailScript}</script>`;
+  const script = `<script>${panelRefreshScript}</script><script>${retireTasksOnSessionChange}</script><script>${taskDetailScript}</script><script>${timelinePaginationScript}</script>`;
   const end = "</div>" + documentEnd;
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
 
@@ -98,7 +98,7 @@ export async function sendProjectDetail(
     res.end(start + unavailable("project", state) + unavailable("sessions", state)
       + progress + budgetPanel(projectId, await loadBudgetBody(projectId, authToken, baseUrl))
       + tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty")
-      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + timelinePlaceholder("error") + script + end);
+      + agentProfilesPanel(projectId, await loadAgentProfilesBody(projectId, authToken, baseUrl)) + timelineFailure(authToken ? undefined : 401) + script + end);
     return;
   }
 
@@ -125,7 +125,12 @@ export async function sendProjectDetail(
       const selected = result.kind === "ok" ? result.data.items.find((item) => item.pipelineSessionId === selectedId) : undefined;
       write(renderSessions(result, projectId, selected, cursor));
       if (!selected) {
-        if (selectedId) write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty") + approvalsPlaceholder("empty") + evidencePlaceholder("empty") + timelinePlaceholder(result.kind === "error" ? "error" : "empty"));
+        if (selectedId) {
+          const timeline = result.kind !== "error" ? timelinePlaceholder("empty")
+            : timelineFailure(failureState("sessions", result) === "access-denied" ? 403 : undefined);
+          write(tasksPlaceholder("empty") + workItemsPlaceholder("empty") + costUsagePlaceholder("empty")
+            + approvalsPlaceholder("empty") + evidencePlaceholder("empty") + timeline);
+        }
         return;
       }
       if (res.destroyed) return;
@@ -141,7 +146,7 @@ export async function sendProjectDetail(
           write(renderApprovalChangeRequests(result));
         }),
         loadCostUsage(client, sessionId).then(write),
-        client.listTimeline(sessionId).then(renderTimeline).then(write),
+        client.listTimeline(sessionId).then((result) => write(renderTimeline(result, sessionId))),
       ]);
     }, () => {
       write(unavailable("sessions", "error"));

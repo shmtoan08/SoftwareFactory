@@ -1,3 +1,4 @@
+import { loadTimelinePage, timelinePageContentType } from "./dashboard-shell/timeline.ts";
 import { loadAgentProfilesBody } from "./dashboard-shell/agent-profiles.ts";
 import { loadWorkItemsBody } from "./dashboard-shell/work-items.ts";
 import { loadTasksBody } from "./dashboard-shell/tasks.ts";
@@ -2358,6 +2359,14 @@ export class WebApprovalConsoleHttpServer {
       if (dashboard) {
         if ("projectId" in dashboard) {
           const header = req.headers[CORE_API_AUTH_HEADER];
+          res.setHeader("Vary", "Accept");
+          if (accept === timelinePageContentType) {
+            const page = await loadTimelinePage(dashboard.projectId, url.searchParams,
+              Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
+            res.writeHead(page.status, { "Content-Type": timelinePageContentType, "Cache-Control": "no-store" });
+            res.end(JSON.stringify(page.body));
+            return;
+          }
           await sendProjectDetail(res, dashboard.projectId, url.searchParams,
             Array.isArray(header) ? header[0] : header, this.dashboardCoreApiBaseUrl);
         } else if (dashboard.status === 400 && wantsJson) {

@@ -60,7 +60,7 @@ const styles = `
   .project-panels:has(#approval-decisions-result) #approval-decisions-loading,
   .project-panels:has(#change-requests-result) #change-requests-loading,
   .project-panels[data-session-changing] :is(#approval-decisions-result, #change-requests-result, #evidence-result),
-  .project-panels[data-session-changing] #timeline-panel ul { display: none; }
+  .project-panels[data-session-changing] #timeline-panel [data-timeline-session] { display: none; }
   .evidence-preview { max-height: 16rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
   .approval-records { display: grid; gap: 1rem; padding-left: 1.25rem; }
   .approval-records h3 { margin: 0 0 .5rem; font-size: 1rem; overflow-wrap: anywhere; }

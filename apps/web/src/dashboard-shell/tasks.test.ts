@@ -10,6 +10,8 @@ import { panelRefreshScript } from "./panel-refresh.ts";
 import { taskDetailScript } from "./task-detail.ts";
 import { retireTasksOnSessionChange } from "./tasks.ts";
 
+import { timelinePaginationScript } from "./timeline.ts";
+
 const projectId = "10000000-0000-0000-0000-000000000007";
 const sessionA = "20000000-0000-0000-0000-000000000007";
 const sessionB = "20000000-0000-0000-0000-000000000008";
@@ -33,7 +35,7 @@ function getTasksPanel(html: string) {
 }
 
 function dashboardScripts(html: string): string[] {
-  const allowed = new Set([panelRefreshScript, retireTasksOnSessionChange, taskDetailScript]);
+  const allowed = new Set([panelRefreshScript, retireTasksOnSessionChange, taskDetailScript, timelinePaginationScript]);
   const scripts = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi)];
   for (const [, attributes, script] of scripts) {
     assert.equal(attributes?.trim(), "", "Dashboard scripts must be inline");
@@ -150,7 +152,8 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
     assert.deepEqual(taskCalls(), [taskPath(sessionA)]);
 
     type Handler = (event: { target: unknown }) => Promise<void> | void;
-    const handlers = new Map<string, Handler>();
+    const handlers = new Map<string, Handler[]>();
+    const dispatch = (name: string, target: unknown) => Promise.all(handlers.get(name)!.map((handler) => handler({ target })));
     const content = { innerHTML: initial.body, setAttribute() {} };
     const panel = { dataset: { panelUrl: initial.endpoint }, isConnected: true,
       querySelector: () => content, remove() { this.isConnected = false; } };
@@ -166,11 +169,11 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
     assert.throws(() => dashboardScripts(htmlA + '<form method="post"></form>'), /forms must be read-only/);
     const scripts = dashboardScripts(htmlA);
     runInNewContext(scripts.join("\n"), {
-      document: { addEventListener: (name: string, handler: Handler) => handlers.set(name, handler) },
+      document: { addEventListener: (name: string, handler: Handler) => handlers.set(name, [...handlers.get(name) ?? [], handler]) },
       fetch: (path: string, options: RequestInit) => fetch(baseUrl + path, { ...options, headers }),
       AbortSignal,
     });
-    const click = async () => handlers.get("click")!({ target: { closest: () => button } });
+    const click = () => dispatch("click", { closest: (selector: string) => selector.includes("[data-panel-refresh]") ? button : null });
 
     taskStatus = 500;
     const beforeError = calls.length;
@@ -206,7 +209,7 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
     await click();
     assert.deepEqual(calls.slice(beforeRefresh), [taskPath(sessionA)]);
 
-    await handlers.get("submit")!({ target: form });
+    await dispatch("submit", form);
     assert.equal(panel.isConnected, false);
     assert.equal(formParent.dataset.sessionChanging, "");
     const htmlB = await (await navigate(`?sessionId=${sessionB}`)).text();
