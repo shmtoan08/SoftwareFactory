@@ -101,22 +101,22 @@ def explain_cases(db, report, fixture, scope, branches, cases):
                                             explain=explain))
 
 
-def verify_submitted_walk(db, scope, expected_count):
-    submitted = probe.base(SUBMITTED, scope)
+def verify_walk(db, scope, expected_count, branch=SUBMITTED):
+    source = probe.base(branch, scope)
     db.query("SET LOCAL statement_timeout = '30s'")
-    expected = db.query(f'SELECT * FROM ({submitted}) AS reference ORDER BY ts DESC, id DESC').splitlines()
+    expected = db.query(f'SELECT * FROM ({source}) AS reference ORDER BY ts DESC, id DESC').splitlines()
     db.query("SET LOCAL statement_timeout = '2s'")
     assert len(expected) == expected_count
     offset = 0
     boundary = None
     while True:
         page = []
-        for sql in probe.bounded(SUBMITTED, scope, boundary):
+        for sql in probe.bounded(branch, scope, boundary):
             page.extend(db.query(sql).splitlines())
             if len(page) >= LIMIT:
                 break
         page = page[:LIMIT]
-        assert page == expected[offset:offset + LIMIT], f'submitted page mismatch at offset {offset}'
+        assert page == expected[offset:offset + LIMIT], f'keyset page mismatch at offset {offset}'
         offset += len(page)
         if len(page) < LIMIT:
             return offset
@@ -187,7 +187,7 @@ def run(db, major, report):
             explain_cases(db, report, 'mixed/global', scope, BRANCHES, cursor_cases(db, source))
         explain_cases(db, report, label + '/submitted', scope, (SUBMITTED,), cursor_cases(db, submitted))
         if all(p['passed'] for p in report['plans']):
-            report.setdefault('walks', {})[label] = verify_submitted_walk(db, scope, requests)
+            report.setdefault('walks', {})[label] = verify_walk(db, scope, requests)
         db.query('ROLLBACK')
 
     assert len(report['plans']) == 30

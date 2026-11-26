@@ -10,12 +10,22 @@ import probe
 import work_bound as work
 
 APPLIED = (7, 'change_requests', 'applied_at', 'cr_id', '', '')
+MIGRATION = probe.MIGRATION.with_name('0033_change_request_applied_timeline_index.sql')
+INDEX = 'idx_change_requests_applied_timeline'
 TIES = 3000
 TIE_TIME = '2026-02-01T00:00:00Z'
 
 
-def measure(db, report, label, scope, artifacts, requests):
-    probe.seed(db, scope, artifacts, requests, TIES, submitted_ties=TIES)
+def assert_index(db):
+    definition = db.query(f"""SELECT indexdef FROM pg_indexes
+      WHERE schemaname='public' AND tablename='change_requests' AND indexname='{INDEX}'""")
+    assert definition == (f'CREATE INDEX {INDEX} ON public.change_requests USING btree '
+                          '(project_id, pipeline_session_id, applied_at DESC, cr_id DESC) '
+                          'WHERE (applied_at IS NOT NULL)')
+    return definition
+
+
+def measure_applied(db, report, label, scope, requests, pending=0):
     project, session, _ = map(probe.quoting, probe.scope(scope))
     db.query(f"""UPDATE change_requests
         SET status='APPLIED', applied_by_principal_id='fixture',
@@ -27,9 +37,32 @@ def measure(db, report, label, scope, artifacts, requests):
     source = probe.base(APPLIED, scope)
     total, tied = map(int, db.query(f"""SELECT count(*),
         count(*) FILTER (WHERE ts='{TIE_TIME}'::timestamptz) FROM ({source}) AS fixture""").split('|'))
-    assert total == requests and tied == TIES, 'fixture did not contain the required applied rows'
-    report['fixtures'][label] = {'applied': total, 'tied': tied}
+    count = int(db.query(f'SELECT count(*) FROM change_requests WHERE project_id={project} AND pipeline_session_id={session}'))
+    assert (total, tied, count) == (requests, TIES, requests + pending)
+    report['fixtures'][label] = {'applied': total, 'tied': tied, 'null': count - total}
+    start = len(report['plans'])
     work.explain_cases(db, report, label, scope, (APPLIED,), work.cursor_cases(db, source))
+    plans = report['plans'][start:]
+    for plan in plans:
+        plan['passed'] = plan['passed'] and plan['indexes'] == [INDEX] and not plan['sort_inputs']
+        plan['passed'] = plan['passed'] and not any(
+            node['Node Type'] == 'Seq Scan' and node.get('Relation Name') == 'change_requests'
+            for node in work.nodes(plan['explain'][0]['Plan'])
+        )
+    if label == 'all-tied' and all(plan['passed'] for plan in plans):
+        report['walked'] = work.verify_walk(db, scope, requests, APPLIED)
+        assert report['walked'] == requests
+    db.query('ROLLBACK')
+
+
+def measure_regression(db, report):
+    probe.read_scope(db, 1)
+    branches = (work.SUBMITTED, work.BRANCHES[-1])
+    sources = ' UNION ALL '.join(probe.base(branch, 1) for branch in work.BRANCHES)
+    work.explain_cases(db, report, 'regression/global', 1, branches, work.cursor_cases(db, sources))
+    for branch in branches:
+        work.explain_cases(db, report, 'regression/branch', 1, (branch,),
+                           work.cursor_cases(db, probe.base(branch, 1)))
     db.query('ROLLBACK')
 
 
@@ -55,11 +88,26 @@ def main():
         report['version'] = db.query('SHOW server_version')
         assert report['version'] == {'16': '16.16', '17': '17.12'}[args.major]
         for migration in sorted(probe.MIGRATION.parent.glob('*.sql')):
-            if not migration.name.startswith('0002'):
+            if not migration.name.startswith('0002') and migration < MIGRATION:
                 db.query(migration.read_text())
-        measure(db, report, 'mixed', 1, 30000, 100000)
-        measure(db, report, 'all-tied', 2, 1, TIES)
-        assert len(report['plans']) == 10
+        ddl = MIGRATION.read_text()
+        db.query(ddl)
+        report['clean_index'] = assert_index(db)
+        db.query(f'BEGIN; DROP INDEX public.{INDEX}; COMMIT')
+        assert db.query(f"SELECT to_regclass('public.{INDEX}')") == ''
+
+        probe.seed(db, 1, 30000, 100000, TIES, submitted_ties=TIES)
+        db.query(ddl)
+        report['upgrade_index'] = assert_index(db)
+        db.query(ddl)
+        assert_index(db)
+        measure_regression(db, report)
+        measure_applied(db, report, 'mixed', 1, 100000)
+        probe.seed(db, 2, 1, TIES, TIES, submitted_ties=TIES)
+        measure_applied(db, report, 'all-tied', 2, TIES)
+        probe.seed(db, 3, 1, TIES, TIES, pending=6000, submitted_ties=TIES)
+        measure_applied(db, report, 'null-majority', 3, TIES, pending=6000)
+        assert len([p for p in report['plans'] if p['fixture'] in ('mixed', 'all-tied')]) == 10
         for row in report['plans']:
             print(f"{row['fixture']} {row['page']} stage {row['stage']}: "
                   f"rows read={row['rows_read']}, sort inputs={row['sort_inputs']}, pass={row['passed']}")
