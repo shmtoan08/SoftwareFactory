@@ -84,6 +84,9 @@ test("Work items use scoped server filtering and paging, with isolated refresh a
   t.mock.method(DashboardClient.prototype, "listApprovalChangeRequests", async () => ({
     kind: "empty", receivedAt, source: base, data: { requests: [] },
   }));
+  t.mock.method(DashboardClient.prototype, "listTimeline", async () => ({
+    kind: "error", receivedAt, source: base, error: { kind: "not-found", status: 404 },
+  }));
   t.mock.method(DashboardClient.prototype, "listSessionTasks", async (
     sessionId: string, options?: Parameters<DashboardClient["listSessionTasks"]>[1],
   ) => {

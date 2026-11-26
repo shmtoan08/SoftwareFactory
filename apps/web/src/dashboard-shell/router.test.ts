@@ -5,6 +5,8 @@ import { test } from "node:test";
 import { CORE_API_AUTH_HEADER, CoreApiService, encodeCoreApiAuthHeader } from "@software-factory/core-api";
 import { SoftwareFactoryControlPlaneStore } from "@software-factory/database";
 import { createControlPlaneStackRuntime, WebApprovalConsoleController, WebApprovalConsoleHttpServer } from "../index.ts";
+import { mapTimeline, type TimelineItemDto } from "../dashboard-data/mapping.ts";
+import { renderTimelineItem } from "./timeline.ts";
 import { withDashboardRouteBoundary } from "./router.ts";
 
 const projectId = "console-project";
@@ -360,7 +362,8 @@ test("project detail streams panel states independently and uses only the approv
         assert.ok([`/api/v1${projectPath}`, `/api/v1${projectPath}/sessions`, `/api/v1${projectPath}/budget-snapshot`, `/api/v1${projectPath}/agent-profiles`,
           `/api/v1${projectPath}/sessions/${chosenId}/tasks`,
           `/api/v1${projectPath}/pipeline-sessions/${chosenId}/cost-session-snapshot`,
-          `/api/v1${projectPath}/pipeline-sessions/${chosenId}`, `/api/v1${projectPath}/pipeline-sessions/${chosenId}/change-requests`].includes(url.pathname));
+          `/api/v1${projectPath}/pipeline-sessions/${chosenId}`, `/api/v1${projectPath}/pipeline-sessions/${chosenId}/change-requests`,
+          `/api/v1${projectPath}/pipeline-sessions/${chosenId}/timeline`].includes(url.pathname));
         assert.ok([...url.searchParams.keys()].every((key) => key === "cursor"));
       }
     }, `http://127.0.0.1:${address.port}`);
@@ -888,8 +891,134 @@ test("Issues #29–30 share selected-session readers and preserve bindings", asy
 
       assert.ok(calls.every(({ method, path }) => method === "GET" && !/approval-center|lineage|production-deployments/.test(path)));
       const allowed = new Set([corePath, `${corePath}/sessions`, `${corePath}/budget-snapshot`, `${corePath}/agent-profiles`,
-        `${corePath}/sessions/${selectedId}/tasks`, `${bundlePath}/cost-session-snapshot`, bundlePath, crPath]);
+        `${corePath}/sessions/${selectedId}/tasks`, `${bundlePath}/cost-session-snapshot`, bundlePath, crPath, `${bundlePath}/timeline`]);
       assert.deepEqual(calls.filter(({ path }) => !allowed.has(path)), []);
+    }, `http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+const recordedAt = "2026-11-26T01:00:01.123456Z";
+const resourceId = "40000000-0000-0000-0000-000000000001";
+const artifactId = "50000000-0000-0000-0000-000000000001";
+const artifactSha256 = "a".repeat(64);
+const timelineIdentity = { recordedAt, resourceId };
+const timelineFixtures: TimelineItemDto[] = [
+  { ...timelineIdentity, type: "session.created", details: {} },
+  { ...timelineIdentity, type: "artifact.recorded", details: { artifactSha256 } },
+  { ...timelineIdentity, type: "gate.decided", details: {
+    decision: "REJECTED", targetArtifactId: artifactId, targetArtifactSha256: artifactSha256,
+  } },
+  { ...timelineIdentity, type: "baseline.frozen", details: {} },
+  { ...timelineIdentity, type: "change-request.submitted", details: {} },
+  { ...timelineIdentity, type: "change-request.decided", details: {} },
+  { ...timelineIdentity, type: "change-request.applied", details: {} },
+];
+
+for (const fixture of timelineFixtures) {
+  test(`Issue #37 renders only S0 fields for ${fixture.type}`, () => {
+    const details = fixture.type === "artifact.recorded"
+      ? `<dt>Artifact SHA-256</dt><dd>${artifactSha256}</dd>`
+      : fixture.type === "gate.decided"
+        ? `<dt>Decision</dt><dd>REJECTED</dd><dt>Target artifact ID</dt><dd>${artifactId}</dd><dt>Target artifact SHA-256</dt><dd>${artifactSha256}</dd>`
+        : "";
+    assert.equal(renderTimelineItem(fixture),
+      `<li data-event-type="${fixture.type}"><h3>${fixture.type}</h3><dl><dt>Recorded at</dt><dd>${recordedAt}</dd><dt>Resource ID</dt><dd>${resourceId}</dd>${details}</dl></li>`);
+  });
+}
+
+const timelineProject = "10000000-0000-0000-0000-000000000037";
+const timelineSession = "20000000-0000-0000-0000-000000000037";
+const timelinePage = (items: unknown[]) => ({
+  schemaVersion: "timeline-v1", fetchedAt: recordedAt,
+  scope: { kind: "project-token", projectId: timelineProject, pipelineSessionId: timelineSession },
+  items, page: { limit: 20, hasMore: false, nextCursor: null },
+});
+
+test("Issue #37 defends against extra detail fields and escapes unknown types", () => {
+  const extraDetails = {
+    actorId: "private-actor", rationale: "private-reason", text: "<script>private-text</script>", taskId: "private-task",
+  };
+  for (const item of timelineFixtures) {
+    const injected = { ...item, details: { ...item.details, ...extraDetails } };
+    assert.throws(() => mapTimeline(timelinePage([injected]), timelineProject, timelineSession), /Invalid dashboard response field/);
+    assert.equal(renderTimelineItem(injected as unknown as TimelineItemDto), renderTimelineItem(item));
+  }
+
+  const unknown = { ...timelineIdentity, type: 'future."<event>', details: extraDetails };
+  assert.throws(() => mapTimeline(timelinePage([unknown]), timelineProject, timelineSession), /timeline item.type/);
+  const html = renderTimelineItem(unknown as unknown as TimelineItemDto);
+  assert.ok(html.includes("<h3>Unsupported event type</h3><dl><dt>Type</dt><dd>future.&quot;&lt;event&gt;</dd>"));
+  assert.ok(html.includes(recordedAt) && html.includes(resourceId));
+  assert.doesNotMatch(html, /private-|<event>/);
+});
+
+test("Issue #37 Project detail streams the first Timeline page in server order with PARTIAL in every state", async () => {
+  const partial = "Partial activity feed — ordered by recorded time. Not a complete or causal audit trail.";
+  const projectPath = `/projects/${timelineProject}`;
+  const apiPath = `/api/v1${projectPath}`;
+  const timelinePath = `${apiPath}/pipeline-sessions/${timelineSession}/timeline`;
+  const order = [...timelineFixtures].reverse();
+  order.unshift({ ...order[0]!, resourceId: artifactId });
+  let timelineBody = timelinePage(order);
+  let timelineStatus = 200;
+  let expectedAuth: string;
+  const timelineCalls: string[] = [];
+  const api = createServer((req, res) => {
+    const path = new URL(req.url!, "http://localhost").pathname;
+    assert.equal(req.method, "GET");
+    assert.equal(req.headers[CORE_API_AUTH_HEADER], expectedAuth);
+    res.setHeader("Content-Type", "application/json");
+    if (path === `${apiPath}/sessions`) {
+      res.end(JSON.stringify({
+        schemaVersion: "dashboard-read-v1", projectId: timelineProject, fetchedAt: recordedAt,
+        items: [{ pipelineSessionId: timelineSession, projectId: timelineProject, title: "Fixture",
+          createdAt: recordedAt, updatedAt: recordedAt }],
+        page: { limit: 20, hasMore: false, nextCursor: null },
+      }));
+    } else if (path === timelinePath) {
+      timelineCalls.push(req.url!);
+      res.writeHead(timelineStatus).end(JSON.stringify(timelineBody));
+    } else {
+      res.writeHead(404).end("{}");
+    }
+  });
+  api.listen(0, "127.0.0.1");
+  await once(api, "listening");
+  const address = api.address();
+  assert.ok(address && typeof address !== "string");
+  const section = (body: string, id: string) => {
+    const match = body.split(`<section id="${id}"`)[1]?.split("</section>")[0];
+    assert.ok(match);
+    assert.ok(match.includes(partial));
+    return match;
+  };
+  try {
+    await withConsole(async ({ endpoint, authHeader }) => {
+      expectedAuth = authHeader;
+      const read = (query = "") => open(endpoint, projectPath + query, { auth: authHeader });
+      const unselected = await read();
+      assert.match(section(unselected.body, "timeline-panel"), /data-state="empty"/);
+      assert.deepEqual(timelineCalls, []);
+      const query = `?sessionId=${timelineSession}`;
+      const ready = await read(query);
+      assert.match(section(ready.body, "timeline-loading"), /data-state="loading"/);
+      const panel = section(ready.body, "timeline-panel");
+      assert.match(panel, /data-state="ready"/);
+      const htmlRows = panel.split('<li data-event-type=').slice(1).map((row) => '<li data-event-type=' + row.split("</li>")[0] + "</li>");
+      assert.deepEqual(htmlRows, order.map(renderTimelineItem));
+      assert.doesNotMatch(panel, /Load more|<button|<form|assembled from separate snapshots/);
+      assert.deepEqual(timelineCalls, [timelinePath]);
+
+      timelineBody = timelinePage([]);
+      assert.match(section((await read(query)).body, "timeline-panel"), /data-state="empty"/);
+      timelineBody = timelinePage([timelineFixtures[0], { ...timelineFixtures[1], details: { text: "private" } }]);
+      const rejected = section((await read(query)).body, "timeline-panel");
+      assert.match(rejected, /data-state="error"/);
+      assert.doesNotMatch(rejected, /session[.]created|private|<li/);
+      timelineStatus = 500;
+      assert.match(section((await read(query)).body, "timeline-panel"), /data-state="error"/);
     }, `http://127.0.0.1:${address.port}`);
   } finally {
     await new Promise<void>((resolve, reject) => api.close((error) => error ? reject(error) : resolve()));

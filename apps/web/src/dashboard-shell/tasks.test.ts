@@ -223,6 +223,7 @@ test("Tasks requires explicit selection, keeps loading and failures local, and i
       taskPath(sessionA), corePath, `${corePath}/sessions`, `${corePath}/budget-snapshot`,
       `${corePath}/agent-profiles`, taskPath(sessionB), `${corePath}/pipeline-sessions/${sessionB}/cost-session-snapshot`,
       `${corePath}/pipeline-sessions/${sessionB}`, `${corePath}/pipeline-sessions/${sessionB}/change-requests`,
+      `${corePath}/pipeline-sessions/${sessionB}/timeline`,
     ].sort());
   } finally {
     heldA?.resolve();
