@@ -3,7 +3,7 @@ import { readTimestamp, type ProjectReadInput } from "./project-read-projection.
 export const TIMELINE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const TIMELINE_TYPES = [
   "session.created", "artifact.recorded", "gate.decided", "baseline.frozen",
-  "change-request.submitted", "change-request.decided",
+  "change-request.submitted", "change-request.decided", "change-request.applied",
 ] as const;
 
 type TimelineType = typeof TIMELINE_TYPES[number];
@@ -88,6 +88,7 @@ const sources = [
   ["baseline_spec_freezes", "frozen_at", "baseline_id", ""],
   ["change_requests", "created_at", "cr_id", ""],
   ["change_requests", "decided_at", "cr_id", ""],
+  ["change_requests", "applied_at", "cr_id", ""],
 ] as const;
 
 type TimelineQuery = { type: TimelineType; stage: string; sql: string; params: readonly (string | number)[] };

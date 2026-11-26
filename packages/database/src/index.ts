@@ -626,6 +626,7 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       if (!inScope(row)) continue;
       add(timelineItem("change-request.submitted", row.created_at, row.cr_id));
       if (row.decided_at !== null) add(timelineItem("change-request.decided", row.decided_at, row.cr_id));
+      if (row.applied_at !== null) add(timelineItem("change-request.applied", row.applied_at, row.cr_id));
     }
     return { fetchedAt, items };
   }
