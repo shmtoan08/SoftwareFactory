@@ -941,6 +941,19 @@ function assertChangeRequestTimelineTimes(
   assert.equal(applied.decided_at, decided.decided_at);
 }
 
+function assertAppliedAfterMaterialization(
+  { changeRequest, tasks, taskLinks }: Awaited<ReturnType<HttpCoreApiClient["applyPipelineChangeRequest"]>>,
+): void {
+  assert.ok(changeRequest.applied_at);
+  assert.ok(tasks.length > 0);
+  assert.equal(taskLinks.length, tasks.length);
+  const appliedAt = Date.parse(changeRequest.applied_at);
+  for (const record of [...tasks, ...taskLinks]) {
+    assert.ok(appliedAt >= Date.parse(record.created_at),
+      `applied_at ${changeRequest.applied_at} precedes materialized created_at ${record.created_at}`);
+  }
+}
+
 describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, Post-Freeze CR & AC-11b)", () => {
   it("M6B-AC1: Stage 5 Project Bootstrapper & external immutable TrustedAcceptanceTests (fail before impl -> pass after impl -> tamper detection)", async () => {
     const mock = await startMockModelProviderServers();
@@ -2195,12 +2208,32 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
       );
       assert.equal(decidedCr.status, "APPROVED");
 
-      const appliedCr = await coreClient.applyPipelineChangeRequest(
-        projectId,
-        authDev,
-        frozen.sessionId,
-        cr1.cr_id
-      );
+      const applyCr = () => coreClient.applyPipelineChangeRequest(projectId, authDev, frozen.sessionId, cr1.cr_id);
+      let failedAfterMaterialization = false;
+      store.setClock(() => {
+        if (store.listTaskPlanLinks(frozen.sessionId).some((link) => link.cr_id === cr1.cr_id)) {
+          failedAfterMaterialization = true;
+          throw new Error("Injected clock failure after materialization");
+        }
+        return new Date();
+      });
+      try {
+        await assert.rejects(applyCr, (error: unknown) => error instanceof HttpCoreApiError && error.statusCode === 500);
+      } finally {
+        store.setClock(() => new Date());
+      }
+      assert.equal(failedAfterMaterialization, true);
+      await store.withRlsTransaction({ currentProjectId: projectId, currentRole: "core_api_service" }, () => {
+        const rolledBack = store.getChangeRequestById(cr1.cr_id);
+        assert.equal(rolledBack?.status, "APPROVED");
+        assert.equal(rolledBack?.applied_at, null);
+        assert.ok(!store.listTaskPlanLinks(frozen.sessionId).some((link) => link.cr_id === cr1.cr_id));
+      });
+
+      let clock = Date.now();
+      store.setClock(() => new Date(clock++));
+      const appliedCr = await applyCr().finally(() => store.setClock(() => new Date()));
+      assertAppliedAfterMaterialization(appliedCr);
       assertChangeRequestTimelineTimes(cr1, decidedCr, appliedCr.changeRequest);
       assert.equal(appliedCr.tasks.length, 1);
       const taskCr = appliedCr.tasks[0]!;
@@ -3478,6 +3511,7 @@ describe("M6B Acceptance Gates (Stages 5–9, Multi-Target Execution Profiles, P
         crPg.cr_id
       );
       assertChangeRequestTimelineTimes(crPg, decidedPg, appliedPg.changeRequest);
+      assertAppliedAfterMaterialization(appliedPg);
       await runFullStage8ToCasMerge({
         store: repo,
         coreClient: gwClient,

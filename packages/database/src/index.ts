@@ -5822,10 +5822,9 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           ...existing,
           status: "APPLIED",
           applied_by_principal_id: input.applied_by_principal_id.trim(),
-          applied_at: nowIso,
           updated_at: nowIso,
         };
-        this.setInMap(this.changeRequests, updated.cr_id, updated);
+        const response = structuredClone(updated);
         this.insertOutboxEventInternal(
           input.project_id,
           "change_request",
@@ -5838,8 +5837,10 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
           }
         );
 
+        const appliedAt = this.clockTimestampIso();
+        this.setInMap(this.changeRequests, updated.cr_id, { ...updated, applied_at: appliedAt });
         return {
-          changeRequest: structuredClone(updated),
+          changeRequest: { ...response, applied_at: appliedAt },
           tasks,
           taskLinks,
         };
