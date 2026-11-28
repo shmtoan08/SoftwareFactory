@@ -191,6 +191,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
   private readonly txUndoStorage = new AsyncLocalStorage<{
     readonly session: RlsSessionContext;
     readonly undos: Array<() => void>;
+    readonly finalizeLocks: Map<string, Promise<void>>;
+    readonly releaseFinalizeLocks: Array<() => void>;
     readonly createdKeys: WeakMap<Map<unknown, unknown>, Set<unknown>>;
     readonly touchedKeys: WeakMap<Map<unknown, unknown>, Set<unknown>>;
   }>();
@@ -350,6 +352,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     const frame = {
       session,
       undos: [] as Array<() => void>,
+      finalizeLocks: new Map<string, Promise<void>>(),
+      releaseFinalizeLocks: [] as Array<() => void>,
       createdKeys: new WeakMap<Map<unknown, unknown>, Set<unknown>>(),
       touchedKeys: new WeakMap<Map<unknown, unknown>, Set<unknown>>(),
     };
@@ -395,6 +399,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     const frame = {
       session,
       undos: [] as Array<() => void>,
+      finalizeLocks: new Map<string, Promise<void>>(),
+      releaseFinalizeLocks: [] as Array<() => void>,
       createdKeys: new WeakMap<Map<unknown, unknown>, Set<unknown>>(),
       touchedKeys: new WeakMap<Map<unknown, unknown>, Set<unknown>>(),
     };
@@ -411,6 +417,8 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
         }
       }
       throw error;
+    } finally {
+      for (const release of frame.releaseFinalizeLocks) release();
     }
   }
 
@@ -4147,6 +4155,30 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
     );
   }
 
+  // The per-call lock still serializes work within one transaction. This queue
+  // prevents a different transaction from reading a finalize's provisional totals.
+  private readonly finalizeSessionQueue = new Map<string, Promise<void>>();
+
+  private async lockFinalizeSession(sessionId: string): Promise<void> {
+    const frame = this.txUndoStorage.getStore();
+    if (!frame) return;
+    const held = frame.finalizeLocks.get(sessionId);
+    if (held) return held;
+
+    const previous = this.finalizeSessionQueue.get(sessionId) ?? Promise.resolve();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const queued = previous.then(() => promise);
+    this.finalizeSessionQueue.set(sessionId, queued);
+    frame.finalizeLocks.set(sessionId, previous);
+    frame.releaseFinalizeLocks.push(() => {
+      resolve();
+      if (this.finalizeSessionQueue.get(sessionId) === queued) {
+        this.finalizeSessionQueue.delete(sessionId);
+      }
+    });
+    return previous;
+  }
+
   public async finalizeModelCallLedger(
     input: FinalizeModelCallInput
   ): Promise<FinalizeModelCallResult> {
@@ -4171,8 +4203,9 @@ export class SoftwareFactoryControlPlaneStore implements ControlPlaneStore {
       throw new RangeError("actual_total_tokens exceeds JavaScript safe integer range");
     }
 
-    const run = (): Promise<FinalizeModelCallResult> => {
+    const run = async (): Promise<FinalizeModelCallResult> => {
       this.assertWritePermissionForProject(input.project_id);
+      await this.lockFinalizeSession(input.cost_session_id);
       return this.withSerializedLock(`cost-session:${input.cost_session_id}`, () =>
         this.withSerializedLock(`budget:${input.project_id}`, () => {
           const session = this.costSessions.get(input.cost_session_id);
