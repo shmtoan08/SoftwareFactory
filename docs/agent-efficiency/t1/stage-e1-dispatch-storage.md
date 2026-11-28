@@ -14,4 +14,33 @@ Migration 0030 adds project-bound prepare/start functions for the managed worker
 
 For row locking, the function owner receives UPDATE privilege on one identifier column per fenced table. A restrictive RLS policy rejects actual updates by that role. Project-bound service logins receive only function execution. The TypeScript runtime currently has no caller for these functions and the migration provisions no login or fixture reservation in production.
 
-The two-session test covers contention with the task lock, recovery's reservation lock, and stale replay after epoch advancement. Administrative fixtures supply reserved amounts. Actual budget admission and hold conversion, plus the verified settlement writer, remain open in E1. Stage D governs enrollment and lifecycle closure.
+The two-session test covers contention with the task lock, recovery's reservation lock, and stale replay after epoch advancement. Administrative fixtures supply reserved amounts. Migration 0035 adds the cost-session admission gate. Accounting-link, hold conversion, and the verified settlement writer remain open in E1. Stage D governs enrollment and lifecycle closure.
+
+## Cost Guard Reserve (E1 step 1a)
+
+A dedicated, project-bound Cost Guard login calls `telemetry.reserve_dispatch_cost`
+on a separate READ COMMITTED connection and commits the outcome before returning
+to the outer unit of work. Use a standalone autocommit statement or explicitly
+commit the private transaction. The result carries either the reservation and
+attempt identifiers with a five-minute server expiry or the committed blocked
+ledger identifier. An outer rollback has no effect on this commit. A rollback
+of the Reserve transaction itself loses its writes. An ambiguous commit denies
+transport. Invalid identity, inaccessible state, and technical errors abort
+admission. Only an evaluated budget denial can produce a truthful
+`BLOCKED_PREFLIGHT` row.
+
+The cost-session row lock serializes admissions with other admissions and
+existing session-accounting writes. Released reservations are excluded.
+Expiry frees an unstarted hold only when Reserve acquires the same reservation
+fence as start and confirms there is no durable start. Lock contention and an
+expired started attempt preserve the hold. No ledger is inferred to be a
+conversion receipt. Used totals may therefore conservatively count a finalized
+charge alongside its open hold until 1b provides the accounting link.
+
+### E2 entry conditions
+
+- Claude decides the order of the two required gates when E2 connects composition.
+- Integration tests prove an enrolled call goes through both gates and cover each gate rejecting independently.
+- E2 explicitly decides how to handle auto-pause when Reserve is the rejecting gate.
+- E2 proves the executor carries the exact server-issued reservation for its attempt.
+- SQL and TypeScript both write `BLOCKED_PREFLIGHT`. Keep the 1a whole-row parity test as the regression guard against format drift.

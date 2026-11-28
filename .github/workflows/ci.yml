@@ -2730,6 +2730,9 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0030_t1_dispatch_fencing.sql
           psql -v ON_ERROR_STOP=1 -f packages/database/tests/telemetry-dispatch-recovery.sql
           node packages/database/tests/telemetry-dispatch-concurrency.mjs
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0035_t1_cost_guard_reserve.sql
+          psql -v ON_ERROR_STOP=1 -f packages/database/migrations/0035_t1_cost_guard_reserve.sql
+          node packages/database/tests/telemetry-cost-guard-reserve.mjs
 
       - name: Execute Full Test Suite
         env:
